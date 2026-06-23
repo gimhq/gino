@@ -1,0 +1,106 @@
+import { describe, expect, it } from "bun:test";
+import {
+  buildResponseHeaders,
+  buildUpstreamHeaders,
+  detectProvider,
+  extractProxyCredential,
+  isAllowedUpstreamPath,
+  isAnthropicTempKey,
+  isPrivateUpstreamHost,
+} from "@/proxy";
+
+const h = (init: Record<string, string>) => new Headers(init);
+
+describe("M7 proxy/provider — path allow-list", () => {
+  it("accepts the known upstream subpaths", () => {
+    for (const p of ["/v1/messages", "/v1/chat/completions", "/v1/responses", "/v1/models", "/api/oauth/token"])
+      expect(isAllowedUpstreamPath(p)).toBe(true);
+  });
+
+  it("rejects unknown subpaths", () => {
+    for (const p of ["/", "/v1/embeddings", "/admin", "/v2/messages", "/api/other"])
+      expect(isAllowedUpstreamPath(p)).toBe(false);
+  });
+});
+
+describe("M7 proxy/provider — provider detection", () => {
+  it("x-api-key header → anthropic regardless of path", () => {
+    expect(detectProvider(h({ "x-api-key": "sk-ant-x" }), "/v1/chat/completions")).toBe("anthropic");
+  });
+
+  it("anthropic-only paths → anthropic", () => {
+    expect(detectProvider(h({}), "/v1/messages")).toBe("anthropic");
+    expect(detectProvider(h({}), "/api/oauth/token")).toBe("anthropic");
+  });
+
+  it("everything else → openai", () => {
+    expect(detectProvider(h({}), "/v1/chat/completions")).toBe("openai");
+    expect(detectProvider(h({}), "/v1/responses")).toBe("openai");
+    expect(detectProvider(h({}), "/v1/models")).toBe("openai");
+  });
+});
+
+describe("M7 proxy/provider — credential extraction", () => {
+  it("prefers x-internal-token", () => {
+    expect(extractProxyCredential(h({ "x-internal-token": "tok", "x-api-key": "other" }))).toBe("tok");
+  });
+
+  it("strips the sk-ant-proxy- placeholder prefix from x-api-key", () => {
+    expect(extractProxyCredential(h({ "x-api-key": "sk-ant-proxy-conn123" }))).toBe("conn123");
+  });
+
+  it("falls back to Authorization: Bearer", () => {
+    expect(extractProxyCredential(h({ authorization: "Bearer abc" }))).toBe("abc");
+  });
+
+  it("returns undefined when nothing is present", () => {
+    expect(extractProxyCredential(h({}))).toBeUndefined();
+  });
+
+  it("detects a real Anthropic temp key (not the proxy placeholder)", () => {
+    expect(isAnthropicTempKey(h({ "x-api-key": "sk-ant-api03-real" }))).toBe(true);
+    expect(isAnthropicTempKey(h({ "x-api-key": "sk-ant-proxy-conn" }))).toBe(false);
+    expect(isAnthropicTempKey(h({ "x-api-key": "sk-other" }))).toBe(false);
+  });
+});
+
+describe("M7 proxy/provider — header hygiene", () => {
+  it("strips hop-by-hop, internal, and client credential headers", () => {
+    const out = buildUpstreamHeaders(h({
+      "host": "evil.local",
+      "connection": "keep-alive",
+      "content-length": "9",
+      "x-internal-token": "secret",
+      "x-gino-model": "claude-sonnet",
+      "x-runner-id": "r1",
+      "x-api-key": "sk-ant-proxy-conn",
+      "authorization": "Bearer conn",
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+    }));
+    for (const stripped of ["host", "connection", "content-length", "x-internal-token", "x-gino-model", "x-runner-id", "x-api-key", "authorization"])
+      expect(out.has(stripped)).toBe(false);
+    // Legitimate passthrough headers survive.
+    expect(out.get("content-type")).toBe("application/json");
+    expect(out.get("anthropic-version")).toBe("2023-06-01");
+  });
+
+  it("drops content-encoding/content-length from the response headers", () => {
+    const out = buildResponseHeaders(h({ "content-encoding": "gzip", "content-length": "100", "x-keep": "yes" }));
+    expect(out.has("content-encoding")).toBe(false);
+    expect(out.has("content-length")).toBe(false);
+    expect(out.get("x-keep")).toBe("yes");
+  });
+});
+
+describe("M7 proxy/provider — SSRF guard", () => {
+  it("flags private/loopback literal IPs", () => {
+    for (const ip of ["127.0.0.1", "10.0.0.5", "172.16.3.4", "192.168.1.1", "169.254.0.1", "::1", "fd00::1", "fe80::1"])
+      expect(isPrivateUpstreamHost(ip)).toBe(true);
+  });
+
+  it("allows public literal IPs and hostnames", () => {
+    for (const host of ["8.8.8.8", "1.1.1.1", "api.anthropic.com", "api.openai.com", "2001:4860:4860::8888"])
+      expect(isPrivateUpstreamHost(host)).toBe(false);
+  });
+});

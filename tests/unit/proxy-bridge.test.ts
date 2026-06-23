@@ -1,0 +1,73 @@
+import type { BridgeSocket, ProxyConfig, WsFactory } from "@/proxy";
+import { describe, expect, it } from "bun:test";
+import { bridgeClaudeToOpenAI, CredentialStore } from "@/proxy";
+
+function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
+  return {
+    anthropic: { baseUrl: new URL("https://api.anthropic.com") },
+    openai: { baseUrl: new URL("https://api.openai.com"), apiKey: "sk-openai" },
+    codex: {},
+    modelMap: {},
+    ...overrides,
+  };
+}
+
+function fakeWs(): { sent: string[]; factory: WsFactory; socket: () => BridgeSocket } {
+  const sent: string[] = [];
+  let sock: BridgeSocket | null = null;
+  const factory: WsFactory = () => {
+    sock = { onopen: null, onmessage: null, onerror: null, onclose: null, send: d => sent.push(d), close: () => {} };
+    return sock;
+  };
+  return { sent, factory, socket: () => sock! };
+}
+
+describe("M7 proxy/bridge — Claude→OpenAI Messages→Responses", () => {
+  it("sends a response.create and streams translated Claude SSE back", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const body = JSON.stringify({ model: "gpt-5-codex", system: "Be brief.", messages: [{ role: "user", content: "hi" }] });
+
+    const res = await bridgeClaudeToOpenAI(body, "gpt-5-codex", { store, wsFactory: ws.factory });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+
+    // Upstream connects → response.create is sent with the target model + instructions.
+    ws.socket().onopen?.(null);
+    expect(ws.sent).toHaveLength(1);
+    const createMsg = JSON.parse(ws.sent[0]!) as { type: string; model: string; instructions: string };
+    expect(createMsg.type).toBe("response.create");
+    expect(createMsg.model).toBe("gpt-5-codex");
+    expect(createMsg.instructions).toBe("Be brief.");
+
+    // Drive a minimal Responses stream → expect translated Claude SSE.
+    const emit = (obj: unknown) => ws.socket().onmessage?.({ data: JSON.stringify(obj) });
+    emit({ type: "response.created", response: { id: "resp_1", model: "gpt-5-codex" } });
+    emit({ type: "response.content_part.added" });
+    emit({ type: "response.output_text.delta", delta: "Hi there" });
+    emit({ type: "response.content_part.done" });
+    emit({ type: "response.completed", response: { usage: { input_tokens: 5, output_tokens: 2 } } });
+
+    const text = await res.text();
+    expect(text).toContain("event: message_start");
+    expect(text).toContain("event: content_block_delta");
+    expect(text).toContain("Hi there");
+    expect(text).toContain("event: message_stop");
+  });
+
+  it("returns 401 when no OpenAI credentials are configured", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig({ openai: { baseUrl: new URL("https://api.openai.com") } }));
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ error: { type: "authentication_error" } });
+  });
+
+  it("returns 400 on an invalid JSON body", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const res = await bridgeClaudeToOpenAI("not-json", "gpt-5", { store, wsFactory: ws.factory });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: { type: "invalid_request_error" } });
+  });
+});

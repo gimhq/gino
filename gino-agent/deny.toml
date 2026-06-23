@@ -1,0 +1,49 @@
+# cargo-deny supply-chain policy for `gino-agent`.
+#
+# rustls-only TLS posture (PLAN-003 / PMA-Rust Lock 1 & 2): openssl and
+# native-tls are banned outright so no later change can pull a C TLS stack into
+# the tree. Security advisories are denied by default.
+
+[advisories]
+# A transiently-yanked transitive crate should not flake CI; real advisories are
+# still denied by default.
+yanked = "warn"
+ignore = []
+
+[licenses]
+# This crate is unpublished (`publish = false`); skip the license check for it.
+private = { ignore = true }
+confidence-threshold = 0.93
+# The allow-list is intentionally a permissive superset so later changes can add
+# dependencies without editing policy; don't warn on as-yet-unused entries.
+unused-allowed-license = "allow"
+# Permissive licenses only. Add a new entry only after a deliberate review.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "0BSD",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "openssl", reason = "rustls only (PLAN-003 / Lock 1)" },
+    { name = "openssl-sys", reason = "rustls only (PLAN-003 / Lock 1)" },
+    { name = "native-tls", reason = "rustls only (PLAN-003 / Lock 1)" },
+    { name = "native-tls-sys", reason = "rustls only (PLAN-003 / Lock 1)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

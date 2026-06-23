@@ -1,0 +1,15 @@
+# Real-flow agent image: the v2 gino-agent + the REAL Claude CLI engine.
+#
+# Built FROM the existing gino-runner image, which already carries the real
+# `claude` binary (a standalone ELF), the unprivileged `gino` user (the real CLI
+# refuses --dangerously-skip-permissions as root), and an entrypoint that drops
+# to that user. We only swap in the freshly-built protocol-v2 runner binary
+# (staged by run.sh as gino-agent.bin). Everything else — the engine, the
+# privilege drop, the workspace layout — comes from the base.
+#
+# Used by run-real.sh, which points the engine at the host /llm proxy so the real
+# CLI's model calls flow through the host's credential injection to real Anthropic.
+FROM gino-runner:latest
+
+COPY gino-agent.bin /app/gino-agent
+RUN chmod +x /app/gino-agent

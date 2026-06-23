@@ -1,0 +1,94 @@
+# Gino end-to-end orchestration: the host, a real gino-agent, a mock LLM
+# upstream and a test driver — wired on one compose network.
+#
+#   mock-llm  oven/bun        canned Anthropic-ish upstream for the /llm proxy test
+#   host      oven/bun        the protocol-v2 control plane (bun src/index.ts), repo bind-mounted
+#   agent     Dockerfile.agent  the Rust gino-agent + a fake `claude` engine; dials the host
+#   tester    oven/bun        drives the host HTTP surface end-to-end, exits 0/1
+#
+# Run via ./run.sh (builds the runner binary first). Single pass/fail:
+#   docker compose -f docker-compose.yml up --abort-on-container-exit --exit-code-from tester
+#
+# `../` (repo root) is bind-mounted read-only into host; all host writes (db,
+# store, logs→stdout) go to a tmpfs so the repo is never touched.
+
+name: gino-e2e
+
+services:
+  mock-llm:
+    image: oven/bun:1.3.14
+    working_dir: /work
+    command: ["bun", "/work/mock-llm.ts"]
+    volumes:
+      - ./mock-llm.ts:/work/mock-llm.ts:ro
+    environment:
+      PORT: "4000"
+
+  host:
+    image: oven/bun:1.3.14
+    working_dir: /app
+    command: ["bun", "src/index.ts"]
+    depends_on:
+      mock-llm:
+        condition: service_started
+    volumes:
+      - ../:/app:ro
+    tmpfs:
+      - /tmp
+    environment:
+      NODE_ENV: development
+      ROOT_DIR: /app
+      GINO_PORT: "3000"
+      GINO_HOST: 0.0.0.0
+      GINO_DB_PATH: /tmp/gino/gino.db
+      GINO_STORE_DIR: /tmp/gino/store
+      GINO_LOG_TO_STDOUT: "true"
+      GINO_LOG_LEVEL: info
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
+      # Credential proxy → mock upstream (private IP, so allow it explicitly).
+      GINO_PROXY_ANTHROPIC_BASE_URL: http://mock-llm:4000
+      GINO_PROXY_ANTHROPIC_API_KEY: sk-ant-host-real
+      GINO_PROXY_ALLOW_PRIVATE_UPSTREAM: "true"
+    ports:
+      - "127.0.0.1:3100:3000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: gino-agent:e2e
+    depends_on:
+      host:
+        condition: service_healthy
+    environment:
+      # The host serves under /api, and the runner appends /agent/* verbatim, so
+      # the base URL must include /api (matches register + ws + /llm).
+      GINO_HOST_URL: http://host:3000/api
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_AGENT_NAME: e2e-runner
+      RUST_LOG: info
+
+  tester:
+    image: oven/bun:1.3.14
+    working_dir: /work
+    command: ["bun", "/work/e2e.ts"]
+    depends_on:
+      host:
+        condition: service_healthy
+      agent:
+        condition: service_started
+    volumes:
+      - ./e2e.ts:/work/e2e.ts:ro
+    environment:
+      BASE: http://host:3000/api
+      REGISTER_TOKEN: e2e-register-secret
+      CHANNEL_TOKEN: e2e-channel-secret
+      AGENT_NAME: e2e-runner
+      PROXY_KEY: sk-ant-host-real

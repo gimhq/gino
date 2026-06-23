@@ -1,0 +1,129 @@
+[package]
+name = "gino-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+description = "Generic WebSocket-based, runtime-agnostic agent runner daemon for the gino orchestrator."
+repository = "https://github.com/gimhq/gino"
+publish = false
+
+# Only the dependencies actually used are declared (config + CLI + logging, the
+# persistence + wire layers, the WS + HTTP transport, the Claude engine, and — added
+# in this change — the scheduler's time/cron deps `chrono` + `croner`). Keeping the
+# set minimal keeps `cargo shear` green.
+#
+# TLS posture (PLAN-003 / PMA-Rust Lock 1 & 2, enforced by deny.toml): every TLS
+# user is pinned to rustls; no `native-tls` feature anywhere. Both clients verify
+# against the **OS trust store** via `rustls-native-certs` rather than the bundled
+# Mozilla set — `webpki-roots`/`webpki-root-certs` carry CDLA-Permissive-2.0, which
+# is absent from deny.toml's license allow-list (and deny.toml is out of scope to
+# edit), whereas `rustls-native-certs` is Apache-2.0/ISC/MIT (allowed) and pulls no
+# banned crate (`openssl-probe` only locates cert paths; it is not `openssl-sys`).
+# `reqwest` is pinned to 0.12 because 0.13 forces `rustls-platform-verifier`, which
+# unconditionally drags in the CDLA `webpki-root-certs`. A single process-wide
+# rustls `CryptoProvider` (aws-lc-rs) is installed at startup (see lib.rs).
+[dependencies]
+anyhow = "1"
+# Object-safe async trait methods for the `Engine`/`Session` abstraction
+# (PLAN-003 §5): native `async fn` in traits is not `dyn`-compatible, so the
+# trait methods desugar to boxed futures via this macro. Pulls only
+# proc-macro2/quote/syn, already in the tree (serde/tokio derives).
+async-trait = "0.1"
+# Timestamp math for the scheduler (PLAN-002): RFC3339 parse/format matching the
+# host `Date.toISOString()`, plus `Utc::now()` and `TimeDelta` interval arithmetic.
+# `default-features = false` + `now` keeps it lean; `croner` unifies in the rest of
+# what it needs. Pure Rust (num-traits + iana-time-zone, all deny-clean licenses).
+chrono = { version = "0.4.45", default-features = false, features = ["now"] }
+clap = { version = "4", features = ["derive", "env"] }
+# 5-field cron next-run computation for the scheduler (PLAN-002 §2). The pinned 2.x
+# line is a deny-clean, pure-Rust crate (MIT) whose only dependency is `chrono`; its
+# default 5-field parsing maps the host's `0 <expr>` cronbake form (seconds = 0) to
+# the same instants. 3.x pulls a much heavier proc-macro tree for no gain here.
+croner = "2"
+# Stream/Sink combinators for the split tokio-tungstenite connection (the WS read
+# half is a Stream, the write half a Sink). `sink` pulls in `SinkExt`/`split`.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# HTTP client for register / config-refresh / output-fallback. rustls + OS roots.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+# JUSTIFICATION (PLAN-003 §7 / PMA-Rust Lock 1): rusqlite `bundled` compiles the
+# vendored SQLite amalgamation via `libsqlite3-sys` — a C dependency. This is the
+# ONE sanctioned C dep: there is no mature, drop-in pure-Rust SQLite, and bundling
+# the amalgamation avoids relying on a system libsqlite3 (portable static builds).
+# It pulls no TLS stack, so the rustls-only posture (deny.toml) is unaffected.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Direct dependency so the process-wide aws-lc-rs `CryptoProvider` can be installed
+# at startup (PLAN-001 Lock 2); tokio-tungstenite's rustls connector relies on it.
+rustls = "0.23"
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+# SHA-256 for attachment integrity + the content-addressed cache key (PLAN-005 /
+# agent-architecture §9, A4). Pure-Rust RustCrypto (MIT OR Apache-2.0,
+# deny-clean); its `digest`/`crypto-common`/`generic-array`/`cpufeatures` deps are
+# already in the tree (pulled by `sha1` for the WS handshake), so this adds only
+# `sha2` itself and pulls no TLS or C stack.
+sha2 = "0.10"
+serde_json = "1"
+# JUSTIFICATION (PLAN-007 §2 / agent-architecture §9b): uncompressed-tar (un)pack of
+# `kind=dir` skill bundles into the content-addressed store. Pure-Rust, MIT OR
+# Apache-2.0 (deny-clean). `default-features = false` drops the optional `xattr`
+# feature (and its `xattr`/`rustix`/`linux-raw-sys` deps) we don't need, leaving only
+# `filetime` (MIT OR Apache-2.0) added to the tree. Used in src/provisioning/store.rs.
+tar = { version = "0.4", default-features = false }
+thiserror = "2"
+# Async runtime + primitives for the transport tasks and the engine. `process`
+# spawns and drives the long-lived `claude` child (PLAN-001); `signal` powers the
+# daemon's clean-shutdown handler.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+    "process",
+    "signal",
+] }
+# Reconnecting WebSocket client (rustls + OS roots; native-tls left off).
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# v4 session/request ids for the control protocol (PLAN-001). Reuses the
+# `getrandom` already in the tree; pulls no TLS or C stack.
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Temp-file SQLite DB for the identity persist/reload test (in-memory DBs cannot
+# survive a reopen).
+tempfile = "3"
+# Mock HTTP host for the register / config-refresh integration tests (no network).
+wiremock = "0.6"
+
+# Lint policy lives in the manifest (PMA-Rust Lock 4), so dev and CI share the
+# same gate. This is a single crate, so the tables are package-level rather than
+# `[workspace.lints]`. `cargo clippy` is invoked plainly — the deny policy is here.
+[lints.rust]
+unsafe_code = "forbid"
+# Deny every warn-by-default lint (current + future toolchains). priority -2 lets
+# the clippy groups below (priority -1) and named lints (priority 0) override it.
+warnings = { level = "deny", priority = -2 }
+missing_debug_implementations = "warn"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+# Promote the high-signal, stable pedantic group. `nursery` and `cargo` are left
+# off: `nursery` is explicitly unstable (its `unreachable_pub`/`redundant_pub_crate`
+# pair conflict inside a binary crate) and `cargo` only checks crates.io publishing
+# metadata, which is irrelevant for this unpublished binary.
+pedantic = { level = "warn", priority = -1 }
+# Lock 6 — no panics in runtime paths (relaxed in tests via clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "warn"
+# Pedantic lints with poor signal-to-noise for this crate.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"

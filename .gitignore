@@ -1,0 +1,27 @@
+# Local snapshot of the pre-v2 host (durable copy also at git tag backup/pre-hostv2)
+backup/
+
+# Bun / Node
+node_modules/
+dist/
+*.log
+
+# Runtime data (sqlite db + WAL/SHM, logs, uploads)
+data/
+# M8 content-addressed blob store (config artifacts + attachments); default
+# GINO_STORE_DIR is data/store (covered above), but honour a top-level store/ too.
+store/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Test / build output
+coverage/
+.turbo/
+
+# Env (commit only the examples)
+.env
+.env.*
+!.env.example
+!.env.*.example

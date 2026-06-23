@@ -1,0 +1,176 @@
+import type { EntryInput } from "@/configstore";
+// M4 — TASK STORE (host-authoritative task identity + placement).
+//
+// The host OWNS task identity: it generates the `task_id` (D5, a ULID) and
+// holds the task's definition — `owner_id`, `engine`, `model`, `workdir?`,
+// `meta?`, `name?`, `kind?`, `status` — plus its placement (`agent_id`, SET
+// ONCE) and the conversation binding (`current_thread_id`). This is the *only*
+// module that writes the `tasks` table.
+//
+// `crons` / `thread_runs` / `messages` are READ-ONLY MIRRORS written by M5 from
+// inbound agent frames — never authored here. This module may *read* the mirror
+// (`listTaskCrons`) for the admin surface, but it never writes it.
+//
+// task-scope config/skill entries (`config_entries` WHERE scope = <task_id>) are
+// M8/B6 — `meta` carries an optional passthrough seam (no config storage here).
+import type { AppDatabase } from "@/db";
+import type { NewTask, Task } from "@/db/schema";
+import { and, desc, eq } from "drizzle-orm";
+import { resolveEntries, setEntries } from "@/configstore";
+import { crons, tasks } from "@/db/schema";
+import { ulid } from "@/platform";
+import { AppError, NotFoundError } from "@/shared/lib/errors";
+
+/** A freshly-created, unplaced task is `pending-assignment` until dispatch pins it (§3). */
+export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
+
+export interface CreateTaskInput {
+  /** Owner (user identity) → resolved to a permitted agent by dispatch (OD13). */
+  ownerId: string;
+  /** OD15 — a task carries `engine` + `model` + `workdir?` + `meta?`. */
+  engine: string;
+  model: string;
+  workdir?: string;
+  meta?: Record<string, unknown>;
+  name?: string;
+  kind?: string;
+  /** Initial status (user/agent-marked); defaults to `pending-assignment`. */
+  status?: string;
+  /** M8 — task-scope config/skill desired set, persisted to `config_entries WHERE scope = task.id`. */
+  entries?: EntryInput[];
+}
+
+/**
+ * Create a task: the host mints the ULID `task_id` and persists the definition
+ * at `pending-assignment` (no placement yet). Dispatch (`dispatch.ts`) then
+ * resolves the owner to a permitted agent and pins `agent_id` once. Any M8
+ * task-scope `entries` are persisted to `config_entries` (scope = the new
+ * `task.id`) with the host resolving the per-engine `target`.
+ */
+export function createTask(db: AppDatabase, input: CreateTaskInput): Task {
+  const values: NewTask = {
+    id: ulid(),
+    ownerId: input.ownerId,
+    engine: input.engine,
+    model: input.model,
+    workdir: input.workdir ?? null,
+    meta: input.meta ?? null,
+    name: input.name ?? null,
+    kind: input.kind ?? null,
+    status: input.status ?? STATUS_PENDING_ASSIGNMENT,
+  };
+  const task = db.insert(tasks).values(values).returning().get();
+  if (input.entries && input.entries.length > 0) {
+    setTaskEntries(db, task.id, input.entries);
+  }
+  return task;
+}
+
+/**
+ * Persist (REPLACE) a task's M8 desired set — `config_entries WHERE scope =
+ * taskId` — resolving the per-engine `target` from the task's engine. The
+ * orchestrator re-materializes this set into `task_upsert.data.entries` on
+ * (re-)dispatch; the agent reconciles it. An empty list clears the task's set.
+ */
+export function setTaskEntries(db: AppDatabase, taskId: string, entries: EntryInput[]): void {
+  const task = requireTask(db, taskId);
+  setEntries(db, taskId, resolveEntries(task.engine, entries));
+}
+
+export function getTask(db: AppDatabase, id: string): Task | undefined {
+  return db.select().from(tasks).where(eq(tasks.id, id)).get();
+}
+
+/** Like `getTask` but throws the standard 404 for the admin surface. */
+export function requireTask(db: AppDatabase, id: string): Task {
+  const task = getTask(db, id);
+  if (!task) {
+    throw new NotFoundError("task", id);
+  }
+  return task;
+}
+
+export interface ListTasksFilter {
+  ownerId?: string;
+  agentId?: string;
+  status?: string;
+}
+
+/** List tasks (admin observe), newest first, optionally filtered. */
+export function listTasks(db: AppDatabase, filter: ListTasksFilter = {}): Task[] {
+  const conds = [
+    filter.ownerId != null ? eq(tasks.ownerId, filter.ownerId) : undefined,
+    filter.agentId != null ? eq(tasks.agentId, filter.agentId) : undefined,
+    filter.status != null ? eq(tasks.status, filter.status) : undefined,
+  ].filter(c => c != null);
+
+  const base = db.select().from(tasks);
+  const filtered = conds.length > 0 ? base.where(and(...conds)) : base;
+  return filtered.orderBy(desc(tasks.createdAt)).all();
+}
+
+/**
+ * Pin a task to an agent — SET ONCE (no migration, §3 hard rule). The first
+ * placement records `agent_id` + `assigned_at`; re-pinning the SAME agent is an
+ * idempotent no-op; re-pinning a DIFFERENT agent is rejected (409) because a
+ * task lives on exactly one agent for life. "Moving agents" is a brand-new task.
+ */
+export function setPlacement(db: AppDatabase, taskId: string, agentId: string): Task {
+  const task = requireTask(db, taskId);
+  if (task.agentId != null) {
+    if (task.agentId === agentId) {
+      return task; // idempotent: already pinned to this agent
+    }
+    throw new AppError(
+      `task ${taskId} is already placed on agent ${task.agentId} — placement is set-once (no migration)`,
+      409,
+      "TASK_ALREADY_PLACED",
+    );
+  }
+  return db
+    .update(tasks)
+    .set({ agentId, assignedAt: Date.now(), updatedAt: Date.now() })
+    .where(eq(tasks.id, taskId))
+    .returning()
+    .get();
+}
+
+/** Set the task's status (user/agent-marked; the host never auto-terminals, DP4). */
+export function setStatus(db: AppDatabase, taskId: string, status: string): Task {
+  requireTask(db, taskId);
+  return db
+    .update(tasks)
+    .set({ status, updatedAt: Date.now() })
+    .where(eq(tasks.id, taskId))
+    .returning()
+    .get();
+}
+
+/**
+ * Track the conversation's ongoing thread (`current_thread_id`, the resume
+ * target). The orchestrator advances this when it opens a thread for a message
+ * (a continue reuses it; a new conversation is a new task, OD7+OD9).
+ */
+export function setCurrentThread(db: AppDatabase, taskId: string, threadId: string): Task {
+  requireTask(db, taskId);
+  return db
+    .update(tasks)
+    .set({ currentThreadId: threadId, updatedAt: Date.now() })
+    .where(eq(tasks.id, taskId))
+    .returning()
+    .get();
+}
+
+/**
+ * Read the cron mirror for a task (READ-ONLY — crons live on the agent, OD14;
+ * M5 writes this from `cron_state`). Used by the `/admin/tasks/:id/crons` list;
+ * this module never writes the `crons` table.
+ */
+export function listTaskCrons(db: AppDatabase, taskId: string) {
+  return db
+    .select()
+    .from(crons)
+    .where(eq(crons.taskId, taskId))
+    .orderBy(desc(crons.updatedAt))
+    .all();
+}

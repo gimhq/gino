@@ -1,0 +1,92 @@
+# Real-flow e2e: the REAL Claude CLI engine driving a REAL model through the host
+# /llm credential proxy to REAL Anthropic. No mock anywhere.
+#
+#   host    the control plane, /llm proxy pointed at https://api.anthropic.com,
+#           injecting the upstream credential the USER supplies via the
+#           environment (GINO_PROXY_ANTHROPIC_API_KEY or _OAUTH_TOKEN).
+#   agent   the v2 runner + the real `claude` engine; ANTHROPIC_BASE_URL points at
+#           the host /llm, authenticated to the proxy with the (non-secret) static
+#           key, so the real CLI never sees the real upstream credential.
+#   tester  drives one real task through and reports.
+#
+# Run via ./run-real.sh (which requires the credential to be set in the env — it
+# never reads your personal ~/.claude credentials).
+
+name: gino-e2e-real
+
+services:
+  host:
+    image: oven/bun:1.3.14
+    working_dir: /app
+    # v1 proxy mode: the entrypoint sources the Anthropic OAuth token from the
+    # mounted Claude credentials file when no explicit credential is configured.
+    entrypoint: ["sh", "/app/e2e/host-real-entrypoint.sh"]
+    volumes:
+      # The repo (read-only) also carries the gitignored e2e/.real-creds.json that
+      # run-real.sh stages in v1 proxy mode; the entrypoint reads it from here.
+      - ../:/app:ro
+    tmpfs:
+      - /tmp
+    environment:
+      NODE_ENV: development
+      ROOT_DIR: /app
+      GINO_PORT: "3000"
+      GINO_HOST: 0.0.0.0
+      GINO_DB_PATH: /tmp/gino/gino.db
+      GINO_STORE_DIR: /tmp/gino/store
+      GINO_LOG_TO_STDOUT: "true"
+      GINO_LOG_LEVEL: info
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
+      # REAL upstream. The proxy injects whichever credential the user provided
+      # (api key wins over oauth token); both default empty so a missing one is a
+      # clear "unconfigured" rather than a baked-in secret.
+      GINO_PROXY_ANTHROPIC_BASE_URL: https://api.anthropic.com
+      GINO_PROXY_ANTHROPIC_API_KEY: "${GINO_PROXY_ANTHROPIC_API_KEY:-}"
+      GINO_PROXY_ANTHROPIC_OAUTH_TOKEN: "${GINO_PROXY_ANTHROPIC_OAUTH_TOKEN:-}"
+      # The agent authenticates to the proxy with this (non-secret) static key.
+      GINO_PROXY_STATIC_KEY: gino-e2e-proxy-key
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent.real
+    image: gino-agent:e2e-real
+    depends_on:
+      host:
+        condition: service_healthy
+    environment:
+      GINO_HOST_URL: http://host:3000/api
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_AGENT_NAME: e2e-real-runner
+      GINO_WORKSPACE_DIR: /workspace/group
+      GINO_DB_PATH: /workspace/group/agent.db
+      # The real CLI inherits these (the runner does not env_clear the child), so
+      # its model calls go to the host /llm proxy, authenticated with the static key.
+      ANTHROPIC_BASE_URL: http://host:3000/api/llm
+      ANTHROPIC_API_KEY: gino-e2e-proxy-key
+      RUST_LOG: info
+
+  tester:
+    image: oven/bun:1.3.14
+    working_dir: /work
+    command: ["bun", "/work/e2e-real.ts"]
+    depends_on:
+      host:
+        condition: service_healthy
+      agent:
+        condition: service_started
+    volumes:
+      - ./e2e-real.ts:/work/e2e-real.ts:ro
+    environment:
+      BASE: http://host:3000/api
+      REGISTER_TOKEN: e2e-register-secret
+      CHANNEL_TOKEN: e2e-channel-secret
+      AGENT_NAME: e2e-real-runner
+      REAL_MODEL: "${REAL_MODEL:-claude-haiku}"

@@ -1,0 +1,28 @@
+# Runtime image for the gino gino-agent e2e.
+#
+# The build context is e2e/ (kept tiny). The runner binary is compiled OUTSIDE
+# this Dockerfile by run.sh — in a rust:1.96-bookworm container with the host's
+# warm cargo registry mounted — and staged here as `gino-agent.bin`. It is a
+# glibc binary built on bookworm, so it runs as-is on this bookworm-slim base
+# (matched glibc; no musl/static juggling needed for a local e2e).
+FROM debian:bookworm-slim
+
+# bash + jq back the fake `claude` engine; ca-certificates lets reqwest verify
+# TLS if the host URL is ever https.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY gino-agent.bin /app/gino-agent
+COPY fake-claude /usr/local/bin/claude
+COPY agent-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/gino-agent /usr/local/bin/claude /app/entrypoint.sh
+
+# Bootstrap inputs (GINO_HOST_URL / GINO_REGISTER_TOKEN / GINO_AGENT_NAME) come
+# from compose env; only the workspace/db defaults are baked here.
+ENV GINO_WORKSPACE_DIR=/workspace \
+    GINO_DB_PATH=/workspace/agent.db \
+    PATH=/usr/local/bin:/usr/bin:/bin
+
+WORKDIR /workspace
+ENTRYPOINT ["/app/entrypoint.sh"]
