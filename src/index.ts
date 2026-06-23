@@ -2,6 +2,7 @@ import process from "node:process";
 import { bootstrap } from "./app";
 import { BUILD_INFO } from "./build-info";
 import { dispatchCliSubcommand } from "./cli";
+import { isUnderLode, markReady } from "./platform/lode";
 
 (async () => {
   const subcommandExit = await dispatchCliSubcommand(process.argv);
@@ -22,6 +23,14 @@ import { dispatchCliSubcommand } from "./cli";
   });
 
   logger.info({ port: config.PORT, host: config.HOST }, "server started");
+
+  // Readiness handshake (docs/host-upgrade-design.md §6.1) — tell the lode loader
+  // we can serve, so it commits this version / stops the old instance. No-op when
+  // not running under lode.
+  if (isUnderLode()) {
+    markReady();
+    logger.info({ instance: process.env.LODE_INSTANCE }, "lode: reported ready");
+  }
 
   let shuttingDown = false;
 

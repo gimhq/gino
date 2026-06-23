@@ -3,6 +3,7 @@ import { sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import { BUILD_INFO } from "@/build-info";
+import { isUnderLode, readLodeState } from "@/platform";
 import { describeRoute, errors, jsonOk, resolver, TAGS } from "@/shared/lib/openapi";
 
 /**
@@ -59,14 +60,28 @@ export function systemRoutes() {
       tags: [TAGS.System],
       summary: "Build version",
       responses: {
-        ...jsonOk(z.object({ commit: z.string(), buildTime: z.string(), version: z.string() }), "Build identifiers"),
+        ...jsonOk(z.object({ commit: z.string(), buildTime: z.string(), version: z.string(), lode: z.any() }), "Build identifiers"),
         ...errors(500),
       },
     }),
-    c => c.json({
-      success: true,
-      data: BUILD_INFO,
-    }),
+    (c) => {
+      // Surface the lode loader's view (host-upgrade-design §6.3) so the admin
+      // UI can show "on version X, update available". Read-only mirror; absent
+      // when not running under lode.
+      const managed = isUnderLode();
+      const s = managed ? readLodeState() : null;
+      const lode = managed
+        ? {
+            managed: true,
+            current: s?.current ?? null,
+            last_good: s?.last_good ?? null,
+            available: s?.available ?? null,
+            channel: s?.channel ?? null,
+            status: s?.status ?? null,
+          }
+        : { managed: false };
+      return c.json({ success: true, data: { ...BUILD_INFO, lode } });
+    },
   );
 
   return router;

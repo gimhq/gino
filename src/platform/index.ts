@@ -13,8 +13,13 @@ export { hashToken, safeEqual, verifyToken } from "./crypto";
 // ids/crypto (ADDED by M9 — the platform's own surface).
 export { generateId, nanoid, ulid } from "./ids";
 
+// lode loader integration (docs/host-upgrade-design.md §6) — state.json readiness
+// + the update/restart control channel. All no-ops outside lode.
+export type { LodeState } from "./lode";
+export { isUnderLode, markReady, readLodeState, requestRestart, requestUpdate } from "./lode";
 // env/config (re-export — `src/config` is the sole config source).
 export { loadConfig, loadConfigStrict } from "@/config";
+
 export type { Config } from "@/config";
 export { configSchema } from "@/config/schema";
 
@@ -26,9 +31,9 @@ export {
   UnauthorizedError,
   ValidationError,
 } from "@/shared/lib/errors";
+
 // logger (re-export — secret-redacting structured logger).
 export { createLogger } from "@/shared/lib/logger";
-
 export type { Logger } from "@/shared/lib/logger";
 
 export const MODULE = "platform" as const;
