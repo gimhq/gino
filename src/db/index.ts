@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { BUILD_INFO } from "../build-info";
 import { ROOT_DIR } from "../dirs";
 import { embeddedMigrations } from "./embedded-migrations";
 import * as schema from "./schema";
@@ -51,11 +52,65 @@ export function createDb(path: string): AppDatabase {
 
   const db = drizzle(sqlite, { schema });
 
+  // Pre-migration snapshot (host-upgrade-design.md §7): on a version change, back
+  // up the existing DB BEFORE the new code migrates it, so a rollback to the
+  // previous version still finds a compatible schema. Then migrate, then record
+  // the version that owns the on-disk schema.
+  snapshotOnVersionChange(sqlite, path, BUILD_INFO.version);
   runMigrations(db);
+  recordDbVersion(path, BUILD_INFO.version);
 
   return Object.assign(db, {
     close: () => sqlite.close(),
   });
+}
+
+const VERSION_MARKER = ".gino-version";
+
+/**
+ * Snapshot the DB to `backups/<prev>.db` when the running `version` differs from
+ * the version that last migrated it (recorded in `<dbDir>/.gino-version`) — the
+ * cheap insurance a strict expand-contract migration policy can't fully cover.
+ * No-op for `:memory:`, the dev placeholder version, a first run (no marker), or
+ * an unchanged version. Best-effort: a failure logs and continues (the running
+ * version is still good; only the rollback safety net is missed).
+ */
+export function snapshotOnVersionChange(sqlite: Database, dbPath: string, version: string): void {
+  if (dbPath === ":memory:" || version === "0.0.0-dev")
+    return;
+  const dir = dirname(dbPath);
+  let prev: string | null = null;
+  try {
+    prev = readFileSync(resolve(dir, VERSION_MARKER), "utf8").trim() || null;
+  }
+  catch {}
+  if (!prev || prev === version || !existsSync(dbPath))
+    return;
+  try {
+    // TRUNCATE checkpoint folds the WAL into the main file, so a plain copy is a
+    // consistent point-in-time snapshot of the pre-migration schema.
+    sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const backups = resolve(dir, "backups");
+    mkdirSync(backups, { recursive: true });
+    copyFileSync(dbPath, resolve(backups, `${prev}.db`));
+    // eslint-disable-next-line no-console
+    console.info(`[db] snapshot ${prev} → backups/${prev}.db before migrating to ${version}`);
+  }
+  catch (err) {
+    console.warn("[db] pre-migration snapshot failed (continuing):", err);
+  }
+}
+
+/** Record the version that now owns the migrated on-disk schema (for next boot). */
+export function recordDbVersion(dbPath: string, version: string): void {
+  if (dbPath === ":memory:" || version === "0.0.0-dev")
+    return;
+  try {
+    writeFileSync(resolve(dirname(dbPath), VERSION_MARKER), `${version}\n`);
+  }
+  catch (err) {
+    console.warn("[db] version marker write failed:", err);
+  }
 }
 
 type DrizzleDb = ReturnType<typeof drizzle<typeof schema>>;
