@@ -1,0 +1,139 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs for the same PR; never cancel main pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pin tool versions so a runtime minor bump is a deliberate PR, not a silent
+  # main-branch breakage.
+  BUN_VERSION: "1.3.14"
+
+jobs:
+  host:
+    name: host — lint + typecheck + test + build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Single source of truth — matches package.json's `check` script (lint +
+      # typecheck + test + build), so a green local run is a green CI run.
+      - name: Check
+        run: bun run check
+
+      - name: Package (lode asset + manifest build smoke)
+        run: bun run package --version 0.0.0-ci --asset-url https://example.invalid/gino.js
+
+  agent:
+    name: agent (rust) — fmt + clippy + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: gino-agent
+    steps:
+      - uses: actions/checkout@v6
+
+      # C toolchain for the two crates that compile C — aws-lc-sys (rustls crypto)
+      # and libsqlite3-sys (bundled SQLite).
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev
+
+      # rust-toolchain.toml pins the channel (1.96.0) + rustfmt/clippy components.
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            gino-agent/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('gino-agent/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --release --locked --all-targets
+
+      - name: Test
+        run: cargo test --release --locked
+
+  security:
+    name: security scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # trufflehog walks history
+
+      - name: trufflehog (secrets)
+        uses: trufflesecurity/trufflehog@v3.95.5
+        with:
+          extra_args: --results=verified,unknown
+
+      - name: osv-scanner (dependency CVEs)
+        uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
+        with:
+          scan-args: |-
+            --lockfile=bun.lock
+            --lockfile=gino-agent/Cargo.lock
+
+  dependency-review:
+    name: dependency review (PR only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  e2e:
+    name: docker e2e (host ↔ agent, hermetic)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Compiles the agent in rust:1.96-bookworm, builds the host + agent images,
+      # boots the compose stack and drives the 50-check hermetic suite.
+      - name: Run e2e
+        run: ./e2e/run.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: ./e2e/run.sh --logs || true

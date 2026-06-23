@@ -1,5 +1,5 @@
-// Stub. Populated at compile time by `scripts/compile.ts`, which rewrites
-// this file before invoking `bun build --compile` and restores the empty
+// Stub. Populated at build time by `scripts/package.ts`, which rewrites
+// this file before invoking `bun build` and restores the empty
 // stub afterwards. The runtime path in `db/index.ts` prefers the on-disk
 // `drizzle/` folder when present and falls back to this map only inside the
 // compiled binary, where the folder has been excluded.

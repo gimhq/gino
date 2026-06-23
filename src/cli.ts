@@ -4,7 +4,7 @@ import process from "node:process";
 import cac from "cac";
 import { consola } from "consola";
 import { BUILD_INFO } from "./build-info";
-import { ROOT_DIR } from "./root";
+import { ROOT_DIR } from "./dirs";
 
 const migrateLog = consola.withTag("migrate");
 

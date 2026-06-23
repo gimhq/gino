@@ -5,7 +5,7 @@ import process from "node:process";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { ROOT_DIR } from "../root";
+import { ROOT_DIR } from "../dirs";
 import { embeddedMigrations } from "./embedded-migrations";
 import * as schema from "./schema";
 
@@ -69,9 +69,9 @@ function runMigrations(db: DrizzleDb): void {
     return;
   }
 
-  // Compile path: `scripts/compile.ts` writes the migration files into
-  // `embedded-migrations.ts` before invoking `bun build --compile`, then
-  // restores the stub. A binary built outside that script — or from a
+  // Package path: `scripts/package.ts` writes the migration files into
+  // `embedded-migrations.ts` before invoking `bun build`, then
+  // restores the stub. A binary built outside that step — or from a
   // worktree where the stub was restored but `drizzle/` was excluded — would
   // otherwise boot with an empty map and crash later on its first DB write.
   // Fail fast with a concrete fix.
@@ -79,9 +79,9 @@ function runMigrations(db: DrizzleDb): void {
     throw new Error(
       "No migrations available: filesystem drizzle/ folder is missing and the "
       + "compiled binary has no embedded migrations. This binary was built "
-      + "outside `bun run compile` (which populates embedded-migrations.ts at "
+      + "outside `bun run package` (which populates embedded-migrations.ts at "
       + "build time) or against a worktree without `drizzle/`. Run "
-      + "`bun run compile` to rebuild, or mount the project's drizzle/ folder.",
+      + "`bun run package` to rebuild, or mount the project's drizzle/ folder.",
     );
   }
 
@@ -92,7 +92,7 @@ function runMigrations(db: DrizzleDb): void {
   if (!embeddedMigrations.has("meta/_journal.json")) {
     throw new Error(
       "Embedded migrations are corrupt: meta/_journal.json missing. "
-      + "Rebuild the binary with `bun run compile`.",
+      + "Rebuild the bundle with `bun run package`.",
     );
   }
 

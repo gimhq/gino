@@ -14,7 +14,7 @@
     "test": "bun --env-file=/dev/null test ./tests/",
     "test:coverage": "bun --env-file=/dev/null test ./tests/ --coverage",
     "check": "bun run lint && bun run typecheck && bun run test && bun run build",
-    "compile": "bun scripts/compile.ts",
+    "package": "bun scripts/package.ts",
     "clean": "bun scripts/clean.ts",
     "gen:frames-schema": "bun run scripts/gen-frames-schema.ts",
     "db:generate": "drizzle-kit generate",
