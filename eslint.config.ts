@@ -27,6 +27,8 @@ export default antfu({
     "data/**",
     "drizzle/**",
     "docs/**",
+    // Vendored verbatim from upstream lode (re-copied to update) — not ours to lint.
+    "src/platform/lode-sdk.ts",
   ],
 }, {
   // Test files construct partial fixtures the strict project rules would

@@ -3,12 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { isUnderLode, markReady, readLodeState, requestRestart, requestUpdate } from "@/platform/lode";
+import { isUnderLode, markReady, readLodeState, requestRestart, requestRollback, requestUpdate } from "@/platform/lode";
 
-// The lode integration (docs/host-upgrade-design.md §6): the host writes the
-// app-owned state.json fields (ready/target/restart_nonce), preserving lode's,
-// and is a no-op outside the loader. Env vars are read dynamically, so each test
-// sets LODE_DATA_DIR/LODE_INSTANCE against a temp dir.
+// gino's adapter over the vendored lode SDK (docs/host-upgrade-design.md §6): the
+// host writes the app-owned state.json fields (ready/target/restart_nonce),
+// preserving lode's, and is inert outside the loader. Env is read dynamically, so
+// each test sets LODE_DATA_DIR/LODE_INSTANCE against a temp dir.
 describe("lode state integration", () => {
   let dir: string;
 
@@ -28,19 +28,32 @@ describe("lode state integration", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("isUnderLode requires both injected vars", () => {
+  it("isUnderLode tracks LODE_DATA_DIR (supervision)", () => {
     expect(isUnderLode()).toBe(true);
-    delete process.env.LODE_INSTANCE;
+    delete process.env.LODE_DATA_DIR;
     expect(isUnderLode()).toBe(false);
   });
 
-  it("markReady writes ready and preserves lode-owned fields", () => {
+  it("readLodeState parses lode's fields (camelCase)", () => {
+    const s = readLodeState();
+    expect(s?.current).toBe("1.0.0");
+    expect(s?.lastGood).toBe("1.0.0");
+    expect(s?.available).toBe("1.1.0");
+    expect(s?.status).toBe("running");
+  });
+
+  it("markReady writes ready, preserving lode-owned fields", () => {
     markReady();
     const s = readLodeState();
     expect(s?.ready).toBe("pid-nanoid");
     expect(s?.current).toBe("1.0.0");
     expect(s?.available).toBe("1.1.0");
-    expect(s?.status).toBe("running");
+  });
+
+  it("markReady is a no-op without an instance id", () => {
+    delete process.env.LODE_INSTANCE;
+    markReady();
+    expect(readLodeState()?.ready).toBeUndefined();
   });
 
   it("requestUpdate sets target", () => {
@@ -48,15 +61,20 @@ describe("lode state integration", () => {
     expect(readLodeState()?.target).toBe("1.1.0");
   });
 
-  it("requestRestart increments restart_nonce monotonically", () => {
+  it("requestRestart increments restartNonce monotonically", () => {
     requestRestart();
-    expect(readLodeState()?.restart_nonce).toBe(1);
+    expect(readLodeState()?.restartNonce).toBe(1);
     requestRestart();
-    expect(readLodeState()?.restart_nonce).toBe(2);
+    expect(readLodeState()?.restartNonce).toBe(2);
   });
 
-  it("is a no-op when not under lode (no ready/target written)", () => {
-    delete process.env.LODE_INSTANCE;
+  it("requestRollback targets last_good by default", () => {
+    expect(requestRollback()).toBe("1.0.0");
+    expect(readLodeState()?.target).toBe("1.0.0");
+  });
+
+  it("is inert when not supervised (no LODE_DATA_DIR)", () => {
+    delete process.env.LODE_DATA_DIR;
     markReady();
     requestUpdate("9.9.9");
     requestRestart();

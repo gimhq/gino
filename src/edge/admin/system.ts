@@ -2,7 +2,7 @@ import type { Context } from "hono";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
-import { isUnderLode, readLodeState, requestRestart, requestUpdate } from "@/platform";
+import { isUnderLode, readLodeState, requestRestart, requestRollback, requestUpdate } from "@/platform";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonOk, TAGS } from "@/shared/lib/openapi";
 
@@ -51,6 +51,31 @@ export function adminSystemRoutes() {
       requestUpdate(version);
       c.get("logger").info({ version }, "lode: update requested via admin");
       return c.json(ok({ requested: version }));
+    },
+  );
+
+  // ── Request a rollback (to a version, or last_good) ────────────────────────
+  router.post(
+    "/rollback",
+    describeRoute({
+      tags: [TAGS.System],
+      summary: "Request a lode rollback ({version?}; default last_good)",
+      responses: { ...jsonOk(z.any(), "Requested"), ...errors(401, 409) },
+    }),
+    async (c) => {
+      if (!isUnderLode())
+        return notManaged(c);
+      const body = (await c.req.json().catch(() => ({}))) as { version?: unknown };
+      const version = typeof body.version === "string" && body.version ? body.version : undefined;
+      const chosen = requestRollback(version);
+      if (!chosen) {
+        return c.json(
+          { success: false, error: { code: "NO_TARGET", message: "no version given and no last_good recorded" } },
+          409,
+        );
+      }
+      c.get("logger").info({ version: chosen }, "lode: rollback requested via admin");
+      return c.json(ok({ requested: chosen }));
     },
   );
 

@@ -170,15 +170,22 @@ on fatal startup; `/api/system/version`; boot-time migrations.
 Recommended host additions (small, optional but they unlock readiness +
 self-service updates):
 
-1. **Readiness report (`readiness = "state"`).** After `Bun.serve` is up and
-   `/health/ready` passes, atomically write `state.ready = $LODE_INSTANCE` to
-   `$LODE_DATA_DIR/state.json` (temp-file + rename, under the `state.json.lock`
-   `flock`, preserving lode's fields). Until then lode won't commit the new
-   version or stop the old one — so a host that fails to bind/migrate never
-   becomes "current". A tiny `src/platform/lode-state.ts` helper covers it.
-   - *(Later)* opt into the **phased prepare handshake** (`-0`/`-1`/`-2`) so the
-     host can drain in-flight admin/agent work *before* cut-over — useful once
-     zero-downtime modes land in lode.
+   > **Implemented via the official lode SDK** (`src/platform/lode-sdk.ts`,
+   > vendored verbatim from `github.com/dotns/lode/sdks/lode.ts`) behind a thin
+   > gino adapter (`src/platform/lode.ts`). The SDK owns the state.json contract —
+   > flock-serialised RMW, field preservation, readiness, update/restart/rollback,
+   > the phased handshake (`markServing`/`ackPrepared`), `hold`/`release`, and a
+   > `watch()` notifier. Re-copy the file to track upstream; it is lint/`ts`-skipped
+   > as vendored code.
+
+1. **Readiness report (`readiness = "state"`).** Once `Bun.serve` is listening,
+   `markReady()` writes `state.ready = $LODE_INSTANCE` (SDK; temp-file + rename
+   under `state.json.lock` `flock`, preserving lode's fields). Until then lode
+   won't commit the new version or stop the old one — so a host that fails to
+   bind/migrate never becomes "current".
+   - *(Later)* opt into the **phased prepare handshake** (`markServing` → `-0`,
+     `ackPrepared` → `-2`, `prepareRequested` → `-1`) so the host can drain
+     in-flight work *before* cut-over — useful once zero-downtime modes land in lode.
 2. **Admin-triggered self-update (optional).** An `POST /api/admin/system/update
    { version? }` that patches `state.json.target` (= a version or `"latest"`)
    lets an operator upgrade/rollback through the existing admin surface; lode

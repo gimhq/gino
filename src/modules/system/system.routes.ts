@@ -74,7 +74,7 @@ export function systemRoutes() {
         ? {
             managed: true,
             current: s?.current ?? null,
-            last_good: s?.last_good ?? null,
+            last_good: s?.lastGood ?? null,
             available: s?.available ?? null,
             channel: s?.channel ?? null,
             status: s?.status ?? null,
