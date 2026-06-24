@@ -62,6 +62,12 @@ export function createDb(path: string): AppDatabase {
 
   return Object.assign(db, {
     close: () => sqlite.close(),
+    // Fold the WAL into the main DB file. Called before lode cuts over to a new
+    // version (src/index.ts prepare handshake) so the next version starts from a
+    // consolidated file, not a half-flushed WAL.
+    checkpoint: () => {
+      sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    },
   });
 }
 
@@ -166,4 +172,4 @@ function runMigrations(db: DrizzleDb): void {
   }
 }
 
-export type AppDatabase = DrizzleDb & { close: () => void };
+export type AppDatabase = DrizzleDb & { close: () => void; checkpoint: () => void };

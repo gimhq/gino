@@ -13,10 +13,10 @@ export { hashToken, safeEqual, verifyToken } from "./crypto";
 // ids/crypto (ADDED by M9 — the platform's own surface).
 export { generateId, nanoid, ulid } from "./ids";
 
-// lode loader integration (docs/host-upgrade-design.md §6) — state.json readiness
-// + the update/restart control channel. All no-ops outside lode.
-export type { LodeState } from "./lode";
-export { isUnderLode, markReady, readLodeState, requestRestart, requestRollback, requestUpdate } from "./lode";
+// lode loader integration moved to `src/lode/` (the bun-tpl convention — the
+// official SDK + app adapter live together). Import readiness/upgrade helpers
+// from `@/lode`, not here.
+
 // env/config (re-export — `src/config` is the sole config source).
 export { loadConfig, loadConfigStrict } from "@/config";
 

@@ -32,21 +32,24 @@ export const ROOT_DIR = detectRootDir();
 
 /**
  * DATA_DIR resolution — the persistent base for *runtime data* (DB / store /
- * logs), a separate concern from `ROOT_DIR` (which locates code + migrations):
+ * logs), a separate concern from `ROOT_DIR` (which locates code + migrations).
+ * This mirrors the lode SDK's `dataDir()` (`src/lode/sdk.ts`):
  *
- *   DATA_DIR (runtime) > LODE_DATA_DIR (runtime, loader-injected) > ROOT_DIR (dev)
+ *   DATA_DIR (runtime) > LODE_DIR (runtime, loader-injected) > ROOT_DIR (dev)
  *
- * The first two are **runtime** dependencies — set in production / under a loader
- * (lode always injects `LODE_DATA_DIR`, pointing at its durable data dir). The
- * final fallback is `ROOT_DIR`, which **always exists** and is used for the
- * development environment. Because the loader always provides `LODE_DATA_DIR`,
- * the `ROOT_DIR` fallback is only ever reached in dev — where `ROOT_DIR` is the
- * stable repo root, never a swappable per-version dir — so data never lands in
- * an ephemeral code dir. Relative `GINO_DB_PATH`/`GINO_STORE_DIR`/`GINO_LOG_FILE`
- * resolve against this base; an absolute path overrides it entirely.
+ * The first two are **runtime** dependencies — set in production / under a loader.
+ * Under lode (SDK ≥ v0.0.10) the supervisor injects `LODE_DIR` (lode's own dir,
+ * where `state.json` + `versions/` live); gino's relative defaults carry a
+ * `data/` prefix, so data lands in `$LODE_DIR/data/**` — beside lode's state, not
+ * inside the swappable version dir. The final fallback is `ROOT_DIR`, which
+ * **always exists** and is used for the development environment; because the
+ * loader always provides `LODE_DIR`, that fallback is only ever reached in dev —
+ * where `ROOT_DIR` is the stable repo root, never an ephemeral per-version dir.
+ * Relative `GINO_DB_PATH`/`GINO_STORE_DIR`/`GINO_LOG_FILE` resolve against this
+ * base; an absolute path overrides it entirely.
  */
 function detectDataDir(): string {
-  return resolve(process.env.DATA_DIR ?? process.env.LODE_DATA_DIR ?? ROOT_DIR);
+  return resolve(process.env.DATA_DIR ?? process.env.LODE_DIR ?? ROOT_DIR);
 }
 
 export const DATA_DIR = detectDataDir();

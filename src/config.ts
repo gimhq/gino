@@ -10,9 +10,9 @@ export type { Config } from "./config/schema";
 const RE_SLASH_TRIM = /^\/+|\/+$/g;
 
 // Relative data paths (DB / store / logs) resolve against the persistent
-// DATA_DIR (DATA_DIR > LODE_DATA_DIR > ROOT_DIR — see src/dirs.ts), so under the
-// lode loader they land in the loader's durable data dir, not the swappable
-// version dir. An absolute path is used as-is.
+// DATA_DIR (DATA_DIR > LODE_DIR > ROOT_DIR — see src/dirs.ts), so under the lode
+// loader they land beside lode's durable state (`$LODE_DIR/data/**`), not the
+// swappable version dir. An absolute path is used as-is.
 function resolvePath(p: string): string {
   return p.startsWith("/") ? p : resolve(DATA_DIR, p);
 }

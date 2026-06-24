@@ -1,8 +1,10 @@
+import type { LodePrepareWatcher } from "./lode";
 import process from "node:process";
+import { sql } from "drizzle-orm";
 import { bootstrap } from "./app";
 import { BUILD_INFO } from "./build-info";
 import { dispatchCliSubcommand } from "./cli";
-import { isUnderLode, markReady } from "./platform/lode";
+import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher } from "./lode";
 
 (async () => {
   const subcommandExit = await dispatchCliSubcommand(process.argv);
@@ -10,7 +12,7 @@ import { isUnderLode, markReady } from "./platform/lode";
     process.exit(subcommandExit);
   }
 
-  const { fetch, websocket, config, logger, closeDb } = bootstrap();
+  const { fetch, websocket, config, logger, db, closeDb } = bootstrap();
   logger.info({ ...BUILD_INFO }, "build info");
 
   const server = Bun.serve({
@@ -24,15 +26,8 @@ import { isUnderLode, markReady } from "./platform/lode";
 
   logger.info({ port: config.PORT, host: config.HOST }, "server started");
 
-  // Readiness handshake (docs/host-upgrade-design.md §6.1) — tell the lode loader
-  // we can serve, so it commits this version / stops the old instance. No-op when
-  // not running under lode.
-  if (isUnderLode()) {
-    markReady();
-    logger.info({ instance: process.env.LODE_INSTANCE }, "lode: reported ready");
-  }
-
   let shuttingDown = false;
+  let lodePrepare: LodePrepareWatcher | undefined;
 
   async function safe(name: string, fn: () => unknown, silent = false): Promise<void> {
     try {
@@ -72,12 +67,44 @@ import { isUnderLode, markReady } from "./platform/lode";
         catch {}
       };
 
+    await safe("stopLodePrepareWatcher", () => lodePrepare?.stop(), silent);
     await safe("server.stop", stopServer, silent);
     await safe("logger.flush", () => logger.flush(), true);
     await safe("closeDb", closeDb, silent);
     await safe("logger.flush", () => logger.flush(), true);
 
     process.exit(opts.fatal ? 1 : 0);
+  }
+
+  // Lode upgrade integration (docs/host-upgrade-design.md §6). No-op unless
+  // running under the lode supervisor. Built on the official SDK (src/lode).
+  try {
+    // Report serving with the phase-0 token, opting into the staged-update
+    // prepare handshake. Gate on the DB answering so lode's `state.ready`
+    // reflects real readiness, not just a bound port.
+    await reportLodeServing({
+      logger,
+      probe: () => {
+        db.run(sql`SELECT 1`);
+        return true;
+      },
+    });
+    // Snapshot lode's config_generation now so a later lode.toml edit surfaces as
+    // "config changed — restart to apply" on /system/version.
+    captureLodeConfigBaseline();
+    // On lode's staged-update prompt, checkpoint the WAL and flush logs before
+    // acking the cut-over, so the next version starts from a consolidated DB.
+    lodePrepare = startLodePrepareWatcher({
+      logger,
+      onPrepare: async () => {
+        db.checkpoint();
+        await logger.flush();
+      },
+    });
+  }
+  catch (err) {
+    await closeServices({ reason: "lode readiness failed", fatal: true, err });
+    return;
   }
 
   process.on("SIGINT", () => {

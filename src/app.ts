@@ -36,6 +36,13 @@ export interface BootstrapResult {
   readonly websocket: typeof websocket;
   readonly config: Config;
   readonly logger: Logger;
+  /**
+   * The open database handle. Exposed so the boot entrypoint can ping it for the
+   * lode readiness probe and checkpoint the WAL on the staged-update prepare
+   * prompt (src/index.ts). The request pipeline uses the per-request `db` from
+   * the hono context, not this.
+   */
+  readonly db: AppDatabase;
   /** Close the DB connection. Call on shutdown. */
   readonly closeDb: () => void;
 }
@@ -165,6 +172,7 @@ export function bootstrap(): BootstrapResult {
     websocket,
     config,
     logger,
+    db,
     closeDb: () => {
       liveness.stop();
       db.close();

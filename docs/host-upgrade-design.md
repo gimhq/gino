@@ -39,11 +39,13 @@ The host is already a good lode citizen:
   lode downloads/caches `bun` ONCE (`[runtime]`, §5) and reuses it across every
   version, so each release ships only the small bundle.
 - **Auto-detects the loader's data dir** — relative data paths resolve against a
-  persistent base **`DATA_DIR > LODE_DATA_DIR > cwd`** (`src/dirs.ts`), kept
-  strictly separate from `ROOT_DIR` (code/migrations). Under lode the DB / store
-  / logs land in the loader's persistent `LODE_DATA_DIR` automatically — no manual
-  `GINO_DB_PATH` needed. It never falls back to `ROOT_DIR`: that is the swappable
-  per-version code dir, so data there would be orphaned on upgrade.
+  persistent base **`DATA_DIR > LODE_DIR > ROOT_DIR`** (`src/dirs.ts`, mirroring
+  the SDK's `dataDir()`), kept strictly separate from the swappable per-version
+  code dir. Under lode (SDK ≥ v0.0.10) the supervisor injects `LODE_DIR` (its own
+  dir, holding `state.json` + `versions/`); gino's relative defaults carry a
+  `data/` prefix, so the DB / store / logs land in `$LODE_DIR/data/**`
+  automatically — no manual `GINO_DB_PATH` needed. The `ROOT_DIR` fallback is the
+  stable repo root, only ever reached in dev, never an ephemeral version dir.
 - **Graceful SIGTERM** — `src/index.ts` already drains the server (bounded ~25s),
   flushes the logger, closes the DB, and `exit(0)`. This *is* lode's required
   stop contract.
@@ -68,10 +70,10 @@ zzci/ubase + lode (static, few MB)     │  lode  (ENTRYPOINT)                  
                                        ▼
    lode spawns + supervises the host child ──── SIGTERM on stop/update (host drains, exit 0)
                                        │
-   PERSISTENT data, auto-resolved under LODE_DATA_DIR (NOT the version dir):
+   PERSISTENT data, auto-resolved under $LODE_DIR/data (NOT the version dir):
      /srv/gino/data/db/gino.db    ← survives every upgrade/rollback
      /srv/gino/data/store
-     /srv/gino/state.json         (lode ↔ host control channel)
+     /srv/gino/state.json         (lode ↔ host control channel, in $LODE_DIR)
 ```
 
 One host = one lode instance following one channel. Switching the release feed
@@ -142,12 +144,13 @@ health_grace = 20                 # a new version must stay healthy this long, e
 stop_timeout = 28                 # ≥ the host's ~25s drain, and < the container stop grace (raise docker --stop-timeout)
 
 # Data dir is auto-detected: the host resolves relative data paths against
-# DATA_DIR > LODE_DATA_DIR > ROOT_DIR, so with data_dir=/srv/gino the DB/store/logs
-# land at /srv/gino/data/** automatically — no GINO_DB_PATH needed. Only secrets +
-# the listen port are configured; host env (-e/secrets) wins over [env] defaults.
+# DATA_DIR > LODE_DIR > ROOT_DIR, so with data_dir=/srv/gino lode injects
+# LODE_DIR=/srv/gino and the DB/store/logs land at /srv/gino/data/** automatically
+# — no GINO_DB_PATH needed. Only secrets + the listen port are configured; host
+# env (-e/secrets) wins over [env] defaults.
 [env]
 GINO_LOG_TO_STDOUT = "true"
-# DATA_DIR         = "/srv/gino"   # optional explicit override (else LODE_DATA_DIR is used)
+# DATA_DIR         = "/srv/gino"   # optional explicit override (else $LODE_DIR is used)
 # GINO_PORT / GINO_REGISTER_TOKEN / GINO_HTTP_CHANNEL_TOKEN / GINO_PROXY_* come from
 # container -e / secrets — never bake secrets here.
 ```
@@ -155,45 +158,50 @@ GINO_LOG_TO_STDOUT = "true"
 **Integration rule (now automatic):** the host's DB, content store and logs MUST
 live on a **persistent path outside the swappable version directory** (lode swaps
 `current → versions/<ver>` on every update). The host handles this itself — it
-resolves relative data paths against **`DATA_DIR > LODE_DATA_DIR > cwd`**
-(`src/dirs.ts`), **decoupled from `ROOT_DIR`** (which locates code/migrations and,
-under lode, the swappable version dir). So under lode they land in the persistent
-`LODE_DATA_DIR` (`/srv/gino/data/**`) without any path config, surviving upgrades
-**and** rollbacks. `DATA_DIR` overrides; it never falls back to `ROOT_DIR` — data
-must never resolve into the per-version code dir.
+resolves relative data paths against **`DATA_DIR > LODE_DIR > ROOT_DIR`**
+(`src/dirs.ts`, mirroring the SDK's `dataDir()`), **decoupled from the swappable
+version dir**. So under lode they land in `$LODE_DIR/data/**` (gino's defaults
+carry a `data/` prefix; `LODE_DIR` is lode's own persistent dir, beside
+`state.json`) without any path config, surviving upgrades **and** rollbacks.
+`DATA_DIR` overrides; the `ROOT_DIR` fallback is the stable repo root, reached
+only in dev — data never resolves into a per-version code dir.
 
 ## 6. Host-side contract — what to keep, what to add
 
 Already satisfied (no change): graceful SIGTERM drain → `exit(0)`; non-zero exit
 on fatal startup; `/api/system/version`; boot-time migrations.
 
-Recommended host additions (small, optional but they unlock readiness +
-self-service updates):
+The integration is **implemented** (aligned to the `zzci/bun-tpl` convention):
 
-   > **Implemented via the official lode SDK** (`src/platform/lode-sdk.ts`,
-   > vendored verbatim from `github.com/dotns/lode/sdks/lode.ts`) behind a thin
-   > gino adapter (`src/platform/lode.ts`). The SDK owns the state.json contract —
-   > flock-serialised RMW, field preservation, readiness, update/restart/rollback,
-   > the phased handshake (`markServing`/`ackPrepared`), `hold`/`release`, and a
-   > `watch()` notifier. Re-copy the file to track upstream; it is lint/`ts`-skipped
-   > as vendored code.
+   > **Built on the official lode SDK** (`src/lode/sdk.ts`, vendored verbatim from
+   > `github.com/dotns/lode/sdks/lode.ts` — lint/`ts`-skipped; re-copy to update),
+   > with the app glue split into `src/lode/index.ts` (readiness, the operator
+   > actions, the read-only summary) and `src/lode/config.ts` (parses the operator
+   > `lode.toml` for the admin UI). The SDK owns the state.json contract —
+   > flock-serialised RMW, field preservation, the phased handshake
+   > (`markServing`/`ackPrepared`), `hold`/`release`, and a `watch()` notifier.
+   > Supervision keys on `$LODE_DIR` (SDK ≥ v0.0.10), not the old `LODE_DATA_DIR`.
 
 1. **Readiness report (`readiness = "state"`).** Once `Bun.serve` is listening,
-   `markReady()` writes `state.ready = $LODE_INSTANCE` (SDK; temp-file + rename
-   under `state.json.lock` `flock`, preserving lode's fields). Until then lode
-   won't commit the new version or stop the old one — so a host that fails to
-   bind/migrate never becomes "current".
-   - *(Later)* opt into the **phased prepare handshake** (`markServing` → `-0`,
-     `ackPrepared` → `-2`, `prepareRequested` → `-1`) so the host can drain
-     in-flight work *before* cut-over — useful once zero-downtime modes land in lode.
-2. **Admin-triggered self-update (optional).** An `POST /api/admin/system/update
-   { version? }` that patches `state.json.target` (= a version or `"latest"`)
-   lets an operator upgrade/rollback through the existing admin surface; lode
-   polls the file (~1s) and applies it. `POST …/restart` bumps `restart_nonce`.
-   This is pure file I/O — no new transport.
-3. **Surface lode state read-only.** `GET /api/system/version` can also report
-   `current`/`last_good`/`available`/`channel` by reading `state.json`, so the
-   admin UI shows "update available / on version X".
+   `reportLodeServing({ probe })` writes the phase-0 token `state.ready =
+   "{instance}-0"` — but only after the DB answers `SELECT 1`, so readiness
+   reflects real health, not just a bound port (`src/index.ts`). Until then lode
+   won't commit the new version or stop the old one. Writing the phase-0 token
+   **opts into the prepare handshake**: `startLodePrepareWatcher` watches for
+   lode's prompt (`ready == "{instance}-1"`), then **checkpoints the WAL + flushes
+   logs** and `ackPrepared()` (`-2`) so the next version starts from a consolidated
+   DB — drain *before* cut-over.
+2. **Operator self-update (`/system/lode/*`, channel-token guarded).** `POST
+   /api/system/lode/update { target }` patches `state.json.target` (a version or
+   `"latest"`); `…/rollback { version? }` falls back to the recorded `last_good`;
+   `…/restart` bumps `restart_nonce`; `…/hold { hold }` sets/clears the
+   maintenance hold. lode polls the file (~1s) and applies it — pure file I/O, no
+   new transport. Inert outside lode → `409 LODE_NOT_ACTIVE`.
+3. **Surface lode state read-only.** `GET /api/system/version` embeds
+   `getLodeSummary()` — `current`/`last_good`/`available`/`channel`/`status`, an
+   `updateAvailable` flag, the `rollbackTarget`, a `configChanged` flag (lode.toml
+   edited since boot, captured via `captureLodeConfigBaseline()`), and the parsed
+   `lode.toml` config — so the admin UI shows "update available / on version X".
 
 ## 7. Data & migration safety (the gino-specific risk)
 
@@ -288,11 +296,14 @@ docker.io/dotns/lode:latest` + the volume + the toml mount.)
    under the `[runtime]`-provided bun on `zzci/ubase`; wire `LODE_SIGN_KEY` to
    enable signing.
 2. **Persistence** — the host now auto-resolves data under
-   `DATA_DIR > LODE_DATA_DIR > cwd` (done, `src/dirs.ts`; decoupled from ROOT_DIR);
-   document the `data_dir` layout and verify a rollback keeps the DB/store intact.
-3. **Readiness helper** — add the `state.ready` writer (§6.1) gated on
-   `readiness=state`; no-op when `LODE_DATA_DIR` is unset (dev / docker e2e).
-4. **Admin update surface** (§6.2/6.3) — optional, behind the channel token.
+   `DATA_DIR > LODE_DIR > ROOT_DIR` (done, `src/dirs.ts`; decoupled from the
+   version dir); document the `data_dir` layout and verify a rollback keeps the
+   DB/store intact.
+3. **Readiness helper** — `reportLodeServing` (§6.1) writes the phase-0 token
+   gated on `readiness=state` + a DB probe; no-op when `LODE_DIR` is unset (dev /
+   docker e2e). Done (`src/index.ts` + `src/lode`).
+4. **Operator update surface** (§6.2/6.3) — `/system/lode/*`, behind the channel
+   token. Done.
 5. **Migration discipline** — adopt expand-contract + pre-apply DB snapshot.
 6. **e2e** — extend the docker-compose e2e with a `lode`-managed host: publish
    v0.1.0, boot, publish v0.2.0, observe hot-update + a deliberately-bad v0.3.0 →
