@@ -230,10 +230,55 @@ pub(crate) enum DbError {
     /// A payload could not be serialized before enqueue.
     #[error("serialize payload: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// Hardening the on-disk permissions of the DB files failed.
+    #[error("harden db file permissions: {0}")]
+    Permissions(#[from] std::io::Error),
 }
 
 /// Convenience alias for fallible DB operations.
 pub(crate) type DbResult<T> = Result<T, DbError>;
+
+/// Restrict the DB file — and its `-wal`/`-shm` siblings when present — to
+/// owner-only read/write (`0600`). Runs on every open so pre-existing files from
+/// deployments that created them world-readable are healed, not only fresh ones.
+#[cfg(unix)]
+fn harden_db_files(path: &Path) -> std::io::Result<()> {
+    set_mode(path, 0o600)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sibling = path.as_os_str().to_owned();
+        sibling.push(suffix);
+        let sibling = std::path::PathBuf::from(sibling);
+        if sibling.exists() {
+            set_mode(&sibling, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_db_files(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Restrict a state directory (the agent workspace holding the DB, engine
+/// work dirs and the provisioning store) to owner-only access (`0700`). Called by
+/// the daemon at startup on directories it owns, so pre-existing deployments are
+/// healed too. Never call this on a shared system directory.
+#[cfg(unix)]
+pub(crate) fn harden_state_dir(path: &Path) -> std::io::Result<()> {
+    set_mode(path, 0o700)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn harden_state_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -411,8 +456,18 @@ pub(crate) struct Db {
 
 impl Db {
     /// Open (creating if absent) the database at `path` and apply the schema.
+    ///
+    /// The connect token lives in this file in plaintext (SQLite has no secret
+    /// type), so the DB file — and its WAL/SHM siblings — are chmod'd `0600` on
+    /// every open: fresh files are created private, and pre-existing deployments
+    /// that shipped world-readable (default umask 0644) are healed at startup.
     pub(crate) fn open(path: &Path) -> DbResult<Self> {
-        Self::from_connection(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        // Harden BEFORE the first write: a WAL/SHM sqlite creates during
+        // `from_connection` inherits the main file's (now 0600) mode; siblings
+        // left behind by an earlier 0644 deployment are healed explicitly.
+        harden_db_files(path)?;
+        Self::from_connection(conn)
     }
 
     /// Open an ephemeral in-memory database (used by unit tests).
@@ -2085,5 +2140,76 @@ mod tests {
         assert_eq!(db.get_config_meta("nope").unwrap(), None);
         db.set_config_meta("nope", "yes").unwrap();
         assert_eq!(db.get_config_meta("nope").unwrap().as_deref(), Some("yes"));
+    }
+
+    // -- file permission hardening (P1-7) -----------------------------------
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_the_db_files_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+
+        let db = Db::open(&path).unwrap();
+        // Force a write so the WAL sibling exists while the connection is live.
+        db.set_identity("agent-1", &SecretString::from("tok"))
+            .unwrap();
+
+        assert_eq!(mode_of(&path), 0o600, "db file must be 0600");
+        let wal = dir.path().join("agent.db-wal");
+        assert!(wal.exists(), "WAL mode must have created the -wal sibling");
+        assert_eq!(mode_of(&wal), 0o600, "WAL sibling must inherit 0600");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_heals_world_readable_preexisting_db_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        // Simulate a pre-hardening deployment: create the DB, close it cleanly
+        // (removing the WAL), then plant a stale 0644 WAL/SHM pair and loosen
+        // the DB file itself to 0644.
+        drop(Db::open(&path).unwrap());
+        let wal = dir.path().join("agent.db-wal");
+        let shm = dir.path().join("agent.db-shm");
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::write(&shm, b"").unwrap();
+        for f in [&path, &wal, &shm] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(mode_of(f), 0o644);
+        }
+
+        let _db = Db::open(&path).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600, "pre-existing db file must be healed");
+        // SQLite may replace the stale siblings; whatever exists must be 0600.
+        for f in [&wal, &shm] {
+            if f.exists() {
+                assert_eq!(mode_of(f), 0o600, "{} must be healed", f.display());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_state_dir_heals_a_world_readable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let outer = tempfile::tempdir().unwrap();
+        let dir = outer.path().join("workspace");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&dir), 0o755);
+
+        super::harden_state_dir(&dir).unwrap();
+        assert_eq!(mode_of(&dir), 0o700, "state dir must be owner-only");
     }
 }
