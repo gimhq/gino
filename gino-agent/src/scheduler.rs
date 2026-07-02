@@ -92,6 +92,22 @@ const SKIP_SHARED_BUSY: &str = "shared_thread_busy";
 /// `cron_logs.skip_reason` for a `once` whose slot lapsed during downtime.
 const MISSED_ONCE_STALE: &str = "once_catchup_window_exceeded";
 
+/// Seconds between queue-GC sweeps (audit P1-9). The sweep piggybacks on the
+/// scheduler's existing tick (no extra thread/task); retention is measured in
+/// days, so sweeping more often than hourly buys nothing.
+const GC_SWEEP_INTERVAL_SECS: i64 = 3_600;
+
+/// Rows deleted per table per GC batch. DECISION: 1000 keeps a single
+/// DB-mutex hold in the low-millisecond range even on slow disks; a first
+/// sweep of a year-old DB (~526k ledger rows) drains across successive
+/// batches/sweeps instead of stalling the execution plane for seconds.
+const GC_BATCH_ROWS: usize = 1_000;
+
+/// Upper bound on batches per sweep, so even a huge backlog costs one bounded
+/// slice of work per sweep ([`GC_MAX_BATCHES`] × [`GC_BATCH_ROWS`] rows/table)
+/// and the mutex is released between batches.
+const GC_MAX_BATCHES: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -532,16 +548,24 @@ pub(crate) struct Scheduler {
     /// Per-thread retry budget stamped on cron-fired threads
     /// (`config.executor.max_attempts`).
     max_attempts: i64,
+    /// Queue-GC retention window in days (`config.retention.days`, audit P1-9).
+    retention_days: u32,
 }
 
 impl Scheduler {
     /// Build a scheduler over the shared DB. `cancel` stops the loop;
     /// `max_attempts` is the retry budget stamped on the threads its fires
-    /// create (`config.executor.max_attempts`). The v2 scheduler is
-    /// scheduling-plane only: it fires triggers into `cron_logs` + pending
-    /// `threads` and signals [`Self::drain_signal`]; the runner's executor owns
-    /// execution.
-    pub(crate) fn new(db: Arc<Mutex<Db>>, cancel: Arc<Cancel>, max_attempts: i64) -> Self {
+    /// create (`config.executor.max_attempts`); `retention_days` is the
+    /// queue-GC window (`config.retention.days`) for the sweep the loop
+    /// piggybacks on its tick. The v2 scheduler is scheduling-plane only: it
+    /// fires triggers into `cron_logs` + pending `threads` and signals
+    /// [`Self::drain_signal`]; the runner's executor owns execution.
+    pub(crate) fn new(
+        db: Arc<Mutex<Db>>,
+        cancel: Arc<Cancel>,
+        max_attempts: i64,
+        retention_days: u32,
+    ) -> Self {
         Self {
             db,
             cancel,
@@ -549,6 +573,7 @@ impl Scheduler {
             drain: Arc::new(Notify::new()),
             poll_interval: DEFAULT_POLL_INTERVAL,
             max_attempts,
+            retention_days,
         }
     }
 
@@ -581,6 +606,10 @@ impl Scheduler {
         }
         // Process-local skip/last-status tally per cron, feeding `cron_state`.
         let mut tally: HashMap<String, CronTally> = HashMap::new();
+        // Queue-GC pacing (audit P1-9): swept on the existing tick, at most once
+        // per GC_SWEEP_INTERVAL_SECS. `None` sweeps on the first tick so a
+        // long-idle DB starts draining immediately (bounded batches).
+        let mut last_gc: Option<DateTime<Utc>> = None;
         loop {
             // Register nudge interest before reading the DB so a change that lands
             // mid-scan still wakes us.
@@ -592,7 +621,16 @@ impl Scheduler {
             tokio::select! {
                 () = self.cancel.cancelled() => break,
                 () = &mut notified => {}
-                () = tokio::time::sleep(wait) => self.tick(now(), &mut tally),
+                () = tokio::time::sleep(wait) => {
+                    let now = now();
+                    self.tick(now, &mut tally);
+                    if last_gc.is_none_or(|at| {
+                        now.signed_duration_since(at).num_seconds() >= GC_SWEEP_INTERVAL_SECS
+                    }) {
+                        self.gc_sweep();
+                        last_gc = Some(now);
+                    }
+                }
             }
         }
         info!("scheduler stopped");
@@ -613,6 +651,48 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+
+    /// One bounded queue-GC sweep over the retention-managed tables (audit
+    /// P1-9): acked outbox, processed inbox, cron ledger lines, and attachment
+    /// snapshots of terminal threads, each older than the retention window.
+    /// Runs [`GC_MAX_BATCHES`] batches of [`GC_BATCH_ROWS`] at most, taking and
+    /// releasing the DB mutex per batch, so a year-old backlog never stalls the
+    /// execution plane; the remainder drains on later sweeps. Failures are
+    /// logged and never disturb scheduling or execution.
+    fn gc_sweep(&self) {
+        let days = self.retention_days;
+        let mut totals = [0usize; 4];
+        for _ in 0..GC_MAX_BATCHES {
+            let batch = {
+                let guard = lock_db(&self.db);
+                [
+                    gc_batch(guard.gc_outbox_batch(days, GC_BATCH_ROWS), "outbox"),
+                    gc_batch(guard.gc_inbox_batch(days, GC_BATCH_ROWS), "inbox"),
+                    gc_batch(guard.gc_cron_logs_batch(days, GC_BATCH_ROWS), "cron_logs"),
+                    gc_batch(
+                        guard.gc_thread_attachments_batch(days, GC_BATCH_ROWS),
+                        "thread_attachments",
+                    ),
+                ]
+            };
+            for (total, deleted) in totals.iter_mut().zip(batch) {
+                *total += deleted;
+            }
+            // Every table came back short of its limit: the backlog is drained.
+            if batch.iter().all(|&deleted| deleted < GC_BATCH_ROWS) {
+                break;
+            }
+        }
+        if totals.iter().any(|&deleted| deleted > 0) {
+            info!(
+                outbox = totals[0],
+                inbox = totals[1],
+                cron_logs = totals[2],
+                thread_attachments = totals[3],
+                "queue GC deleted rows past the retention window"
+            );
+        }
     }
 
     /// How long to sleep before the next scan: until the earliest due cron, capped
@@ -914,6 +994,15 @@ fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Unwrap one queue-GC batch result, degrading a failure to zero-with-warning
+/// so a GC error never disturbs scheduling or execution (audit P1-9).
+fn gc_batch(result: Result<usize, DbError>, table: &str) -> usize {
+    result.unwrap_or_else(|err| {
+        warn!(table, error = %err, "queue GC batch failed");
+        0
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -930,7 +1019,7 @@ mod tests {
         apply_cron_upsert, cron_state_data, decide_fire, isolated_thread_id, lock_db,
         next_run_at_creation, parse_iso, shared_thread_id,
     };
-    use crate::config::ExecutorConfig;
+    use crate::config::{ExecutorConfig, RetentionConfig};
     use crate::db::{CronLogRow, CronRow, Db, TaskRow, ThreadRow};
     use crate::engine::{
         Engine, EngineError, EngineEvent, Input, Payload, RunErrorKind, RunOutcome, RunStatus,
@@ -1037,11 +1126,13 @@ mod tests {
 
     fn make_scheduler(db: Arc<Mutex<Db>>) -> Scheduler {
         // The retry budget cron threads are stamped with comes from
-        // `config.executor.max_attempts`; tests use the shipped default.
+        // `config.executor.max_attempts`; tests use the shipped defaults
+        // (likewise the queue-GC retention window, `config.retention.days`).
         Scheduler::new(
             db,
             Arc::new(Cancel::new()),
             ExecutorConfig::default().max_attempts,
+            RetentionConfig::default().days,
         )
     }
 
@@ -1945,5 +2036,53 @@ mod tests {
         // The cron id rides the secondary column so the transport can rebuild the
         // envelope `cronId` the host routes `cron_state` by (agent-architecture §10).
         assert_eq!(rows[0].thread_id.as_deref(), Some("c-1"));
+    }
+
+    // ===== queue GC sweep (audit P1-9) =====
+
+    /// The sweep deletes expired terminal rows across the retention-managed
+    /// tables in one call, and leaves rows still owed to the at-least-once
+    /// contract untouched at any age.
+    #[test]
+    fn gc_sweep_deletes_expired_rows_and_spares_the_pending() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        {
+            let guard = lock_db(&db);
+            // outbox: an expired acked row + an ancient but un-acked row.
+            let acked = guard
+                .enqueue_outbox("output", &serde_json::json!({}))
+                .unwrap();
+            guard.mark_outbox_acked(acked).unwrap();
+            let unacked = guard
+                .enqueue_outbox("output", &serde_json::json!({}))
+                .unwrap();
+            guard
+                .exec_raw(&format!(
+                    "UPDATE outbox SET created_at = datetime('now', '-400 days')
+                      WHERE id IN ({acked}, {unacked})"
+                ))
+                .unwrap();
+            // inbox: an expired processed row.
+            let processed = guard
+                .record_inbound("message", &serde_json::json!({}))
+                .unwrap();
+            guard.mark_inbox_processed(processed).unwrap();
+            guard
+                .exec_raw(&format!(
+                    "UPDATE inbox SET received_at = datetime('now', '-400 days')
+                      WHERE id = {processed}"
+                ))
+                .unwrap();
+        }
+
+        make_scheduler(Arc::clone(&db)).gc_sweep();
+
+        let guard = lock_db(&db);
+        // Only the un-acked outbox row survives; the inbox is fully drained.
+        let unacked = guard.list_unacked_outbox().unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert!(unacked[0].acked_at.is_none());
+        assert_eq!(guard.gc_outbox_batch(30, 100).unwrap(), 0);
+        assert_eq!(guard.gc_inbox_batch(30, 100).unwrap(), 0);
     }
 }
