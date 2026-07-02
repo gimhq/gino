@@ -65,6 +65,30 @@ const ENGINE_CONFIG_SUBDIR: &str = "engine-config";
 /// acked.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Create the DB/workspace directories, then restrict the workspace to
+/// owner-only (`0700`): it holds the DB (connect token), engine work dirs and
+/// the provisioning store. Hardening runs on every startup so pre-existing
+/// world-readable deployments are healed, not only fresh installs.
+fn prepare_state_dirs(paths: &crate::config::Paths) -> Result<()> {
+    if let Some(parent) = paths.db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating db directory {}", parent.display()))?;
+    }
+    std::fs::create_dir_all(&paths.workspace_dir).with_context(|| {
+        format!(
+            "creating workspace directory {}",
+            paths.workspace_dir.display()
+        )
+    })?;
+    crate::db::harden_state_dir(&paths.workspace_dir).with_context(|| {
+        format!(
+            "hardening workspace directory permissions {}",
+            paths.workspace_dir.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Build the tokio runtime and drive the daemon to completion. Kept sync so the
 /// CLI dispatcher in [`crate`] stays sync.
 pub(crate) fn run_daemon(
@@ -97,16 +121,7 @@ async fn run_async(
     ));
     config.validate()?;
 
-    if let Some(parent) = config.paths.db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating db directory {}", parent.display()))?;
-    }
-    std::fs::create_dir_all(&config.paths.workspace_dir).with_context(|| {
-        format!(
-            "creating workspace directory {}",
-            config.paths.workspace_dir.display()
-        )
-    })?;
+    prepare_state_dirs(&config.paths)?;
 
     let db = Db::open(&config.paths.db_path)
         .with_context(|| format!("opening db at {}", config.paths.db_path.display()))?;

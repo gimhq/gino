@@ -79,8 +79,11 @@ struct BootstrapArgs {
 
     /// Enrollment token — a bootstrap credential used only to register. The
     /// per-agent connect token used for the WebSocket is negotiated at
-    /// registration and is never this value.
-    #[arg(long, env = "GINO_REGISTER_TOKEN", global = true)]
+    /// registration and is never this value. DEPRECATED as a flag (argv is
+    /// world-readable via /proc/*/cmdline): prefer GINO_REGISTER_TOKEN or
+    /// GINO_REGISTER_TOKEN_FILE, both resolved in [`register`] and taking
+    /// precedence over this flag.
+    #[arg(long, global = true)]
     register_token: Option<String>,
 
     /// Human-readable agent name.
@@ -128,7 +131,7 @@ pub fn run() -> Result<()> {
         Command::Run => {
             runner::run_daemon(
                 cli.bootstrap.host,
-                cli.bootstrap.register_token,
+                register::resolve_register_token(cli.bootstrap.register_token),
                 cli.bootstrap.name,
             )?;
         }
