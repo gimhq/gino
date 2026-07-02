@@ -72,6 +72,47 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// systemd's default `TimeoutStopSec` (90 s).
 const SHUTDOWN_DRAIN_WINDOW: Duration = Duration::from_secs(15);
 
+/// Lockfile inside the (0700-hardened) workspace dir backing the daemon's
+/// single-instance flock.
+const DAEMON_LOCK_FILE: &str = "agent.lock";
+
+/// The daemon's single-instance guard (audit P2-18): an exclusive advisory
+/// lock (`flock`-style, via [`std::fs::File::try_lock`]) on a lockfile in the
+/// state dir, held for the daemon's whole lifetime and released by the OS on
+/// any exit, clean or not. A second daemon fails fast instead of racing the
+/// first over migrations and thread claims. CLI subcommands never take this
+/// lock — they are short-lived readers/writers of the shared WAL DB.
+#[derive(Debug)]
+struct DaemonLock {
+    /// The open lockfile handle; dropping it releases the lock.
+    _file: std::fs::File,
+}
+
+/// Acquire the exclusive daemon lock, failing fast (no blocking wait) when
+/// another process — or another handle in this one — already holds it. The
+/// lock is advisory and per open-file-description, so it works across
+/// processes and is testable with two handles in one.
+fn acquire_daemon_lock(workspace_dir: &Path) -> Result<DaemonLock> {
+    let path = workspace_dir.join(DAEMON_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening daemon lockfile {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(DaemonLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
+            "another gino-agent daemon is already running (exclusive lock on {} is held); \
+             stop it before starting a new one",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("locking daemon lockfile {}", path.display()))
+        }
+    }
+}
+
 /// Create the DB/workspace directories, then restrict the workspace to
 /// owner-only (`0700`): it holds the DB (connect token), engine work dirs and
 /// the provisioning store. Hardening runs on every startup so pre-existing
@@ -129,6 +170,11 @@ async fn run_async(
     config.validate()?;
 
     prepare_state_dirs(&config.paths)?;
+
+    // Single-instance guard (P2-18), taken BEFORE the DB open so a second
+    // daemon can never run migrations — let alone claim threads — against a
+    // live instance's database. Held (via the binding) until run_async returns.
+    let _daemon_lock = acquire_daemon_lock(&config.paths.workspace_dir)?;
 
     let db = Db::open(&config.paths.db_path)
         .with_context(|| format!("opening db at {}", config.paths.db_path.display()))?;
@@ -1305,9 +1351,29 @@ mod tests {
     };
 
     use super::{
-        InboxPromptSource, apply_task_def, conclude_inbox_row, ensure_chat_thread,
-        handle_cron_upsert, lock_db, minted_thread_id, repend_queued_messages,
+        InboxPromptSource, acquire_daemon_lock, apply_task_def, conclude_inbox_row,
+        ensure_chat_thread, handle_cron_upsert, lock_db, minted_thread_id, repend_queued_messages,
     };
+
+    /// P2-18 regression: the daemon's single-instance lock is exclusive and
+    /// fails fast. The lock is per open-file-description, so a second handle in
+    /// THIS process conflicts exactly like a second daemon process would — that
+    /// is the seam this test drives (no subprocess needed).
+    #[test]
+    fn daemon_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire_daemon_lock(dir.path()).unwrap();
+
+        let err = acquire_daemon_lock(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("already running"),
+            "second acquire must fail fast with a clear error, got: {err}"
+        );
+
+        // Released on drop (any process exit): a new daemon can start.
+        drop(held);
+        acquire_daemon_lock(dir.path()).unwrap();
+    }
 
     fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
         ThreadRow {

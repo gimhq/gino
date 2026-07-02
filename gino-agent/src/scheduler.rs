@@ -1402,7 +1402,7 @@ mod tests {
         );
 
         // Restore the outbox: the SAME slot now fires cleanly (retry semantics).
-        lock_db(&db).migrate().unwrap();
+        lock_db(&db).restore_outbox_table().unwrap();
         sched.tick(at("2026-06-22T12:00:06Z"), &mut HashMap::new());
         assert!(lock_db(&db).get_thread(&tid).unwrap().is_some());
         assert_eq!(lock_db(&db).max_round_seq("c-1").unwrap(), Some(1));

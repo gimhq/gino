@@ -67,13 +67,31 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use thiserror::Error;
 
-/// Idempotent schema. `CREATE TABLE IF NOT EXISTS` for every table, so running
-/// it on a fresh or an already-created DB is a no-op either way.
-///
-/// PLAN-006 §4 is a **fresh-schema rebuild** (pre-release, no data migration):
-/// existing dev DBs are discarded/recreated rather than ALTER-migrated, so the
-/// v2 columns live directly in the `CREATE TABLE` statements.
-const SCHEMA: &str = "\
+// ---------------------------------------------------------------------------
+// Schema migration ladder (audit P2-18)
+// ---------------------------------------------------------------------------
+//
+// The schema is versioned through `PRAGMA user_version` and [`Db::migrate`]
+// steps a database from its recorded version to [`SCHEMA_VERSION`], one
+// transaction per step: a step's DDL/DML and its version bump commit
+// atomically, so a crash mid-ladder resumes at the incomplete step. The former
+// single CREATE-IF-NOT-EXISTS blob could not evolve an existing DB — a column
+// added to a CREATE TABLE (`inbox.msg_id`, `thread_attachments`) simply never
+// appeared in a pre-existing file and every read/write of it broke (P2-18).
+//
+// DECISION: an unversioned DB (`user_version = 0`) that already has tables is
+// treated as the v1 baseline — the last CREATE-only shape (pre-campaign).
+// Databases created by intermediate development builds between v1 and this
+// ladder are not supported (pre-release: discard and recreate), which keeps
+// every step unconditional.
+
+/// The schema version this binary reads and writes (`PRAGMA user_version`).
+pub(crate) const SCHEMA_VERSION: i64 = 3;
+
+/// Step v0 → v1: the baseline schema (the pre-campaign CREATE-only shape).
+/// `IF NOT EXISTS` throughout, so a legacy unversioned DB — which already has
+/// exactly these tables — passes through unchanged and is merely stamped v1.
+const MIGRATE_V1_BASELINE: &str = "\
 CREATE TABLE IF NOT EXISTS outbox (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   type        TEXT    NOT NULL,
@@ -86,10 +104,6 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_task   ON outbox(task_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_thread ON outbox(thread_id);
--- Partial hot-path index (audit P1-9): reconnect replay scans
--- WHERE acked_at IS NULL under the global DB mutex on every flush, so the scan
--- must stay proportional to the unacked backlog, not the table's history.
-CREATE INDEX IF NOT EXISTS idx_outbox_unacked ON outbox(id) WHERE acked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS inbox (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,16 +111,12 @@ CREATE TABLE IF NOT EXISTS inbox (
   payload      TEXT    NOT NULL,
   task_id      TEXT,
   thread_id    TEXT,
-  msg_id       INTEGER UNIQUE,                    -- host delivery id (protocol.md §6 dedupe-by-id); NULL when the frame carries none (multiple NULLs allowed)
   received_at  TEXT    NOT NULL DEFAULT (datetime('now')),
   processed_at TEXT,
   retry_count  INTEGER NOT NULL DEFAULT 0         -- PROCESSING failures (not replays); the poison policy discards a row after MAX failures
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_task   ON inbox(task_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_thread ON inbox(thread_id);
--- Partial hot-path index (audit P1-9): the reconnect replay's
--- WHERE processed_at IS NULL twin of idx_outbox_unacked.
-CREATE INDEX IF NOT EXISTS idx_inbox_unprocessed ON inbox(id) WHERE processed_at IS NULL;
 
 -- The global top category (agent-architecture §3). The v2 entity columns are
 -- (id, name, kind, status, created_at, updated_at), driven by TaskRow. The legacy
@@ -210,7 +220,7 @@ CREATE INDEX IF NOT EXISTS idx_cron_logs_thread ON cron_logs(thread_id);
 -- repair, and observability.
 CREATE TABLE IF NOT EXISTS config_entries (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope        TEXT NOT NULL,   -- materialization location: 'global' (engine-config root) | <thread_id> (per-thread project/). A faithful refinement of PLAN's 'global'|<task_id> — v2 has N concurrent threads per task and project/ is per-thread.
+  scope        TEXT NOT NULL,   -- materialization location: 'global' (engine-config root) | <task_id> (the task project/ scope, P1-11). Rows written under the pre-v3 <thread_id> scoping are deleted by migration step v3.
   name         TEXT NOT NULL,   -- logical id (= store <name>)
   sha256       TEXT NOT NULL,   -- full hash (version / integrity)
   short        TEXT NOT NULL,   -- store short id (sha256[:12])
@@ -223,17 +233,6 @@ CREATE TABLE IF NOT EXISTS config_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_config_entries_scope ON config_entries(scope);
 CREATE INDEX IF NOT EXISTS idx_config_entries_store ON config_entries(name, sha256);
-
--- Inbound attachment descriptors snapshotted per thread (audit P1-10b). The
--- inbox `message` carrying them is CONSUMED at prompt-resolve time, so without
--- this snapshot a retry or a restarted daemon would re-run the thread with its
--- snapshotted prompt but ZERO attachments and still report success. Written
--- before the message is consumed; read (never popped) on every attempt.
-CREATE TABLE IF NOT EXISTS thread_attachments (
-  thread_id   TEXT PRIMARY KEY REFERENCES threads(id),
-  descriptors TEXT NOT NULL,                       -- JSON array of wire AttachmentDescriptor
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
 
 CREATE TABLE IF NOT EXISTS identity (
   id            INTEGER PRIMARY KEY CHECK (id = 1),
@@ -252,6 +251,59 @@ CREATE TABLE IF NOT EXISTS config_meta (
 );
 ";
 
+/// Step v1 → v2: the inbound-dedup / hot-path additions.
+const MIGRATE_V2_INBOUND_DEDUP: &str = "\
+-- Host delivery id (protocol.md §6 dedupe-by-id, audit P0-3); NULL when the
+-- frame carries none. Uniqueness lives in the index below (multiple NULLs
+-- allowed) so the ALTER-stepped and fresh shapes are identical.
+ALTER TABLE inbox ADD COLUMN msg_id INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_msg_id ON inbox(msg_id);
+
+-- Partial hot-path indexes (audit P1-9): reconnect replay scans
+-- WHERE acked_at IS NULL / processed_at IS NULL under the global DB mutex on
+-- every flush, so the scans must stay proportional to the unacked/unprocessed
+-- backlog, not the tables' history.
+CREATE INDEX IF NOT EXISTS idx_outbox_unacked ON outbox(id) WHERE acked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_inbox_unprocessed ON inbox(id) WHERE processed_at IS NULL;
+
+-- Inbound attachment descriptors snapshotted per thread (audit P1-10b). The
+-- inbox `message` carrying them is CONSUMED at prompt-resolve time, so without
+-- this snapshot a retry or a restarted daemon would re-run the thread with its
+-- snapshotted prompt but ZERO attachments and still report success. Written
+-- before the message is consumed; read (never popped) on every attempt.
+CREATE TABLE IF NOT EXISTS thread_attachments (
+  thread_id   TEXT PRIMARY KEY REFERENCES threads(id),
+  descriptors TEXT NOT NULL,                       -- JSON array of wire AttachmentDescriptor
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
+/// Step v2 → v3: drop legacy thread-scoped provisioning-manifest rows.
+///
+/// `config_entries.scope` re-keyed from `<thread_id>` to `<task_id>` (audit
+/// P1-11); rows written under the old scoping are dead — no reconcile or GC
+/// path ever matches them again. DECISION: delete rather than translate — the
+/// manifest is rebuildable provisioning state (the next fire's reconcile
+/// re-materializes its scope from the desired set), and the old thread-scoped
+/// link trees live inside per-thread work dirs that workspace lifecycle
+/// reclaims wholesale.
+const MIGRATE_V3_SCOPE_CLEANUP: &str = "DELETE FROM config_entries WHERE scope <> 'global';";
+
+/// The ladder: `MIGRATIONS[n]` steps a database from version `n` to `n + 1`.
+const MIGRATIONS: [&str; 3] = [
+    MIGRATE_V1_BASELINE,
+    MIGRATE_V2_INBOUND_DEDUP,
+    MIGRATE_V3_SCOPE_CLEANUP,
+];
+
+/// The per-connection pragma preamble. WAL for concurrent read/write; a busy
+/// timeout to ride out brief locks; `foreign_keys` because SQLite ships FK
+/// enforcement OFF per connection while this schema declares — and the code
+/// assumes — live REFERENCES (audit P2-19). (On an in-memory DB the WAL pragma
+/// simply reports `memory`; it is a harmless no-op there.)
+const PRAGMAS: &str =
+    "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 3000; PRAGMA foreign_keys = ON;";
+
 /// `config_meta` key holding the last APPLIED global config version (PLAN-007 §6).
 const APPLIED_GLOBAL_VERSION_KEY: &str = "applied_global_config_version";
 
@@ -267,6 +319,20 @@ pub(crate) enum DbError {
     /// Hardening the on-disk permissions of the DB files failed.
     #[error("harden db file permissions: {0}")]
     Permissions(#[from] std::io::Error),
+    /// The DB was written by a newer binary; migrating down is not supported.
+    #[error(
+        "database schema is v{found} but this binary supports up to v{supported}; \
+         upgrade gino-agent"
+    )]
+    SchemaNewerThanBinary { found: i64, supported: i64 },
+    /// A non-migrating open ([`Db::open_existing`]) found a schema version this
+    /// binary cannot serve.
+    #[error(
+        "database schema is v{found} but this binary expects v{expected}; \
+         start the daemon to migrate an older database, or upgrade this binary \
+         for a newer one"
+    )]
+    SchemaVersionMismatch { found: i64, expected: i64 },
 }
 
 /// Convenience alias for fallible DB operations.
@@ -491,7 +557,14 @@ pub(crate) struct Db {
 }
 
 impl Db {
-    /// Open (creating if absent) the database at `path` and apply the schema.
+    /// Open (creating if absent) the database at `path` and migrate it to
+    /// [`SCHEMA_VERSION`] — the **daemon** open path.
+    ///
+    /// DECISION (P2-18 open-path split): this migrating open is reserved for
+    /// the daemon startup (which holds the single-instance lock); short-lived
+    /// CLI invocations go through [`Self::open_existing`], which never
+    /// migrates, so a mismatched CLI binary cannot rewrite the schema under a
+    /// live daemon.
     ///
     /// The connect token lives in this file in plaintext (SQLite has no secret
     /// type), so the DB file — and its WAL/SHM siblings — are chmod'd `0600` on
@@ -506,6 +579,27 @@ impl Db {
         Self::from_connection(conn)
     }
 
+    /// Open the database at `path` WITHOUT creating or migrating it — the
+    /// **CLI** open path (see the decision on [`Self::open`]). Fails when the
+    /// file does not exist (no daemon has initialized this state dir) and when
+    /// the recorded schema version is not exactly [`SCHEMA_VERSION`]
+    /// ([`DbError::SchemaVersionMismatch`]) — only the daemon migrates.
+    pub(crate) fn open_existing(path: &Path) -> DbResult<Self> {
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.execute_batch(PRAGMAS)?;
+        let db = Self { conn };
+        let found = db.user_version()?;
+        if found != SCHEMA_VERSION {
+            return Err(DbError::SchemaVersionMismatch {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        Ok(db)
+    }
+
     /// Open an ephemeral in-memory database (used by unit tests).
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> DbResult<Self> {
@@ -513,19 +607,64 @@ impl Db {
     }
 
     fn from_connection(conn: Connection) -> DbResult<Self> {
-        // WAL for concurrent read/write; a busy timeout to ride out brief locks.
-        // (On an in-memory DB SQLite simply reports `memory`; the pragma is a
-        // harmless no-op there.)
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 3000;")?;
+        conn.execute_batch(PRAGMAS)?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
 
-    /// Apply the idempotent schema. Safe to call repeatedly.
+    /// Step the schema to [`SCHEMA_VERSION`] through the [`MIGRATIONS`] ladder.
+    /// Idempotent: an up-to-date DB is a no-op. Each step commits its DDL/DML
+    /// together with its `user_version` bump in one `BEGIN IMMEDIATE`
+    /// transaction. A fresh (table-less) DB fast-paths to the latest shape in a
+    /// single transaction — the data-migration step v3 has nothing to touch.
     pub(crate) fn migrate(&self) -> DbResult<()> {
-        self.conn.execute_batch(SCHEMA)?;
+        let mut version = self.user_version()?;
+        if version > SCHEMA_VERSION {
+            return Err(DbError::SchemaNewerThanBinary {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version == 0 && self.is_uninitialized()? {
+            return self.run_migration_step(SCHEMA_VERSION, &MIGRATIONS[..2].concat());
+        }
+        for (to_version, step) in (1..).zip(MIGRATIONS) {
+            if version < to_version {
+                self.run_migration_step(to_version, step)?;
+                version = to_version;
+            }
+        }
         Ok(())
+    }
+
+    /// The schema version recorded in the DB header (`PRAGMA user_version`).
+    pub(crate) fn user_version(&self) -> DbResult<i64> {
+        let version = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        Ok(version)
+    }
+
+    /// Whether the DB holds no tables at all — a freshly created file (or a
+    /// pristine in-memory DB), as opposed to an unversioned legacy baseline.
+    fn is_uninitialized(&self) -> DbResult<bool> {
+        let tables: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(tables == 0)
+    }
+
+    /// Run one ladder step: its statements plus the `user_version` bump to
+    /// `to_version`, atomically.
+    fn run_migration_step(&self, to_version: i64, sql: &str) -> DbResult<()> {
+        self.immediate_transaction(|db| {
+            db.conn.execute_batch(sql)?;
+            db.conn.pragma_update(None, "user_version", to_version)?;
+            Ok(())
+        })
     }
 
     /// Run `f` inside one `BEGIN IMMEDIATE` transaction on the shared connection:
@@ -557,6 +696,26 @@ impl Db {
     pub(crate) fn exec_raw(&self, sql: &str) -> DbResult<()> {
         self.conn.execute_batch(sql)?;
         Ok(())
+    }
+
+    /// Recreate the `outbox` table after a fault-injection `DROP TABLE outbox`
+    /// (the transactional-plane tests' failure lever). `migrate()` no longer
+    /// repairs dropped tables — it is a versioned ladder and a no-op at the
+    /// latest version — so the tests restore the table explicitly.
+    #[cfg(test)]
+    pub(crate) fn restore_outbox_table(&self) -> DbResult<()> {
+        self.exec_raw(
+            "CREATE TABLE outbox (
+               id          INTEGER PRIMARY KEY AUTOINCREMENT,
+               type        TEXT    NOT NULL,
+               payload     TEXT    NOT NULL,
+               task_id     TEXT,
+               thread_id   TEXT,
+               created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+               acked_at    TEXT,
+               retry_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
     }
 
     // -- Outbox (at-least-once, runner → host) -----------------------------
@@ -1032,6 +1191,28 @@ impl Db {
                 t.prompt,
             ])?;
         Ok(())
+    }
+
+    /// CAS-claim a pending thread (audit P2-18): `pending → dispatched`,
+    /// stamping the attempt's `started_at` and the assigned `work_dir`, guarded
+    /// by `status = 'pending'`. Returns `false` when the guard rejected the
+    /// claim — the row is gone, already claimed (a concurrent claimer won), or
+    /// otherwise no longer pending — so even a rogue second daemon cannot drive
+    /// the same thread twice.
+    pub(crate) fn claim_pending_thread(
+        &self,
+        id: &str,
+        started_at: &str,
+        work_dir: &str,
+    ) -> DbResult<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE threads SET status = 'dispatched', started_at = ?2, work_dir = ?3
+                  WHERE id = ?1 AND status = 'pending'",
+            )?
+            .execute(params![id, started_at, work_dir])?;
+        Ok(changed == 1)
     }
 
     /// Read a single thread by id, or `None`.
@@ -1569,7 +1750,10 @@ mod tests {
     use secrecy::{ExposeSecret, SecretString};
     use serde_json::json;
 
-    use super::{ConfigEntryRow, CronLogRow, CronRow, Db, InboxRow, OutboxRow, TaskRow, ThreadRow};
+    use super::{
+        ConfigEntryRow, CronLogRow, CronRow, Db, DbError, InboxRow, MIGRATE_V1_BASELINE, OutboxRow,
+        SCHEMA_VERSION, TaskRow, ThreadRow,
+    };
 
     // -- v2 row builders ---------------------------------------------------
 
@@ -1665,14 +1849,245 @@ mod tests {
 
     // -- Schema / migration ------------------------------------------------
 
+    /// Whether `table` has a column named `column` (via `pragma_table_info`).
+    fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                rusqlite::params![table, column],
+                |r| r.get(0),
+            )
+            .unwrap();
+        count > 0
+    }
+
+    fn raw_user_version(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Build an UNVERSIONED legacy database file at `path` — the pre-campaign
+    /// baseline shape old deployments left on disk: no `inbox.msg_id`, no
+    /// `thread_attachments`, `user_version = 0`. The pre-conditions are
+    /// asserted so the constructed shape stays honestly pre-campaign even if
+    /// the baseline const drifts.
+    fn create_legacy_db(path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(MIGRATE_V1_BASELINE).unwrap();
+        assert!(!column_exists(&conn, "inbox", "msg_id"));
+        assert!(
+            !conn
+                .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_attachments'")
+                .unwrap()
+                .exists([])
+                .unwrap()
+        );
+        assert_eq!(raw_user_version(&conn), 0);
+        conn
+    }
+
     #[test]
     fn schema_init_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
+        // A fresh DB fast-paths straight to the latest version.
+        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
         // Re-running the migration must not error or disturb existing data.
         db.insert_task_row(&task_row("t-1", "active")).unwrap();
         db.migrate().unwrap();
         db.migrate().unwrap();
+        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
         assert!(db.get_task_row("t-1").unwrap().is_some());
+    }
+
+    /// P2-18 regression: a legacy unversioned DB (pre-campaign shape) used to
+    /// break on every read/write of the later-added `inbox.msg_id` column and
+    /// `thread_attachments` table. The ladder must step it to latest with its
+    /// data intact, after which the daemon paths work.
+    #[test]
+    fn legacy_db_migrates_through_ladder_to_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        {
+            let conn = create_legacy_db(&path);
+            // Pre-campaign data that must survive the ladder.
+            conn.execute(
+                "INSERT INTO tasks (id, status, created_at, updated_at)
+                 VALUES ('t-1', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO inbox (type, payload) VALUES ('message', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
+
+        // The audit's broken paths now work: msg_id-deduped inbound recording…
+        assert!(
+            db.record_inbound_correlated("message", &json!({}), None, None, Some(7))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.record_inbound_correlated("message", &json!({}), None, None, Some(7))
+                .unwrap()
+                .is_none(),
+            "redelivery of a stored msg_id dedups"
+        );
+        // …and the per-thread attachment snapshot plane.
+        db.insert_thread(&thread_row("th-1", "t-1", None, "pending"))
+            .unwrap();
+        db.set_thread_attachments("th-1", &json!([{"id": "a-1"}]))
+            .unwrap();
+        assert!(db.get_thread_attachments("th-1").unwrap().is_some());
+
+        // Pre-existing rows survived the ladder.
+        assert!(db.get_task_row("t-1").unwrap().is_some());
+        assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 2);
+    }
+
+    /// The v3 data step: `config_entries.scope` re-keyed thread-id → task-id
+    /// (P1-11), so legacy thread-scoped manifest rows are dead scopes and are
+    /// removed by the migration; the global scope survives.
+    #[test]
+    fn migration_removes_legacy_thread_scoped_config_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        {
+            let conn = create_legacy_db(&path);
+            for scope in ["global", "th-dead-1", "th-dead-2"] {
+                conn.execute(
+                    "INSERT INTO config_entries
+                       (scope, name, sha256, short, target, kind, store_path, link_path, installed_at)
+                     VALUES (?1, 'notes', 'aaaa', 'aaaa', 'CLAUDE.md', 'file', 's', 'l', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![scope],
+                )
+                .unwrap();
+            }
+        }
+
+        let db = Db::open(&path).unwrap();
+        let rows = db.list_all_config_entries().unwrap();
+        assert_eq!(rows.len(), 1, "only the global row survives");
+        assert_eq!(rows[0].scope, "global");
+    }
+
+    /// P2-19 regression: SQLite ships `PRAGMA foreign_keys` OFF per connection;
+    /// every open path must switch it on so the schema's REFERENCES (which the
+    /// code assumes are live) are actually enforced.
+    #[test]
+    fn foreign_keys_are_on_and_enforced() {
+        let db = Db::open_in_memory().unwrap();
+        let on: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, 1, "foreign_keys must be ON");
+        // An FK-violating insert fails: a thread under an absent task.
+        assert!(
+            db.insert_thread(&thread_row("th-orphan", "t-absent", None, "pending"))
+                .is_err(),
+            "FK violation must be rejected"
+        );
+
+        // The file-backed open paths enable it too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        for db in [Db::open(&path).unwrap(), Db::open_existing(&path).unwrap()] {
+            let on: i64 = db
+                .conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "foreign_keys must be ON on file opens");
+        }
+    }
+
+    /// P2-18: the daemon refuses a database written by a newer binary rather
+    /// than corrupting a schema it does not understand.
+    #[test]
+    fn daemon_open_refuses_a_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        Db::open(&path).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        assert!(matches!(
+            Db::open(&path).unwrap_err(),
+            DbError::SchemaNewerThanBinary { .. }
+        ));
+    }
+
+    /// P2-18: the CLI open path ([`Db::open_existing`]) neither creates nor
+    /// migrates — a missing file and a version mismatch both fail fast, and a
+    /// mismatched file is left byte-identical (only the daemon migrates).
+    #[test]
+    fn open_existing_never_creates_or_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+
+        // Missing file: refused, and not created.
+        assert!(Db::open_existing(&path).is_err());
+        assert!(!path.exists(), "open_existing must not create the DB");
+
+        // Legacy (v0) file: refused with the version-mismatch error…
+        drop(create_legacy_db(&path));
+        assert!(matches!(
+            Db::open_existing(&path).unwrap_err(),
+            DbError::SchemaVersionMismatch { found: 0, expected } if expected == SCHEMA_VERSION
+        ));
+        // …and left unmigrated.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(raw_user_version(&conn), 0);
+            assert!(
+                !column_exists(&conn, "inbox", "msg_id"),
+                "open_existing must not migrate"
+            );
+        }
+
+        // A daemon-migrated file opens fine.
+        drop(Db::open(&path).unwrap());
+        let db = Db::open_existing(&path).unwrap();
+        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    /// P2-18 regression: claiming a pending thread is a CAS — of two claims on
+    /// one pending row, exactly one wins.
+    #[test]
+    fn claim_pending_thread_is_a_cas() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_thread(&thread_row("th-1", "t-1", None, "pending"))
+            .unwrap();
+
+        assert!(
+            db.claim_pending_thread("th-1", "2026-06-22T12:00:00Z", "/w/th-1")
+                .unwrap()
+        );
+        assert!(
+            !db.claim_pending_thread("th-1", "2026-06-22T12:00:01Z", "/w/th-1-b")
+                .unwrap(),
+            "the second claim must lose"
+        );
+
+        let row = db.get_thread("th-1").unwrap().unwrap();
+        assert_eq!(row.status, "dispatched");
+        assert_eq!(
+            row.started_at.as_deref(),
+            Some("2026-06-22T12:00:00Z"),
+            "the loser must not overwrite the winner's stamps"
+        );
+        assert_eq!(row.work_dir.as_deref(), Some("/w/th-1"));
+
+        // Absent id: nothing to claim.
+        assert!(!db.claim_pending_thread("th-absent", "t", "w").unwrap());
     }
 
     #[test]

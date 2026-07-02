@@ -360,7 +360,7 @@ pub(crate) mod v2 {
 
         /// Fail a pending thread that has no resolvable prompt.
         fn fail_unrunnable(&self, thread: &ThreadRow) {
-            if let Ok(claimed) = self.claim(thread) {
+            if let Ok(Some(claimed)) = self.claim(thread) {
                 let started = Self::started_or_now(&claimed);
                 self.finalize(
                     claimed,
@@ -390,7 +390,11 @@ pub(crate) mod v2 {
         ) -> ThreadRow {
             // 1. Claim: pending → dispatched (records started_at + work_dir).
             let thread = match self.claim(&thread) {
-                Ok(claimed) => claimed,
+                Ok(Some(claimed)) => claimed,
+                Ok(None) => {
+                    warn!(thread = %thread.id, "claim lost: thread no longer pending");
+                    return thread;
+                }
                 Err(err) => {
                     warn!(thread = %thread.id, error = %err, "failed to claim thread");
                     return thread;
@@ -715,13 +719,18 @@ pub(crate) mod v2 {
         /// Claim a pending thread: `pending → dispatched`, stamping `started_at`
         /// (the attempt's start — both watchdogs key off it, the schema has no
         /// separate `dispatched_at`) and assigning the per-thread `work_dir`.
-        fn claim(&self, thread: &ThreadRow) -> DbResult<ThreadRow> {
+        /// The flip is a CAS guarded on `status = 'pending'` (audit P2-18);
+        /// `None` means the claim was lost — the row is no longer pending (a
+        /// concurrent claimer won) and this caller must not drive the thread.
+        fn claim(&self, thread: &ThreadRow) -> DbResult<Option<ThreadRow>> {
             let mut claimed = thread.clone();
             DISPATCHED.clone_into(&mut claimed.status);
-            claimed.started_at = Some(to_iso(now()));
-            claimed.work_dir = Some(self.work_dir_for(&thread.id));
-            lock_db(&self.db).update_thread(&claimed)?;
-            Ok(claimed)
+            let started_at = to_iso(now());
+            let work_dir = self.work_dir_for(&thread.id);
+            let won = lock_db(&self.db).claim_pending_thread(&thread.id, &started_at, &work_dir)?;
+            claimed.started_at = Some(started_at);
+            claimed.work_dir = Some(work_dir);
+            Ok(won.then_some(claimed))
         }
 
         /// `dispatched → running` — the engine is about to start.
@@ -1586,13 +1595,20 @@ pub(crate) mod v2 {
             let thread = pending_thread("th-sm", 1);
             lock(&db).insert_thread(&thread).unwrap();
 
-            let claimed = exec.claim(&thread).unwrap();
+            let claimed = exec.claim(&thread).unwrap().unwrap();
             assert_eq!(claimed.status, "dispatched");
             assert!(claimed.started_at.is_some(), "dispatch stamps started_at");
             assert!(claimed.work_dir.is_some(), "dispatch assigns work_dir");
             assert_eq!(
                 lock(&db).get_thread("th-sm").unwrap().unwrap().status,
                 "dispatched"
+            );
+
+            // P2-18 CAS regression: a second claim on the same (now dispatched)
+            // thread loses — exactly one claimer ever drives a pending row.
+            assert!(
+                exec.claim(&thread).unwrap().is_none(),
+                "second claim must lose the CAS"
             );
 
             let running = exec.mark_running(&claimed).unwrap();
@@ -2286,7 +2302,12 @@ pub(crate) mod v2 {
                 false,
                 no_inactivity(),
             );
-            let resumed = lock(&db).get_thread("th-seq").unwrap().unwrap();
+            // Claim is a CAS on `pending` (P2-18), and the drain plane only
+            // ever runs pending rows — a shared re-fire re-pends first (the
+            // scheduler's repend_shared_thread), mirrored here.
+            let mut resumed = lock(&db).get_thread("th-seq").unwrap().unwrap();
+            "pending".clone_into(&mut resumed.status);
+            lock(&db).update_thread(&resumed).unwrap();
             let row = second
                 .run_thread(resumed, "again".to_owned(), Continuity::Shared)
                 .await;
@@ -2332,7 +2353,7 @@ pub(crate) mod v2 {
             );
 
             // Restore the outbox (empty) and re-run the thread: now BOTH commit.
-            lock(&db).migrate().unwrap();
+            lock(&db).restore_outbox_table().unwrap();
             assert!(results(&db).is_empty(), "no orphan thread_result frame");
             let mut repend = persisted;
             "pending".clone_into(&mut repend.status);
