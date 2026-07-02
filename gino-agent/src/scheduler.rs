@@ -649,6 +649,9 @@ impl Scheduler {
             if cron.run_count != truth {
                 let mut fixed = cron.clone();
                 fixed.run_count = truth;
+                // Full-row update_cron is acceptable here: this runs once at
+                // startup, before the scheduler/executor loops (and thus any
+                // concurrent cron edits) exist.
                 lock_db(&self.db).update_cron(&fixed)?;
                 debug!(cron = %cron.id, from = cron.run_count, to = truth, "reconciled run_count");
             }
@@ -1025,8 +1028,7 @@ mod tests {
     use crate::config::{ExecutorConfig, RetentionConfig};
     use crate::db::{CronLogRow, CronRow, Db, TaskRow, ThreadRow};
     use crate::engine::{
-        Engine, EngineError, EngineEvent, Input, Payload, RunErrorKind, RunOutcome, RunStatus,
-        Session, SessionCfg,
+        Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
     };
     use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
     use crate::protocol::v2::CronUpsertData;
@@ -1772,9 +1774,6 @@ mod tests {
 
     #[async_trait]
     impl Session for ScriptSession {
-        async fn send(&self, _input: Input) -> Result<(), EngineError> {
-            Ok(())
-        }
         async fn interrupt(&self) -> Result<(), EngineError> {
             Ok(())
         }
@@ -1802,9 +1801,6 @@ mod tests {
                     error_kind: None,
                 }),
             ])))
-        }
-        async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
-            unreachable!("the executor drives sessions, not run_once")
         }
     }
 
@@ -1915,9 +1911,6 @@ mod tests {
                 })]
             };
             Ok(Box::new(ScriptSession(script)))
-        }
-        async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
-            unreachable!("the executor drives sessions, not run_once")
         }
     }
 
