@@ -36,7 +36,7 @@ use chrono::TimeDelta;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::attachment_source::{InboundAttachments, InboxAttachmentSource};
+use crate::attachment_source::DbAttachmentSource;
 use crate::attachments::{self, AttachmentManager, AttachmentSource};
 use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
@@ -181,13 +181,12 @@ async fn run_async(
     // The v2 execution plane: the source-agnostic pending-thread drainer, its
     // out-of-band attachment plane (PLAN-005, Lane Z1) and the global config/skills
     // provisioner (PLAN-007) — all over one shared content-addressed manager — then
-    // the startup global reconcile. The shared stash hands a resolved message's
-    // inbound descriptors from the prompt drainer to the executor.
-    let (executor, inbound_attachments, provisioner) =
+    // the startup global reconcile. A resolved message's inbound descriptors reach
+    // the executor through the durable `thread_attachments` snapshot (P1-10b).
+    let (executor, provisioner) =
         build_execution_plane(&config, &http, &db, &engine_config_dir, &cancel).await;
     let prompts = Arc::new(InboxPromptSource {
         db: Arc::clone(&db),
-        inbound: inbound_attachments,
     });
 
     // Crash recovery: any thread left `dispatched`/`running`/`active` by a previous
@@ -393,11 +392,6 @@ fn in_flight_threads(db: &Mutex<Db>) -> Vec<ThreadRow> {
 /// the thread `runner.invalid_request`.
 struct InboxPromptSource {
     db: Arc<Mutex<Db>>,
-    /// Shared stash the executor's attachment plane reads: resolving a chat/api
-    /// message also lifts its inbound descriptors off the same `MessageInData` and
-    /// records them here, since consuming the message hides it from a later inbox
-    /// query (see [`crate::attachment_source`]).
-    inbound: InboundAttachments,
 }
 
 impl PromptSource for InboxPromptSource {
@@ -410,7 +404,7 @@ impl PromptSource for InboxPromptSource {
                 .and_then(|cron_id| lock_db(&self.db).get_cron(cron_id).ok().flatten())
                 .map(|cron| cron.prompt)
                 .filter(|prompt| !prompt.trim().is_empty()),
-            _ => resolve_inbox_message(&self.db, thread, &self.inbound),
+            _ => resolve_inbox_message(&self.db, thread),
         }
     }
 }
@@ -421,36 +415,36 @@ impl PromptSource for InboxPromptSource {
 /// re-resolve; an empty message yields `None` (which fails the thread) but is still
 /// consumed so it cannot loop.
 ///
-/// For a runnable message this also stashes its inbound attachment descriptors into
-/// `inbound`: consuming the row hides it from the executor's later inbound query, so
-/// the descriptors are lifted off the same `MessageInData` here (empty/absent →
-/// nothing recorded). Stashed only when the prompt is non-empty, so a failed
-/// (unrunnable) thread — which never reaches materialization — leaves no orphan
-/// entry.
-fn resolve_inbox_message(
-    db: &Mutex<Db>,
-    thread: &ThreadRow,
-    inbound: &InboundAttachments,
-) -> Option<String> {
+/// For a runnable message this also snapshots its inbound attachment descriptors
+/// into the durable `thread_attachments` table (P1-10b), BEFORE consuming the row:
+/// once processed the message is invisible to every later query, so a
+/// consumed-but-unsnapshotted crash window would silently strip the thread of its
+/// inputs. Snapshotted only when the prompt is non-empty, so a failed (unrunnable)
+/// thread — which never reaches materialization — leaves no orphan row; on a
+/// snapshot write failure the message is left unconsumed (a later resolve retries)
+/// and the resolve fails rather than running without the inputs.
+fn resolve_inbox_message(db: &Mutex<Db>, thread: &ThreadRow) -> Option<String> {
     let guard = lock_db(db);
     let rows = guard.list_inbox_by_type("message").ok()?;
     let row = rows.into_iter().find(|row| {
         row.thread_id.as_deref() == Some(thread.id.as_str())
             || (row.thread_id.is_none() && row.task_id.as_deref() == Some(thread.task_id.as_str()))
     })?;
+    let message = match serde_json::from_str::<InboundFrameV2>(&row.payload) {
+        Ok(InboundFrameV2::Message { data, .. }) if !data.text.trim().is_empty() => Some(data),
+        _ => None,
+    };
+    if let Some(data) = &message
+        && let Some(attachments) = data.attachments.as_ref().filter(|a| !a.is_empty())
+        && let Err(err) = guard.set_thread_attachments(&thread.id, attachments)
+    {
+        warn!(thread = %thread.id, error = %err, "failed to snapshot inbound attachments; leaving the message unconsumed");
+        return None;
+    }
     if let Err(err) = guard.mark_inbox_processed(row.id) {
         warn!(id = row.id, error = %err, "failed to consume inbox message");
     }
-    let frame: InboundFrameV2 = serde_json::from_str(&row.payload).ok()?;
-    match frame {
-        InboundFrameV2::Message { data, .. } if !data.text.trim().is_empty() => {
-            if let Some(attachments) = data.attachments {
-                inbound.record(&thread.id, attachments);
-            }
-            Some(data.text)
-        }
-        _ => None,
-    }
+    message.map(|data| data.text)
 }
 
 /// Map the [`ExecutorConfig`] knobs onto the executor's watchdog thresholds. A
@@ -526,11 +520,7 @@ async fn build_execution_plane(
     db: &Arc<Mutex<Db>>,
     engine_config_dir: &Path,
     shutdown: &Arc<Cancel>,
-) -> (
-    Arc<ThreadExecutor>,
-    InboundAttachments,
-    Option<Arc<Provisioner>>,
-) {
+) -> (Arc<ThreadExecutor>, Option<Arc<Provisioner>>) {
     let manager = build_attachment_manager(config, http);
 
     // The shared content-addressed provisioner over the manager (`impl BlobFetcher
@@ -546,7 +536,7 @@ async fn build_execution_plane(
         ))
     });
 
-    let (executor, inbound) = build_executor(
+    let executor = build_executor(
         config,
         Arc::clone(db),
         engine_config_dir,
@@ -565,16 +555,17 @@ async fn build_execution_plane(
         )
         .await;
     }
-    (executor, inbound, provisioner)
+    (executor, provisioner)
 }
 
 /// Build the v2 [`ThreadExecutor`] and (when present) wire its out-of-band
-/// attachment plane (PLAN-005, Lane Z1) onto the shared `manager`. Returns the
-/// executor plus the shared [`InboundAttachments`] stash to hand the prompt
-/// drainer, so a resolved message's inbound descriptors reach the executor (the
-/// message is consumed before materialization — see [`crate::attachment_source`]).
-/// The plane is non-fatal: a `None` manager (absent host base / connect token)
-/// leaves attachments off and the executor behaves as before.
+/// attachment plane (PLAN-005, Lane Z1) onto the shared `manager`. The inbound
+/// descriptors reach the executor through a [`DbAttachmentSource`] over the
+/// durable `thread_attachments` snapshot the prompt drainer writes (the message
+/// is consumed before materialization, and retries/restarts must resolve the
+/// same set — P1-10b; see [`crate::attachment_source`]). The plane is non-fatal:
+/// a `None` manager (absent host base / connect token) leaves attachments off
+/// and the executor behaves as before.
 fn build_executor(
     config: &Config,
     db: Arc<Mutex<Db>>,
@@ -582,22 +573,20 @@ fn build_executor(
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
     shutdown: Arc<Cancel>,
-) -> (Arc<ThreadExecutor>, InboundAttachments) {
+) -> Arc<ThreadExecutor> {
     let engine = build_engine(config, engine_config_dir);
     // The daemon shutdown token (P1-6): a shutdown cancels the active run through
     // the executor's converged cancel path and stops the pending drain.
     let mut executor = ThreadExecutor::new(
         engine,
-        db,
+        Arc::clone(&db),
         config.paths.workspace_dir.clone(),
         watchdog_cfg(&config.executor),
     )
     .with_shutdown(shutdown);
-    let inbound = InboundAttachments::default();
     if let Some(manager) = manager {
         info!("attachment plane active (host-proxy byte backend)");
-        let source: Arc<dyn AttachmentSource> =
-            Arc::new(InboxAttachmentSource::new(inbound.clone()));
+        let source: Arc<dyn AttachmentSource> = Arc::new(DbAttachmentSource::new(db));
         executor = executor.with_attachments(manager, source);
     } else {
         debug!("attachment plane disabled (no host base / connect token)");
@@ -611,7 +600,7 @@ fn build_executor(
     } else {
         debug!("task provisioning plane disabled (no host base / connect token)");
     }
-    (Arc::new(executor), inbound)
+    Arc::new(executor)
 }
 
 /// Build the Claude engine from the resolved config, exporting the workspace dir
@@ -1301,7 +1290,7 @@ fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::attachment_source::{InboundAttachments, InboxAttachmentSource};
+    use crate::attachment_source::DbAttachmentSource;
     use crate::attachments::AttachmentSource;
     use crate::db::{Db, TaskRow, ThreadRow};
     use crate::executor::v2::PromptSource;
@@ -1353,8 +1342,10 @@ mod tests {
 
     /// Record a `message` frame carrying `attachments` for the thread, then resolve
     /// its prompt. The drainer consumes the inbox row (hiding it from a later inbox
-    /// query) yet the executor's source still surfaces the descriptors — proof the
-    /// consume-before-materialize ordering is handled via the shared stash.
+    /// query) yet the executor's source still surfaces the descriptors — the
+    /// consume-before-materialize ordering is handled via the durable
+    /// `thread_attachments` snapshot (P1-10b), so a retry AND a fresh source over
+    /// the same db (a daemon restart) resolve the identical set.
     #[test]
     fn message_attachments_survive_prompt_consumption_for_inbound_for() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
@@ -1374,13 +1365,26 @@ mod tests {
         lock_db(&db)
             .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(7))
             .unwrap();
+        let thread = chat_thread("th-1", "t-1");
+        {
+            // Seed the FK targets: the snapshot table references threads(id).
+            let guard = lock_db(&db);
+            guard
+                .insert_task_row(&TaskRow {
+                    id: "t-1".to_owned(),
+                    name: None,
+                    kind: None,
+                    status: "active".to_owned(),
+                    created_at: "2026-06-22T00:00:00Z".to_owned(),
+                    updated_at: "2026-06-22T00:00:00Z".to_owned(),
+                })
+                .unwrap();
+            guard.insert_thread(&thread).unwrap();
+        }
 
-        let inbound = InboundAttachments::default();
         let prompts = InboxPromptSource {
             db: Arc::clone(&db),
-            inbound: inbound.clone(),
         };
-        let thread = chat_thread("th-1", "t-1");
 
         // Resolving the prompt consumes the inbox message...
         assert_eq!(
@@ -1395,13 +1399,23 @@ mod tests {
             "message must be consumed (no replay/re-resolve)"
         );
 
-        // ...but the executor's attachment source still resolves the descriptors.
-        let source = InboxAttachmentSource::new(inbound);
+        // ...but the executor's attachment source still resolves the descriptors,
+        // on the first attempt AND on a retry (the snapshot is never popped).
+        let source = DbAttachmentSource::new(Arc::clone(&db));
         assert_eq!(source.inbound_for(&thread), descriptors);
+        assert_eq!(
+            source.inbound_for(&thread),
+            descriptors,
+            "a retried run must see the same attachments"
+        );
+
+        // A daemon restart = a fresh source over the same db: identical set.
+        let restarted = DbAttachmentSource::new(Arc::clone(&db));
+        assert_eq!(restarted.inbound_for(&thread), descriptors);
     }
 
-    /// A message with no attachments stashes nothing → `inbound_for` is empty (the
-    /// executor then materializes no inputs).
+    /// A message with no attachments snapshots nothing → `inbound_for` is empty
+    /// (the executor then materializes no inputs).
     #[test]
     fn message_without_attachments_yields_no_inbound() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
@@ -1418,15 +1432,13 @@ mod tests {
             .record_inbound_correlated("message", &frame, Some("t-2"), Some("th-2"), None)
             .unwrap();
 
-        let inbound = InboundAttachments::default();
         let prompts = InboxPromptSource {
             db: Arc::clone(&db),
-            inbound: inbound.clone(),
         };
         let thread = chat_thread("th-2", "t-2");
         assert!(prompts.prompt_for(&thread).is_some());
 
-        let source = InboxAttachmentSource::new(inbound);
+        let source = DbAttachmentSource::new(Arc::clone(&db));
         assert!(source.inbound_for(&thread).is_empty());
     }
 
@@ -1831,7 +1843,6 @@ mod tests {
         );
         let source = InboxPromptSource {
             db: Arc::clone(&db),
-            inbound: InboundAttachments::default(),
         };
 
         // First drain: runs turn 1 only; the second message sits queued.
@@ -1999,7 +2010,6 @@ mod tests {
         ));
         let prompts = Arc::new(InboxPromptSource {
             db: Arc::clone(&db),
-            inbound: InboundAttachments::default(),
         });
 
         // The runner's own planes: the real scheduler task + executor worker.
@@ -2174,7 +2184,6 @@ mod tests {
         );
         let prompts = Arc::new(InboxPromptSource {
             db: Arc::clone(&db),
-            inbound: InboundAttachments::default(),
         });
         let worker = tokio::spawn(super::run_worker(
             Arc::clone(&executor),
