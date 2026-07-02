@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::TimeDelta;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -40,8 +41,8 @@ use crate::attachment_source::DbAttachmentSource;
 use crate::attachments::{self, AttachmentManager, AttachmentSource};
 use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
-use crate::engine::Engine;
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
+use crate::engine::{Engine, EngineError, Payload, RunOutcome, Session, SessionCfg};
 use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
 use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
@@ -230,7 +231,7 @@ async fn run_async(
     // the startup global reconcile. A resolved message's inbound descriptors reach
     // the executor through the durable `thread_attachments` snapshot (P1-10b).
     let flush = transport.flush_handle();
-    let (executor, provisioner) = build_execution_plane(
+    let (executor, provisioner, settings) = build_execution_plane(
         &config,
         &http,
         &db,
@@ -281,6 +282,8 @@ async fn run_async(
         chat_max_attempts: max_attempts,
         provisioner,
         engine_config_dir,
+        config: Mutex::new(config),
+        engine_settings: settings,
     };
     serve(&mut transport, &context, &cancel).await;
 
@@ -572,6 +575,8 @@ async fn fetch_and_apply_config(
 /// `None` manager (absent host base / connect token) degrades both planes off. The
 /// returned provisioner is `None` in that same degraded case. The startup reconcile
 /// (repair → reconcile(global) → gc) is non-fatal — see [`reconcile_global_startup`].
+/// Also returns the live engine-settings seam (audit P2-19) the executor's engine
+/// snapshots at every spawn, so the `config_update` route can replace its contents.
 async fn build_execution_plane(
     config: &Config,
     http: &HttpClient,
@@ -579,7 +584,13 @@ async fn build_execution_plane(
     engine_config_dir: &Path,
     shutdown: &Arc<Cancel>,
     flush: Arc<Notify>,
-) -> (Arc<ThreadExecutor>, Option<Arc<Provisioner>>) {
+) -> (
+    Arc<ThreadExecutor>,
+    Option<Arc<Provisioner>>,
+    SharedEngineSettings,
+) {
+    let settings: SharedEngineSettings =
+        Arc::new(Mutex::new(engine_settings(config, engine_config_dir)));
     let manager = build_attachment_manager(config, http);
 
     // The shared content-addressed provisioner over the manager (`impl BlobFetcher
@@ -598,7 +609,7 @@ async fn build_execution_plane(
     let executor = build_executor(
         config,
         Arc::clone(db),
-        engine_config_dir,
+        &settings,
         manager,
         provisioner.clone(),
         Arc::clone(shutdown),
@@ -615,7 +626,7 @@ async fn build_execution_plane(
         )
         .await;
     }
-    (executor, provisioner)
+    (executor, provisioner, settings)
 }
 
 /// Build the v2 [`ThreadExecutor`] and (when present) wire its out-of-band
@@ -629,13 +640,15 @@ async fn build_execution_plane(
 fn build_executor(
     config: &Config,
     db: Arc<Mutex<Db>>,
-    engine_config_dir: &Path,
+    settings: &SharedEngineSettings,
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
     shutdown: Arc<Cancel>,
     flush: Arc<Notify>,
 ) -> Arc<ThreadExecutor> {
-    let engine = build_engine(config, engine_config_dir);
+    let engine: Arc<dyn Engine> = Arc::new(ReloadableEngine {
+        settings: Arc::clone(settings),
+    });
     // The daemon shutdown token (P1-6): a shutdown cancels the active run through
     // the executor's converged cancel path and stops the pending drain. The
     // transport flush signal (P2-16): the executor pokes it after each persisted
@@ -667,12 +680,12 @@ fn build_executor(
     Arc::new(executor)
 }
 
-/// Build the Claude engine from the resolved config, exporting the workspace dir
-/// (`GINO_WORKSPACE_DIR`, read by the PreCompact `archive` hook subprocess) and
-/// pointing the engine at the provisioned global config dir (PLAN-007 §6) on top
-/// of the credential env. Returned as `Arc<dyn Engine>` so everything downstream
-/// stays engine-agnostic.
-fn build_engine(config: &Config, engine_config_dir: &Path) -> Arc<dyn Engine> {
+/// Resolve the Claude engine settings from the config, exporting the workspace
+/// dir (`GINO_WORKSPACE_DIR`, read by the PreCompact `archive` hook subprocess)
+/// and pointing the engine at the provisioned global config dir (PLAN-007 §6) on
+/// top of the credential env. Rebuilt on a live `config_update` (audit P2-19) so
+/// a rotated credential reaches the next engine run without a restart.
+fn engine_settings(config: &Config, engine_config_dir: &Path) -> ClaudeSettings {
     let mut settings = ClaudeSettings::from_config(config);
     settings.env.push((
         "GINO_WORKSPACE_DIR".to_owned(),
@@ -681,7 +694,46 @@ fn build_engine(config: &Config, engine_config_dir: &Path) -> Arc<dyn Engine> {
     // Launch the engine reading the global instruction file + skills the runner
     // materialized; `ClaudeSettings` exports `ENGINE_CONFIG_DIR`/`CLAUDE_CONFIG_DIR`.
     settings.config_dir = Some(engine_config_dir.to_path_buf());
-    Arc::new(ClaudeEngine::new(settings))
+    settings
+}
+
+/// The live engine-settings seam (audit P2-19): the executor's engine snapshots
+/// these settings at every spawn, and the `config_update` route replaces them
+/// after merging the overlay onto the live [`Config`] — so a rotated
+/// `anthropicApiKey` takes effect without a daemon restart.
+type SharedEngineSettings = Arc<Mutex<ClaudeSettings>>;
+
+/// An [`Engine`] over the [`SharedEngineSettings`] seam: each call snapshots the
+/// current settings and delegates to a [`ClaudeEngine`] built from that snapshot.
+/// Decision (protocol.md leaves `config_update` apply semantics open):
+/// APPLY-ON-NEXT-RUN — a session already spawned keeps the environment it was
+/// born with; only the next spawn reads the updated settings. A mid-flight run
+/// is never hot-swapped.
+#[derive(Debug)]
+struct ReloadableEngine {
+    settings: SharedEngineSettings,
+}
+
+#[async_trait]
+impl Engine for ReloadableEngine {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        self.snapshot().start_session(cfg).await
+    }
+
+    async fn run_once(&self, payload: Payload) -> Result<RunOutcome, EngineError> {
+        self.snapshot().run_once(payload).await
+    }
+}
+
+impl ReloadableEngine {
+    /// A [`ClaudeEngine`] over the settings as they stand right now.
+    fn snapshot(&self) -> ClaudeEngine {
+        ClaudeEngine::new(lock(&self.settings).clone())
+    }
 }
 
 /// Build the shared content-addressed [`AttachmentManager`] (PLAN-005, agent-
@@ -818,6 +870,13 @@ struct ServeContext {
     /// The global scope root the provisioner materializes into (= the engine's
     /// `ENGINE_CONFIG_DIR`), re-reconciled live on `config_update`.
     engine_config_dir: PathBuf,
+    /// The merged live config. A WS `config_update` overlay lands here (the last
+    /// layer of the config.rs precedence chain) and drives the engine-settings
+    /// rebuild below.
+    config: Mutex<Config>,
+    /// The live engine-settings seam (audit P2-19): replaced on `config_update`,
+    /// snapshotted by [`ReloadableEngine`] at every engine spawn.
+    engine_settings: SharedEngineSettings,
 }
 
 /// Resolve when a daemon shutdown signal arrives (P1-6): SIGINT (Ctrl-C) and —
@@ -951,13 +1010,12 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             ControlFlow::Continue(())
         }
         InboundFrameV2::ConfigUpdate { data, .. } => {
-            // Engine-affecting config changes take effect on the next engine start;
-            // record the update so it is not silently dropped.
             debug!(keys = ?config_keys(&data), "config_update received");
-            // A `config_update` carrying the full re-pushed global provisioning set
-            // is reconciled live (PLAN-007 §6): add / repoint / remove converge the
-            // engine config dir without an engine restart. Always marked processed:
-            // the host re-pushes config on connect, so a replay is worthless.
+            // Applied on both planes (audit P2-19): the overlay merges onto the
+            // live config + engine settings (rotated credentials reach the next
+            // engine run), and a re-pushed global provisioning set is reconciled
+            // live (PLAN-007 §6). Always marked processed: the host re-pushes
+            // config on connect, so a replay is worthless.
             apply_config_update(context, &data).await;
             ControlFlow::Continue(())
         }
@@ -1284,9 +1342,51 @@ fn config_keys(data: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Apply a live `config_update` end-to-end (audit P2-19). The payload is parsed
+/// ONCE as a [`ConfigOverlay`], then applied on both planes:
+///
+/// 1. **engine/config** ([`apply_engine_config`]) — merge the overlay onto the
+///    live [`Config`] and rebuild the shared engine settings, so a rotated
+///    `anthropicApiKey` reaches the next engine run without a restart.
+/// 2. **provisioning** ([`apply_provisioning_update`]) — the version-gated global
+///    reconcile (PLAN-007 §6).
+///
+/// A payload that does not parse as an overlay is dropped, not retried: the
+/// failure is deterministic (a replay re-fails identically) and the host
+/// re-pushes config on connect, so dropping follows the same dead-letter policy
+/// the transport applies to malformed known-type frames. Non-fatal.
+async fn apply_config_update(context: &ServeContext, data: &serde_json::Value) {
+    let overlay: ConfigOverlay = match serde_json::from_value(data.clone()) {
+        Ok(overlay) => overlay,
+        Err(err) => {
+            warn!(error = %err, "config_update did not parse as a config overlay; dropping (dead-letter)");
+            return;
+        }
+    };
+    apply_engine_config(context, overlay.clone());
+    apply_provisioning_update(context, &overlay).await;
+}
+
+/// Merge a `config_update` overlay onto the live [`Config`] (the "WS update"
+/// layer — last in the config.rs precedence chain) and rebuild the shared
+/// [`ClaudeSettings`] from the merged result, so the NEXT engine spawn sees the
+/// updated credentials/model/tools (see [`ReloadableEngine`] for the
+/// apply-on-next-run decision). Fields the engine does not read at spawn time
+/// (heartbeat cadence, paths) are merged too but only take effect where they
+/// are re-read — the transport and DB keep their startup values until restart.
+fn apply_engine_config(context: &ServeContext, overlay: ConfigOverlay) {
+    let rebuilt = {
+        let mut config = lock(&context.config);
+        config.apply(overlay);
+        engine_settings(&config, &context.engine_config_dir)
+    };
+    *lock(&context.engine_settings) = rebuilt;
+    debug!("config_update merged onto live config; engine settings apply on the next run");
+}
+
 /// Apply the provisioning side of a live `config_update` (PLAN-007 §6) under the SAME
-/// version gate as the startup reconcile. Parse the payload as a [`ConfigOverlay`] and
-/// re-reconcile the global scope ONLY when it carries BOTH a `version` and an
+/// version gate as the startup reconcile. Re-reconcile the global scope ONLY when the
+/// overlay carries BOTH a `version` and an
 /// `entries` set AND that version advances past the persisted applied version. The
 /// host re-pushes the FULL desired set, so one [`Provisioner::reconcile`] converges
 /// add / repoint / remove (incl. the authoritative-empty case — a versioned empty set
@@ -1296,16 +1396,9 @@ fn config_keys(data: &serde_json::Value) -> Vec<String> {
 /// applied version is persisted only after a successful reconcile. Unlike the startup
 /// path this does NOT gc — orphaned store versions are collected on the next restart's
 /// startup gc, matching the documented "no GC without a restart". Non-fatal.
-async fn apply_config_update(context: &ServeContext, data: &serde_json::Value) {
+async fn apply_provisioning_update(context: &ServeContext, overlay: &ConfigOverlay) {
     let Some(provisioner) = &context.provisioner else {
         return;
-    };
-    let overlay: ConfigOverlay = match serde_json::from_value(data.clone()) {
-        Ok(overlay) => overlay,
-        Err(err) => {
-            warn!(error = %err, "config_update did not parse as a config overlay; skipping reconcile");
-            return;
-        }
     };
     // The version gate keys on a (version, entries) pair: a versioned desired set.
     let (Some(fetched), Some(entries)) = (overlay.version(), overlay.entries()) else {
@@ -1350,6 +1443,12 @@ fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Poison-tolerant lock for the live config / engine-settings seams — same
+/// policy as [`lock_db`]: short critical sections, never across an `.await`.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1364,9 +1463,11 @@ mod tests {
     };
 
     use super::{
-        InboxPromptSource, acquire_daemon_lock, apply_task_def, conclude_inbox_row,
-        ensure_chat_thread, handle_cron_upsert, lock_db, minted_thread_id, repend_queued_messages,
+        InboxPromptSource, ServeContext, acquire_daemon_lock, apply_task_def, conclude_inbox_row,
+        ensure_chat_thread, handle_cron_upsert, lock, lock_db, minted_thread_id,
+        repend_queued_messages, route,
     };
+    use crate::transport::Inbound;
 
     /// P2-18 regression: the daemon's single-instance lock is exclusive and
     /// fails fast. The lock is per open-file-description, so a second handle in
@@ -1398,7 +1499,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = Arc::new(crate::scheduler::Cancel::new());
         let flush = Arc::new(tokio::sync::Notify::new());
-        let (executor, _provisioner) = super::build_execution_plane(
+        let (executor, _provisioner, _settings) = super::build_execution_plane(
             &crate::config::Config::default(),
             &http,
             &db,
@@ -1408,6 +1509,117 @@ mod tests {
         )
         .await;
         assert!(executor.flush_wired());
+    }
+
+    /// Build a [`ServeContext`] over an in-memory DB for route-level tests. The
+    /// default config carries no host, so the provisioner is absent and the
+    /// provisioning side of `config_update` is a no-op here.
+    async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContext {
+        let http = crate::transport::http::HttpClient::new().unwrap();
+        let cancel = Arc::new(crate::scheduler::Cancel::new());
+        let config = crate::config::Config::default();
+        let (executor, provisioner, settings) = super::build_execution_plane(
+            &config,
+            &http,
+            &db,
+            dir,
+            &cancel,
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await;
+        ServeContext {
+            executor,
+            db,
+            nudge: Arc::new(tokio::sync::Notify::new()),
+            drain: Arc::new(tokio::sync::Notify::new()),
+            chat_max_attempts: 1,
+            provisioner,
+            engine_config_dir: dir.to_path_buf(),
+            config: Mutex::new(config),
+            engine_settings: settings,
+        }
+    }
+
+    /// P2-19 regression: a `config_update` carrying a rotated `anthropicApiKey`
+    /// takes effect WITHOUT a restart — the route merges the overlay onto the
+    /// live config and rebuilds the shared engine settings the executor's engine
+    /// snapshots at its next spawn — and the inbox row is settled like any other
+    /// applied frame (no replay).
+    #[tokio::test]
+    async fn config_update_rotated_key_applies_to_the_next_engine_run() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let context = serve_context(Arc::clone(&db), dir.path()).await;
+        assert!(
+            !lock(&context.engine_settings)
+                .env
+                .iter()
+                .any(|(key, _)| key == "ANTHROPIC_API_KEY"),
+            "no key configured at startup"
+        );
+
+        let frame = InboundFrameV2::ConfigUpdate {
+            data: serde_json::json!({ "engine": { "anthropicApiKey": "sk-rotated" } }),
+            msg_id: Some(21),
+        };
+        let inbox_id = lock_db(&db)
+            .record_inbound_correlated("config_update", &frame, None, None, Some(21))
+            .unwrap()
+            .expect("a fresh msg_id stores a row");
+
+        assert!(
+            route(Inbound { inbox_id, frame }, &context)
+                .await
+                .is_continue()
+        );
+
+        // The seam the engine snapshots at every spawn now carries the new key…
+        let env = lock(&context.engine_settings).env.clone();
+        assert!(
+            env.iter()
+                .any(|(key, value)| key == "ANTHROPIC_API_KEY" && value == "sk-rotated"),
+            "the next engine run must see the rotated key: {env:?}"
+        );
+        // …and the row is settled (applied), never left to replay.
+        assert!(lock_db(&db).list_unprocessed_inbox().unwrap().is_empty());
+    }
+
+    /// P2-19: a `config_update` whose payload does not parse as a config overlay
+    /// follows the dead-letter policy — dropped and settled (the failure is
+    /// deterministic and the host re-pushes config on connect), never left to
+    /// head-of-line-block the inbox — and the engine settings stay untouched.
+    #[tokio::test]
+    async fn malformed_config_update_overlay_is_dropped_and_settled() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let context = serve_context(Arc::clone(&db), dir.path()).await;
+        let before = lock(&context.engine_settings).env.clone();
+
+        let frame = InboundFrameV2::ConfigUpdate {
+            // `engine` must be an object; a number fails the overlay parse.
+            data: serde_json::json!({ "engine": 5 }),
+            msg_id: Some(22),
+        };
+        let inbox_id = lock_db(&db)
+            .record_inbound_correlated("config_update", &frame, None, None, Some(22))
+            .unwrap()
+            .expect("a fresh msg_id stores a row");
+
+        assert!(
+            route(Inbound { inbox_id, frame }, &context)
+                .await
+                .is_continue()
+        );
+
+        assert_eq!(
+            lock(&context.engine_settings).env,
+            before,
+            "a malformed overlay must not disturb the engine settings"
+        );
+        assert!(
+            lock_db(&db).list_unprocessed_inbox().unwrap().is_empty(),
+            "the malformed update is settled, not left to replay"
+        );
     }
 
     fn chat_thread(id: &str, task_id: &str) -> ThreadRow {

@@ -18,17 +18,22 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
 /// The maximum characters of a message body kept in the Markdown archive (longer
 /// bodies are truncated with an ellipsis), matching the TypeScript runner.
 const MAX_BODY_CHARS: usize = 2000;
+
+/// Sidecar lockfile under the conversations dir serializing concurrent `archive`
+/// hook processes (audit P2-19).
+const CONVERSATIONS_LOCK_FILE: &str = ".sessions-index.lock";
 
 /// Errors raised while archiving a transcript.
 #[derive(Debug, Error)]
@@ -140,8 +145,18 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
         source,
     })?;
 
+    // Serialize concurrent PreCompact hooks (audit P2-19). Decision: an advisory
+    // exclusive lock on a sidecar lockfile — each hook is its own short-lived
+    // `gino-agent archive` process, so there is no in-process single writer to
+    // lean on and the lock must work cross-process. Held (via the binding) across
+    // name selection, the Markdown write, and the index update, so two hooks can
+    // neither pick the same archive name nor interleave the index
+    // read-modify-write; the index write itself is temp+rename (see
+    // [`update_index`]) so a crash mid-write never leaves a torn file behind.
+    let _dir_lock = lock_conversations_dir(&conversations_dir)?;
+
     let now = now_unix();
-    let file_path = conversations_dir.join(format!("{}-{name}.md", date_stamp(now)));
+    let file_path = unique_archive_path(&conversations_dir, &date_stamp(now), &name);
     let markdown = format_markdown(&messages, summary.as_deref(), now);
     fs::write(&file_path, markdown).map_err(|source| ArchiveError::Write {
         dir: file_path.display().to_string(),
@@ -266,7 +281,10 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 /// Slug a summary into a filename fragment: lowercase, non-alphanumerics collapsed
-/// to single dashes, trimmed, capped at 50 characters.
+/// to single dashes, trimmed, capped at 50 characters. A summary with no ASCII
+/// alphanumerics at all (e.g. fully non-ASCII) used to slug to the empty string —
+/// making every such same-day archive share one name (audit P2-19); it now falls
+/// back to a content hash, so distinct summaries yield distinct, non-empty names.
 fn sanitize_filename(summary: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
@@ -280,7 +298,59 @@ fn sanitize_filename(summary: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-');
-    trimmed.chars().take(50).collect()
+    let slug: String = trimmed.chars().take(50).collect();
+    if slug.is_empty() {
+        return hashed_slug(summary);
+    }
+    slug
+}
+
+/// A deterministic, non-empty slug for a summary that survives no ASCII
+/// characters: `conversation-` plus the first 4 bytes of the summary's SHA-256.
+fn hashed_slug(summary: &str) -> String {
+    let digest = Sha256::digest(summary.as_bytes());
+    format!(
+        "conversation-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// Acquire the exclusive advisory lock serializing archive writers for this
+/// conversations dir. Blocks until the lock is free (hooks are short-lived);
+/// released by the OS when the returned handle drops, clean exit or not.
+fn lock_conversations_dir(dir: &Path) -> Result<fs::File, ArchiveError> {
+    let path = dir.join(CONVERSATIONS_LOCK_FILE);
+    let write_err = |source| ArchiveError::Write {
+        dir: path.display().to_string(),
+        source,
+    };
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(write_err)?;
+    file.lock().map_err(write_err)?;
+    Ok(file)
+}
+
+/// The first free `<stamp>-<name>[-N].md` path under `dir`: same-day archives
+/// with identical (or identically-slugged) summaries get `-2`, `-3`, … suffixes
+/// instead of overwriting each other (audit P2-19). The caller holds the
+/// conversations-dir lock, so the existence probe cannot race another hook.
+fn unique_archive_path(dir: &Path, stamp: &str, name: &str) -> PathBuf {
+    let base = dir.join(format!("{stamp}-{name}.md"));
+    if !base.exists() {
+        return base;
+    }
+    let mut counter: u64 = 2;
+    loop {
+        let candidate = dir.join(format!("{stamp}-{name}-{counter}.md"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
 }
 
 /// A fallback archive name when no summary is available: `conversation-HHMM` (UTC).
@@ -338,7 +408,16 @@ fn update_index(
     }
 
     let json = serde_json::to_string_pretty(&index).map_err(ArchiveError::Index)?;
-    fs::write(&index_path, json).map_err(|source| ArchiveError::Write {
+    // Write-temp + rename: the index is never truncated in place, so a crash
+    // mid-write (or a reader racing the writer) can never observe a torn file.
+    // The caller holds the conversations-dir lock, so the fixed temp name is
+    // safe from concurrent writers.
+    let tmp_path = conversations_dir.join("sessions-index.json.tmp");
+    fs::write(&tmp_path, json).map_err(|source| ArchiveError::Write {
+        dir: tmp_path.display().to_string(),
+        source,
+    })?;
+    fs::rename(&tmp_path, &index_path).map_err(|source| ArchiveError::Write {
         dir: index_path.display().to_string(),
         source,
     })
@@ -519,6 +598,145 @@ mod tests {
         assert_eq!(index.entries[0].summary, "Build a Thing");
         assert_eq!(index.entries[0].first_prompt, "Build me a thing");
         assert!(index.entries[0].full_path.ends_with(&archive));
+    }
+
+    /// P2-19 regression: a summary with no ASCII alphanumerics used to slug to
+    /// the EMPTY string, so every such same-day archive shared one name. The
+    /// content-hash fallback yields distinct, non-empty, deterministic slugs.
+    #[test]
+    fn non_ascii_summary_slugs_to_distinct_nonempty_names() {
+        let first = sanitize_filename("éàü");
+        let second = sanitize_filename("çß");
+        assert!(
+            first.starts_with("conversation-") && first.len() > "conversation-".len(),
+            "hash fallback must be non-empty: {first:?}"
+        );
+        assert!(second.starts_with("conversation-"));
+        assert_ne!(first, second, "distinct summaries must not collide");
+        // Deterministic: the same summary keeps its name.
+        assert_eq!(first, sanitize_filename("éàü"));
+    }
+
+    /// P2-19 regression: two same-day archives with the SAME summary get
+    /// distinct file names (counter suffix) instead of overwriting each other,
+    /// and both land in the index.
+    #[test]
+    fn same_day_identical_summaries_produce_distinct_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript_path = project.join("t.jsonl");
+        std::fs::write(
+            &transcript_path,
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("sessions-index.json"),
+            json!({ "entries": [
+                { "sessionId": "sess-1", "fullPath": "", "summary": "Build a Thing", "firstPrompt": "" },
+                { "sessionId": "sess-2", "fullPath": "", "summary": "Build a Thing", "firstPrompt": "" }
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        for session in ["sess-1", "sess-2"] {
+            let input = json!({
+                "transcript_path": transcript_path.display().to_string(),
+                "session_id": session
+            })
+            .to_string();
+            run(workspace, Cursor::new(input)).unwrap();
+        }
+
+        let conversations = workspace.join("conversations");
+        let names: Vec<String> = std::fs::read_dir(&conversations)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| std::path::Path::new(name).extension() == Some("md".as_ref()))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "the second archive must not overwrite the first: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("build-a-thing.md") && !name.contains("thing-2")),
+            "base name present: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("build-a-thing-2.md")),
+            "collision gets a counter suffix: {names:?}"
+        );
+
+        let index: SessionsIndex = serde_json::from_str(
+            &std::fs::read_to_string(conversations.join("sessions-index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index.entries.len(), 2);
+        assert_ne!(
+            index.entries[0].full_path, index.entries[1].full_path,
+            "index entries point at distinct archives"
+        );
+    }
+
+    /// P2-19 regression: the index update is a read-modify-write; two archive
+    /// hooks racing it used to lose entries (a stale read clobbers the other
+    /// writer's insert). The conversations-dir advisory lock serializes the
+    /// whole archive write, so every concurrent run's entry survives.
+    #[test]
+    fn concurrent_runs_do_not_lose_index_entries() {
+        const PER_THREAD: usize = 20;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript_path = project.join("t.jsonl");
+        std::fs::write(
+            &transcript_path,
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string(),
+        )
+        .unwrap();
+
+        let workers: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|prefix| {
+                let workspace = workspace.clone();
+                let transcript = transcript_path.display().to_string();
+                let prefix = (*prefix).to_owned();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let input = json!({
+                            "transcript_path": transcript,
+                            "session_id": format!("sess-{prefix}-{i}")
+                        })
+                        .to_string();
+                        run(&workspace, Cursor::new(input)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let index: SessionsIndex = serde_json::from_str(
+            &std::fs::read_to_string(workspace.join("conversations/sessions-index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            index.entries.len(),
+            2 * PER_THREAD,
+            "no interleaved index update may lose an entry"
+        );
     }
 
     #[test]
