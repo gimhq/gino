@@ -29,15 +29,20 @@
 //! "400") into policy-changing reasons (P2-14). Callers that *know* the cause
 //! (the watchdog setting `runner.timeout`) construct the reason directly.
 //!
-//! Several reasons are part of the spec §6 wire taxonomy but have no
-//! constructing code path yet (nothing detects them); those carry per-variant
-//! `dead_code` allows below rather than being dropped from the wire contract.
+//! ## Strangler coexistence
+//!
+//! Added for lane D (execution) but not yet wired by the runner (lane G); several
+//! reasons/variants are constructed only by tests until then, so the whole module
+//! is `allow(dead_code)`, mirroring [`crate::protocol::v2`].
+#![allow(dead_code)]
 
 use crate::engine::{EngineError, RunErrorKind};
 
 /// A `runner.*` failure — the runner/platform side is at fault. Retryable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunnerFailure {
+    /// The thread sat queued past its dispatch deadline.
+    QueuedExpired,
     /// The runtime/engine host was offline when the thread was due.
     RuntimeOffline,
     /// A dispatch/run watchdog tripped (`dispatched > Td` / `running > Tr`) or the
@@ -46,79 +51,33 @@ pub(crate) enum RunnerFailure {
     /// The run hit the runner-imposed turn/iteration cap.
     IterationLimit,
     /// The runner refused the work (policy / safety gate).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no policy gate emits it yet"
-    )]
     AgentBlocked,
     /// The runner built a request the backend rejected as malformed.
     InvalidRequest,
 }
 
 /// An `agent.*` failure — the engine/provider side failed. Not retryable.
-///
-/// Only [`ProcessFailure`](Self::ProcessFailure) and [`Unknown`](Self::Unknown)
-/// have constructing code paths today: the engine reports no structured cause
-/// finer than `RunErrorKind`, so the provider-specific reasons cannot be
-/// detected without prose-matching (banned — P2-14). They stay declared (wire
-/// taxonomy, spec §6) under per-variant allows until a structured signal exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentFailure {
     /// Authentication rejected (bad/expired API key, 401/403).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ProviderAuth,
     /// Out of quota / credit / billing rejected the call.
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ProviderQuota,
     /// Rate limited (429 / too many requests).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ProviderRateLimit,
     /// Provider 5xx / overloaded (500/502/503/529).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ProviderServerError,
     /// Network/transport failure reaching the provider (DNS, refused, reset, TLS).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ProviderNetwork,
     /// The engine process crashed / exited abnormally / could not be spawned.
     ProcessFailure,
     /// The engine produced empty or unparseable output (no usable result).
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     EmptyOrUnparseableOutput,
     /// The conversation exceeded the model's context window.
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ContextOverflow,
     /// The requested model is unknown / unavailable.
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     ModelUnavailable,
     /// Required engine configuration is missing.
-    #[allow(
-        dead_code,
-        reason = "spec §6 wire taxonomy; no structured detector yet"
-    )]
     MissingConfig,
     /// Unclassified — the catch-all when nothing else matched.
     Unknown,
@@ -140,6 +99,7 @@ impl FailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Runner(r) => match r {
+                RunnerFailure::QueuedExpired => "runner.queued_expired",
                 RunnerFailure::RuntimeOffline => "runner.runtime_offline",
                 RunnerFailure::Timeout => "runner.timeout",
                 RunnerFailure::IterationLimit => "runner.iteration_limit",
@@ -160,6 +120,33 @@ impl FailureReason {
                 AgentFailure::Unknown => "agent.unknown",
             },
         }
+    }
+
+    /// Parse a dotted wire string back into a reason (inverse of [`Self::as_str`]),
+    /// or `None` if it is not a known reason.
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "runner.queued_expired" => Self::Runner(RunnerFailure::QueuedExpired),
+            "runner.runtime_offline" => Self::Runner(RunnerFailure::RuntimeOffline),
+            "runner.timeout" => Self::Runner(RunnerFailure::Timeout),
+            "runner.iteration_limit" => Self::Runner(RunnerFailure::IterationLimit),
+            "runner.agent_blocked" => Self::Runner(RunnerFailure::AgentBlocked),
+            "runner.invalid_request" => Self::Runner(RunnerFailure::InvalidRequest),
+            "agent.provider_auth" => Self::Agent(AgentFailure::ProviderAuth),
+            "agent.provider_quota" => Self::Agent(AgentFailure::ProviderQuota),
+            "agent.provider_rate_limit" => Self::Agent(AgentFailure::ProviderRateLimit),
+            "agent.provider_server_error" => Self::Agent(AgentFailure::ProviderServerError),
+            "agent.provider_network" => Self::Agent(AgentFailure::ProviderNetwork),
+            "agent.process_failure" => Self::Agent(AgentFailure::ProcessFailure),
+            "agent.empty_or_unparseable_output" => {
+                Self::Agent(AgentFailure::EmptyOrUnparseableOutput)
+            }
+            "agent.context_overflow" => Self::Agent(AgentFailure::ContextOverflow),
+            "agent.model_unavailable" => Self::Agent(AgentFailure::ModelUnavailable),
+            "agent.missing_config" => Self::Agent(AgentFailure::MissingConfig),
+            "agent.unknown" => Self::Agent(AgentFailure::Unknown),
+            _ => return None,
+        })
     }
 
     /// `true` for the `runner.*` group.
@@ -215,9 +202,10 @@ pub(crate) fn classify_engine_error(err: &EngineError) -> FailureReason {
     match err {
         // The engine process could not be spawned, lost its pipes, or its
         // session plumbing failed — the engine side is at fault.
-        EngineError::Spawn(_) | EngineError::MissingPipe(_) | EngineError::Closed => {
-            FailureReason::Agent(AgentFailure::ProcessFailure)
-        }
+        EngineError::Spawn(_)
+        | EngineError::Io(_)
+        | EngineError::MissingPipe(_)
+        | EngineError::Closed => FailureReason::Agent(AgentFailure::ProcessFailure),
         // The runner built a control/input message that would not serialize:
         // the runner's own request is malformed and would recur on resume.
         EngineError::Serialize(_) => FailureReason::Runner(RunnerFailure::InvalidRequest),
@@ -232,8 +220,9 @@ mod tests {
     use crate::engine::{EngineError, RunErrorKind};
 
     #[test]
-    fn wire_strings_are_dotted_grouped_for_every_reason() {
+    fn wire_strings_round_trip_for_every_reason() {
         let all = [
+            FailureReason::Runner(RunnerFailure::QueuedExpired),
             FailureReason::Runner(RunnerFailure::RuntimeOffline),
             FailureReason::Runner(RunnerFailure::Timeout),
             FailureReason::Runner(RunnerFailure::IterationLimit),
@@ -257,8 +246,14 @@ mod tests {
                 wire.starts_with("runner.") || wire.starts_with("agent."),
                 "{wire} must be dotted-grouped"
             );
+            assert_eq!(
+                FailureReason::from_wire(wire),
+                Some(reason),
+                "round-trip {wire}"
+            );
             assert_eq!(reason.to_string(), wire, "Display matches as_str");
         }
+        assert_eq!(FailureReason::from_wire("nonsense.reason"), None);
     }
 
     #[test]
@@ -317,6 +312,10 @@ mod tests {
         let io = || std::io::Error::other("boom");
         assert_eq!(
             classify_engine_error(&EngineError::Spawn(io())),
+            FailureReason::Agent(AgentFailure::ProcessFailure)
+        );
+        assert_eq!(
+            classify_engine_error(&EngineError::Io(io())),
             FailureReason::Agent(AgentFailure::ProcessFailure)
         );
         assert_eq!(

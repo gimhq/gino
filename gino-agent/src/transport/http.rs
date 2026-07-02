@@ -3,7 +3,8 @@
 //! The WebSocket is the primary channel; HTTP is retained for the endpoints that
 //! sit outside the persistent socket. Enrollment is **protocol-version-shared**
 //! (unchanged across the v1 → v2 cut); the v2 terminal output of an execution is a
-//! `thread_result` frame over the outbox/WS, not an HTTP post.
+//! `thread_result` frame over the outbox/WS (see [`super::Transport::send`]), not
+//! an HTTP post.
 //!
 //! * `POST /agent/register` — enrollment (§2.1). The bootstrap *register* token
 //!   travels in the JSON body; no auth header. Returns the host-assigned
@@ -149,6 +150,10 @@ impl HttpClient {
     }
 
     /// `GET {url}` for the host-assigned config overlay (raw JSON).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "config refresh is wired by the config/engine L3")
+    )]
     pub(crate) async fn fetch_config(
         &self,
         url: &str,

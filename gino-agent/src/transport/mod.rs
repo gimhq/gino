@@ -12,11 +12,10 @@
 //!
 //! [`Transport`] is the engine-agnostic facade over the WS side: it works purely
 //! on [`crate::protocol::v2`] frames and the [`crate::db`] outbox/inbox, so the
-//! engine and scheduler (later L3s) never touch tungstenite. Producers persist
-//! outbound frames straight to the durable outbox and poke
-//! [`Transport::flush_handle`]; the manager task drains the outbox, dedups the
-//! inbox, and forwards inbound frames on an unbounded channel drained via
-//! [`Transport::recv`].
+//! engine and scheduler (later L3s) never touch tungstenite. [`Transport::send`]
+//! persists an outbound frame to the outbox *before* transmitting it; the manager
+//! task drains the outbox, dedups the inbox, and forwards inbound frames on an
+//! unbounded channel drained via [`Transport::recv`].
 //!
 //! ## Envelope vs payload (protocol v2, agent-architecture §8/§10)
 //!
@@ -26,7 +25,7 @@
 //!
 //! * **outbox payload = the frame's `data` only.** The correlation ids are written
 //!   to the indexed `task_id`/`thread_id` columns; the full `{type, …ids, data,
-//!   outboxId}` envelope is *rebuilt on replay* from those columns
+//!   outboxId}` envelope is *rebuilt on send/replay* from those columns
 //!   ([`build_envelope`]). The host routes purely off the envelope ids.
 //! * **inbox payload = the full received frame**, re-delivered verbatim on replay;
 //!   the `type` column is the replay *classification* and the correlation columns
@@ -46,12 +45,13 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 use serde_json::{Map, Value};
+use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::db::Db;
-use crate::protocol::v2::InboundFrameV2;
+use crate::db::{Db, DbError};
+use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
 
 pub(crate) use self::ws::MAX_INBOX_RETRIES;
 use self::ws::WsDriver;
@@ -142,6 +142,17 @@ pub(crate) struct Inbound {
     pub(crate) frame: InboundFrameV2,
 }
 
+/// Errors raised while driving the transport.
+#[derive(Debug, Error)]
+pub(crate) enum TransportError {
+    /// Persisting an outbound frame to the outbox failed.
+    #[error(transparent)]
+    Db(#[from] DbError),
+    /// An outbound frame could not be serialized.
+    #[error("serialize outbound frame: {0}")]
+    Serialize(#[from] serde_json::Error),
+}
+
 // ---------------------------------------------------------------------------
 // Transport facade
 // ---------------------------------------------------------------------------
@@ -150,6 +161,11 @@ pub(crate) struct Inbound {
 /// the actual IO runs in a spawned manager task.
 #[derive(Debug)]
 pub(crate) struct Transport {
+    db: Arc<Mutex<Db>>,
+    // Written by `send` (the engine L3's producer path); only that method reads it,
+    // so it is dead in the not-yet-wired binary build.
+    #[allow(dead_code, reason = "read by Transport::send, wired by the engine L3")]
+    immediate_tx: mpsc::UnboundedSender<String>,
     inbound_rx: mpsc::UnboundedReceiver<Inbound>,
     cancel: Arc<Cancel>,
     /// Poked to make the manager replay the unacked outbox over the live socket
@@ -172,14 +188,16 @@ impl Transport {
         db: Arc<Mutex<Db>>,
         config: TransportConfig,
     ) -> Self {
+        let (immediate_tx, immediate_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(Cancel::new());
         let flush = Arc::new(Notify::new());
         let driver = WsDriver {
             ws_url,
             connect_token,
-            db,
+            db: Arc::clone(&db),
             inbound_tx,
+            immediate_rx,
             cancel: Arc::clone(&cancel),
             flush: Arc::clone(&flush),
             heartbeat: config.heartbeat,
@@ -189,6 +207,8 @@ impl Transport {
         };
         let manager = tokio::spawn(run_manager(driver));
         Self {
+            db,
+            immediate_tx,
             inbound_rx,
             cancel,
             flush,
@@ -206,6 +226,46 @@ impl Transport {
     /// `(thread_id, seq)` either way.
     pub(crate) fn flush_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.flush)
+    }
+
+    /// Persist a data-bearing frame to the outbox and transmit it best-effort.
+    /// Returns the outbox row id for data frames; `None` for the raw control
+    /// frames (`heartbeat`/`ack`/`msg_ack`), which are sent without outbox
+    /// backing. A frame whose live send is dropped (disconnected) is still durably
+    /// queued and replayed on the next (re)connect.
+    ///
+    /// The persisted payload is the frame's `data` only; its correlation ids go to
+    /// the indexed `task_id`/`thread_id` columns (the `cron_state` frame's `cronId`
+    /// rides the secondary column). The wire envelope is rebuilt here and on every
+    /// replay via [`build_envelope`], so the bytes are identical either way.
+    #[allow(
+        dead_code,
+        reason = "the engine/scheduler L3s are the producers of outbound frames"
+    )]
+    pub(crate) fn send(&self, frame: &OutboundFrameV2) -> Result<Option<i64>, TransportError> {
+        if let Some(entry) = outbox_entry(frame)? {
+            let id = lock_db(&self.db).enqueue_outbox_correlated(
+                entry.msg_type,
+                &entry.data,
+                entry.task_id.as_deref(),
+                entry.secondary_id.as_deref(),
+            )?;
+            let envelope = build_envelope(
+                entry.msg_type,
+                &entry.data,
+                entry.task_id.as_deref(),
+                entry.secondary_id.as_deref(),
+                id,
+            );
+            // Unbounded + best-effort: a closed channel just means the manager has
+            // stopped; the row stays unacked and replays on reconnect.
+            let _ = self.immediate_tx.send(envelope.to_string());
+            Ok(Some(id))
+        } else {
+            // Raw control frame (heartbeat/ack/msg_ack): no outbox backing.
+            let _ = self.immediate_tx.send(serde_json::to_string(frame)?);
+            Ok(None)
+        }
     }
 
     /// Await the next inbound frame. Returns `None` once the manager task has
@@ -255,12 +315,70 @@ async fn run_manager(mut driver: WsDriver) {
 // Outbox mapping (protocol v2)
 // ---------------------------------------------------------------------------
 
+/// What [`outbox_entry`] extracts from a data-bearing v2 frame: the wire `type`,
+/// the `data`-only payload to persist, and the correlation ids destined for the
+/// outbox's indexed columns. `secondary_id` is the frame's `threadId` (thread
+/// frames) or `cronId` (`cron_state`) — both share the single `thread_id` column;
+/// [`secondary_id_key`] maps it back to the right envelope key on rebuild.
+struct OutboxEntry {
+    msg_type: &'static str,
+    data: Value,
+    task_id: Option<String>,
+    secondary_id: Option<String>,
+}
+
+/// Split an outbound v2 frame into its [`OutboxEntry`], or `None` for the raw
+/// control frames (`heartbeat`/`msg_ack`/`ack`) that are not outbox-backed. The
+/// persisted payload is the frame's `data` only; [`build_envelope`] rebuilds the
+/// full `{type, …ids, data, outboxId}` envelope on send and on every replay.
+fn outbox_entry(frame: &OutboundFrameV2) -> Result<Option<OutboxEntry>, serde_json::Error> {
+    Ok(match frame {
+        OutboundFrameV2::ThreadResult {
+            task_id,
+            thread_id,
+            data,
+            ..
+        } => Some(OutboxEntry {
+            msg_type: "thread_result",
+            data: serde_json::to_value(data)?,
+            task_id: Some(task_id.clone()),
+            secondary_id: Some(thread_id.clone()),
+        }),
+        OutboundFrameV2::ThreadMessage {
+            task_id,
+            thread_id,
+            data,
+            ..
+        } => Some(OutboxEntry {
+            msg_type: "thread_message",
+            data: serde_json::to_value(data)?,
+            task_id: Some(task_id.clone()),
+            secondary_id: Some(thread_id.clone()),
+        }),
+        OutboundFrameV2::CronState {
+            task_id,
+            cron_id,
+            data,
+            ..
+        } => Some(OutboxEntry {
+            msg_type: "cron_state",
+            data: serde_json::to_value(data)?,
+            task_id: Some(task_id.clone()),
+            secondary_id: Some(cron_id.clone()),
+        }),
+        OutboundFrameV2::Heartbeat { .. }
+        | OutboundFrameV2::MsgAck { .. }
+        | OutboundFrameV2::Ack { .. }
+        | OutboundFrameV2::Unknown => None,
+    })
+}
+
 /// Rebuild the v2 wire envelope from the outbox correlation columns + `data`.
 /// Correlation ids sit at the **envelope top level** (never inside `data`); the
 /// host routes/correlates off them without parsing `data`. `secondary_id` is the
 /// `thread_id` column, keyed as `cronId` for a `cron_state` frame and `threadId`
-/// otherwise (see [`secondary_id_key`]). Used by the `ws` outbox replay, which
-/// is the only transmit path — producers write the outbox and poke flush.
+/// otherwise (see [`secondary_id_key`]). Shared by [`Transport::send`] and the
+/// `ws` outbox replay so live sends and replays are byte-identical.
 pub(super) fn build_envelope(
     msg_type: &str,
     data: &Value,
@@ -399,7 +517,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-    use super::{Backoff, BackoffConfig, Transport, TransportConfig, build_envelope};
+    use super::{Backoff, BackoffConfig, Transport, TransportConfig, build_envelope, outbox_entry};
     use crate::db::Db;
     use crate::protocol::v2::{HeartbeatData, MessageKind, OutboundFrameV2, ThreadMessageData};
 
@@ -435,6 +553,67 @@ mod tests {
             input: None,
             output: None,
         }
+    }
+
+    #[test]
+    fn outbox_entry_splits_data_frames_and_skips_control_frames() {
+        let message = OutboundFrameV2::ThreadMessage {
+            task_id: "t-1".to_owned(),
+            thread_id: "c-9".to_owned(),
+            data: sample_message_data(),
+            outbox_id: None,
+        };
+        let entry = outbox_entry(&message).unwrap().unwrap();
+        assert_eq!(entry.msg_type, "thread_message");
+        // Persisted payload is `data` only — correlation ids ride the columns.
+        assert_eq!(entry.task_id.as_deref(), Some("t-1"));
+        assert_eq!(entry.secondary_id.as_deref(), Some("c-9"));
+        assert_eq!(entry.data["seq"], json!(3));
+        assert!(entry.data.get("taskId").is_none());
+        assert!(entry.data.get("threadId").is_none());
+
+        // A cron_state frame routes its `cronId` through the same secondary column.
+        let cron = OutboundFrameV2::CronState {
+            task_id: "t-1".to_owned(),
+            cron_id: "cr-1".to_owned(),
+            data: crate::protocol::v2::CronStateData {
+                kind: "schedule".to_owned(),
+                schedule_type: Some("interval".to_owned()),
+                schedule_value: Some("60".to_owned()),
+                continuity: Some("isolated".to_owned()),
+                next_run: None,
+                status: Some("active".to_owned()),
+                round_count: 2,
+                skipped_count: 0,
+                last_status: Some("dispatched".to_owned()),
+            },
+            outbox_id: None,
+        };
+        let entry = outbox_entry(&cron).unwrap().unwrap();
+        assert_eq!(entry.msg_type, "cron_state");
+        assert_eq!(entry.secondary_id.as_deref(), Some("cr-1"));
+
+        // Control frames are not outbox-backed.
+        assert!(
+            outbox_entry(&OutboundFrameV2::Heartbeat {
+                data: HeartbeatData {
+                    active_threads: None
+                },
+                outbox_id: None,
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            outbox_entry(&OutboundFrameV2::MsgAck { msg_id: 1 })
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            outbox_entry(&OutboundFrameV2::Ack { id: 1 })
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -840,16 +1019,16 @@ mod tests {
             test_config(),
         );
 
-        // The producer path works while offline: enqueue a frame's `data` to the
-        // durable outbox (as the executor/scheduler do) and poke flush.
-        let data = serde_json::to_value(sample_message_data()).unwrap();
-        let id = db
-            .lock()
-            .unwrap()
-            .enqueue_outbox_correlated("thread_message", &data, Some("t-1"), Some("c-1"))
+        // The producer path works while offline: the frame lands in the outbox.
+        let id = transport
+            .send(&OutboundFrameV2::ThreadMessage {
+                task_id: "t-1".to_owned(),
+                thread_id: "c-1".to_owned(),
+                data: sample_message_data(),
+                outbox_id: None,
+            })
             .unwrap();
-        transport.flush_handle().notify_one();
-        assert_eq!(id, 1);
+        assert_eq!(id, Some(1));
         assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 1);
 
         // Well past the fast schedule's old 8-attempt test budget: the manager

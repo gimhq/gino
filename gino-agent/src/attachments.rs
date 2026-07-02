@@ -5,10 +5,10 @@
 //! [`crate::protocol::v2::AttachmentDescriptor`]). This module owns the byte
 //! plane:
 //!
-//! * a **config-selected backend** ([`build_backend`]): **host-proxy** (`GET`/
-//!   `POST /agent/attachments`, connect-token auth, bytes through the host) —
-//!   currently the only backend; the spec's presigned/CDN arm was never
-//!   implemented and its config variant was deleted (A2).
+//! * a **config-selected backend** ([`build_backend`]): **host-proxy** by default
+//!   (`GET`/`POST /agent/attachments`, connect-token auth, bytes through the
+//!   host); the **presigned/CDN** arm is left unimplemented this campaign and
+//!   returns [`AttachmentError::Unsupported`] (A2).
 //! * a **content-addressed cache** keyed by `sha256` under the workspace dir,
 //!   shared within a workspace, with a size-cap + LRU GC (A4).
 //! * the **materialize-inbound / collect-outbound** flow the executor drives:
@@ -20,9 +20,15 @@
 //! 500 MB per execution) + an optional content-type allowlist are enforced (A5).
 //!
 //! Construction (`build_backend`, [`AttachmentManager::new`],
-//! [`AttachmentSource`]) is wired by the runner; the executor drives
-//! [`AttachmentManager::materialize_inputs`] /
-//! [`AttachmentManager::collect_outputs`].
+//! [`AttachmentSource`]) is wired by the runner (Lane G); the executor only
+//! drives [`AttachmentManager::materialize_inputs`] /
+//! [`AttachmentManager::collect_outputs`]. The not-yet-wired construction surface
+//! keeps a module-level `dead_code` allow, mirroring the executor v2 module; the
+//! unit tests below exercise the whole surface.
+#![allow(
+    dead_code,
+    reason = "attachment backend construction is wired by the runner (Lane G); tests cover it"
+)]
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -166,8 +172,9 @@ pub(crate) trait AttachmentBackend: Send + Sync {
     ) -> Result<UploadedAttachment, AttachmentError>;
 }
 
-/// Select the byte backend from config (A2). Host-proxy is currently the only
-/// backend (the unimplemented presigned/CDN variant was deleted).
+/// Select the byte backend from config (A2). **Host-proxy is the default**;
+/// `Presigned` returns a [`PresignedBackend`] whose ops all error
+/// [`AttachmentError::Unsupported`] until object storage is wired.
 pub(crate) fn build_backend(
     config: &AttachmentsConfig,
     http: HttpClient,
@@ -178,6 +185,7 @@ pub(crate) fn build_backend(
         AttachmentBackendKind::HostProxy => {
             Box::new(HostProxyBackend::new(http, http_base, connect_token))
         }
+        AttachmentBackendKind::Presigned => Box::new(PresignedBackend),
     }
 }
 
@@ -280,6 +288,31 @@ impl AttachmentBackend for HostProxyBackend {
             .http
             .upload_attachment(&url, &self.connect_token, name, content_type, sha256, bytes)
             .await?)
+    }
+}
+
+/// Presigned-URL / CDN backend (A2). Config-selected when object storage is
+/// configured — **not implemented this campaign**; every op is unsupported.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PresignedBackend;
+
+#[async_trait]
+impl AttachmentBackend for PresignedBackend {
+    async fn download(
+        &self,
+        _descriptor: &AttachmentDescriptor,
+    ) -> Result<Vec<u8>, AttachmentError> {
+        Err(AttachmentError::Unsupported)
+    }
+
+    async fn upload(
+        &self,
+        _name: &str,
+        _content_type: &str,
+        _sha256: &str,
+        _bytes: Vec<u8>,
+    ) -> Result<UploadedAttachment, AttachmentError> {
+        Err(AttachmentError::Unsupported)
     }
 }
 
@@ -1231,6 +1264,36 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn presigned_backend_is_unsupported() {
+        use super::{PresignedBackend, build_backend};
+        let ws = tempfile::tempdir().unwrap();
+        let config = AttachmentsConfig {
+            backend: crate::config::AttachmentBackendKind::Presigned,
+            ..AttachmentsConfig::default()
+        };
+        let backend = build_backend(
+            &config,
+            crate::transport::http::HttpClient::new().unwrap(),
+            "https://host.example".to_owned(),
+            secrecy::SecretString::from("connect"),
+        );
+        let mgr = AttachmentManager::new(backend, ws.path(), config);
+        let d = descriptor("x.txt", b"DATA", "/r/x");
+        let err = mgr
+            .materialize_inputs(&ws.path().join("t"), &[d])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AttachmentError::Unsupported));
+
+        // The unit type also errors directly.
+        let presigned = PresignedBackend;
+        assert!(matches!(
+            presigned.download(&descriptor("y", b"y", "/r/y")).await,
+            Err(AttachmentError::Unsupported)
+        ));
     }
 
     #[tokio::test]

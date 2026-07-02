@@ -16,8 +16,7 @@
 //! ## Delivery model (protocol v2)
 //!
 //! * **Outbound** — every data frame is persisted to the `outbox` before it is
-//!   sent (producers enqueue via [`crate::db::Db::enqueue_outbox_correlated`] and
-//!   poke the flush handle), storing the frame's `data` plus its
+//!   sent (by [`super::Transport::send`]), storing the frame's `data` plus its
 //!   correlation ids in the indexed columns. On every (re)connect the driver
 //!   replays *all* unacked rows oldest-first — rebuilding each `{type, …ids,
 //!   data, outboxId}` envelope from the columns via [`build_envelope`],
@@ -25,7 +24,9 @@
 //!   only the rows **not yet sent on this connection** (a per-connection
 //!   watermark — P2-16: flushing under ack lag must not retransmit the whole
 //!   backlog every time); rows whose acks stall for a full ack window are
-//!   retransmitted in bulk. The host's `ack {id}` marks a row acked.
+//!   retransmitted in bulk. The host's `ack {id}` marks a row acked. Stale
+//!   immediate sends queued while disconnected are discarded on reconnect so
+//!   replay does not double-transmit.
 //! * **Inbound** — every frame (bar `ack`, and unknown forward-compat frames) is
 //!   recorded to the `inbox` *verbatim* (the full received frame is the payload;
 //!   the `type` column classifies it and the correlation ids index it), a
@@ -148,6 +149,7 @@ pub(super) struct WsDriver {
     pub(super) connect_token: SecretString,
     pub(super) db: Arc<Mutex<Db>>,
     pub(super) inbound_tx: mpsc::UnboundedSender<Inbound>,
+    pub(super) immediate_rx: mpsc::UnboundedReceiver<String>,
     pub(super) cancel: Arc<Cancel>,
     pub(super) flush: Arc<Notify>,
     pub(super) heartbeat: Duration,
@@ -162,6 +164,9 @@ impl WsDriver {
     pub(super) async fn run(mut self, initial: WsStream) {
         let mut current = initial;
         loop {
+            // Discard immediate-send envelopes that piled up while disconnected;
+            // `serve` replays the outbox, which is the durable source of truth.
+            while self.immediate_rx.try_recv().is_ok() {}
             self.serve(current).await;
             if self.cancel.is_cancelled() {
                 break;
@@ -236,6 +241,11 @@ impl WsDriver {
                             debug!("websocket closed by peer; reconnecting");
                             return;
                         }
+                    }
+                }
+                Some(raw) = self.immediate_rx.recv() => {
+                    if sink.send(Message::text(raw)).await.is_err() {
+                        return;
                     }
                 }
                 () = self.flush.notified() => {

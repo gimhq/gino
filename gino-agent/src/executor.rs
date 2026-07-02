@@ -856,6 +856,7 @@ pub(crate) mod v2 {
                         };
                         self.stream_message(thread, kind, message);
                     }
+                    Some(EngineEvent::Usage { .. }) => {}
                     Some(EngineEvent::Result(outcome)) => {
                         let resolved = outcome.session_id.or(session_id);
                         return match outcome.status {
@@ -1377,8 +1378,8 @@ pub(crate) mod v2 {
         use crate::config::AttachmentsConfig;
         use crate::db::{Db, TaskRow, ThreadRow};
         use crate::engine::{
-            Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session,
-            SessionCfg,
+            Engine, EngineError, EngineEvent, Input, Payload, RunErrorKind, RunOutcome, RunStatus,
+            Session, SessionCfg,
         };
         use crate::protocol::v2::{
             AttachmentDescriptor, EntryKind, ProvisioningEntry, ThreadMessageData,
@@ -1416,10 +1417,27 @@ pub(crate) mod v2 {
                     stall: self.stall,
                 }))
             }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                for event in &self.script {
+                    if let EngineEvent::Result(outcome) = event {
+                        return Ok(outcome.clone());
+                    }
+                }
+                Ok(RunOutcome {
+                    status: RunStatus::Success,
+                    result: None,
+                    session_id: None,
+                    error: None,
+                    error_kind: None,
+                })
+            }
         }
 
         #[async_trait]
         impl Session for MockSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
             async fn interrupt(&self) -> Result<(), EngineError> {
                 Ok(())
             }
@@ -1676,10 +1694,16 @@ pub(crate) mod v2 {
                     gate: Arc::clone(&self.gate),
                 }))
             }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                Ok(RunOutcome::errored("run_once is not used by this test"))
+            }
         }
 
         #[async_trait]
         impl Session for GatedSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
             async fn interrupt(&self) -> Result<(), EngineError> {
                 Ok(())
             }
@@ -2053,6 +2077,15 @@ pub(crate) mod v2 {
                         stall: false,
                     }))
                 }
+                async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                    Ok(RunOutcome {
+                        status: RunStatus::Success,
+                        result: None,
+                        session_id: None,
+                        error: None,
+                        error_kind: None,
+                    })
+                }
             }
 
             let db = test_db();
@@ -2286,10 +2319,16 @@ pub(crate) mod v2 {
                         rx: Mutex::new(Some(rx)),
                     }))
                 }
+                async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                    unreachable!("the executor drives sessions")
+                }
             }
 
             #[async_trait]
             impl Session for SettlingSession {
+                async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                    Ok(())
+                }
                 async fn interrupt(&self) -> Result<(), EngineError> {
                     let _ = self.tx.send(EngineEvent::Result(RunOutcome {
                         status: RunStatus::Error,
@@ -2617,6 +2656,15 @@ pub(crate) mod v2 {
                     stall: false,
                 }))
             }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                Ok(RunOutcome {
+                    status: RunStatus::Success,
+                    result: Some("done".to_owned()),
+                    session_id: Some("sess-att".to_owned()),
+                    error: None,
+                    error_kind: None,
+                })
+            }
         }
 
         #[tokio::test]
@@ -2735,6 +2783,15 @@ pub(crate) mod v2 {
                     script: vec![started("sess-prov"), ok_result("done", "sess-prov")],
                     stall: false,
                 }))
+            }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                Ok(RunOutcome {
+                    status: RunStatus::Success,
+                    result: Some("done".to_owned()),
+                    session_id: Some("sess-prov".to_owned()),
+                    error: None,
+                    error_kind: None,
+                })
             }
         }
 
