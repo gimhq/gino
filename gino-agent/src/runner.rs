@@ -144,15 +144,16 @@ async fn run_async(
         heartbeat: Duration::from_millis(config.heartbeat_interval_ms),
         ..TransportConfig::default()
     };
+    // The dial happens in the background (P0-2): the daemon boots and serves
+    // local work while the host is unreachable; outbound frames queue durably
+    // and replay once a connection is up.
     let mut transport = Transport::open(
         ws_url,
         identity.connect_token,
         Arc::clone(&db),
         transport_config,
-    )
-    .await
-    .context("opening the websocket transport")?;
-    info!("transport connected");
+    );
+    info!("transport started; connecting in the background");
 
     // The GLOBAL provisioning scope root (PLAN-007 §1/§6). Created up front so the
     // engine always launches with a stable config dir — even with no entries.
@@ -716,10 +717,12 @@ struct ServeContext {
     engine_config_dir: PathBuf,
 }
 
-/// Pump inbound v2 frames until Ctrl-C, a `close`, or the transport closes
-/// (reconnect exhausted). Outbound frames are produced straight into the durable
-/// outbox by the executor/scheduler and shipped by the transport (flush/replay), so
-/// the serve loop has no outbound branch.
+/// Pump inbound v2 frames until Ctrl-C or a `close`. Outbound frames are
+/// produced straight into the durable outbox by the executor/scheduler and
+/// shipped by the transport (flush/replay), so the serve loop has no outbound
+/// branch. Transport loss never ends the loop (P0-2): the manager reconnects
+/// forever, and even a dead manager task only stops the frame pump — the
+/// daemon (scheduler + executor) keeps serving local work until shutdown.
 async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cancel) {
     loop {
         tokio::select! {
@@ -734,7 +737,11 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
             () = cancel.cancelled() => break,
             inbound = transport.recv() => {
                 let Some(inbound) = inbound else {
-                    warn!("transport closed (reconnect exhausted); shutting down");
+                    // Reconnect never exhausts, so a closed channel means the
+                    // manager task itself died. Local execution must outlive
+                    // the transport: keep running, wait for a real shutdown.
+                    warn!("transport channel closed; daemon keeps serving local work");
+                    wait_for_shutdown(cancel).await;
                     break;
                 };
                 if route(inbound, context).await.is_break() {
@@ -743,6 +750,21 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
                 }
             }
         }
+    }
+}
+
+/// Block until Ctrl-C or an internal cancel — the tail of [`serve`] once the
+/// transport channel has closed (P0-2: transport death must not shut the
+/// daemon down; the scheduler and executor keep running until a real shutdown).
+async fn wait_for_shutdown(cancel: &Cancel) {
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(err) = signal {
+                warn!(error = %err, "failed to listen for shutdown signal");
+            }
+            info!("shutdown signal received");
+        }
+        () = cancel.cancelled() => {}
     }
 }
 
@@ -1766,6 +1788,188 @@ mod tests {
             0,
             "nothing left to re-pend — the loop terminates"
         );
+    }
+
+    /// P0-2 regression, over the runner's own wiring: with the host UNREACHABLE
+    /// (the transport dialing in the background, never connected) the local
+    /// planes still run — the scheduler fires a due cron and the executor
+    /// worker drains it through the engine — and shutdown completes cleanly.
+    /// The old code blocked boot on the first dial and shut the whole daemon
+    /// down once the transport's 60-retry budget was exhausted.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the in-test engine stub is the bulk; splitting it would obscure the scenario"
+    )]
+    #[tokio::test]
+    async fn local_planes_run_and_shut_down_cleanly_while_host_unreachable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use futures_util::stream::{self, BoxStream};
+        use secrecy::SecretString;
+
+        use crate::db::CronRow;
+        use crate::engine::{
+            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
+            SessionCfg,
+        };
+        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+        use crate::scheduler::{Cancel, Scheduler};
+        use crate::transport::{Transport, TransportConfig};
+
+        /// Counts engine runs; every session immediately succeeds.
+        struct CountingEngine {
+            runs: AtomicUsize,
+        }
+        struct OkSession;
+
+        #[async_trait]
+        impl Engine for CountingEngine {
+            fn name(&self) -> &'static str {
+                "counting"
+            }
+            async fn start_session(
+                &self,
+                _cfg: SessionCfg,
+            ) -> Result<Box<dyn Session>, EngineError> {
+                self.runs.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(OkSession))
+            }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                unreachable!("the executor drives sessions, not run_once")
+            }
+        }
+
+        #[async_trait]
+        impl Session for OkSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn interrupt(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn events(&self) -> BoxStream<'_, EngineEvent> {
+                Box::pin(stream::iter(vec![
+                    EngineEvent::SessionStarted {
+                        session_id: "sess-off".to_owned(),
+                    },
+                    EngineEvent::Result(RunOutcome {
+                        status: RunStatus::Success,
+                        result: Some("ran while the host was down".to_owned()),
+                        session_id: Some("sess-off".to_owned()),
+                        error: None,
+                    }),
+                ]))
+            }
+        }
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        // A task with a cron already due: the scheduler's first tick fires it
+        // (an overdue `interval` slot dispatches; only `once` has a grace cut).
+        lock_db(&db)
+            .insert_task_row(&TaskRow {
+                id: "task-1".to_owned(),
+                name: None,
+                kind: None,
+                status: "active".to_owned(),
+                created_at: "2026-06-22T09:00:00.000Z".to_owned(),
+                updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
+            })
+            .unwrap();
+        lock_db(&db)
+            .insert_cron(&CronRow {
+                id: "c-off".to_owned(),
+                task_id: "task-1".to_owned(),
+                kind: "schedule".to_owned(),
+                prompt: "run the recurring job".to_owned(),
+                schedule_type: Some("interval".to_owned()),
+                schedule_value: Some("60000".to_owned()),
+                next_run: Some("2026-06-22T09:00:00.000Z".to_owned()),
+                last_fired_at: None,
+                continuity: "isolated".to_owned(),
+                run_count: 0,
+                status: "active".to_owned(),
+                dirty: false,
+                created_at: "2026-06-22T09:00:00.000Z".to_owned(),
+                updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
+            })
+            .unwrap();
+
+        // The host is UNREACHABLE: a bound-then-dropped port refuses every dial.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-off"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            TransportConfig::default(),
+        );
+
+        let engine = Arc::new(CountingEngine {
+            runs: AtomicUsize::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ThreadExecutor::new(
+            Arc::clone(&engine) as Arc<dyn Engine>,
+            Arc::clone(&db),
+            dir.path().to_path_buf(),
+            WatchdogCfg {
+                inactivity_timeout: None,
+                ..WatchdogCfg::default()
+            },
+        ));
+        let prompts = Arc::new(InboxPromptSource {
+            db: Arc::clone(&db),
+            inbound: InboundAttachments::default(),
+        });
+
+        // The runner's own planes: the real scheduler task + executor worker.
+        let cancel = Arc::new(Cancel::new());
+        let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), 1);
+        let drain = scheduler.drain_signal();
+        let scheduler_task = tokio::spawn(scheduler.run());
+        let worker = tokio::spawn(super::run_worker(
+            Arc::clone(&executor),
+            Arc::clone(&db),
+            prompts,
+            drain,
+            transport.flush_handle(),
+            Arc::clone(&cancel),
+            1,
+        ));
+
+        // The cron fires and its thread EXECUTES while the host is down.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lock_db(&db)
+            .list_threads_by_status("succeeded")
+            .unwrap()
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cron thread did not execute while the host was unreachable"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            engine.runs.load(Ordering::SeqCst),
+            1,
+            "the engine actually ran offline"
+        );
+        // The result plane queued durably for the eventual reconnect replay.
+        assert!(
+            !lock_db(&db).list_unacked_outbox().unwrap().is_empty(),
+            "result frames wait in the outbox for the host to come back"
+        );
+
+        // Shutdown completes although the transport never connected.
+        cancel.cancel();
+        worker.await.unwrap();
+        scheduler_task.await.unwrap();
+        transport.shutdown().await;
     }
 }
 
