@@ -1030,7 +1030,7 @@ mod tests {
     use crate::engine::{
         Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
     };
-    use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
+    use crate::executor::{PromptSource, ThreadExecutor, WatchdogCfg};
     use crate::protocol::v2::CronUpsertData;
 
     fn at(value: &str) -> DateTime<Utc> {

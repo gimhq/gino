@@ -43,7 +43,7 @@ use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
 use crate::engine::{Engine, EngineError, Session, SessionCfg};
-use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
+use crate::executor::{PromptSource, ThreadExecutor, WatchdogCfg};
 use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
 use crate::register::{self, ResolvedIdentity};
@@ -1452,7 +1452,7 @@ mod tests {
     use crate::attachment_source::DbAttachmentSource;
     use crate::attachments::AttachmentSource;
     use crate::db::{Db, TaskRow, ThreadRow};
-    use crate::executor::v2::PromptSource;
+    use crate::executor::PromptSource;
     use crate::protocol::v2::{
         AttachmentDescriptor, EntryKind, InboundFrameV2, MessageInData, ProvisioningEntry,
         TaskUpsertData,
@@ -2053,7 +2053,7 @@ mod tests {
         use crate::engine::{
             Engine, EngineError, EngineEvent, RunOutcome, RunStatus, Session, SessionCfg,
         };
-        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+        use crate::executor::{ThreadExecutor, WatchdogCfg};
 
         /// Records every prompt it is started with, succeeding each run.
         struct RecordingEngine {
@@ -2203,7 +2203,7 @@ mod tests {
         use crate::engine::{
             Engine, EngineError, EngineEvent, RunOutcome, RunStatus, Session, SessionCfg,
         };
-        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+        use crate::executor::{ThreadExecutor, WatchdogCfg};
         use crate::scheduler::{Cancel, Scheduler};
         use crate::transport::{Transport, TransportConfig};
 
@@ -2405,7 +2405,7 @@ mod tests {
         use futures_util::stream::{self, BoxStream};
 
         use crate::engine::{Engine, EngineError, EngineEvent, Session, SessionCfg};
-        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+        use crate::executor::{ThreadExecutor, WatchdogCfg};
         use crate::scheduler::Cancel;
 
         /// Announces a session then stalls forever, ignoring the interrupt —

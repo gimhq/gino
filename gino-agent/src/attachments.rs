@@ -284,7 +284,7 @@ impl AttachmentBackend for HostProxyBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Inbound descriptor source (executor seam; mirrors `executor::v2::PromptSource`).
+// Inbound descriptor source (executor seam; mirrors `executor::PromptSource`).
 // ---------------------------------------------------------------------------
 
 /// Resolves the inbound attachment descriptors to materialize for a thread. The
