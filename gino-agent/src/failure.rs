@@ -21,10 +21,13 @@
 //!   or `agent.context_overflow`) poisons the session, so the executor drops
 //!   `engine_session_id` and the next turn starts fresh (§6).
 //!
-//! [`classify`] maps a backend's free-text error into a reason. It is deliberately
-//! best-effort (substring heuristics, most-specific-first); callers that *know* the
-//! cause (the watchdog setting `runner.timeout`) construct the reason directly
-//! rather than round-tripping through text.
+//! [`classify_outcome`] maps a turn's *structured* error cause (the engine's
+//! parsed `result.subtype`, carried as [`RunErrorKind`]) into a reason;
+//! [`classify_engine_error`] does the same for process-level [`EngineError`]s.
+//! Error *prose* is never consulted — it is (or quotes) model output, and
+//! substring matching against it misclassifies ordinary text ("took 1500ms",
+//! "400") into policy-changing reasons (P2-14). Callers that *know* the cause
+//! (the watchdog setting `runner.timeout`) construct the reason directly.
 //!
 //! ## Strangler coexistence
 //!
@@ -32,6 +35,8 @@
 //! reasons/variants are constructed only by tests until then, so the whole module
 //! is `allow(dead_code)`, mirroring [`crate::protocol::v2`].
 #![allow(dead_code)]
+
+use crate::engine::{EngineError, RunErrorKind};
 
 /// A `runner.*` failure — the runner/platform side is at fault. Retryable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,197 +180,44 @@ impl std::fmt::Display for FailureReason {
     }
 }
 
-/// Substring heuristics, matched **most-specific-first**: the first group whose
-/// any-needle is present wins. Needles are lowercase; the haystack is lowercased
-/// once before matching. Ordered so a more specific signal (a context-window
-/// message, an iteration cap) is checked before a broader one.
-const PATTERNS: &[(&[&str], FailureReason)] = &[
-    // Auth — checked first; "forbidden"/"403" are auth, not a policy block.
-    (
-        &[
-            "401",
-            "403",
-            "unauthorized",
-            "forbidden",
-            "authentication",
-            "invalid api key",
-            "invalid x-api-key",
-            "authentication_error",
-        ],
-        FailureReason::Agent(AgentFailure::ProviderAuth),
-    ),
-    // Quota / billing.
-    (
-        &[
-            "402",
-            "quota",
-            "billing",
-            "insufficient credit",
-            "out of credit",
-            "payment required",
-            "exceeded your current quota",
-        ],
-        FailureReason::Agent(AgentFailure::ProviderQuota),
-    ),
-    // Rate limiting.
-    (
-        &[
-            "429",
-            "rate limit",
-            "rate_limit",
-            "ratelimit",
-            "too many requests",
-        ],
-        FailureReason::Agent(AgentFailure::ProviderRateLimit),
-    ),
-    // Provider 5xx / overloaded.
-    (
-        &[
-            "500",
-            "502",
-            "503",
-            "529",
-            "overloaded",
-            "internal server error",
-            "bad gateway",
-            "service unavailable",
-            "server_error",
-        ],
-        FailureReason::Agent(AgentFailure::ProviderServerError),
-    ),
-    // Context window — before the generic network/timeout bucket.
-    (
-        &[
-            "context window",
-            "context length",
-            "context_length_exceeded",
-            "maximum context",
-            "prompt is too long",
-            "too many tokens",
-            "context overflow",
-        ],
-        FailureReason::Agent(AgentFailure::ContextOverflow),
-    ),
-    // Model availability.
-    (
-        &[
-            "model not found",
-            "unknown model",
-            "model unavailable",
-            "no such model",
-            "model does not exist",
-            "not_found_error",
-        ],
-        FailureReason::Agent(AgentFailure::ModelUnavailable),
-    ),
-    // Missing configuration.
-    (
-        &[
-            "missing config",
-            "not configured",
-            "missing required",
-            "missing env",
-            "no api key",
-            "api key not",
-        ],
-        FailureReason::Agent(AgentFailure::MissingConfig),
-    ),
-    // Network / transport.
-    (
-        &[
-            "connection refused",
-            "connection reset",
-            "econnrefused",
-            "broken pipe",
-            "network",
-            "dns",
-            "tls",
-            "ssl",
-            "unreachable",
-            "timed out",
-            "connection closed",
-        ],
-        FailureReason::Agent(AgentFailure::ProviderNetwork),
-    ),
-    // Runner-side iteration cap.
-    (
-        &[
-            "max turns",
-            "maximum turns",
-            "iteration limit",
-            "max iterations",
-            "turn limit",
-        ],
-        FailureReason::Runner(RunnerFailure::IterationLimit),
-    ),
-    // Runner-side policy block.
-    (
-        &[
-            "blocked",
-            "refused by policy",
-            "not permitted",
-            "permission denied",
-        ],
-        FailureReason::Runner(RunnerFailure::AgentBlocked),
-    ),
-    // Runner-built malformed request.
-    (
-        &[
-            "400",
-            "invalid request",
-            "invalid_request",
-            "bad request",
-            "malformed",
-        ],
-        FailureReason::Runner(RunnerFailure::InvalidRequest),
-    ),
-    // Empty / unparseable engine output.
-    (
-        &[
-            "empty output",
-            "no output",
-            "unparseable",
-            "failed to parse",
-            "parse error",
-            "unexpected end of",
-            "invalid json",
-        ],
-        FailureReason::Agent(AgentFailure::EmptyOrUnparseableOutput),
-    ),
-    // Process / spawn failure.
-    (
-        &[
-            "exit code",
-            "exited with",
-            "killed",
-            "signal",
-            "panicked",
-            "segfault",
-            "core dumped",
-            "command not found",
-            "no such file",
-            "spawn",
-        ],
-        FailureReason::Agent(AgentFailure::ProcessFailure),
-    ),
-];
-
-/// Map a backend's free-text error into a [`FailureReason`]. Best-effort,
-/// most-specific-first substring matching; an unmatched message folds into
-/// `agent.unknown` so the host always sees a reason.
-pub(crate) fn classify(raw: &str) -> FailureReason {
-    let haystack = raw.to_ascii_lowercase();
-    for (needles, reason) in PATTERNS {
-        if needles.iter().any(|needle| haystack.contains(needle)) {
-            return *reason;
-        }
+/// Map a turn's structured error cause ([`RunErrorKind`], the engine's parsed
+/// `result.subtype`) into a [`FailureReason`]. Only the structured signal is
+/// consulted — never the error/result prose (P2-14).
+pub(crate) fn classify_outcome(kind: Option<RunErrorKind>) -> FailureReason {
+    match kind {
+        Some(RunErrorKind::MaxTurns) => FailureReason::Runner(RunnerFailure::IterationLimit),
+        // Fallback policy: an engine-reported error with no more specific
+        // structured cause (a generic `error_during_execution`, an unrecognised
+        // subtype, `is_error` on a success subtype) folds into `agent.unknown` —
+        // non-retryable and resume-safe, so the runner neither burns attempts on
+        // an opaque failure nor discards a healthy session handle on a guess.
+        Some(RunErrorKind::Execution) | None => FailureReason::Agent(AgentFailure::Unknown),
     }
-    FailureReason::Agent(AgentFailure::Unknown)
+}
+
+/// Map a process-level [`EngineError`] (the session could not be started or
+/// driven) into a [`FailureReason`], keyed on the error *variant*, not its
+/// rendered message.
+pub(crate) fn classify_engine_error(err: &EngineError) -> FailureReason {
+    match err {
+        // The engine process could not be spawned, lost its pipes, or its
+        // session plumbing failed — the engine side is at fault.
+        EngineError::Spawn(_)
+        | EngineError::Io(_)
+        | EngineError::MissingPipe(_)
+        | EngineError::Closed => FailureReason::Agent(AgentFailure::ProcessFailure),
+        // The runner built a control/input message that would not serialize:
+        // the runner's own request is malformed and would recur on resume.
+        EngineError::Serialize(_) => FailureReason::Runner(RunnerFailure::InvalidRequest),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentFailure, FailureReason, RunnerFailure, classify};
+    use super::{
+        AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
+    };
+    use crate::engine::{EngineError, RunErrorKind};
 
     #[test]
     fn wire_strings_round_trip_for_every_reason() {
@@ -425,65 +277,58 @@ mod tests {
     }
 
     #[test]
-    fn classify_maps_agent_group_text() {
-        assert_eq!(
-            classify("HTTP 401 Unauthorized: invalid x-api-key"),
-            FailureReason::Agent(AgentFailure::ProviderAuth)
-        );
-        assert_eq!(
-            classify("You exceeded your current quota, please check billing"),
-            FailureReason::Agent(AgentFailure::ProviderQuota)
-        );
-        assert_eq!(
-            classify("rate limit exceeded (429)"),
-            FailureReason::Agent(AgentFailure::ProviderRateLimit)
-        );
-        assert_eq!(
-            classify("Error 529: the model is overloaded"),
-            FailureReason::Agent(AgentFailure::ProviderServerError)
-        );
-        assert_eq!(
-            classify("connection refused while reaching api.anthropic.com"),
-            FailureReason::Agent(AgentFailure::ProviderNetwork)
-        );
-        assert_eq!(
-            classify("claude process exited with code 1"),
-            FailureReason::Agent(AgentFailure::ProcessFailure)
-        );
-        assert_eq!(
-            classify("failed to parse engine output: unexpected end of stream"),
-            FailureReason::Agent(AgentFailure::EmptyOrUnparseableOutput)
-        );
-        assert_eq!(
-            classify("prompt is too long: exceeds the model context window"),
-            FailureReason::Agent(AgentFailure::ContextOverflow)
-        );
-        assert_eq!(
-            classify("model not found: claude-does-not-exist"),
-            FailureReason::Agent(AgentFailure::ModelUnavailable)
-        );
-        assert_eq!(
-            classify("missing required ANTHROPIC_API_KEY, not configured"),
-            FailureReason::Agent(AgentFailure::MissingConfig)
-        );
-        assert_eq!(
-            classify("something nobody anticipated"),
-            FailureReason::Agent(AgentFailure::Unknown)
-        );
+    fn classify_outcome_maps_every_structured_kind() {
+        // Table-driven over the full RunErrorKind set plus the no-signal case.
+        let cases = [
+            (
+                Some(RunErrorKind::MaxTurns),
+                FailureReason::Runner(RunnerFailure::IterationLimit),
+            ),
+            (
+                Some(RunErrorKind::Execution),
+                FailureReason::Agent(AgentFailure::Unknown),
+            ),
+            (None, FailureReason::Agent(AgentFailure::Unknown)),
+        ];
+        for (kind, reason) in cases {
+            assert_eq!(classify_outcome(kind), reason, "{kind:?}");
+        }
     }
 
     #[test]
-    fn classify_maps_runner_group_text() {
+    fn classify_outcome_ignores_prose_entirely() {
+        // P2-14 regression: classification takes no text input at all, so
+        // error-looking prose ("took 1500ms" → 500, "400" → invalid_request)
+        // can never flip policy. The fallback must be resume-safe so a healthy
+        // engine_session_id survives an unclassified failure.
+        let fallback = classify_outcome(None);
+        assert_eq!(fallback, FailureReason::Agent(AgentFailure::Unknown));
+        assert!(!fallback.is_retryable());
+        assert!(fallback.resume_safe());
+    }
+
+    #[test]
+    fn classify_engine_error_keys_on_variant() {
+        let io = || std::io::Error::other("boom");
         assert_eq!(
-            classify("run aborted: max turns reached"),
-            FailureReason::Runner(RunnerFailure::IterationLimit)
+            classify_engine_error(&EngineError::Spawn(io())),
+            FailureReason::Agent(AgentFailure::ProcessFailure)
         );
         assert_eq!(
-            classify("request blocked by safety policy"),
-            FailureReason::Runner(RunnerFailure::AgentBlocked)
+            classify_engine_error(&EngineError::Io(io())),
+            FailureReason::Agent(AgentFailure::ProcessFailure)
         );
         assert_eq!(
-            classify("HTTP 400 Bad Request: malformed body"),
+            classify_engine_error(&EngineError::MissingPipe("stdin")),
+            FailureReason::Agent(AgentFailure::ProcessFailure)
+        );
+        assert_eq!(
+            classify_engine_error(&EngineError::Closed),
+            FailureReason::Agent(AgentFailure::ProcessFailure)
+        );
+        let serialize = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert_eq!(
+            classify_engine_error(&EngineError::Serialize(serialize)),
             FailureReason::Runner(RunnerFailure::InvalidRequest)
         );
     }

@@ -1757,6 +1757,7 @@ mod tests {
                     result: None,
                     session_id: None,
                     error: None,
+                    error_kind: None,
                 })
             }
         }
@@ -1775,6 +1776,7 @@ mod tests {
                     result: Some("ok".to_owned()),
                     session_id: Some("sess".to_owned()),
                     error: None,
+                    error_kind: None,
                 })]))
             }
         }
@@ -1935,6 +1937,7 @@ mod tests {
                         result: Some("ran while the host was down".to_owned()),
                         session_id: Some("sess-off".to_owned()),
                         error: None,
+                        error_kind: None,
                     }),
                 ]))
             }

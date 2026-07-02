@@ -933,8 +933,8 @@ mod tests {
     use crate::config::ExecutorConfig;
     use crate::db::{CronLogRow, CronRow, Db, TaskRow, ThreadRow};
     use crate::engine::{
-        Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
-        SessionCfg,
+        Engine, EngineError, EngineEvent, Input, Payload, RunErrorKind, RunOutcome, RunStatus,
+        Session, SessionCfg,
     };
     use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
     use crate::protocol::v2::CronUpsertData;
@@ -1680,6 +1680,7 @@ mod tests {
                     result: Some("turn done".to_owned()),
                     session_id: Some(self.session_id.to_owned()),
                     error: None,
+                    error_kind: None,
                 }),
             ])))
         }
@@ -1782,7 +1783,8 @@ mod tests {
                     status: RunStatus::Error,
                     result: None,
                     session_id: Some("sess-flaky".to_owned()),
-                    error: Some("run aborted: max turns reached".to_owned()),
+                    error: Some("run aborted".to_owned()),
+                    error_kind: Some(RunErrorKind::MaxTurns),
                 })]
             } else {
                 vec![EngineEvent::Result(RunOutcome {
@@ -1790,6 +1792,7 @@ mod tests {
                     result: Some("done on retry".to_owned()),
                     session_id: Some("sess-flaky".to_owned()),
                     error: None,
+                    error_kind: None,
                 })]
             };
             Ok(Box::new(ScriptSession(script)))

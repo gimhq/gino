@@ -83,7 +83,9 @@ pub(crate) mod v2 {
     use crate::attachments::{AttachmentError, AttachmentManager, AttachmentSource};
     use crate::db::{Db, DbResult, ThreadRow};
     use crate::engine::{Engine, EngineEvent, LogLevel, RunStatus, Session, SessionCfg};
-    use crate::failure::{AgentFailure, FailureReason, RunnerFailure, classify};
+    use crate::failure::{
+        AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
+    };
     use crate::protocol::v2::{
         AttachmentDescriptor, MessageKind, ProvisioningEntry, ThreadMessageData, ThreadResultData,
         ThreadStatus,
@@ -429,7 +431,7 @@ pub(crate) mod v2 {
                 Ok(session) => Arc::from(session),
                 Err(err) => {
                     let conclusion = Conclusion::Failure {
-                        reason: classify(&err.to_string()),
+                        reason: classify_engine_error(&err),
                         error: format!("start_session failed: {err}"),
                         session_id: thread.engine_session_id.clone(),
                     };
@@ -825,12 +827,16 @@ pub(crate) mod v2 {
                                 session_id: resolved,
                             },
                             RunStatus::Error => {
+                                // Classify off the structured cause only; the
+                                // text is (or quotes) model output and rides
+                                // along as detail, never as a policy input.
+                                let reason = classify_outcome(outcome.error_kind);
                                 let text = outcome
                                     .error
                                     .or(outcome.result)
                                     .unwrap_or_else(|| "engine reported an error".to_owned());
                                 Conclusion::Failure {
-                                    reason: classify(&text),
+                                    reason,
                                     error: text,
                                     session_id: resolved,
                                 }
@@ -1318,8 +1324,8 @@ pub(crate) mod v2 {
         use crate::config::AttachmentsConfig;
         use crate::db::{Db, TaskRow, ThreadRow};
         use crate::engine::{
-            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
-            SessionCfg,
+            Engine, EngineError, EngineEvent, Input, Payload, RunErrorKind, RunOutcome, RunStatus,
+            Session, SessionCfg,
         };
         use crate::protocol::v2::{
             AttachmentDescriptor, EntryKind, ProvisioningEntry, ThreadMessageData,
@@ -1368,6 +1374,7 @@ pub(crate) mod v2 {
                     result: None,
                     session_id: None,
                     error: None,
+                    error_kind: None,
                 })
             }
         }
@@ -1417,15 +1424,23 @@ pub(crate) mod v2 {
                 result: Some(result.to_owned()),
                 session_id: Some(session_id.to_owned()),
                 error: None,
+                error_kind: None,
             })
         }
 
+        /// An errored result with no structured cause (`error_kind: None`) —
+        /// the shape of an unclassifiable engine failure.
         fn err_result(error: &str) -> EngineEvent {
+            err_result_kind(error, None)
+        }
+
+        fn err_result_kind(error: &str, error_kind: Option<RunErrorKind>) -> EngineEvent {
             EngineEvent::Result(RunOutcome {
                 status: RunStatus::Error,
                 result: None,
                 session_id: None,
                 error: Some(error.to_owned()),
+                error_kind,
             })
         }
 
@@ -1591,10 +1606,14 @@ pub(crate) mod v2 {
         #[tokio::test]
         async fn runner_failure_retries_while_attempts_remain() {
             let db = test_db();
-            // "max turns reached" classifies as runner.iteration_limit (retryable).
+            // The structured `error_max_turns` cause classifies as
+            // runner.iteration_limit (retryable).
             let exec = build(
                 &db,
-                vec![started("s"), err_result("run aborted: max turns reached")],
+                vec![
+                    started("s"),
+                    err_result_kind("run aborted", Some(RunErrorKind::MaxTurns)),
+                ],
                 false,
                 no_inactivity(),
             );
@@ -1619,9 +1638,42 @@ pub(crate) mod v2 {
         }
 
         #[tokio::test]
+        async fn success_prose_is_never_classified() {
+            // P2-14 regression: a successful turn whose text happens to contain
+            // error-looking prose ("took 1500ms", "400") stays a success — the
+            // classifier never sees result text.
+            let db = test_db();
+            let exec = build(
+                &db,
+                vec![
+                    started("s"),
+                    ok_result("the fetch took 1500ms and returned 400 rows", "s"),
+                ],
+                false,
+                no_inactivity(),
+            );
+            lock(&db)
+                .insert_thread(&pending_thread("th-prose", 1))
+                .unwrap();
+
+            let row = exec
+                .run_thread(
+                    pending_thread("th-prose", 1),
+                    "go".to_owned(),
+                    Continuity::Isolated,
+                )
+                .await;
+
+            assert_eq!(row.status, "succeeded");
+            assert!(row.failure_reason.is_none());
+            assert_eq!(row.engine_session_id.as_deref(), Some("s"));
+        }
+
+        #[tokio::test]
         async fn agent_failure_does_not_retry() {
             let db = test_db();
-            // 401 → agent.provider_auth (not retryable) even with attempts to spare.
+            // An error with no structured cause → agent.unknown (not retryable)
+            // even with attempts to spare; the prose is never sniffed.
             let exec = build(
                 &db,
                 vec![started("s"), err_result("HTTP 401 Unauthorized")],
@@ -1641,39 +1693,78 @@ pub(crate) mod v2 {
                 .await;
 
             assert_eq!(row.status, "failed");
-            assert_eq!(row.failure_reason.as_deref(), Some("agent.provider_auth"));
+            assert_eq!(row.failure_reason.as_deref(), Some("agent.unknown"));
             let res = results(&db);
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].status, ThreadStatus::Failed);
-            assert_eq!(
-                res[0].failure_reason.as_deref(),
-                Some("agent.provider_auth")
-            );
+            assert_eq!(res[0].failure_reason.as_deref(), Some("agent.unknown"));
         }
 
         #[tokio::test]
-        async fn resume_unsafe_failure_drops_session_but_safe_one_keeps_it() {
-            // Resume-unsafe: runner.invalid_request drops the engine_session_id.
+        async fn prose_false_positives_no_longer_poison_the_session() {
+            // P2-14 regression: error prose containing "400" (or timing text
+            // like "took 1500ms") used to substring-classify as
+            // runner.invalid_request / agent.provider_server_error, discarding
+            // a healthy engine_session_id. With no structured cause the reason
+            // is agent.unknown and the resume handle SURVIVES.
             let db = test_db();
             let exec = build(
                 &db,
                 vec![
-                    started("sess-poison"),
-                    err_result("HTTP 400 Bad Request: malformed body"),
+                    started("sess-keep"),
+                    err_result("the request took 1500ms and returned HTTP 400 Bad Request"),
                 ],
                 false,
                 no_inactivity(),
             );
             lock(&db)
-                .insert_thread(&pending_thread("th-poison", 1))
+                .insert_thread(&pending_thread("th-keep", 1))
                 .unwrap();
             let row = exec
                 .run_thread(
-                    pending_thread("th-poison", 1),
+                    pending_thread("th-keep", 1),
                     "go".to_owned(),
                     Continuity::Isolated,
                 )
                 .await;
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.failure_reason.as_deref(), Some("agent.unknown"));
+            assert_eq!(
+                row.engine_session_id.as_deref(),
+                Some("sess-keep"),
+                "prose false positives must not drop the resume handle"
+            );
+            assert_eq!(
+                results(&db)[0].engine_session_id.as_deref(),
+                Some("sess-keep")
+            );
+        }
+
+        #[tokio::test]
+        async fn resume_unsafe_reason_still_drops_the_session() {
+            // The drop mechanic itself is unchanged: a resume-unsafe reason
+            // (now only reachable from structured sources, e.g. inbound
+            // materialization) still poisons the handle at finalize time.
+            use crate::failure::{FailureReason, RunnerFailure};
+
+            let db = test_db();
+            let exec = build(&db, vec![], false, no_inactivity());
+            let mut thread = pending_thread("th-poison", 1);
+            thread.status = "running".to_owned();
+            thread.engine_session_id = Some("sess-poison".to_owned());
+            lock(&db).insert_thread(&thread).unwrap();
+
+            let row = exec.finalize(
+                thread,
+                super::Conclusion::Failure {
+                    reason: FailureReason::Runner(RunnerFailure::InvalidRequest),
+                    error: "malformed request".to_owned(),
+                    session_id: Some("sess-poison".to_owned()),
+                },
+                now(),
+                Continuity::Isolated,
+                Vec::new(),
+            );
             assert_eq!(row.status, "failed");
             assert_eq!(
                 row.failure_reason.as_deref(),
@@ -1684,34 +1775,6 @@ pub(crate) mod v2 {
                 "poisoned session is dropped"
             );
             assert!(results(&db)[0].engine_session_id.is_none());
-
-            // Resume-safe: agent.provider_network keeps the session for resume.
-            let db2 = test_db();
-            let exec2 = build(
-                &db2,
-                vec![started("sess-keep"), err_result("connection refused")],
-                false,
-                no_inactivity(),
-            );
-            lock(&db2)
-                .insert_thread(&pending_thread("th-keep", 1))
-                .unwrap();
-            let row2 = exec2
-                .run_thread(
-                    pending_thread("th-keep", 1),
-                    "go".to_owned(),
-                    Continuity::Isolated,
-                )
-                .await;
-            assert_eq!(
-                row2.failure_reason.as_deref(),
-                Some("agent.provider_network")
-            );
-            assert_eq!(
-                row2.engine_session_id.as_deref(),
-                Some("sess-keep"),
-                "a resume-safe failure preserves the session"
-            );
         }
 
         #[tokio::test]
@@ -1772,7 +1835,10 @@ pub(crate) mod v2 {
                     _cfg: SessionCfg,
                 ) -> Result<Box<dyn Session>, EngineError> {
                     let script = if self.sessions.fetch_add(1, Ordering::SeqCst) == 0 {
-                        vec![started("s1"), err_result("run aborted: max turns reached")]
+                        vec![
+                            started("s1"),
+                            err_result_kind("run aborted", Some(RunErrorKind::MaxTurns)),
+                        ]
                     } else {
                         vec![started("s2"), ok_result("done on retry", "s2")]
                     };
@@ -1787,6 +1853,7 @@ pub(crate) mod v2 {
                         result: None,
                         session_id: None,
                         error: None,
+                        error_kind: None,
                     })
                 }
             }
@@ -2038,6 +2105,7 @@ pub(crate) mod v2 {
                         result: None,
                         session_id: Some("sess-settled".to_owned()),
                         error: Some("aborted by user".to_owned()),
+                        error_kind: None,
                     }));
                     Ok(())
                 }
@@ -2359,6 +2427,7 @@ pub(crate) mod v2 {
                     result: Some("done".to_owned()),
                     session_id: Some("sess-att".to_owned()),
                     error: None,
+                    error_kind: None,
                 })
             }
         }
@@ -2486,6 +2555,7 @@ pub(crate) mod v2 {
                     result: Some("done".to_owned()),
                     session_id: Some("sess-prov".to_owned()),
                     error: None,
+                    error_kind: None,
                 })
             }
         }
