@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use super::store::{self, EntryKind};
 use super::{ProvisioningError, safe_link_path, short_id};
-use crate::attachments::AttachmentManager;
+use crate::attachments::{AttachmentManager, run_blocking};
 use crate::db::{ConfigEntryRow, Db};
 use crate::protocol::v2::{EntryKind as WireKind, ProvisioningEntry};
 
@@ -169,22 +169,19 @@ impl Provisioner {
         // Reuse requires full-hash re-verification (P2-17): the short-id path
         // plus a shape check is not identity — a truncated post-crash file or a
         // tampered entry passes `is_file()` forever. A verified entry keeps the
-        // re-reconcile fetch-free; anything else is evicted and re-fetched.
-        if !store::verify_entry(&store_path, kind, &entry.sha256) {
-            store::remove_store_entry(&self.workspace_dir, &entry.id, &entry.sha256)?;
-            let bytes = self
-                .fetcher
-                .fetch(&Self::reference_for(&entry.id), &entry.sha256)
+        // re-reconcile fetch-free; anything else is evicted and re-fetched. The
+        // sweep re-reads every byte of the entry → blocking pool (P2-15).
+        let verified = {
+            let store_path = store_path.clone();
+            let sha = entry.sha256.clone();
+            run_blocking(move || store::verify_entry(&store_path, kind, &sha)).await?
+        };
+        if !verified {
+            self.evict_and_materialize(&entry.id, &entry.sha256, kind)
                 .await?;
-            match kind {
-                EntryKind::File => {
-                    store::materialize_file(&self.workspace_dir, &entry.id, &entry.sha256, &bytes)?;
-                }
-                EntryKind::Dir => {
-                    store::materialize_dir(&self.workspace_dir, &entry.id, &entry.sha256, &bytes)?;
-                }
-            }
         }
+        // The (re)link itself is a handful of small syscalls (symlink + rename)
+        // — cheap enough to stay inline on the async thread.
         let link_path = store::link(scope_root, &entry.target, &store_path, kind)?;
 
         // Keep `installed_at` stable when the row already points at this exact
@@ -209,6 +206,38 @@ impl Provisioner {
         Ok(())
     }
 
+    /// Evict the (missing/corrupt) store entry for `(name, sha256)`, fetch its
+    /// bytes, and re-materialize it as `kind` — the shared heal path of
+    /// reconcile and repair. Eviction stays ordered before the fetch (as
+    /// before); the filesystem halves (tree removal, tar unpack / large-file
+    /// write + seal) run on the blocking pool (P2-15), only the fetch is async.
+    async fn evict_and_materialize(
+        &self,
+        name: &str,
+        sha256: &str,
+        kind: EntryKind,
+    ) -> Result<(), ProvisioningError> {
+        {
+            let ws = self.workspace_dir.clone();
+            let name = name.to_owned();
+            let sha = sha256.to_owned();
+            run_blocking(move || store::remove_store_entry(&ws, &name, &sha)).await??;
+        }
+        let bytes = self
+            .fetcher
+            .fetch(&Self::reference_for(name), sha256)
+            .await?;
+        let ws = self.workspace_dir.clone();
+        let name = name.to_owned();
+        let sha = sha256.to_owned();
+        run_blocking(move || match kind {
+            EntryKind::File => store::materialize_file(&ws, &name, &sha, &bytes).map(|_| ()),
+            EntryKind::Dir => store::materialize_dir(&ws, &name, &sha, &bytes).map(|_| ()),
+        })
+        .await??;
+        Ok(())
+    }
+
     /// Refcount-GC the store: remove every `store/<name>/<short>` entry that no
     /// `config_entries` row references (i.e. `count_store_refs(name, sha256) == 0`).
     /// Held under the GC lock so it never races a reconcile materialize (Risk 4).
@@ -226,42 +255,10 @@ impl Provisioner {
                 .collect()
         };
 
-        let store_base = self.workspace_dir.join(STORE_SUBDIR);
-        let names = match std::fs::read_dir(&store_base) {
-            Ok(names) => names,
-            // No store tree yet → nothing to collect.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err.into()),
-        };
-        for name_entry in names.flatten() {
-            if !name_entry.file_type().is_ok_and(|ty| ty.is_dir()) {
-                continue;
-            }
-            let Ok(name) = name_entry.file_name().into_string() else {
-                continue;
-            };
-            let Ok(shorts) = std::fs::read_dir(name_entry.path()) else {
-                continue;
-            };
-            for short_entry in shorts.flatten() {
-                let Ok(short) = short_entry.file_name().into_string() else {
-                    continue;
-                };
-                // In-flight / stale temp siblings are not store entries; leave them
-                // (a concurrent reconcile is serialized out by the GC lock anyway).
-                if short.starts_with(".tmp.") {
-                    continue;
-                }
-                if referenced.contains(&(name.clone(), short.clone())) {
-                    continue;
-                }
-                // `short` is the on-disk dir name (= sha256[:12]); `store_path`
-                // re-derives <short> via `short_id`, which is identity on a 12-char
-                // input, so passing `short` as the sha key targets exactly this dir.
-                store::remove_store_entry(&self.workspace_dir, &name, &short)?;
-                debug!(name, short, "gc removed unreferenced store entry");
-            }
-        }
+        // The whole-store directory scan (plus tree deletions) is filesystem
+        // work → blocking pool (P2-15).
+        let workspace_dir = self.workspace_dir.clone();
+        run_blocking(move || gc_scan(&workspace_dir, &referenced)).await??;
         Ok(())
     }
 
@@ -310,32 +307,24 @@ impl Provisioner {
             // Recompute the store path under the current workspace dir (robust to a
             // relocated workspace; the table stores an absolute snapshot only).
             let store_path = store::store_path(&self.workspace_dir, &row.name, &row.sha256)?;
-            if store::verify_entry(&store_path, kind, &row.sha256) {
-                store::seal_entry(&store_path, kind)?;
-            } else {
-                store::remove_store_entry(&self.workspace_dir, &row.name, &row.sha256)?;
-                let bytes = self
-                    .fetcher
-                    .fetch(&Self::reference_for(&row.name), &row.sha256)
+            // Full-hash verification sweep + recursive re-seal both walk/read the
+            // whole entry → one blocking-pool hop for the pair (P2-15).
+            let intact = {
+                let store_path = store_path.clone();
+                let sha = row.sha256.clone();
+                run_blocking(move || -> Result<bool, ProvisioningError> {
+                    if store::verify_entry(&store_path, kind, &sha) {
+                        store::seal_entry(&store_path, kind)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                })
+                .await??
+            };
+            if !intact {
+                self.evict_and_materialize(&row.name, &row.sha256, kind)
                     .await?;
-                match kind {
-                    EntryKind::File => {
-                        store::materialize_file(
-                            &self.workspace_dir,
-                            &row.name,
-                            &row.sha256,
-                            &bytes,
-                        )?;
-                    }
-                    EntryKind::Dir => {
-                        store::materialize_dir(
-                            &self.workspace_dir,
-                            &row.name,
-                            &row.sha256,
-                            &bytes,
-                        )?;
-                    }
-                }
                 warn!(scope = %row.scope, target = %row.target,
                     "repair re-fetched a missing or corrupt store entry");
             }
@@ -358,6 +347,53 @@ impl Provisioner {
 // ===========================================================================
 // Free helpers
 // ===========================================================================
+
+/// The filesystem half of [`Provisioner::gc`]: scan the store tree and remove
+/// every `store/<name>/<short>` entry not in `referenced`. Extracted as a free
+/// function so the whole scan-and-delete pass moves onto the blocking pool in
+/// one hop (P2-15).
+fn gc_scan(
+    workspace_dir: &Path,
+    referenced: &HashSet<(String, String)>,
+) -> Result<(), ProvisioningError> {
+    let store_base = workspace_dir.join(STORE_SUBDIR);
+    let names = match std::fs::read_dir(&store_base) {
+        Ok(names) => names,
+        // No store tree yet → nothing to collect.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for name_entry in names.flatten() {
+        if !name_entry.file_type().is_ok_and(|ty| ty.is_dir()) {
+            continue;
+        }
+        let Ok(name) = name_entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(shorts) = std::fs::read_dir(name_entry.path()) else {
+            continue;
+        };
+        for short_entry in shorts.flatten() {
+            let Ok(short) = short_entry.file_name().into_string() else {
+                continue;
+            };
+            // In-flight / stale temp siblings are not store entries; leave them
+            // (a concurrent reconcile is serialized out by the GC lock anyway).
+            if short.starts_with(".tmp.") {
+                continue;
+            }
+            if referenced.contains(&(name.clone(), short.clone())) {
+                continue;
+            }
+            // `short` is the on-disk dir name (= sha256[:12]); `store_path`
+            // re-derives <short> via `short_id`, which is identity on a 12-char
+            // input, so passing `short` as the sha key targets exactly this dir.
+            store::remove_store_entry(workspace_dir, &name, &short)?;
+            debug!(name, short, "gc removed unreferenced store entry");
+        }
+    }
+    Ok(())
+}
 
 /// Poison-tolerant DB lock (mirrors `executor::lock_db`, Lock 6): recover the
 /// guard rather than panic. Critical sections are short and never span an `.await`.
@@ -902,6 +938,64 @@ mod tests {
         assert_eq!(mode_of(&store_file), 0o444);
         assert_eq!(mode_of(&store_dir), 0o555);
         assert_eq!(mode_of(&store_dir.join("SKILL.md")), 0o444);
+    }
+
+    /// P2-15 seam: reconciles of distinct scopes driven concurrently — with the
+    /// verify / unpack / materialize work hopping through the blocking pool —
+    /// land every symlink and manifest row correctly, and the shared dir bundle
+    /// is still fetched exactly once (the reconciles serialize on the GC lock,
+    /// so later scopes verify-hit the store entry the first one materialized).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_reconciles_land_all_entries() {
+        let ws = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeFetcher::default());
+        let (prov, db) = provisioner(ws.path(), &fake);
+        let prov = Arc::new(prov);
+
+        let tar = build_tar(&[("SKILL.md", b"# demo\n")]);
+        fake.insert("/agent/attachments/demo-skill", &tar);
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let file_bytes = format!("# scope {i}\n").into_bytes();
+            fake.insert(&format!("/agent/attachments/cfg-{i}"), &file_bytes);
+            let desired = vec![
+                entry(
+                    &format!("cfg-{i}"),
+                    "CLAUDE.md",
+                    EntryKind::File,
+                    &file_bytes,
+                ),
+                entry("demo-skill", ".claude/skills/demo", EntryKind::Dir, &tar),
+            ];
+            let scope_root = ws.path().join(format!("t{i}-project"));
+            let prov = Arc::clone(&prov);
+            handles.push(tokio::spawn(async move {
+                prov.reconcile(&format!("t{i}"), &scope_root, &desired)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        for i in 0..4 {
+            let scope_root = ws.path().join(format!("t{i}-project"));
+            assert_eq!(
+                std::fs::read(scope_root.join("CLAUDE.md")).unwrap(),
+                format!("# scope {i}\n").as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(scope_root.join(".claude/skills/demo/SKILL.md")).unwrap(),
+                b"# demo\n"
+            );
+            assert_eq!(rows(&db, &format!("t{i}")).len(), 2);
+        }
+        assert_eq!(
+            fake.fetch_count(),
+            5,
+            "4 per-scope files + the shared bundle exactly once"
+        );
     }
 
     #[tokio::test]

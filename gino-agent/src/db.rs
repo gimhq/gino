@@ -551,6 +551,24 @@ pub(crate) struct Identity {
 
 /// The runner's SQLite store. Owns one connection; all access is through cached
 /// prepared statements.
+///
+/// DECISION (P2-15, execution placement): every rusqlite call on this type runs
+/// inline on the calling thread — often a tokio async worker — rather than
+/// through `spawn_blocking`. This is deliberate. Current posture: statements
+/// are short point-indexed reads/writes on a WAL database with a single writer
+/// (the daemon), the execution plane is strictly serial, and the 3 s
+/// `busy_timeout` is a worst-case bound that engages only against a short-lived
+/// CLI invocation — in steady state each call is microseconds of blocking, far
+/// below the cost of a blocking-pool hop. Converting call sites piecemeal is
+/// the one option that is NOT acceptable: callers hold the global `Mutex<Db>`
+/// around each call, so a `spawn_blocking` inside the guard means holding the
+/// mutex across an `.await` (a known deadlock source in this codebase) and a
+/// `spawn_blocking` outside means handing the guard to another thread. A future
+/// migration, if profiling ever shows DB stalls on the runtime, must move the
+/// whole type behind an owned boundary in one step: either a dedicated DB
+/// thread consuming a channel of operations, or `spawn_blocking` at the Db API
+/// boundary with the connection owned by the blocking side — never
+/// mutex-across-await.
 #[derive(Debug)]
 pub(crate) struct Db {
     conn: Connection,
