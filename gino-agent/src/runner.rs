@@ -199,7 +199,12 @@ async fn run_async(
 
     // One retry budget for every thread source (cron fires + chat messages).
     let max_attempts = config.executor.max_attempts;
-    let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), max_attempts);
+    let scheduler = Scheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&cancel),
+        max_attempts,
+        config.retention.days,
+    );
     let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let flush = transport.flush_handle();
     let scheduler_task = tokio::spawn(scheduler.run());
@@ -2014,7 +2019,7 @@ mod tests {
 
         // The runner's own planes: the real scheduler task + executor worker.
         let cancel = Arc::new(Cancel::new());
-        let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), 1);
+        let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), 1, 30);
         let drain = scheduler.drain_signal();
         let scheduler_task = tokio::spawn(scheduler.run());
         let worker = tokio::spawn(super::run_worker(

@@ -48,6 +48,10 @@ const DEFAULT_ATTACHMENT_MAX_SINGLE_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_MAX_EXECUTION_BYTES: u64 = 500 * 1024 * 1024;
 /// Default content-addressed attachment cache cap before LRU GC (A4: 1 GiB).
 const DEFAULT_ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default days a terminal queue row (acked outbox / processed inbox / cron_logs
+/// ledger line / terminal-thread attachment snapshot) is retained before the
+/// periodic GC sweep deletes it (audit P1-9).
+const DEFAULT_RETENTION_DAYS: u32 = 30;
 
 /// Errors raised while validating a resolved [`Config`].
 #[derive(Debug, Error)]
@@ -82,6 +86,8 @@ pub(crate) struct Config {
     pub(crate) executor: ExecutorConfig,
     /// Out-of-band attachment channel limits + backend selection (PLAN-005).
     pub(crate) attachments: AttachmentsConfig,
+    /// Queue/ledger GC retention window (audit P1-9).
+    pub(crate) retention: RetentionConfig,
     /// Global-scope provisioning entries — the desired set of instruction files +
     /// skills materialized into `$ENGINE_CONFIG_DIR/` (PLAN-007 §5). The host
     /// re-pushes the full desired global set each refresh; an overlay carrying
@@ -119,6 +125,7 @@ impl Default for Config {
             engine: EngineConfig::default(),
             executor: ExecutorConfig::default(),
             attachments: AttachmentsConfig::default(),
+            retention: RetentionConfig::default(),
             entries: Vec::new(),
             config_version: None,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -221,6 +228,25 @@ impl Default for AttachmentsConfig {
     }
 }
 
+/// Queue/ledger GC retention window (audit P1-9). The periodic sweep deletes
+/// **terminal** rows — acked outbox, processed inbox, cron_logs ledger lines,
+/// and attachment snapshots of terminal threads — older than this window.
+/// Un-acked/un-processed rows are never deleted regardless of age (the
+/// at-least-once contract).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetentionConfig {
+    /// Days a terminal row survives before the GC sweep deletes it.
+    pub(crate) days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            days: DEFAULT_RETENTION_DAYS,
+        }
+    }
+}
+
 /// Filesystem layout for local state.
 #[derive(Clone, Debug)]
 pub(crate) struct Paths {
@@ -255,6 +281,7 @@ impl Config {
             engine,
             executor,
             attachments,
+            retention,
             entries,
             version,
             heartbeat_interval_ms,
@@ -312,6 +339,11 @@ impl Config {
         }
 
         self.apply_attachments(attachments);
+
+        let RetentionOverlay { days } = retention;
+        if let Some(value) = days {
+            self.retention.days = value;
+        }
 
         // Provisioning entries are a replace-when-Some list (cf. `allowed_tools` /
         // `content_type_allowlist`): the host re-pushes the full desired global set
@@ -439,6 +471,7 @@ pub(crate) struct ConfigOverlay {
     engine: EngineOverlay,
     executor: ExecutorOverlay,
     attachments: AttachmentsOverlay,
+    retention: RetentionOverlay,
     /// Full desired global provisioning set (PLAN-007 §5). Unlike `register_token`
     /// this is host-sent, so it is **not** `#[serde(skip)]`; when present it
     /// replaces `Config::entries` wholesale.
@@ -479,6 +512,12 @@ struct AttachmentsOverlay {
     max_execution_bytes: Option<u64>,
     content_type_allowlist: Option<Vec<String>>,
     cache_max_bytes: Option<u64>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RetentionOverlay {
+    days: Option<u32>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -604,6 +643,18 @@ mod tests {
         assert!(config.host_url.is_none());
         assert!(config.register_token.is_none());
         assert!(config.engine.allowed_tools.is_empty());
+        assert_eq!(config.retention.days, 30);
+    }
+
+    #[test]
+    fn from_json_overlays_retention_window() {
+        let mut config = Config::default();
+        config.apply(ConfigOverlay::from_json(r#"{ "retention": { "days": 7 } }"#).unwrap());
+        assert_eq!(config.retention.days, 7);
+
+        // An overlay without `retention` leaves the prior value untouched.
+        config.apply(ConfigOverlay::from_json(r#"{ "logLevel": "debug" }"#).unwrap());
+        assert_eq!(config.retention.days, 7);
     }
 
     #[test]

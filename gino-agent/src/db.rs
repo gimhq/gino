@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_task   ON outbox(task_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_thread ON outbox(thread_id);
+-- Partial hot-path index (audit P1-9): reconnect replay scans
+-- WHERE acked_at IS NULL under the global DB mutex on every flush, so the scan
+-- must stay proportional to the unacked backlog, not the table's history.
+CREATE INDEX IF NOT EXISTS idx_outbox_unacked ON outbox(id) WHERE acked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS inbox (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +104,9 @@ CREATE TABLE IF NOT EXISTS inbox (
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_task   ON inbox(task_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_thread ON inbox(thread_id);
+-- Partial hot-path index (audit P1-9): the reconnect replay's
+-- WHERE processed_at IS NULL twin of idx_outbox_unacked.
+CREATE INDEX IF NOT EXISTS idx_inbox_unprocessed ON inbox(id) WHERE processed_at IS NULL;
 
 -- The global top category (agent-architecture §3). The v2 entity columns are
 -- (id, name, kind, status, created_at, updated_at), driven by TaskRow. The legacy
@@ -620,6 +627,15 @@ impl Db {
             .prepare_cached("UPDATE outbox SET retry_count = retry_count + 1 WHERE id = ?1")?
             .execute(params![id])?;
         Ok(())
+    }
+
+    /// Dead-letter a poison outbox row (audit P3): stamp `acked_at` so it leaves
+    /// the replay set and ages out with the acked rows. DECISION: `acked_at`
+    /// doubles as the tombstone — the inbox poison policy reuses `processed_at`
+    /// the same way — so no schema change is needed and `acked_at IS NULL` stays
+    /// the single replay predicate the partial index serves.
+    pub(crate) fn mark_outbox_dead(&self, id: i64) -> DbResult<()> {
+        self.mark_outbox_acked(id)
     }
 
     // -- Inbox (at-least-once replay, host → runner) -----------------------
@@ -1379,6 +1395,92 @@ impl Db {
         Ok(json)
     }
 
+    // -- Queue GC (retention sweep, audit P1-9) ------------------------------
+    //
+    // Each method deletes ONE bounded batch (`LIMIT` inside an `id IN (…)`
+    // subquery — SQLite's portable DELETE…LIMIT form) so a caller can sweep a
+    // year-old backlog across many short mutex holds instead of one multi-second
+    // one. Rows still owed to the at-least-once contract (un-acked outbox,
+    // un-processed inbox) are never eligible, regardless of age. The cutoff is
+    // computed in SQL (`datetime('now', '-N days')`) so it compares in the same
+    // format the DB-defaulted timestamp columns store.
+
+    /// Delete one batch of acked outbox rows older than the retention window.
+    /// Dead-lettered poison rows carry `acked_at` too and age out the same way.
+    /// Returns the rows deleted; a count below `limit` means the backlog is drained.
+    pub(crate) fn gc_outbox_batch(&self, retention_days: u32, limit: usize) -> DbResult<usize> {
+        let deleted = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM outbox WHERE id IN (
+                   SELECT id FROM outbox
+                    WHERE acked_at IS NOT NULL AND created_at < datetime('now', ?1)
+                    LIMIT ?2)",
+            )?
+            .execute(params![gc_cutoff_modifier(retention_days), limit])?;
+        Ok(deleted)
+    }
+
+    /// Delete one batch of processed inbox rows older than the retention window.
+    pub(crate) fn gc_inbox_batch(&self, retention_days: u32, limit: usize) -> DbResult<usize> {
+        let deleted = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM inbox WHERE id IN (
+                   SELECT id FROM inbox
+                    WHERE processed_at IS NOT NULL AND received_at < datetime('now', ?1)
+                    LIMIT ?2)",
+            )?
+            .execute(params![gc_cutoff_modifier(retention_days), limit])?;
+        Ok(deleted)
+    }
+
+    /// Delete one batch of cron ledger rows older than the retention window.
+    /// Every `cron_logs` row is a terminal ledger line, but the **newest row of
+    /// each cron is always kept** so the round-accounting truth
+    /// (`MAX(round_seq)`, D4) and the latest fire's dedup slot survive even for
+    /// a cron idle longer than the window.
+    pub(crate) fn gc_cron_logs_batch(&self, retention_days: u32, limit: usize) -> DbResult<usize> {
+        let deleted = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM cron_logs WHERE id IN (
+                   SELECT id FROM cron_logs
+                    WHERE created_at < datetime('now', ?1)
+                      AND id NOT IN (SELECT MAX(id) FROM cron_logs GROUP BY cron_id)
+                    LIMIT ?2)",
+            )?
+            .execute(params![gc_cutoff_modifier(retention_days), limit])?;
+        Ok(deleted)
+    }
+
+    /// Delete one batch of attachment snapshots whose owning thread is terminal
+    /// and older than the retention window. DECISION: no thread-deletion path
+    /// exists today, so the snapshot's lifetime is tied to the same retention
+    /// window as the queues rather than to a thread GC; a live (non-terminal)
+    /// thread keeps its snapshot at any age because a retry must still resolve
+    /// the identical attachment set. Thread timestamps are ISO-8601 (`to_iso`),
+    /// so they are normalized through `datetime()` before comparing against the
+    /// SQL-side cutoff.
+    pub(crate) fn gc_thread_attachments_batch(
+        &self,
+        retention_days: u32,
+        limit: usize,
+    ) -> DbResult<usize> {
+        let deleted = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM thread_attachments WHERE thread_id IN (
+                   SELECT ta.thread_id FROM thread_attachments ta
+                   JOIN threads t ON t.id = ta.thread_id
+                    WHERE t.status IN ('succeeded', 'failed', 'cancelled')
+                      AND datetime(t.created_at) < datetime('now', ?1)
+                    LIMIT ?2)",
+            )?
+            .execute(params![gc_cutoff_modifier(retention_days), limit])?;
+        Ok(deleted)
+    }
+
     // -- Identity (PLAN-003 §2.1) ------------------------------------------
 
     /// Persist (or replace) the runner identity: the host-generated `agent_id`
@@ -1454,6 +1556,12 @@ impl Db {
             .get_config_meta(APPLIED_GLOBAL_VERSION_KEY)?
             .and_then(|raw| raw.parse::<i64>().ok()))
     }
+}
+
+/// The SQLite datetime modifier selecting rows older than the retention window
+/// (`datetime('now', '-N days')`).
+fn gc_cutoff_modifier(retention_days: u32) -> String {
+    format!("-{retention_days} days")
 }
 
 #[cfg(test)]
@@ -2293,6 +2401,207 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].msg_type, "system_close");
         assert!(db.list_inbox_by_type("user_message").unwrap().is_empty());
+    }
+
+    // -- Queue GC (retention sweep, audit P1-9) -----------------------------
+
+    /// Rewrite a DB-defaulted timestamp column so the row is `days` old.
+    fn age_row(db: &Db, table: &str, column: &str, id: i64, days: u32) {
+        db.exec_raw(&format!(
+            "UPDATE {table} SET {column} = datetime('now', '-{days} days') WHERE id = {id}"
+        ))
+        .unwrap();
+    }
+
+    /// Rewrite a thread's ISO-8601 `created_at` so the thread is `days` old
+    /// (relative to the test's real wall clock, never a fixed date).
+    fn age_thread(db: &Db, thread_id: &str, days: u32) {
+        db.exec_raw(&format!(
+            "UPDATE threads SET created_at =
+               strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-{days} days'))
+             WHERE id = '{thread_id}'"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn gc_outbox_deletes_only_old_acked_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let old_acked = db.enqueue_outbox("output", &json!({})).unwrap();
+        let fresh_acked = db.enqueue_outbox("output", &json!({})).unwrap();
+        let old_unacked = db.enqueue_outbox("output", &json!({})).unwrap();
+        db.mark_outbox_acked(old_acked).unwrap();
+        db.mark_outbox_acked(fresh_acked).unwrap();
+        age_row(&db, "outbox", "created_at", old_acked, 40);
+        age_row(&db, "outbox", "created_at", old_unacked, 400);
+
+        assert_eq!(db.gc_outbox_batch(30, 100).unwrap(), 1);
+
+        // The fresh acked row survives the window; the un-acked row survives at
+        // ANY age (at-least-once contract) and still replays.
+        let unacked = db.list_unacked_outbox().unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].id, old_unacked);
+        let remaining: i64 = db
+            .conn
+            .prepare("SELECT COUNT(*) FROM outbox")
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn gc_inbox_deletes_only_old_processed_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let old_processed = db.record_inbound("message", &json!({})).unwrap();
+        let fresh_processed = db.record_inbound("message", &json!({})).unwrap();
+        let old_unprocessed = db.record_inbound("message", &json!({})).unwrap();
+        db.mark_inbox_processed(old_processed).unwrap();
+        db.mark_inbox_processed(fresh_processed).unwrap();
+        age_row(&db, "inbox", "received_at", old_processed, 40);
+        age_row(&db, "inbox", "received_at", old_unprocessed, 400);
+
+        assert_eq!(db.gc_inbox_batch(30, 100).unwrap(), 1);
+
+        let unprocessed = db.list_unprocessed_inbox().unwrap();
+        assert_eq!(unprocessed.len(), 1);
+        assert_eq!(unprocessed[0].id, old_unprocessed);
+        let remaining: i64 = db
+            .conn
+            .prepare("SELECT COUNT(*) FROM inbox")
+            .unwrap()
+            .query_row([], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn gc_cron_logs_deletes_old_rows_but_keeps_each_crons_newest() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
+        db.insert_cron(&cron_row("cr-2", "t-1", "active")).unwrap();
+
+        // cr-1: three old dispatched rows — the two oldest age out, the newest
+        // stays so MAX(round_seq) (the D4 round truth) survives a long idle.
+        for (round, at, age_days) in [(0, "12:00", 42), (1, "12:01", 41), (2, "12:02", 40)] {
+            let id = db
+                .insert_cron_log(&cron_log_row(
+                    "cr-1",
+                    "t-1",
+                    round,
+                    &format!("2026-01-01T{at}:00Z"),
+                ))
+                .unwrap();
+            age_row(&db, "cron_logs", "created_at", id, age_days);
+        }
+        // cr-2: one fresh row — inside the window, untouched.
+        db.insert_cron_log(&cron_log_row("cr-2", "t-1", 0, "2026-01-02T12:00:00Z"))
+            .unwrap();
+
+        assert_eq!(db.gc_cron_logs_batch(30, 100).unwrap(), 2);
+        assert_eq!(db.max_round_seq("cr-1").unwrap(), Some(2));
+        assert_eq!(db.max_round_seq("cr-2").unwrap(), Some(0));
+        // Nothing further to collect.
+        assert_eq!(db.gc_cron_logs_batch(30, 100).unwrap(), 0);
+    }
+
+    #[test]
+    fn gc_thread_attachments_ages_out_terminal_threads_only() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
+        db.insert_thread(&thread_row("th-old-done", "t-1", None, "succeeded"))
+            .unwrap();
+        db.insert_thread(&thread_row("th-old-live", "t-1", None, "pending"))
+            .unwrap();
+        db.insert_thread(&thread_row("th-fresh-done", "t-1", None, "failed"))
+            .unwrap();
+        age_thread(&db, "th-old-done", 40);
+        age_thread(&db, "th-old-live", 400);
+        age_thread(&db, "th-fresh-done", 1);
+        for id in ["th-old-done", "th-old-live", "th-fresh-done"] {
+            db.set_thread_attachments(id, &json!([{ "id": "a-1" }]))
+                .unwrap();
+        }
+
+        assert_eq!(db.gc_thread_attachments_batch(30, 100).unwrap(), 1);
+
+        // Only the old TERMINAL thread's snapshot is gone; a live thread keeps
+        // its snapshot at any age (a retry must resolve the same set).
+        assert!(db.get_thread_attachments("th-old-done").unwrap().is_none());
+        assert!(db.get_thread_attachments("th-old-live").unwrap().is_some());
+        assert!(
+            db.get_thread_attachments("th-fresh-done")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gc_batches_are_bounded_by_limit() {
+        let db = Db::open_in_memory().unwrap();
+        for _ in 0..5 {
+            let id = db.enqueue_outbox("output", &json!({})).unwrap();
+            db.mark_outbox_acked(id).unwrap();
+            age_row(&db, "outbox", "created_at", id, 40);
+        }
+
+        // Each invocation deletes at most `limit` rows; repeated calls drain.
+        assert_eq!(db.gc_outbox_batch(30, 2).unwrap(), 2);
+        assert_eq!(db.gc_outbox_batch(30, 2).unwrap(), 2);
+        assert_eq!(db.gc_outbox_batch(30, 2).unwrap(), 1);
+        assert_eq!(db.gc_outbox_batch(30, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn partial_indexes_exist_and_drive_the_replay_queries() {
+        let db = Db::open_in_memory().unwrap();
+
+        // The partial hot-path indexes are created by the idempotent schema.
+        let indexes: Vec<String> = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                  AND name IN ('idx_outbox_unacked', 'idx_inbox_unprocessed')
+                  ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(indexes, ["idx_inbox_unprocessed", "idx_outbox_unacked"]);
+
+        // …and the planner actually uses them for the replay hot paths (the SQL
+        // mirrors list_unacked_outbox / list_unprocessed_inbox).
+        let plan = |sql: &str| -> String {
+            db.conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ")
+        };
+        let outbox_plan = plan(
+            "SELECT id, type, payload, task_id, thread_id, created_at, acked_at, retry_count
+               FROM outbox WHERE acked_at IS NULL ORDER BY id",
+        );
+        assert!(
+            outbox_plan.contains("idx_outbox_unacked"),
+            "outbox replay must use the partial index, got: {outbox_plan}"
+        );
+        let inbox_plan = plan(
+            "SELECT id, type, payload, task_id, thread_id, received_at, processed_at, retry_count
+               FROM inbox WHERE processed_at IS NULL ORDER BY id",
+        );
+        assert!(
+            inbox_plan.contains("idx_inbox_unprocessed"),
+            "inbox replay must use the partial index, got: {inbox_plan}"
+        );
     }
 
     #[test]

@@ -61,6 +61,13 @@ const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
 /// by a reconnect replay — network flaps must not discard a legitimately queued
 /// message).
 pub(crate) const MAX_INBOX_RETRIES: i64 = 10;
+/// Outbox poison-pill guard (audit P3), mirroring [`MAX_INBOX_RETRIES`]: a row
+/// whose payload no longer parses can never be rebuilt into an envelope, so
+/// after this many replay attempts it is dead-lettered
+/// ([`crate::db::Db::mark_outbox_dead`]) instead of replayed forever. Healthy
+/// rows never reach the guard — only the malformed-payload branch counts, so
+/// ack lag can never kill a deliverable frame.
+pub(crate) const MAX_OUTBOX_RETRIES: i64 = 10;
 /// Host-supplied heartbeat cadence clamp: `heartbeatIntervalMs: 0` would panic
 /// `tokio::time::interval`, and an absurdly large value would silence liveness.
 const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
@@ -265,18 +272,46 @@ impl WsDriver {
 /// counter. DB read/write errors are logged and skipped; only a socket send
 /// failure propagates (the caller reconnects).
 async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), TungsteniteError> {
+    let envelopes = collect_outbox_replay(db);
+    let count = envelopes.len();
+    for envelope in envelopes {
+        sink.send(Message::text(envelope)).await?;
+    }
+    if count > 0 {
+        debug!(count, "replayed unacked outbox rows");
+    }
+    Ok(())
+}
+
+/// Build the envelope for every replayable unacked outbox row, oldest-first,
+/// bumping each row's retry counter. A row whose payload fails to parse is
+/// skipped, and — since that failure is deterministic and will recur on every
+/// replay — dead-lettered once its replay count reaches [`MAX_OUTBOX_RETRIES`]
+/// (the outbound poison policy, audit P3). Split from [`replay_outbox`] so the
+/// per-row policy is unit-testable without a live socket.
+fn collect_outbox_replay(db: &Arc<Mutex<Db>>) -> Vec<String> {
     let rows = match lock_db(db).list_unacked_outbox() {
         Ok(rows) => rows,
         Err(err) => {
             warn!(error = %err, "failed to list outbox for replay");
-            return Ok(());
+            return Vec::new();
         }
     };
-    let count = rows.len();
+    let mut envelopes = Vec::with_capacity(rows.len());
     for row in rows {
         let _ = lock_db(db).increment_outbox_retry(row.id);
+        let attempts = row.retry_count + 1;
         let Ok(data) = serde_json::from_str::<Value>(&row.payload) else {
-            warn!(id = row.id, "skipping outbox row with malformed payload");
+            if attempts >= MAX_OUTBOX_RETRIES {
+                warn!(
+                    id = row.id,
+                    attempts,
+                    "outbox row payload malformed after repeated replays; dead-lettering (poison)"
+                );
+                let _ = lock_db(db).mark_outbox_dead(row.id);
+            } else {
+                warn!(id = row.id, "skipping outbox row with malformed payload");
+            }
             continue;
         };
         // Rebuild the v2 envelope from the correlation columns + `data`. The
@@ -289,12 +324,9 @@ async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), Tun
             row.thread_id.as_deref(),
             row.id,
         );
-        sink.send(Message::text(envelope.to_string())).await?;
+        envelopes.push(envelope.to_string());
     }
-    if count > 0 {
-        debug!(count, "replayed unacked outbox rows");
-    }
-    Ok(())
+    envelopes
 }
 
 /// Re-deliver every unprocessed inbox row to the consumer (dedup: rows are not
@@ -591,8 +623,8 @@ mod tests {
 
     use super::{
         HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, InboundDisposition,
-        MAX_HEARTBEAT, MIN_HEARTBEAT, classify_inbound, correlation_of, heartbeat_period,
-        inbox_type, msg_id_of,
+        MAX_HEARTBEAT, MAX_OUTBOX_RETRIES, MIN_HEARTBEAT, classify_inbound, collect_outbox_replay,
+        correlation_of, heartbeat_period, inbox_type, msg_id_of,
     };
     use crate::db::Db;
     use crate::protocol::v2::{InboundFrameV2, MessageInData};
@@ -607,6 +639,42 @@ mod tests {
             },
             msg_id: Some(3),
         }
+    }
+
+    /// Outbox poison policy (audit P3): a row whose payload cannot be parsed is
+    /// skipped on each replay and dead-lettered at [`MAX_OUTBOX_RETRIES`]
+    /// attempts, while healthy rows keep replaying before and after.
+    #[test]
+    fn malformed_outbox_row_dead_letters_after_repeated_replays() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let healthy = {
+            let guard = db.lock().unwrap();
+            let id = guard.enqueue_outbox("heartbeat", &json!({})).unwrap();
+            // A malformed payload can only enter via raw SQL — the enqueue API
+            // always serializes valid JSON.
+            guard
+                .exec_raw("INSERT INTO outbox (type, payload) VALUES ('thread_result', 'not-json')")
+                .unwrap();
+            id
+        };
+
+        // Below the limit: the malformed row is skipped (never an envelope) but
+        // stays queued; the healthy row replays every time.
+        for _ in 0..MAX_OUTBOX_RETRIES - 1 {
+            let envelopes = collect_outbox_replay(&db);
+            assert_eq!(envelopes.len(), 1);
+            assert!(envelopes[0].contains("heartbeat"));
+            assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 2);
+        }
+
+        // The attempt that reaches the limit dead-letters the poison row…
+        assert_eq!(collect_outbox_replay(&db).len(), 1);
+        let unacked = db.lock().unwrap().list_unacked_outbox().unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].id, healthy);
+
+        // …and the healthy row continues to replay afterwards.
+        assert_eq!(collect_outbox_replay(&db).len(), 1);
     }
 
     #[test]
