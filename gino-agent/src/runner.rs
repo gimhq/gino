@@ -43,12 +43,12 @@ use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::Engine;
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
 use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
-use crate::protocol::v2::{InboundFrameV2, ProvisioningEntry, TaskUpsertData};
+use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
 use crate::register::{self, ResolvedIdentity};
 use crate::scheduler::{Cancel, Scheduler, apply_cron_delete, apply_cron_upsert, now, to_iso};
 use crate::transport::http::HttpClient;
-use crate::transport::{Inbound, Transport, TransportConfig};
+use crate::transport::{Inbound, MAX_INBOX_RETRIES, Transport, TransportConfig};
 
 /// Engine a chat/api thread defaults to (the only engine today; sourced from the
 /// task/config when more engines land).
@@ -183,6 +183,7 @@ async fn run_async(
         Arc::clone(&drain),
         Arc::clone(&flush),
         Arc::clone(&cancel),
+        config.executor.max_attempts,
     ));
     info!("scheduler + executor running; serving inbound/outbound frames");
 
@@ -226,6 +227,7 @@ async fn run_worker(
     drain: Arc<Notify>,
     flush: Arc<Notify>,
     cancel: Arc<Cancel>,
+    chat_max_attempts: i64,
 ) {
     loop {
         // Register drain interest before draining so a fire that lands mid-drain
@@ -246,10 +248,68 @@ async fn run_worker(
         // live here and there is nothing to race. Live runs are bounded by the
         // in-run watchdog inside [`ThreadExecutor::drive`].
         executor.reap_stale(&in_flight_threads(&db));
-        executor.drain_pending(prompts.as_ref()).await;
+        drain_with_queued_messages(&executor, &db, prompts.as_ref(), chat_max_attempts).await;
         flush.notify_one();
     }
     debug!("executor worker stopped");
+}
+
+/// Drain every `pending` thread, then keep re-pending threads whose inbox holds a
+/// queued `message` (one that arrived while the thread was in flight and was only
+/// logged "queued") and draining again until no queued message remains — the
+/// post-terminal re-scan that closes P0-4 (the second of two quick messages must
+/// EXECUTE once the first run finishes, not rot in the inbox). Terminates because
+/// every re-pended thread's next run consumes its queued message row.
+async fn drain_with_queued_messages(
+    executor: &ThreadExecutor,
+    db: &Mutex<Db>,
+    prompts: &InboxPromptSource,
+    chat_max_attempts: i64,
+) {
+    executor.drain_pending(prompts).await;
+    while repend_queued_messages(db, chat_max_attempts) > 0 {
+        executor.drain_pending(prompts).await;
+    }
+}
+
+/// Re-pend every resting thread that still has an unprocessed inbox `message`
+/// targeting it (P0-4). An untargeted (absent-`threadId`) row maps to its
+/// deterministically minted thread ([`minted_thread_id`]) — recreating it if a
+/// crash lost the mint. Threads that are in flight (or already `pending`) are
+/// left alone: their message stays queued for the next pass. Cron threads are
+/// never re-pended here — their prompt source is `crons.prompt`, so a re-pend
+/// would re-run the cron without ever consuming the message. Returns how many
+/// threads were made `pending`.
+fn repend_queued_messages(db: &Mutex<Db>, chat_max_attempts: i64) -> usize {
+    let rows = match lock_db(db).list_inbox_by_type("message") {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(error = %err, "failed to scan inbox for queued messages");
+            return 0;
+        }
+    };
+    let mut pended = 0;
+    for row in rows {
+        let Some(task_id) = row.task_id.clone() else {
+            continue;
+        };
+        let tid = row
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| minted_thread_id(&task_id, row.id));
+        let is_cron_thread = matches!(
+            lock_db(db).get_thread(&tid),
+            Ok(Some(thread)) if thread.source == "cron"
+        );
+        if is_cron_thread {
+            debug!(thread = %tid, inbox = row.id, "queued message targets a cron thread; leaving it");
+            continue;
+        }
+        if ensure_chat_thread(db, &task_id, &tid, chat_max_attempts) {
+            pended += 1;
+        }
+    }
+    pended
 }
 
 /// The in-flight threads (`dispatched` + `running`) — the crash-orphan recovery /
@@ -661,7 +721,7 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
                     warn!("transport closed (reconnect exhausted); shutting down");
                     break;
                 };
-                if route(inbound, transport, context).await.is_break() {
+                if route(inbound, context).await.is_break() {
                     info!("close received; shutting down");
                     break;
                 }
@@ -670,24 +730,27 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
     }
 }
 
-/// Route one inbound v2 frame to the executor / scheduler / config, then mark its
-/// inbox row processed. Returns [`ControlFlow::Break`] for a `close`.
+/// Route one inbound v2 frame to the executor / scheduler / config, then settle
+/// its inbox row: a successfully applied frame is marked processed; a FAILED
+/// apply leaves the row unprocessed (it replays on reconnect) and bumps its
+/// processing-failure counter, so the poison policy counts real failures — never
+/// reconnects (P1-12/P2-19). Returns [`ControlFlow::Break`] for a `close`.
 ///
-/// A `message` is the one frame **not** marked processed here: its text is the chat
+/// A `message` is the one frame **not** settled here: its text is the chat
 /// thread's prompt, consumed (and marked) later by the [`InboxPromptSource`].
-async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) -> ControlFlow<()> {
+async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
     let Inbound { inbox_id, frame } = inbound;
     let defer_processing = matches!(frame, InboundFrameV2::Message { .. });
+    let mut applied = true;
     let flow = match frame {
         InboundFrameV2::Message {
             task_id, thread_id, ..
         } => {
-            ensure_chat_thread(
-                &context.db,
-                &task_id,
-                thread_id.as_deref(),
-                context.chat_max_attempts,
-            );
+            // Idempotent thread minting (P0-3): an absent `threadId` derives the
+            // thread id from the inbox row, so a reconnect replay of the same row
+            // finds the already-minted thread instead of racing a fresh one.
+            let tid = thread_id.unwrap_or_else(|| minted_thread_id(&task_id, inbox_id));
+            ensure_chat_thread(&context.db, &task_id, &tid, context.chat_max_attempts);
             context.drain.notify_one();
             ControlFlow::Continue(())
         }
@@ -696,11 +759,11 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskUpsert { task_id, data, .. } => {
-            apply_task_def(&context.db, &task_id, &data);
+            applied = apply_task_def(&context.db, &task_id, &data);
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskDelete { task_id, .. } => {
-            delete_task(&context.db, &task_id);
+            applied = delete_task(&context.db, &task_id);
             ControlFlow::Continue(())
         }
         InboundFrameV2::CronUpsert {
@@ -709,15 +772,11 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             data,
             ..
         } => {
-            apply_trigger(
-                || apply_cron_upsert(&context.db, &task_id, &cron_id, &data),
-                "cron_upsert",
-                &context.nudge,
-            );
+            applied = handle_cron_upsert(&context.db, &task_id, &cron_id, &data, &context.nudge);
             ControlFlow::Continue(())
         }
         InboundFrameV2::CronDelete { cron_id, .. } => {
-            apply_trigger(
+            applied = apply_trigger(
                 || apply_cron_delete(&context.db, &cron_id),
                 "cron_delete",
                 &context.nudge,
@@ -730,7 +789,8 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             debug!(keys = ?config_keys(&data), "config_update received");
             // A `config_update` carrying the full re-pushed global provisioning set
             // is reconciled live (PLAN-007 §6): add / repoint / remove converge the
-            // engine config dir without an engine restart.
+            // engine config dir without an engine restart. Always marked processed:
+            // the host re-pushes config on connect, so a replay is worthless.
             apply_config_update(context, &data).await;
             ControlFlow::Continue(())
         }
@@ -738,34 +798,122 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
         // The transport intercepts `ack`; an unknown frame is forward-compat noise.
         InboundFrameV2::Ack { .. } | InboundFrameV2::Unknown => ControlFlow::Continue(()),
     };
-    if !defer_processing && let Err(err) = transport.mark_inbox_processed(inbox_id) {
-        warn!(error = %err, "failed to mark inbox row processed");
+    if !defer_processing {
+        conclude_inbox_row(&context.db, inbox_id, applied);
     }
     flow
 }
 
-/// Ensure a chat thread exists and is runnable for a `message` (host-v2 §M4
-/// threading). A **present** `threadId` CONTINUES that thread: a resting
-/// (`active`/`succeeded`/`failed`/`cancelled`) thread is re-set `pending` for the new
-/// turn, KEEPING its `engine_session_id` so the engine conversation resumes; an
-/// in-flight thread is left as-is (the message waits in the inbox — concurrent
-/// same-thread messaging is a Lane I follow-up). An **absent** `threadId` STARTS A
-/// FRESH thread: a new unique id is minted with no carried `engine_session_id`, so the
-/// outbound `thread_result`/`thread_message` carry it back (the executor drives by
-/// `thread.id`) for the host to record as `current_thread_id`. There is no implicit
-/// per-task `"<task>@chat"` continue — every absent-`threadId` message is brand-new.
-fn ensure_chat_thread(db: &Mutex<Db>, task_id: &str, thread_id: Option<&str>, max_attempts: i64) {
-    // Absent threadId → a brand-new thread each call: mint a unique id keeping the
-    // `task_id@` prefix so `resolve_inbox_message` still correlates the untargeted inbox
-    // row by `task_id`. Threads drain in creation order, so sequential absent-threadId
-    // messages map FIFO to their freshly-minted threads — correct for the common case
-    // (concurrent same-thread messaging is a Lane I follow-up).
-    let tid = thread_id.map_or_else(
-        || format!("{task_id}@{}", uuid::Uuid::new_v4()),
-        str::to_owned,
-    );
+/// Settle a routed inbox row. Applied → processed. Failed → left unprocessed
+/// (replayed on reconnect) with its processing-failure counter bumped; once the
+/// counter reaches [`MAX_INBOX_RETRIES`] the row is discarded (marked processed)
+/// so a permanently failing frame cannot replay forever.
+fn conclude_inbox_row(db: &Mutex<Db>, inbox_id: i64, applied: bool) {
     let guard = lock_db(db);
-    match guard.get_thread(&tid) {
+    if applied {
+        if let Err(err) = guard.mark_inbox_processed(inbox_id) {
+            warn!(inbox = inbox_id, error = %err, "failed to mark inbox row processed");
+        }
+        return;
+    }
+    match guard.increment_inbox_retry(inbox_id) {
+        Ok(failures) if failures >= MAX_INBOX_RETRIES => {
+            warn!(
+                inbox = inbox_id,
+                failures, "inbox row failed too many times; discarding (poison)"
+            );
+            if let Err(err) = guard.mark_inbox_processed(inbox_id) {
+                warn!(inbox = inbox_id, error = %err, "failed to discard poison inbox row");
+            }
+        }
+        Ok(failures) => {
+            debug!(
+                inbox = inbox_id,
+                failures, "inbox row apply failed; left unprocessed for replay"
+            );
+        }
+        Err(err) => {
+            warn!(inbox = inbox_id, error = %err, "failed to record inbox processing failure");
+        }
+    }
+}
+
+/// Apply a host `cron_upsert`, seeding a minimal task row first when the cron
+/// arrives before its `task_upsert` (P2-19: the ordering must not drop the cron —
+/// the later `task_upsert` patches the seeded row in place).
+fn handle_cron_upsert(
+    db: &Mutex<Db>,
+    task_id: &str,
+    cron_id: &str,
+    data: &CronUpsertData,
+    nudge: &Notify,
+) -> bool {
+    if !seed_task_if_missing(&lock_db(db), task_id) {
+        return false;
+    }
+    apply_trigger(
+        || apply_cron_upsert(db, task_id, cron_id, data),
+        "cron_upsert",
+        nudge,
+    )
+}
+
+/// The deterministic thread id for an absent-`threadId` `message` (P0-3): derived
+/// from the inbox row that carries the message, so every delivery of that row —
+/// original or reconnect replay — resolves to the SAME thread instead of minting a
+/// fresh UUID each time (N reconnects must not race N+1 threads for one inbox
+/// row). The `task_id@` prefix is kept so the id shape matches host-minted ones.
+fn minted_thread_id(task_id: &str, inbox_id: i64) -> String {
+    format!("{task_id}@in-{inbox_id}")
+}
+
+/// Seed a minimal `tasks` row when `task_id` is unknown (satisfies the
+/// `→ tasks(id)` FK for frames that may arrive before their `task_upsert`; the
+/// later `task_upsert` patches the seeded row in place). Returns `false` only on
+/// a DB error.
+fn seed_task_if_missing(db: &Db, task_id: &str) -> bool {
+    match db.get_task_row(task_id) {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            let now_iso = to_iso(now());
+            let task = TaskRow {
+                id: task_id.to_owned(),
+                name: None,
+                kind: None,
+                status: "active".to_owned(),
+                created_at: now_iso.clone(),
+                updated_at: now_iso,
+            };
+            match db.insert_task_row(&task) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(task = %task_id, error = %err, "failed to seed task row");
+                    false
+                }
+            }
+        }
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task lookup failed");
+            false
+        }
+    }
+}
+
+/// Ensure the chat thread `tid` exists and is runnable for a `message` (host-v2
+/// §M4 threading). A host-supplied `threadId` CONTINUES that thread; an absent
+/// one arrives here as the [`minted_thread_id`] derived from the message's inbox
+/// row, so the call is idempotent across replays (P0-3). A resting
+/// (`active`/`succeeded`/`failed`/`cancelled`) thread is re-set `pending` for the
+/// new turn, KEEPING its `engine_session_id` so the engine conversation resumes;
+/// an in-flight (or already `pending`) thread is left as-is — the message waits in
+/// the inbox and [`repend_queued_messages`] re-pends the thread once it settles
+/// (P0-4). An unknown `tid` creates a fresh thread with no carried
+/// `engine_session_id`, so the outbound `thread_result`/`thread_message` carry it
+/// back for the host to record as `current_thread_id`. Returns `true` when this
+/// call made the thread `pending` (re-pended or created).
+fn ensure_chat_thread(db: &Mutex<Db>, task_id: &str, tid: &str, max_attempts: i64) -> bool {
+    let guard = lock_db(db);
+    match guard.get_thread(tid) {
         Ok(Some(existing)) => {
             if matches!(
                 existing.status.as_str(),
@@ -784,32 +932,23 @@ fn ensure_chat_thread(db: &Mutex<Db>, task_id: &str, thread_id: Option<&str>, ma
                 // the executor re-resolves this turn's `message.text` at attempt 0
                 // (D10). Retries within the turn then reuse the fresh snapshot.
                 turn.prompt = String::new();
-                if let Err(err) = guard.update_thread(&turn) {
-                    warn!(thread = %tid, error = %err, "failed to re-pend chat thread");
+                match guard.update_thread(&turn) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(thread = %tid, error = %err, "failed to re-pend chat thread");
+                        false
+                    }
                 }
             } else {
                 debug!(thread = %tid, status = %existing.status, "chat message for an in-flight thread; queued");
+                false
             }
         }
         Ok(None) => {
-            // Satisfy the `threads.task_id → tasks(id)` FK: a chat message may arrive
-            // before its `task_upsert`, so seed a minimal task row if absent.
-            if guard.get_task_row(task_id).ok().flatten().is_none() {
-                let now_iso = to_iso(now());
-                let task = TaskRow {
-                    id: task_id.to_owned(),
-                    name: None,
-                    kind: None,
-                    status: "active".to_owned(),
-                    created_at: now_iso.clone(),
-                    updated_at: now_iso,
-                };
-                if let Err(err) = guard.insert_task_row(&task) {
-                    warn!(task = %task_id, error = %err, "failed to seed task for chat thread");
-                }
-            }
+            // A chat message may arrive before its `task_upsert`.
+            seed_task_if_missing(&guard, task_id);
             let row = ThreadRow {
-                id: tid.clone(),
+                id: tid.to_owned(),
                 task_id: task_id.to_owned(),
                 cron_id: None,
                 source: "chat".to_owned(),
@@ -831,17 +970,25 @@ fn ensure_chat_thread(db: &Mutex<Db>, task_id: &str, thread_id: Option<&str>, ma
                 synced: false,
                 created_at: to_iso(now()),
             };
-            if let Err(err) = guard.insert_thread(&row) {
-                warn!(thread = %tid, error = %err, "failed to create chat thread");
+            match guard.insert_thread(&row) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(thread = %tid, error = %err, "failed to create chat thread");
+                    false
+                }
             }
         }
-        Err(err) => warn!(thread = %tid, error = %err, "chat thread lookup failed"),
+        Err(err) => {
+            warn!(thread = %tid, error = %err, "chat thread lookup failed");
+            false
+        }
     }
 }
 
 /// Apply a host `task_upsert` to the v2 `tasks` entity: insert when new, patch the
-/// supplied fields in place when known.
-fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
+/// supplied fields in place when known. Returns `false` on a DB failure so the
+/// router leaves the inbox row unprocessed for replay.
+fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool {
     let guard = lock_db(db);
     let now_iso = to_iso(now());
     match guard.get_task_row(task_id) {
@@ -858,8 +1005,9 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
             row.updated_at = now_iso;
             if let Err(err) = guard.update_task_row(&row) {
                 warn!(task = %task_id, error = %err, "failed to update task");
+                return false;
             }
-            persist_task_entries(&guard, task_id, data);
+            persist_task_entries(&guard, task_id, data)
         }
         Ok(None) => {
             let row = TaskRow {
@@ -872,10 +1020,14 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
             };
             if let Err(err) = guard.insert_task_row(&row) {
                 warn!(task = %task_id, error = %err, "failed to insert task");
+                return false;
             }
-            persist_task_entries(&guard, task_id, data);
+            persist_task_entries(&guard, task_id, data)
         }
-        Err(err) => warn!(task = %task_id, error = %err, "task lookup failed"),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task lookup failed");
+            false
+        }
     }
 }
 
@@ -883,50 +1035,77 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
 /// §5). Present → serialized to the `entries` JSON column for the per-thread
 /// materialize ([`ThreadExecutor::with_provisioning`]); absent (`None`) → left
 /// untouched, so a `task_upsert` that omits `entries` never wipes a prior set.
-fn persist_task_entries(db: &Db, task_id: &str, data: &TaskUpsertData) {
+/// Returns `false` on a serialize/DB failure.
+fn persist_task_entries(db: &Db, task_id: &str, data: &TaskUpsertData) -> bool {
     let Some(entries) = &data.entries else {
-        return;
+        return true;
     };
     match serde_json::to_string(entries) {
-        Ok(json) => {
-            if let Err(err) = db.set_task_entries(task_id, Some(&json)) {
+        Ok(json) => match db.set_task_entries(task_id, Some(&json)) {
+            Ok(()) => true,
+            Err(err) => {
                 warn!(task = %task_id, error = %err, "failed to persist task entries");
+                false
             }
+        },
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "failed to serialize task entries");
+            false
         }
-        Err(err) => warn!(task = %task_id, error = %err, "failed to serialize task entries"),
     }
 }
 
 /// Apply a host `task_delete`: there is no hard delete, so the task is marked
-/// `cancelled` (its triggers stop being seeded by their own `cron_delete`).
-fn delete_task(db: &Mutex<Db>, task_id: &str) {
+/// `cancelled` (its triggers stop being seeded by their own `cron_delete`). An
+/// unknown task is a no-op success (nothing to replay); only a DB failure
+/// returns `false`.
+fn delete_task(db: &Mutex<Db>, task_id: &str) -> bool {
     let guard = lock_db(db);
     match guard.get_task_row(task_id) {
         Ok(Some(mut row)) => {
             "cancelled".clone_into(&mut row.status);
             row.updated_at = to_iso(now());
-            if let Err(err) = guard.update_task_row(&row) {
-                warn!(task = %task_id, error = %err, "failed to cancel task");
+            match guard.update_task_row(&row) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(task = %task_id, error = %err, "failed to cancel task");
+                    false
+                }
             }
         }
-        Ok(None) => debug!(task = %task_id, "task_delete for an unknown task; ignoring"),
-        Err(err) => warn!(task = %task_id, error = %err, "task lookup failed"),
+        Ok(None) => {
+            debug!(task = %task_id, "task_delete for an unknown task; ignoring");
+            true
+        }
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task lookup failed");
+            false
+        }
     }
 }
 
 /// Apply a trigger-definition mutation and nudge the scheduler when it changed.
+/// Returns `false` only when the apply FAILED (an unchanged trigger is a
+/// success), so the router can leave the inbox row unprocessed for replay.
 fn apply_trigger(
     op: impl FnOnce() -> Result<bool, crate::db::DbError>,
     label: &str,
     nudge: &Notify,
-) {
+) -> bool {
     match op() {
         Ok(true) => {
             debug!(op = label, "trigger updated; nudging scheduler");
             nudge.notify_one();
+            true
         }
-        Ok(false) => debug!(op = label, "trigger unchanged"),
-        Err(err) => warn!(op = label, error = %err, "failed to apply trigger"),
+        Ok(false) => {
+            debug!(op = label, "trigger unchanged");
+            true
+        }
+        Err(err) => {
+            warn!(op = label, error = %err, "failed to apply trigger");
+            false
+        }
     }
 }
 
@@ -1017,7 +1196,10 @@ mod tests {
         TaskUpsertData,
     };
 
-    use super::{InboxPromptSource, apply_task_def, ensure_chat_thread, lock_db};
+    use super::{
+        InboxPromptSource, apply_task_def, conclude_inbox_row, ensure_chat_thread,
+        handle_cron_upsert, lock_db, minted_thread_id, repend_queued_messages,
+    };
 
     fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
         ThreadRow {
@@ -1076,7 +1258,7 @@ mod tests {
             msg_id: Some(7),
         };
         lock_db(&db)
-            .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"))
+            .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(7))
             .unwrap();
 
         let inbound = InboundAttachments::default();
@@ -1119,7 +1301,7 @@ mod tests {
             msg_id: None,
         };
         lock_db(&db)
-            .record_inbound_correlated("message", &frame, Some("t-2"), Some("th-2"))
+            .record_inbound_correlated("message", &frame, Some("t-2"), Some("th-2"), None)
             .unwrap();
 
         let inbound = InboundAttachments::default();
@@ -1135,14 +1317,14 @@ mod tests {
     }
 
     /// host-v2 §M4: a `message` with an ABSENT `threadId` starts a brand-new thread
-    /// every call — two such messages for the same task mint TWO DISTINCT thread rows,
-    /// each fresh (no inherited `engine_session_id`). The old `"<task>@chat"` implicit
+    /// per MESSAGE — two distinct inbox rows derive two distinct thread ids, each
+    /// fresh (no inherited `engine_session_id`). The old `"<task>@chat"` implicit
     /// continue is gone.
     #[test]
-    fn absent_thread_id_mints_fresh_thread_each_call() {
+    fn absent_thread_id_mints_fresh_thread_per_inbox_row() {
         let db = Mutex::new(Db::open_in_memory().unwrap());
-        ensure_chat_thread(&db, "t-1", None, 1);
-        ensure_chat_thread(&db, "t-1", None, 1);
+        ensure_chat_thread(&db, "t-1", &minted_thread_id("t-1", 1), 1);
+        ensure_chat_thread(&db, "t-1", &minted_thread_id("t-1", 2), 1);
 
         let threads = lock_db(&db).list_pending_threads().unwrap();
         assert_eq!(
@@ -1156,6 +1338,29 @@ mod tests {
             threads.iter().all(|t| t.engine_session_id.is_none()),
             "fresh threads carry no engine session (nothing inherited to resume)"
         );
+    }
+
+    /// P0-3 regression: replaying an unprocessed absent-`threadId` message (the
+    /// reconnect replay re-delivers the SAME inbox row) derives the SAME thread id
+    /// and must NOT mint a second thread — N reconnects used to race N+1 threads
+    /// for one inbox row.
+    #[test]
+    fn replayed_absent_thread_id_message_does_not_mint_second_thread() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let tid = minted_thread_id("t-1", 5);
+
+        assert!(
+            ensure_chat_thread(&db, "t-1", &tid, 1),
+            "original delivery mints"
+        );
+        assert!(
+            !ensure_chat_thread(&db, "t-1", &tid, 1),
+            "the replay finds the minted thread and is a no-op"
+        );
+
+        let threads = lock_db(&db).list_pending_threads().unwrap();
+        assert_eq!(threads.len(), 1, "replay must not mint a second thread");
+        assert_eq!(threads[0].id, tid);
     }
 
     /// host-v2 §M4: a `message` with a PRESENT `threadId` continues that same thread —
@@ -1183,7 +1388,7 @@ mod tests {
             guard.insert_thread(&existing).unwrap();
         }
 
-        ensure_chat_thread(&db, "t-1", Some("th-x"), 1);
+        ensure_chat_thread(&db, "t-1", "th-x", 1);
 
         let row = lock_db(&db)
             .get_thread("th-x")
@@ -1272,6 +1477,278 @@ mod tests {
             lock_db(&db).get_task_entries("t-1").unwrap().as_deref(),
             Some("[]"),
             "an explicit empty entries set replaces the prior one"
+        );
+    }
+
+    /// P2-19 regression (inbound half): a processing FAILURE leaves the inbox row
+    /// unprocessed (so it replays) and bumps the failure counter; a success marks
+    /// it processed. The poison policy discards the row only after
+    /// [`MAX_INBOX_RETRIES`] processing failures — reconnects never count.
+    #[test]
+    fn processing_failure_leaves_row_unprocessed_and_poisons_after_limit() {
+        use crate::transport::MAX_INBOX_RETRIES;
+
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let id = lock_db(&db)
+            .record_inbound_correlated(
+                "cron_upsert",
+                &serde_json::json!({ "type": "cron_upsert" }),
+                Some("t-1"),
+                Some("cr-1"),
+                Some(11),
+            )
+            .unwrap()
+            .unwrap();
+
+        // One failure: still unprocessed (replayable), counter = 1.
+        conclude_inbox_row(&db, id, false);
+        let rows = lock_db(&db).list_unprocessed_inbox().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a failed apply must NOT mark the row processed"
+        );
+        assert_eq!(
+            rows[0].retry_count, 1,
+            "the counter counts processing failures"
+        );
+
+        // A later success settles it.
+        conclude_inbox_row(&db, id, true);
+        assert!(lock_db(&db).list_unprocessed_inbox().unwrap().is_empty());
+
+        // A row that keeps failing is discarded exactly at the limit.
+        let poison = lock_db(&db)
+            .record_inbound_correlated(
+                "task_delete",
+                &serde_json::json!({ "type": "task_delete" }),
+                Some("t-2"),
+                None,
+                Some(12),
+            )
+            .unwrap()
+            .unwrap();
+        for _ in 0..MAX_INBOX_RETRIES - 1 {
+            conclude_inbox_row(&db, poison, false);
+        }
+        assert_eq!(
+            lock_db(&db).list_unprocessed_inbox().unwrap().len(),
+            1,
+            "below the limit the row stays replayable"
+        );
+        conclude_inbox_row(&db, poison, false);
+        assert!(
+            lock_db(&db).list_unprocessed_inbox().unwrap().is_empty(),
+            "at the limit the poison row is discarded"
+        );
+    }
+
+    /// P2-19 regression: a `cron_upsert` arriving BEFORE its `task_upsert` is not
+    /// dropped — the task row is seeded and the cron applies (the later
+    /// `task_upsert` patches the seeded row in place).
+    #[test]
+    fn cron_upsert_before_task_upsert_is_not_dropped() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let nudge = tokio::sync::Notify::new();
+        let data = crate::protocol::v2::CronUpsertData {
+            kind: "schedule".to_owned(),
+            prompt: "do the rounds".to_owned(),
+            schedule_type: Some("interval".to_owned()),
+            schedule_value: Some("60000".to_owned()),
+            next_run: None,
+            continuity: "isolated".to_owned(),
+            status: Some("active".to_owned()),
+        };
+
+        assert!(
+            handle_cron_upsert(&db, "t-new", "cr-1", &data, &nudge),
+            "a cron for a not-yet-seen task applies (task seeded)"
+        );
+        assert!(
+            lock_db(&db).get_task_row("t-new").unwrap().is_some(),
+            "a minimal task row is seeded to satisfy the FK"
+        );
+        let cron = lock_db(&db)
+            .get_cron("cr-1")
+            .unwrap()
+            .expect("cron persisted");
+        assert_eq!(cron.prompt, "do the rounds");
+
+        // The later task_upsert patches the seeded row rather than failing.
+        assert!(apply_task_def(
+            &db,
+            "t-new",
+            &TaskUpsertData {
+                name: Some("rounds".to_owned()),
+                kind: None,
+                status: None,
+                entries: None,
+            },
+        ));
+        assert_eq!(
+            lock_db(&db)
+                .get_task_row("t-new")
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("rounds")
+        );
+    }
+
+    /// P0-4 regression: two quick messages to the SAME thread — the first runs
+    /// immediately; the second (queued while the thread was in flight) must
+    /// actually EXECUTE once the first run finishes, driven by the post-terminal
+    /// inbox re-scan. Asserts the second EXECUTION (the engine receives the
+    /// second prompt), not just a queued row.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the in-test engine stub is the bulk; splitting it would obscure the scenario"
+    )]
+    #[tokio::test]
+    async fn queued_message_executes_after_the_run_finishes() {
+        use async_trait::async_trait;
+        use futures_util::stream::{self, BoxStream};
+
+        use crate::engine::{
+            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
+            SessionCfg,
+        };
+        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+
+        /// Records every prompt it is started with, succeeding each run.
+        struct RecordingEngine {
+            prompts: Arc<Mutex<Vec<String>>>,
+        }
+        struct OkSession;
+
+        #[async_trait]
+        impl Engine for RecordingEngine {
+            fn name(&self) -> &'static str {
+                "recording"
+            }
+            async fn start_session(
+                &self,
+                cfg: SessionCfg,
+            ) -> Result<Box<dyn Session>, EngineError> {
+                self.prompts
+                    .lock()
+                    .unwrap()
+                    .push(cfg.initial_prompt.unwrap_or_default());
+                Ok(Box::new(OkSession))
+            }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                Ok(RunOutcome {
+                    status: RunStatus::Success,
+                    result: None,
+                    session_id: None,
+                    error: None,
+                })
+            }
+        }
+
+        #[async_trait]
+        impl Session for OkSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn interrupt(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn events(&self) -> BoxStream<'_, EngineEvent> {
+                Box::pin(stream::iter(vec![EngineEvent::Result(RunOutcome {
+                    status: RunStatus::Success,
+                    result: Some("ok".to_owned()),
+                    session_id: Some("sess".to_owned()),
+                    error: None,
+                })]))
+            }
+        }
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+        // Message 1 arrives: inbox row + pending thread th-1.
+        let m1 = InboundFrameV2::Message {
+            task_id: "t-1".to_owned(),
+            thread_id: Some("th-1".to_owned()),
+            data: MessageInData {
+                text: "first".to_owned(),
+                attachments: None,
+            },
+            msg_id: Some(1),
+        };
+        lock_db(&db)
+            .record_inbound_correlated("message", &m1, Some("t-1"), Some("th-1"), Some(1))
+            .unwrap();
+        assert!(ensure_chat_thread(&db, "t-1", "th-1", 1));
+
+        // Message 2 arrives while th-1 is in flight: only queued (the original
+        // P0-4 defect: nothing ever re-checked the inbox after the run).
+        let m2 = InboundFrameV2::Message {
+            task_id: "t-1".to_owned(),
+            thread_id: Some("th-1".to_owned()),
+            data: MessageInData {
+                text: "second".to_owned(),
+                attachments: None,
+            },
+            msg_id: Some(2),
+        };
+        lock_db(&db)
+            .record_inbound_correlated("message", &m2, Some("t-1"), Some("th-1"), Some(2))
+            .unwrap();
+        assert!(
+            !ensure_chat_thread(&db, "t-1", "th-1", 1),
+            "the second quick message is queued, not a second pending turn"
+        );
+
+        let prompts_seen = Arc::new(Mutex::new(Vec::new()));
+        let engine: Arc<dyn Engine> = Arc::new(RecordingEngine {
+            prompts: Arc::clone(&prompts_seen),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ThreadExecutor::new(
+            engine,
+            Arc::clone(&db),
+            dir.path().to_path_buf(),
+            WatchdogCfg {
+                inactivity_timeout: None,
+                ..WatchdogCfg::default()
+            },
+        );
+        let source = InboxPromptSource {
+            db: Arc::clone(&db),
+            inbound: InboundAttachments::default(),
+        };
+
+        // First drain: runs turn 1 only; the second message sits queued.
+        executor.drain_pending(&source).await;
+        assert_eq!(*prompts_seen.lock().unwrap(), vec!["first".to_owned()]);
+        assert_eq!(
+            lock_db(&db).get_thread("th-1").unwrap().unwrap().status,
+            "active",
+            "chat thread rests between turns"
+        );
+
+        // The post-terminal re-scan re-pends the thread for the queued message...
+        assert_eq!(repend_queued_messages(&db, 1), 1);
+        // ...and the next drain EXECUTES it (this is the P0-4 fix).
+        executor.drain_pending(&source).await;
+        assert_eq!(
+            *prompts_seen.lock().unwrap(),
+            vec!["first".to_owned(), "second".to_owned()],
+            "the queued second message must actually execute"
+        );
+        assert!(
+            lock_db(&db)
+                .list_inbox_by_type("message")
+                .unwrap()
+                .is_empty(),
+            "both messages consumed"
+        );
+        assert_eq!(
+            repend_queued_messages(&db, 1),
+            0,
+            "nothing left to re-pend — the loop terminates"
         );
     }
 }

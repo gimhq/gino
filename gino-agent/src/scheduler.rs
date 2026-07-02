@@ -459,7 +459,11 @@ pub(crate) struct CronTally {
 
 /// Build the local scheduling-ledger summary frame payload for a cron. `pub(crate)`
 /// so the `gino-agent cron` CLI can enqueue a `cron_state` for AI-managed crons.
-pub(crate) fn cron_state_data(cron: &CronRow, round_count: i64, tally: &CronTally) -> CronStateData {
+pub(crate) fn cron_state_data(
+    cron: &CronRow,
+    round_count: i64,
+    tally: &CronTally,
+) -> CronStateData {
     CronStateData {
         kind: cron.kind.clone(),
         schedule_type: cron.schedule_type.clone(),

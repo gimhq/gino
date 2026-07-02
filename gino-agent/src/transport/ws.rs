@@ -25,8 +25,13 @@
 //!   recorded to the `inbox` *verbatim* (the full received frame is the payload;
 //!   the `type` column classifies it and the correlation ids index it), a
 //!   `msg_ack` is returned so the host can advance its cursor, and the typed frame
-//!   is forwarded to the consumer. Rows stay unprocessed until the consumer calls
-//!   [`super::Transport::mark_inbox_processed`]; `close` is marked processed
+//!   is forwarded to the consumer. The `msg_id` UNIQUE column closes the
+//!   at-least-once loop (protocol.md §6): a redelivery of an already-stored
+//!   `msg_id` inserts nothing and is only re-acked, so a lost `msg_ack` can never
+//!   run the same frame twice. A known-type frame with a malformed body is
+//!   dead-lettered (acked and dropped) rather than left to head-of-line-block the
+//!   stream. Rows stay unprocessed until the consumer marks them processed
+//!   ([`crate::db::Db::mark_inbox_processed`]); `close` is marked processed
 //!   *before* delivery to avoid a spurious re-shutdown on crash recovery.
 
 use std::sync::{Arc, Mutex};
@@ -51,8 +56,15 @@ use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
 
 /// The auth header carrying the connect token (host WS handler reads this name).
 const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
-/// Inbox replay poison-pill guard (TS parity): drop a row after this many retries.
-const MAX_INBOX_RETRIES: i64 = 10;
+/// Inbox poison-pill guard: discard a row after this many PROCESSING failures
+/// (`retry_count` is bumped by the consumer when applying the frame fails, never
+/// by a reconnect replay — network flaps must not discard a legitimately queued
+/// message).
+pub(crate) const MAX_INBOX_RETRIES: i64 = 10;
+/// Host-supplied heartbeat cadence clamp: `heartbeatIntervalMs: 0` would panic
+/// `tokio::time::interval`, and an absurdly large value would silence liveness.
+const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT: Duration = Duration::from_hours(1);
 /// Pre-serialized liveness ping; equal to the v2 `OutboundFrameV2::Heartbeat`
 /// with no `activeThreads` summary (asserted by a unit test) so the constant
 /// never drifts from the type. The runner-driven periodic heartbeat carries no
@@ -150,7 +162,7 @@ impl WsDriver {
         }
         replay_inbox(&self.db, &self.inbound_tx);
 
-        let mut heartbeat = tokio::time::interval(self.heartbeat);
+        let mut heartbeat = tokio::time::interval(heartbeat_period(self.heartbeat));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await; // consume the immediate first tick
 
@@ -286,7 +298,9 @@ async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), Tun
 }
 
 /// Re-deliver every unprocessed inbox row to the consumer (dedup: rows are not
-/// re-recorded). Mirrors the TS `replayInbound`: drop poison rows, skip
+/// re-recorded). Mirrors the TS `replayInbound`: drop poison rows (rows whose
+/// PROCESSING failed [`MAX_INBOX_RETRIES`] times — a replay itself never bumps
+/// the counter, so reconnect flaps cannot poison a queued message), skip
 /// `system_config` (the host re-pushes config), mark `system_close` processed
 /// before delivery, and defer the rest until the consumer acknowledges them.
 fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>) {
@@ -302,12 +316,11 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
         if row.retry_count >= MAX_INBOX_RETRIES {
             warn!(
                 id = row.id,
-                "inbox row exceeded retry limit; marking processed"
+                "inbox row exceeded the processing-failure limit; marking processed"
             );
             let _ = lock_db(db).mark_inbox_processed(row.id);
             continue;
         }
-        let _ = lock_db(db).increment_inbox_retry(row.id);
 
         let Ok(frame) = serde_json::from_str::<InboundFrameV2>(&row.payload) else {
             warn!(
@@ -349,37 +362,79 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
 // Inbound handling
 // ---------------------------------------------------------------------------
 
+/// The socket-free decision for one received text frame, made by
+/// [`classify_inbound`] and acted on by [`handle_inbound`] (which owns the sink).
+#[derive(Debug)]
+enum InboundDisposition {
+    /// Nothing to send or deliver: an outbox `ack` (already applied), a
+    /// forward-compat unknown frame, or junk with no ackable `msgId`.
+    Done,
+    /// Send a `msg_ack` but deliver nothing: a duplicate redelivery of an
+    /// already-stored `msg_id`, or a dead-lettered malformed known-type frame.
+    AckOnly { msg_id: i64 },
+    /// Freshly persisted: ack durable receipt (when the frame carries a
+    /// `msg_id`) and forward to the consumer. The frame is boxed to keep the
+    /// enum's ack-only variants small.
+    Deliver {
+        frame: Box<InboundFrameV2>,
+        inbox_id: i64,
+        msg_id: Option<i64>,
+    },
+}
+
 /// Route a freshly received text frame: ack our outbox, drop a forward-compat
 /// unknown frame, or persist + msg_ack + forward an inbound frame. The full frame
 /// is stored to the inbox verbatim (the host's wire bytes, parsed once as a
-/// [`Value`] for storage and once as the typed frame for routing). Parse failures
-/// are logged and swallowed (the socket stays up); only a `msg_ack` send failure
-/// propagates.
+/// [`Value`] for storage and once as the typed frame for routing); the `msg_id`
+/// UNIQUE column dedups an at-least-once redelivery, which is re-acked without a
+/// second row. Parse failures are dead-lettered (acked away when a `msgId` is
+/// extractable, so a permanently malformed frame cannot head-of-line-block the
+/// stream) or logged and swallowed; only a `msg_ack` send failure propagates.
 async fn handle_inbound(
     text: &str,
     sink: &mut WsSink,
     db: &Arc<Mutex<Db>>,
     inbound_tx: &mpsc::UnboundedSender<Inbound>,
 ) -> Result<(), TungsteniteError> {
+    match classify_inbound(text, db) {
+        InboundDisposition::Done => Ok(()),
+        InboundDisposition::AckOnly { msg_id } => send_msg_ack(sink, msg_id).await,
+        InboundDisposition::Deliver {
+            frame,
+            inbox_id,
+            msg_id,
+        } => {
+            // Confirm durable receipt so the host can advance its cursor.
+            if let Some(msg_id) = msg_id {
+                send_msg_ack(sink, msg_id).await?;
+            }
+            deliver(*frame, inbox_id, db, inbound_tx);
+            Ok(())
+        }
+    }
+}
+
+/// Parse, dedup, and persist one received text frame (everything except the
+/// socket IO, so the at-least-once decisions are unit-testable).
+fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
     let frame = match serde_json::from_str::<InboundFrameV2>(text) {
         Ok(frame) => frame,
-        Err(err) => {
-            warn!(error = %err, "ignoring unparsable inbound frame");
-            return Ok(());
-        }
+        // An unknown `type` parses into `Unknown`, so a typed-parse failure is a
+        // KNOWN type with a malformed body (or unusable JSON): dead-letter it.
+        Err(err) => return dead_letter(text, &err),
     };
 
     // The host's `ack {id}` confirms one of our outbox rows.
     if let InboundFrameV2::Ack { id } = frame {
         let _ = lock_db(db).mark_outbox_acked(id);
-        return Ok(());
+        return InboundDisposition::Done;
     }
 
     // A frame `type` this runner does not model (additive-within-major): ignore it
     // rather than persist/ack/deliver a frame we cannot act on.
     if matches!(frame, InboundFrameV2::Unknown) {
         debug!("ignoring unknown inbound v2 frame");
-        return Ok(());
+        return InboundDisposition::Done;
     }
 
     // Persist the FULL received frame (verbatim) for at-least-once before doing
@@ -390,30 +445,64 @@ async fn handle_inbound(
             // Unreachable in practice — the typed parse above already succeeded —
             // but never persist a payload we cannot re-deliver verbatim.
             warn!(error = %err, "inbound frame is not storable json; dropping");
-            return Ok(());
+            return InboundDisposition::Done;
         }
     };
     let inbox_type = inbox_type(&frame);
     let (task_id, secondary_id) = correlation_of(&frame);
-    let inbox_id =
-        match lock_db(db).record_inbound_correlated(inbox_type, &raw, task_id, secondary_id) {
-            Ok(id) => id,
-            Err(err) => {
-                warn!(error = %err, "failed to persist inbound frame; dropping");
-                return Ok(());
+    let msg_id = msg_id_of(&frame);
+    match lock_db(db).record_inbound_correlated(inbox_type, &raw, task_id, secondary_id, msg_id) {
+        Ok(Some(inbox_id)) => InboundDisposition::Deliver {
+            frame: Box::new(frame),
+            inbox_id,
+            msg_id,
+        },
+        // `msg_id` already stored: a redelivery after a lost `msg_ack`. Re-ack so
+        // the host advances; the original row already drives (or drove) delivery.
+        Ok(None) => match msg_id {
+            Some(msg_id) => {
+                debug!(msg_id, "duplicate inbound delivery; re-acking");
+                InboundDisposition::AckOnly { msg_id }
             }
-        };
-
-    // Confirm durable receipt so the host can advance its cursor.
-    if let Some(msg_id) = msg_id_of(&frame) {
-        let ack = serde_json::to_string(&OutboundFrameV2::MsgAck { msg_id });
-        if let Ok(ack) = ack {
-            sink.send(Message::text(ack)).await?;
+            // Unreachable: only a `msg_id` collision can conflict.
+            None => InboundDisposition::Done,
+        },
+        Err(err) => {
+            warn!(error = %err, "failed to persist inbound frame; dropping");
+            InboundDisposition::Done
         }
     }
+}
 
-    deliver(frame, inbox_id, db, inbound_tx);
+/// Dead-letter a frame that failed the typed parse: extract the top-level
+/// `msgId` so the row can be acked away (the host must not resend it forever);
+/// with no extractable `msgId` there is nothing to ack — drop it.
+fn dead_letter(text: &str, err: &serde_json::Error) -> InboundDisposition {
+    let msg_id = serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|raw| raw.get("msgId")?.as_i64());
+    if let Some(msg_id) = msg_id {
+        warn!(error = %err, msg_id, "dead-lettering malformed inbound frame (acked, dropped)");
+        InboundDisposition::AckOnly { msg_id }
+    } else {
+        warn!(error = %err, "ignoring unparsable inbound frame");
+        InboundDisposition::Done
+    }
+}
+
+/// Send a `msg_ack {msgId}` over the live sink.
+async fn send_msg_ack(sink: &mut WsSink, msg_id: i64) -> Result<(), TungsteniteError> {
+    if let Ok(ack) = serde_json::to_string(&OutboundFrameV2::MsgAck { msg_id }) {
+        sink.send(Message::text(ack)).await?;
+    }
     Ok(())
+}
+
+/// The effective heartbeat cadence: the host-supplied interval clamped into
+/// [`MIN_HEARTBEAT`, `MAX_HEARTBEAT`] so `heartbeatIntervalMs: 0` (which would
+/// panic `tokio::time::interval`) or an absurd value cannot break the transport.
+fn heartbeat_period(requested: Duration) -> Duration {
+    requested.clamp(MIN_HEARTBEAT, MAX_HEARTBEAT)
 }
 
 /// Forward a frame to the consumer. `close` is marked processed *before* delivery
@@ -495,12 +584,17 @@ fn msg_id_of(frame: &InboundFrameV2) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::{
-        HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, correlation_of, inbox_type,
-        msg_id_of,
+        HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, InboundDisposition,
+        MAX_HEARTBEAT, MIN_HEARTBEAT, classify_inbound, correlation_of, heartbeat_period,
+        inbox_type, msg_id_of,
     };
+    use crate::db::Db;
     use crate::protocol::v2::{InboundFrameV2, MessageInData};
 
     fn message(thread_id: Option<&str>) -> InboundFrameV2 {
@@ -609,5 +703,126 @@ mod tests {
     fn heartbeat_frame_carries_empty_data_object() {
         // The constant is the v2 liveness ping with no `activeThreads` summary.
         assert_eq!(HEARTBEAT_FRAME, r#"{"type":"heartbeat","data":{}}"#);
+    }
+
+    /// P1-12 regression: a host-supplied `heartbeatIntervalMs: 0` (or an absurd
+    /// value) is clamped, never handed to `tokio::time::interval` (which panics
+    /// on zero).
+    #[test]
+    fn heartbeat_period_clamps_zero_and_absurd_values() {
+        assert_eq!(heartbeat_period(Duration::ZERO), MIN_HEARTBEAT);
+        assert_eq!(
+            heartbeat_period(Duration::from_hours(24 * 365)),
+            MAX_HEARTBEAT
+        );
+        // A sane value passes through unchanged.
+        assert_eq!(
+            heartbeat_period(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    fn test_db() -> Arc<Mutex<Db>> {
+        Arc::new(Mutex::new(Db::open_in_memory().unwrap()))
+    }
+
+    const MESSAGE_FRAME: &str =
+        r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hi"},"msgId":7}"#;
+
+    /// P0-3 regression: delivering the same `msgId` twice stores exactly ONE
+    /// inbox row and delivers ONE frame; the duplicate is only re-acked (so a
+    /// lost `msg_ack` cannot run the same prompt twice).
+    #[test]
+    fn duplicate_msg_id_is_reacked_not_restored() {
+        let db = test_db();
+
+        let first = classify_inbound(MESSAGE_FRAME, &db);
+        assert!(
+            matches!(
+                first,
+                InboundDisposition::Deliver {
+                    msg_id: Some(7),
+                    ..
+                }
+            ),
+            "first delivery persists and delivers: {first:?}"
+        );
+
+        let dup = classify_inbound(MESSAGE_FRAME, &db);
+        assert!(
+            matches!(dup, InboundDisposition::AckOnly { msg_id: 7 }),
+            "redelivery is re-acked without delivery: {dup:?}"
+        );
+        assert_eq!(
+            db.lock().unwrap().list_unprocessed_inbox().unwrap().len(),
+            1,
+            "exactly one inbox row for the deduped delivery"
+        );
+    }
+
+    /// P1-12 regression: a KNOWN-type frame with a malformed body is acked away
+    /// (dead-lettered) rather than left unpersisted+unacked, where the host
+    /// would resend it forever and head-of-line-block the stream.
+    #[test]
+    fn malformed_known_type_frame_is_dead_lettered_with_ack() {
+        let db = test_db();
+        // `data.text` must be a string; a number fails the typed parse.
+        let malformed = r#"{"type":"message","taskId":"t-1","data":{"text":12345},"msgId":9}"#;
+        let disposition = classify_inbound(malformed, &db);
+        assert!(
+            matches!(disposition, InboundDisposition::AckOnly { msg_id: 9 }),
+            "malformed known-type frame is acked per the dead-letter policy: {disposition:?}"
+        );
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty(),
+            "a dead-lettered frame is not queued for processing"
+        );
+
+        // A well-formed frame right after flows normally — the stream is not blocked.
+        assert!(matches!(
+            classify_inbound(MESSAGE_FRAME, &db),
+            InboundDisposition::Deliver { .. }
+        ));
+    }
+
+    /// Junk with no extractable `msgId` (or non-JSON) has nothing to ack: dropped.
+    #[test]
+    fn unusable_junk_is_dropped_without_ack() {
+        let db = test_db();
+        assert!(matches!(
+            classify_inbound("not json at all", &db),
+            InboundDisposition::Done
+        ));
+        assert!(matches!(
+            classify_inbound(r#"{"type":"message","data":{"text":1}}"#, &db),
+            InboundDisposition::Done
+        ));
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A forward-compat unknown `type` is ignored (not persisted, not acked).
+    #[test]
+    fn unknown_type_is_ignored() {
+        let db = test_db();
+        let disposition =
+            classify_inbound(r#"{"type":"brand_new_frame","data":{},"msgId":3}"#, &db);
+        assert!(matches!(disposition, InboundDisposition::Done));
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

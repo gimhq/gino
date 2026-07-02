@@ -88,9 +88,10 @@ CREATE TABLE IF NOT EXISTS inbox (
   payload      TEXT    NOT NULL,
   task_id      TEXT,
   thread_id    TEXT,
+  msg_id       INTEGER UNIQUE,                    -- host delivery id (protocol.md §6 dedupe-by-id); NULL when the frame carries none (multiple NULLs allowed)
   received_at  TEXT    NOT NULL DEFAULT (datetime('now')),
   processed_at TEXT,
-  retry_count  INTEGER NOT NULL DEFAULT 0
+  retry_count  INTEGER NOT NULL DEFAULT 0         -- PROCESSING failures (not replays); the poison policy discards a row after MAX failures
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_task   ON inbox(task_id);
 CREATE INDEX IF NOT EXISTS idx_inbox_thread ON inbox(thread_id);
@@ -509,32 +510,43 @@ impl Db {
     // -- Inbox (at-least-once replay, host → runner) -----------------------
 
     /// Persist an inbound message to the inbox for at-least-once processing,
-    /// tagging it with the v2 correlation ids (either may be `None`). Returns
-    /// the new row id.
+    /// tagging it with the v2 correlation ids (either may be `None`) and the
+    /// host's delivery `msg_id`. The `msg_id` UNIQUE column is the at-least-once
+    /// dedup (protocol.md §6): a redelivery of an already-stored `msg_id` is a
+    /// no-op and returns `None` (the caller re-acks); a fresh insert returns the
+    /// new row id. A `None` msg_id (frame without one) always inserts.
     pub(crate) fn record_inbound_correlated<T: Serialize>(
         &self,
         msg_type: &str,
         payload: &T,
         task_id: Option<&str>,
         thread_id: Option<&str>,
-    ) -> DbResult<i64> {
+        msg_id: Option<i64>,
+    ) -> DbResult<Option<i64>> {
         let json = serde_json::to_string(payload)?;
-        self.conn
+        let inserted = self
+            .conn
             .prepare_cached(
-                "INSERT INTO inbox (type, payload, task_id, thread_id) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO inbox (type, payload, task_id, thread_id, msg_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(msg_id) DO NOTHING",
             )?
-            .execute(params![msg_type, json, task_id, thread_id])?;
-        Ok(self.conn.last_insert_rowid())
+            .execute(params![msg_type, json, task_id, thread_id, msg_id])?;
+        Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
     }
 
-    /// Persist an inbound message to the inbox (no correlation ids). Returns the
-    /// new row id.
+    /// Persist an inbound message to the inbox (no correlation ids, no delivery
+    /// id — never deduped). Returns the new row id.
+    #[cfg(test)]
     pub(crate) fn record_inbound<T: Serialize>(
         &self,
         msg_type: &str,
         payload: &T,
     ) -> DbResult<i64> {
-        self.record_inbound_correlated(msg_type, payload, None, None)
+        let id = self
+            .record_inbound_correlated(msg_type, payload, None, None, None)?
+            .expect("insert without msg_id never conflicts");
+        Ok(id)
     }
 
     /// All inbox rows not yet processed, oldest first.
@@ -582,12 +594,18 @@ impl Db {
         Ok(())
     }
 
-    /// Bump an inbox row's retry counter before a replay attempt.
-    pub(crate) fn increment_inbox_retry(&self, id: i64) -> DbResult<()> {
-        self.conn
-            .prepare_cached("UPDATE inbox SET retry_count = retry_count + 1 WHERE id = ?1")?
-            .execute(params![id])?;
-        Ok(())
+    /// Bump an inbox row's processing-failure counter after a failed apply,
+    /// returning the new count (drives the poison policy: the row is discarded
+    /// once the count reaches the limit).
+    pub(crate) fn increment_inbox_retry(&self, id: i64) -> DbResult<i64> {
+        let count = self
+            .conn
+            .prepare_cached(
+                "UPDATE inbox SET retry_count = retry_count + 1 WHERE id = ?1
+                 RETURNING retry_count",
+            )?
+            .query_row(params![id], |r| r.get(0))?;
+        Ok(count)
     }
 
     // -- Tasks (v2 top category) -------------------------------------------
@@ -1904,7 +1922,9 @@ mod tests {
                 &json!({ "text": "hi" }),
                 Some("t-1"),
                 Some("cr-1@1718"),
+                Some(7),
             )
+            .unwrap()
             .unwrap();
         db.record_inbound("close", &json!({})).unwrap();
 
@@ -1913,6 +1933,45 @@ mod tests {
         assert_eq!(in_correlated.task_id.as_deref(), Some("t-1"));
         assert_eq!(in_correlated.thread_id.as_deref(), Some("cr-1@1718"));
         assert_eq!(db.list_inbox_by_type("message").unwrap().len(), 1);
+    }
+
+    /// P0-3 regression: the `msg_id` UNIQUE column dedups an at-least-once
+    /// redelivery — the second insert of the same delivery id is a no-op
+    /// (`None`), leaving exactly ONE row; frames without a `msg_id` are never
+    /// deduped (multiple NULLs allowed).
+    #[test]
+    fn inbox_msg_id_dedups_redelivery() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .record_inbound_correlated(
+                "message",
+                &json!({ "text": "hi" }),
+                Some("t-1"),
+                None,
+                Some(42),
+            )
+            .unwrap();
+        assert!(first.is_some(), "first delivery inserts");
+        let dup = db
+            .record_inbound_correlated(
+                "message",
+                &json!({ "text": "hi" }),
+                Some("t-1"),
+                None,
+                Some(42),
+            )
+            .unwrap();
+        assert_eq!(dup, None, "redelivery of the same msg_id is a no-op");
+        assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 1);
+
+        // No msg_id → no dedup key → both rows insert.
+        db.record_inbound_correlated("interrupt", &json!({}), None, None, None)
+            .unwrap()
+            .unwrap();
+        db.record_inbound_correlated("interrupt", &json!({}), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 3);
     }
 
     // -- Existing outbox/inbox behavior (regression) -----------------------
@@ -1958,7 +2017,8 @@ mod tests {
         assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 2);
         assert_eq!(db.list_inbox_by_type("user_message").unwrap().len(), 1);
 
-        db.increment_inbox_retry(id).unwrap();
+        assert_eq!(db.increment_inbox_retry(id).unwrap(), 1);
+        assert_eq!(db.increment_inbox_retry(id).unwrap(), 2);
         db.mark_inbox_processed(id).unwrap();
 
         let remaining = db.list_unprocessed_inbox().unwrap();

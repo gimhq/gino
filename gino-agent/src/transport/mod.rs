@@ -52,6 +52,7 @@ use tracing::warn;
 use crate::db::{Db, DbError};
 use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
 
+pub(crate) use self::ws::MAX_INBOX_RETRIES;
 use self::ws::{WsDriver, WsError};
 
 /// Default liveness ping cadence. The TS runner sent no heartbeat; the Rust
@@ -112,8 +113,11 @@ impl Default for TransportConfig {
 }
 
 /// An inbound frame handed to the consumer, paired with the inbox row id that
-/// holds it. The consumer calls [`Transport::mark_inbox_processed`] once it has
-/// durably handled the frame — until then the row replays on reconnect.
+/// holds it. The consumer marks the row processed
+/// ([`crate::db::Db::mark_inbox_processed`]) once it has durably handled the
+/// frame — until then the row replays on reconnect. A failed apply instead bumps
+/// the row's failure counter ([`crate::db::Db::increment_inbox_retry`]); the
+/// replay poison policy discards the row after [`MAX_INBOX_RETRIES`] failures.
 #[derive(Debug)]
 pub(crate) struct Inbound {
     pub(crate) inbox_id: i64,
@@ -248,12 +252,6 @@ impl Transport {
     /// wind down.
     pub(crate) async fn recv(&mut self) -> Option<Inbound> {
         self.inbound_rx.recv().await
-    }
-
-    /// Mark an inbox row durably handled so it is not replayed on reconnect.
-    pub(crate) fn mark_inbox_processed(&self, inbox_id: i64) -> Result<(), TransportError> {
-        lock_db(&self.db).mark_inbox_processed(inbox_id)?;
-        Ok(())
     }
 
     /// Signal shutdown and wait for the manager task to drain and exit.
@@ -858,6 +856,103 @@ mod tests {
         assert_eq!(second["threadId"], json!("c-1"));
 
         wait_until(|| db.lock().unwrap().list_unacked_outbox().unwrap().is_empty()).await;
+        transport.shutdown().await;
+    }
+
+    /// P0-3 regression, end to end: the host redelivers the same `msgId` (as it
+    /// does after a lost `msg_ack`) — both deliveries are msg_acked, but exactly
+    /// ONE inbox row exists and exactly ONE frame reaches the consumer.
+    #[tokio::test]
+    async fn duplicate_delivery_is_reacked_and_delivered_once() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let frame = r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hello"},"msgId":7}"#;
+            ws.send(Message::text(frame.to_owned())).await.unwrap();
+            let first_ack = next_text(&mut ws).await;
+            // Simulate a lost msg_ack on the host side: resend the SAME frame.
+            ws.send(Message::text(frame.to_owned())).await.unwrap();
+            let second_ack = next_text(&mut ws).await;
+            (first_ack, second_ack)
+        });
+
+        let mut transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-4"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            test_config(),
+        )
+        .await
+        .unwrap();
+
+        let (first_ack, second_ack) = server.await.unwrap();
+        let expected = json!({ "type": "msg_ack", "msgId": 7 });
+        assert_eq!(serde_json::from_str::<Value>(&first_ack).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(&second_ack).unwrap(),
+            expected,
+            "the duplicate delivery is re-acked"
+        );
+
+        // Exactly one frame reaches the consumer...
+        let inbound = transport.recv().await.unwrap();
+        assert!(matches!(
+            inbound.frame,
+            crate::protocol::v2::InboundFrameV2::Message { .. }
+        ));
+        // ...and exactly one inbox row exists (dedup on msg_id).
+        assert_eq!(
+            db.lock().unwrap().list_unprocessed_inbox().unwrap().len(),
+            1,
+            "redelivery must not create a second inbox row"
+        );
+        transport.shutdown().await;
+    }
+
+    /// P1-12 regression: a host-supplied heartbeat interval of ZERO must not
+    /// panic the transport task — the driver clamps it and keeps serving.
+    #[tokio::test]
+    async fn zero_heartbeat_interval_does_not_panic_the_driver() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::text(
+                r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"still alive"},"msgId":1}"#
+                    .to_owned(),
+            ))
+            .await
+            .unwrap();
+            next_text(&mut ws).await // the msg_ack proves the driver survived
+        });
+
+        let mut transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-5"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            TransportConfig {
+                heartbeat: Duration::ZERO,
+                backoff: BackoffConfig::for_tests(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The frame flows through a live (un-panicked) driver task.
+        let inbound = transport.recv().await.unwrap();
+        assert!(matches!(
+            inbound.frame,
+            crate::protocol::v2::InboundFrameV2::Message { .. }
+        ));
+        let ack: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(ack, json!({ "type": "msg_ack", "msgId": 1 }));
         transport.shutdown().await;
     }
 }
