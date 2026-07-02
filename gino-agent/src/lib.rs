@@ -15,6 +15,7 @@
 mod archive;
 mod attachment_source;
 mod attachments;
+mod chat;
 mod config;
 // The scheduler/executor/transport/runner wire the live v2 persistence surface;
 // the v1 strangler tables and the write-only reconciliation state
