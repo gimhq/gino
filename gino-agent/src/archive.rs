@@ -18,17 +18,22 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
 /// The maximum characters of a message body kept in the Markdown archive (longer
 /// bodies are truncated with an ellipsis), matching the TypeScript runner.
 const MAX_BODY_CHARS: usize = 2000;
+
+/// Sidecar lockfile under the conversations dir serializing concurrent `archive`
+/// hook processes (audit P2-19).
+const CONVERSATIONS_LOCK_FILE: &str = ".sessions-index.lock";
 
 /// Errors raised while archiving a transcript.
 #[derive(Debug, Error)]
@@ -140,8 +145,18 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
         source,
     })?;
 
+    // Serialize concurrent PreCompact hooks (audit P2-19). Decision: an advisory
+    // exclusive lock on a sidecar lockfile — each hook is its own short-lived
+    // `gino-agent archive` process, so there is no in-process single writer to
+    // lean on and the lock must work cross-process. Held (via the binding) across
+    // name selection, the Markdown write, and the index update, so two hooks can
+    // neither pick the same archive name nor interleave the index
+    // read-modify-write; the index write itself is temp+rename (see
+    // [`update_index`]) so a crash mid-write never leaves a torn file behind.
+    let _dir_lock = lock_conversations_dir(&conversations_dir)?;
+
     let now = now_unix();
-    let file_path = conversations_dir.join(format!("{}-{name}.md", date_stamp(now)));
+    let file_path = unique_archive_path(&conversations_dir, &date_stamp(now), &name);
     let markdown = format_markdown(&messages, summary.as_deref(), now);
     fs::write(&file_path, markdown).map_err(|source| ArchiveError::Write {
         dir: file_path.display().to_string(),
@@ -266,7 +281,10 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 /// Slug a summary into a filename fragment: lowercase, non-alphanumerics collapsed
-/// to single dashes, trimmed, capped at 50 characters.
+/// to single dashes, trimmed, capped at 50 characters. A summary with no ASCII
+/// alphanumerics at all (e.g. fully non-ASCII) used to slug to the empty string —
+/// making every such same-day archive share one name (audit P2-19); it now falls
+/// back to a content hash, so distinct summaries yield distinct, non-empty names.
 fn sanitize_filename(summary: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
@@ -280,7 +298,59 @@ fn sanitize_filename(summary: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-');
-    trimmed.chars().take(50).collect()
+    let slug: String = trimmed.chars().take(50).collect();
+    if slug.is_empty() {
+        return hashed_slug(summary);
+    }
+    slug
+}
+
+/// A deterministic, non-empty slug for a summary that survives no ASCII
+/// characters: `conversation-` plus the first 4 bytes of the summary's SHA-256.
+fn hashed_slug(summary: &str) -> String {
+    let digest = Sha256::digest(summary.as_bytes());
+    format!(
+        "conversation-{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// Acquire the exclusive advisory lock serializing archive writers for this
+/// conversations dir. Blocks until the lock is free (hooks are short-lived);
+/// released by the OS when the returned handle drops, clean exit or not.
+fn lock_conversations_dir(dir: &Path) -> Result<fs::File, ArchiveError> {
+    let path = dir.join(CONVERSATIONS_LOCK_FILE);
+    let write_err = |source| ArchiveError::Write {
+        dir: path.display().to_string(),
+        source,
+    };
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(write_err)?;
+    file.lock().map_err(write_err)?;
+    Ok(file)
+}
+
+/// The first free `<stamp>-<name>[-N].md` path under `dir`: same-day archives
+/// with identical (or identically-slugged) summaries get `-2`, `-3`, … suffixes
+/// instead of overwriting each other (audit P2-19). The caller holds the
+/// conversations-dir lock, so the existence probe cannot race another hook.
+fn unique_archive_path(dir: &Path, stamp: &str, name: &str) -> PathBuf {
+    let base = dir.join(format!("{stamp}-{name}.md"));
+    if !base.exists() {
+        return base;
+    }
+    let mut counter: u64 = 2;
+    loop {
+        let candidate = dir.join(format!("{stamp}-{name}-{counter}.md"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
 }
 
 /// A fallback archive name when no summary is available: `conversation-HHMM` (UTC).
@@ -338,7 +408,16 @@ fn update_index(
     }
 
     let json = serde_json::to_string_pretty(&index).map_err(ArchiveError::Index)?;
-    fs::write(&index_path, json).map_err(|source| ArchiveError::Write {
+    // Write-temp + rename: the index is never truncated in place, so a crash
+    // mid-write (or a reader racing the writer) can never observe a torn file.
+    // The caller holds the conversations-dir lock, so the fixed temp name is
+    // safe from concurrent writers.
+    let tmp_path = conversations_dir.join("sessions-index.json.tmp");
+    fs::write(&tmp_path, json).map_err(|source| ArchiveError::Write {
+        dir: tmp_path.display().to_string(),
+        source,
+    })?;
+    fs::rename(&tmp_path, &index_path).map_err(|source| ArchiveError::Write {
         dir: index_path.display().to_string(),
         source,
     })
