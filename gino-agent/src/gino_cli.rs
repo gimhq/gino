@@ -105,7 +105,9 @@ pub(crate) fn system() -> Result<()> {
     println!("version       : {}", env!("CARGO_PKG_VERSION"));
     println!(
         "agent_id      : {}",
-        identity.as_ref().map_or("(not registered)", |i| i.agent_id.as_str())
+        identity
+            .as_ref()
+            .map_or("(not registered)", |i| i.agent_id.as_str())
     );
     println!("name          : {}", env_or("GINO_AGENT_NAME"));
     println!("host_url      : {}", env_or("GINO_HOST_URL"));
@@ -114,7 +116,11 @@ pub(crate) fn system() -> Result<()> {
     println!("capabilities  : claude");
     println!("tasks         : {}", tasks.len());
     println!("active_crons  : {}", active_crons.len());
-    println!("threads       : pending={} running={}", pending.len(), running.len());
+    println!(
+        "threads       : pending={} running={}",
+        pending.len(),
+        running.len()
+    );
     Ok(())
 }
 
@@ -225,7 +231,10 @@ pub(crate) fn thread(cmd: ThreadCommand) -> Result<()> {
                 println!("failure_reason: {reason}");
             }
             println!("engine        : {}", th.engine);
-            println!("session_id    : {}", th.engine_session_id.as_deref().unwrap_or("-"));
+            println!(
+                "session_id    : {}",
+                th.engine_session_id.as_deref().unwrap_or("-")
+            );
             println!("attempt       : {}/{}", th.attempt, th.max_attempts);
             if let Some(ms) = th.duration_ms {
                 println!("duration_ms   : {ms}");
@@ -251,8 +260,12 @@ fn cron_create(db: &Db, a: CreateArgs) -> Result<()> {
         other => bail!("--continuity must be 'isolated' or 'shared' (got '{other}')"),
     };
     // Seed the first fire (and validate the schedule) the same way the host path does.
-    let next_run = next_run_at_creation(&a.schedule_type, &a.value, now())
-        .with_context(|| format!("invalid schedule: --type {} --value {}", a.schedule_type, a.value))?;
+    let next_run = next_run_at_creation(&a.schedule_type, &a.value, now()).with_context(|| {
+        format!(
+            "invalid schedule: --type {} --value {}",
+            a.schedule_type, a.value
+        )
+    })?;
     let now_iso = to_iso(now());
     let row = CronRow {
         id: format!("cron-{}", Uuid::new_v4()),
@@ -279,7 +292,9 @@ fn cron_create(db: &Db, a: CreateArgs) -> Result<()> {
 }
 
 fn cron_set_status(db: &Db, id: &str, status: &str, clear_next: bool) -> Result<()> {
-    let mut cron = db.get_cron(id)?.ok_or_else(|| anyhow!("no such cron: {id}"))?;
+    let mut cron = db
+        .get_cron(id)?
+        .ok_or_else(|| anyhow!("no such cron: {id}"))?;
     status.clone_into(&mut cron.status);
     if clear_next {
         cron.next_run = None;
@@ -293,17 +308,26 @@ fn cron_set_status(db: &Db, id: &str, status: &str, clear_next: bool) -> Result<
 }
 
 fn cron_resume(db: &Db, id: &str) -> Result<()> {
-    let mut cron = db.get_cron(id)?.ok_or_else(|| anyhow!("no such cron: {id}"))?;
+    let mut cron = db
+        .get_cron(id)?
+        .ok_or_else(|| anyhow!("no such cron: {id}"))?;
     "active".clone_into(&mut cron.status);
     // Recompute the next fire forward from now (don't replay a backlog).
-    if let (Some(ty), Some(val)) = (cron.schedule_type.as_deref(), cron.schedule_value.as_deref()) {
+    if let (Some(ty), Some(val)) = (
+        cron.schedule_type.as_deref(),
+        cron.schedule_value.as_deref(),
+    ) {
         cron.next_run = next_run_at_creation(ty, val, now()).ok().flatten();
     }
     cron.dirty = true;
     cron.updated_at = to_iso(now());
     db.update_cron(&cron).context("updating the cron")?;
     push_cron_state(db, &cron);
-    println!("{} -> active (next={})", cron.id, cron.next_run.as_deref().unwrap_or("-"));
+    println!(
+        "{} -> active (next={})",
+        cron.id,
+        cron.next_run.as_deref().unwrap_or("-")
+    );
     Ok(())
 }
 
@@ -340,7 +364,10 @@ fn push_cron_state(db: &Db, row: &CronRow) {
     if let Err(err) =
         db.enqueue_outbox_correlated("cron_state", &data, Some(&row.task_id), Some(&row.id))
     {
-        eprintln!("warning: failed to enqueue cron_state for {}: {err}", row.id);
+        eprintln!(
+            "warning: failed to enqueue cron_state for {}: {err}",
+            row.id
+        );
     }
 }
 
