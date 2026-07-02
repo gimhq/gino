@@ -31,10 +31,12 @@
 )]
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use reqwest::Url;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -60,6 +62,10 @@ pub(crate) enum AttachmentError {
     /// A single attachment exceeds the per-file size cap (A5).
     #[error("attachment exceeds the single-file size limit ({size} > {limit} bytes)")]
     SizeLimitExceeded { size: u64, limit: u64 },
+    /// A descriptor declared a negative size — rejected explicitly instead of
+    /// clamping to 0, which would bypass every declared-size pre-check (P1-10a).
+    #[error("attachment declares an invalid size ({size} bytes)")]
+    InvalidDeclaredSize { size: i64 },
     /// The inbound attachments for one execution exceed the per-execution cap (A5).
     #[error("attachments exceed the per-execution size limit ({total} > {limit} bytes)")]
     ExecutionLimitExceeded { total: u64, limit: u64 },
@@ -91,11 +97,52 @@ pub(crate) enum AttachmentError {
 /// The byte plane: download/upload raw bytes for a descriptor. Integrity,
 /// caching, limits and materialization live in [`AttachmentManager`]; an impl
 /// only moves bytes.
+///
+/// Production code downloads exclusively through [`download_to`] (streaming,
+/// capped — P1-10a); the buffered [`download`] exists as the simple seam
+/// in-memory test backends implement, and the provided [`download_to`] adapts
+/// it (the buffer is a small test fixture there, never a network body).
+///
+/// [`download`]: AttachmentBackend::download
+/// [`download_to`]: AttachmentBackend::download_to
 #[async_trait]
 pub(crate) trait AttachmentBackend: Send + Sync {
-    /// Fetch the bytes referenced by `descriptor` (`ref` is backend-specific).
-    async fn download(&self, descriptor: &AttachmentDescriptor)
-    -> Result<Vec<u8>, AttachmentError>;
+    /// Fetch the bytes referenced by `descriptor` (`ref` is backend-specific),
+    /// fully buffered. Implemented by in-memory (test) backends; a streaming
+    /// backend leaves this unsupported and overrides [`download_to`] instead.
+    ///
+    /// [`download_to`]: AttachmentBackend::download_to
+    async fn download(
+        &self,
+        _descriptor: &AttachmentDescriptor,
+    ) -> Result<Vec<u8>, AttachmentError> {
+        Err(AttachmentError::Unsupported)
+    }
+
+    /// Stream the bytes referenced by `descriptor` into `sink`, aborting as soon
+    /// as the transfer would exceed `max_bytes` (the sink never receives more
+    /// than the cap). Returns the byte count. The default adapts a buffered
+    /// [`download`] impl and enforces the cap post-buffer — acceptable only for
+    /// in-memory backends whose whole store already lives in memory.
+    ///
+    /// [`download`]: AttachmentBackend::download
+    async fn download_to(
+        &self,
+        descriptor: &AttachmentDescriptor,
+        max_bytes: u64,
+        sink: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, AttachmentError> {
+        let bytes = self.download(descriptor).await?;
+        let size = bytes.len() as u64;
+        if size > max_bytes {
+            return Err(AttachmentError::SizeLimitExceeded {
+                size,
+                limit: max_bytes,
+            });
+        }
+        sink.write_all(&bytes)?;
+        Ok(size)
+    }
 
     /// Upload `bytes`; return the host-assigned `{id, ref}` (A1).
     async fn upload(
@@ -167,19 +214,48 @@ impl HostProxyBackend {
     fn upload_url(&self) -> String {
         format!("{}/agent/attachments", self.http_base)
     }
+
+    /// Whether `url` shares the configured host base's origin (scheme + host +
+    /// port). Unparseable URLs are conservatively NOT same-origin.
+    fn same_origin(&self, url: &str) -> bool {
+        let (Ok(target), Ok(base)) = (Url::parse(url), Url::parse(&self.http_base)) else {
+            return false;
+        };
+        target.scheme() == base.scheme()
+            && target.host() == base.host()
+            && target.port_or_known_default() == base.port_or_known_default()
+    }
 }
 
 #[async_trait]
 impl AttachmentBackend for HostProxyBackend {
-    async fn download(
+    // The buffered `download` is deliberately left at its unsupported default:
+    // every host-proxy byte transfer must go through the streaming, capped path
+    // below — reintroducing a whole-body buffer here would resurrect P1-10a.
+
+    async fn download_to(
         &self,
         descriptor: &AttachmentDescriptor,
-    ) -> Result<Vec<u8>, AttachmentError> {
+        max_bytes: u64,
+        sink: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, AttachmentError> {
         let url = self.resolve(&descriptor.reference);
-        Ok(self
-            .http
-            .download_attachment(&url, &self.connect_token)
-            .await?)
+        // DECISION (P1-10c): the connect token authenticates this agent to ITS
+        // host only, so it is attached iff the resolved URL is same-origin with
+        // the configured host base. An absolute `ref` to any other origin (e.g.
+        // a presigned/CDN URL) is fetched WITHOUT credentials rather than
+        // rejected — sha256 verification still gates the content, and the token
+        // can never travel to an arbitrary origin.
+        let token = self.same_origin(&url).then_some(&self.connect_token);
+        self.http
+            .download_attachment(&url, token, max_bytes, sink)
+            .await
+            .map_err(|err| match err {
+                HttpError::TooLarge { size, limit, .. } => {
+                    AttachmentError::SizeLimitExceeded { size, limit }
+                }
+                other => AttachmentError::Backend(other),
+            })
     }
 
     async fn upload(
@@ -280,13 +356,18 @@ impl AttachmentManager {
         descriptors: &[AttachmentDescriptor],
     ) -> Result<Vec<PathBuf>, AttachmentError> {
         // Pre-check declared sizes against the per-execution budget so a flood of
-        // oversized descriptors is rejected before any byte transfer.
-        let declared_total = descriptors
-            .iter()
-            .filter(|d| !is_outbound(d))
-            .fold(0_u64, |acc, d| {
-                acc.saturating_add(u64::try_from(d.size).unwrap_or(0))
-            });
+        // oversized descriptors is rejected before any byte transfer. A negative
+        // declared size is rejected explicitly (P1-10a): clamping it to 0 would
+        // let the descriptor bypass every declared-size gate.
+        let mut declared_total = 0_u64;
+        for descriptor in descriptors.iter().filter(|d| !is_outbound(d)) {
+            let declared = u64::try_from(descriptor.size).map_err(|_| {
+                AttachmentError::InvalidDeclaredSize {
+                    size: descriptor.size,
+                }
+            })?;
+            declared_total = declared_total.saturating_add(declared);
+        }
         if declared_total > self.config.max_execution_bytes {
             return Err(AttachmentError::ExecutionLimitExceeded {
                 total: declared_total,
@@ -377,12 +458,14 @@ impl AttachmentManager {
     /// through.
     ///
     /// Serves from the content-addressed cache by `sha256` when present (no
-    /// download); otherwise downloads via the backend (a minimal descriptor carries
-    /// only `reference` + `sha256`, the rest defaulted — the byte plane reads
-    /// nothing else), verifies the bytes hash to `sha256` (rejecting
-    /// [`AttachmentError::IntegrityMismatch`] on a miss), enforces `max_bytes` as
-    /// the single-file cap, caches, and returns. Unlike [`fetch`] **no content-type
-    /// allowlist** is applied — config artifacts carry no declared content type.
+    /// download); otherwise **streams** the download into a temp file next to the
+    /// cache with an in-flight `max_bytes` cap and incremental hashing (P1-10a —
+    /// the body is never buffered whole; an over-cap transfer aborts mid-stream),
+    /// verifies the streamed hash against `sha256` (rejecting
+    /// [`AttachmentError::IntegrityMismatch`] on a miss), promotes the verified
+    /// temp file into the cache, and returns the (cap-bounded) bytes. Unlike
+    /// [`fetch`] **no content-type allowlist** is applied — config artifacts carry
+    /// no declared content type.
     ///
     /// [`fetch`]: AttachmentManager::fetch
     pub(crate) async fn fetch_verified(
@@ -395,6 +478,14 @@ impl AttachmentManager {
             debug!(sha256 = %sha256, "content-addressed artifact cache hit");
             return Ok(bytes);
         }
+        // A malformed expected hash can never verify — reject before any transfer
+        // (and it keeps the validated key safe as a temp/cache path component).
+        let Some(key) = cache_key(sha256) else {
+            return Err(AttachmentError::IntegrityMismatch {
+                expected: sha256.to_owned(),
+                actual: "(expected hash is not valid sha256 hex)".to_owned(),
+            });
+        };
         // Only `ref` + `sha256` matter to the byte backend; the rest is defaulted.
         let descriptor = AttachmentDescriptor {
             id: String::new(),
@@ -405,23 +496,56 @@ impl AttachmentManager {
             reference: reference.to_owned(),
             direction: None,
         };
-        let bytes = self.backend.download(&descriptor).await?;
-        let actual = sha256_hex(&bytes);
-        if !actual.eq_ignore_ascii_case(sha256) {
+        std::fs::create_dir_all(&self.cache_dir)?;
+        let tmp = self.cache_dir.join(format!(".tmp.dl.{key}"));
+        let bytes = match self.download_verified_to(&descriptor, &key, max_bytes, &tmp).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(err);
+            }
+        };
+        // Promote the verified temp file into the cache by rename (same dir, so
+        // same filesystem); an over-cache-cap blob is simply not cached.
+        if bytes.len() as u64 <= self.config.cache_max_bytes
+            && std::fs::rename(&tmp, self.cache_dir.join(&key)).is_ok()
+        {
+            self.gc();
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Ok(bytes)
+    }
+
+    /// Stream `descriptor` into `tmp` with the in-flight `max_bytes` cap and
+    /// incremental hashing, verify the streamed hash equals `key` (the validated
+    /// lowercase expected hash), and read the cap-bounded file back. The caller
+    /// owns `tmp` cleanup on error.
+    async fn download_verified_to(
+        &self,
+        descriptor: &AttachmentDescriptor,
+        key: &str,
+        max_bytes: u64,
+        tmp: &Path,
+    ) -> Result<Vec<u8>, AttachmentError> {
+        let mut sink = HashingSink {
+            inner: std::fs::File::create(tmp)?,
+            hasher: Sha256::new(),
+        };
+        self.backend
+            .download_to(descriptor, max_bytes, &mut sink)
+            .await?;
+        sink.inner.flush()?;
+        drop(sink.inner);
+        let actual = hex_digest(sink.hasher);
+        if actual != key {
             return Err(AttachmentError::IntegrityMismatch {
-                expected: sha256.to_owned(),
+                expected: descriptor.sha256.clone(),
                 actual,
             });
         }
-        let size = bytes.len() as u64;
-        if size > max_bytes {
-            return Err(AttachmentError::SizeLimitExceeded {
-                size,
-                limit: max_bytes,
-            });
-        }
-        self.cache_put(&actual, &bytes);
-        Ok(bytes)
+        // Bounded read-back: the in-flight cap guarantees the file ≤ max_bytes.
+        Ok(std::fs::read(tmp)?)
     }
 
     /// Fetch one descriptor's verified bytes: enforce the single-file cap + the
@@ -433,8 +557,12 @@ impl AttachmentManager {
     async fn fetch(&self, descriptor: &AttachmentDescriptor) -> Result<Vec<u8>, AttachmentError> {
         self.check_content_type(&descriptor.content_type)?;
         // Pre-empt an oversized download off the declared size (a config artifact
-        // carries no declared size, so this gate is descriptor-only).
-        let declared = u64::try_from(descriptor.size).unwrap_or(0);
+        // carries no declared size, so this gate is descriptor-only). A negative
+        // declared size is rejected, never clamped to 0 (P1-10a).
+        let declared =
+            u64::try_from(descriptor.size).map_err(|_| AttachmentError::InvalidDeclaredSize {
+                size: descriptor.size,
+            })?;
         if declared > self.config.max_single_bytes {
             return Err(AttachmentError::SizeLimitExceeded {
                 size: declared,
@@ -592,6 +720,11 @@ impl AttachmentManager {
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
+    hex_digest(hasher)
+}
+
+/// Finalize `hasher` into its lowercase hex digest.
+fn hex_digest(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -599,6 +732,27 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// An [`std::io::Write`] adapter that feeds every written byte into a running
+/// SHA-256 alongside the inner writer — the incremental-hash half of the
+/// streaming download path (P1-10a): the hash is complete the moment the stream
+/// ends, without ever holding the body in memory.
+struct HashingSink<W: std::io::Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: std::io::Write> std::io::Write for HashingSink<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A 64-char lowercase hex string usable as a cache filename, or `None` if the

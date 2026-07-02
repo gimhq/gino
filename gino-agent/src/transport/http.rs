@@ -61,6 +61,21 @@ pub(crate) enum HttpError {
         endpoint: &'static str,
         source: reqwest::Error,
     },
+    /// A streamed body exceeded the caller's byte cap. `size` is the declared
+    /// `Content-Length` when the pre-check tripped, or the running count at the
+    /// moment the in-flight cap aborted the stream (audit P1-10a).
+    #[error("{endpoint} body exceeds the size limit ({size} > {limit} bytes)")]
+    TooLarge {
+        endpoint: &'static str,
+        size: u64,
+        limit: u64,
+    },
+    /// Writing a streamed chunk into the caller's sink failed.
+    #[error("{endpoint} sink write failed: {source}")]
+    Sink {
+        endpoint: &'static str,
+        source: std::io::Error,
+    },
 }
 
 /// Thin wrapper over a shared `reqwest::Client` (the client is internally
@@ -140,10 +155,15 @@ impl HttpClient {
             })
     }
 
-    /// `GET {url}` — download an attachment's raw bytes from the host proxy
-    /// (`GET /agent/attachments/:id`, agent-architecture §9 / PLAN-005). Same
-    /// connect-token auth as the other runner endpoints. Integrity (`sha256`) is
-    /// verified by [`crate::attachments`], not here — this is only byte transfer.
+    /// `GET {url}` — stream an attachment's raw bytes from the host proxy
+    /// (`GET /agent/attachments/:id`, agent-architecture §9 / PLAN-005) into
+    /// `sink`, returning the byte count. The body is never buffered whole (audit
+    /// P1-10a): a declared `Content-Length` over `max_bytes` aborts before any
+    /// body read, and the chunk loop aborts as soon as the running count would
+    /// exceed the cap — the sink never receives more than `max_bytes`. The token
+    /// is optional so the attachment layer can withhold it from cross-origin
+    /// URLs (audit P1-10c). Integrity (`sha256`) is verified by
+    /// [`crate::attachments`], not here — this is only byte transfer.
     #[cfg_attr(
         not(test),
         allow(
@@ -154,24 +174,52 @@ impl HttpClient {
     pub(crate) async fn download_attachment(
         &self,
         url: &str,
-        connect_token: &SecretString,
-    ) -> Result<Vec<u8>, HttpError> {
-        let response = self
-            .client
-            .get(url)
-            .header(INTERNAL_TOKEN_HEADER, connect_token.expose_secret())
-            .send()
-            .await
-            .map_err(|source| HttpError::Request {
-                endpoint: "attachment_download",
-                source,
-            })?;
-        let response = error_for_status(response, "attachment_download")?;
-        let bytes = response.bytes().await.map_err(|source| HttpError::Decode {
-            endpoint: "attachment_download",
+        connect_token: Option<&SecretString>,
+        max_bytes: u64,
+        sink: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, HttpError> {
+        const ENDPOINT: &str = "attachment_download";
+        let mut request = self.client.get(url);
+        if let Some(token) = connect_token {
+            request = request.header(INTERNAL_TOKEN_HEADER, token.expose_secret());
+        }
+        let response = request.send().await.map_err(|source| HttpError::Request {
+            endpoint: ENDPOINT,
             source,
         })?;
-        Ok(bytes.to_vec())
+        let mut response = error_for_status(response, ENDPOINT)?;
+        if let Some(declared) = response.content_length()
+            && declared > max_bytes
+        {
+            return Err(HttpError::TooLarge {
+                endpoint: ENDPOINT,
+                size: declared,
+                limit: max_bytes,
+            });
+        }
+        let mut received = 0_u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|source| HttpError::Decode {
+                endpoint: ENDPOINT,
+                source,
+            })?
+        {
+            received = received.saturating_add(chunk.len() as u64);
+            if received > max_bytes {
+                return Err(HttpError::TooLarge {
+                    endpoint: ENDPOINT,
+                    size: received,
+                    limit: max_bytes,
+                });
+            }
+            sink.write_all(&chunk).map_err(|source| HttpError::Sink {
+                endpoint: ENDPOINT,
+                source,
+            })?;
+        }
+        Ok(received)
     }
 
     /// `POST {url}` — upload bytes to the host proxy (`POST /agent/attachments`).
@@ -277,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_attachment_sends_token_and_returns_bytes() {
+    async fn download_attachment_sends_token_and_streams_bytes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/agent/attachments/a-1"))
@@ -288,11 +336,74 @@ mod tests {
 
         let http = HttpClient::new().unwrap();
         let url = format!("{}/agent/attachments/a-1", server.uri());
-        let bytes = http
-            .download_attachment(&url, &SecretString::from("connect-xyz"))
+        let mut sink = Vec::new();
+        let received = http
+            .download_attachment(
+                &url,
+                Some(&SecretString::from("connect-xyz")),
+                1 << 20,
+                &mut sink,
+            )
             .await
             .unwrap();
-        assert_eq!(bytes, b"hello-bytes");
+        assert_eq!(sink, b"hello-bytes");
+        assert_eq!(received, sink.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn download_attachment_without_token_sends_no_auth_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent/attachments/a-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"open".to_vec()))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::new().unwrap();
+        let url = format!("{}/agent/attachments/a-2", server.uri());
+        let mut sink = Vec::new();
+        http.download_attachment(&url, None, 1 << 20, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(sink, b"open");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("x-internal-token"),
+            "a token-less download must not carry the auth header"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_attachment_aborts_an_oversized_body_without_buffering_it() {
+        // A body far over the cap: the declared Content-Length pre-check (or the
+        // in-flight count for a chunked body) aborts, and the sink never receives
+        // more than the cap — the whole body is never buffered (P1-10a).
+        let server = MockServer::start().await;
+        let body = vec![0xAB_u8; 1 << 20]; // 1 MiB served, 1 KiB cap
+        Mock::given(method("GET"))
+            .and(path("/agent/attachments/huge"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let http = HttpClient::new().unwrap();
+        let url = format!("{}/agent/attachments/huge", server.uri());
+        let mut sink = Vec::new();
+        let err = http
+            .download_attachment(&url, None, 1024, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, super::HttpError::TooLarge { limit: 1024, .. }),
+            "expected TooLarge, got {err:?}"
+        );
+        assert!(
+            sink.len() as u64 <= 1024,
+            "sink must never receive more than the cap (got {} bytes)",
+            sink.len()
+        );
     }
 
     #[tokio::test]
@@ -341,8 +452,14 @@ mod tests {
 
         let http = HttpClient::new().unwrap();
         let url = format!("{}/agent/attachments/missing", server.uri());
+        let mut sink = Vec::new();
         let err = http
-            .download_attachment(&url, &SecretString::from("connect-xyz"))
+            .download_attachment(
+                &url,
+                Some(&SecretString::from("connect-xyz")),
+                1 << 20,
+                &mut sink,
+            )
             .await
             .unwrap_err();
         assert!(matches!(

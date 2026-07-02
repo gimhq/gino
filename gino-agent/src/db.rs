@@ -217,6 +217,17 @@ CREATE TABLE IF NOT EXISTS config_entries (
 CREATE INDEX IF NOT EXISTS idx_config_entries_scope ON config_entries(scope);
 CREATE INDEX IF NOT EXISTS idx_config_entries_store ON config_entries(name, sha256);
 
+-- Inbound attachment descriptors snapshotted per thread (audit P1-10b). The
+-- inbox `message` carrying them is CONSUMED at prompt-resolve time, so without
+-- this snapshot a retry or a restarted daemon would re-run the thread with its
+-- snapshotted prompt but ZERO attachments and still report success. Written
+-- before the message is consumed; read (never popped) on every attempt.
+CREATE TABLE IF NOT EXISTS thread_attachments (
+  thread_id   TEXT PRIMARY KEY REFERENCES threads(id),
+  descriptors TEXT NOT NULL,                       -- JSON array of wire AttachmentDescriptor
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS identity (
   id            INTEGER PRIMARY KEY CHECK (id = 1),
   agent_id      TEXT NOT NULL,
@@ -1334,6 +1345,40 @@ impl Db {
         Ok(entries)
     }
 
+    // -- Thread attachments (inbound descriptor snapshot, audit P1-10b) -----
+
+    /// Persist (or replace) the inbound attachment descriptors snapshotted for a
+    /// thread. Serialized here (like the outbox/inbox payloads) so the schema
+    /// stays wire-agnostic; the runner writes this BEFORE consuming the inbox
+    /// `message` the descriptors rode in on, making retries and restarts see the
+    /// same attachments the first attempt saw.
+    pub(crate) fn set_thread_attachments<T: Serialize>(
+        &self,
+        thread_id: &str,
+        descriptors: &T,
+    ) -> DbResult<()> {
+        let json = serde_json::to_string(descriptors)?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO thread_attachments (thread_id, descriptors) VALUES (?1, ?2)
+                 ON CONFLICT(thread_id) DO UPDATE SET descriptors = excluded.descriptors",
+            )?
+            .execute(params![thread_id, json])?;
+        Ok(())
+    }
+
+    /// Read a thread's snapshotted inbound descriptors JSON, or `None` when the
+    /// thread never carried any. The row is never deleted on read — a retried or
+    /// recovered thread must resolve the identical set on every attempt.
+    pub(crate) fn get_thread_attachments(&self, thread_id: &str) -> DbResult<Option<String>> {
+        let json = self
+            .conn
+            .prepare_cached("SELECT descriptors FROM thread_attachments WHERE thread_id = ?1")?
+            .query_row(params![thread_id], |r| r.get::<_, String>(0))
+            .optional()?;
+        Ok(json)
+    }
+
     // -- Identity (PLAN-003 §2.1) ------------------------------------------
 
     /// Persist (or replace) the runner identity: the host-generated `agent_id`
@@ -2076,6 +2121,40 @@ mod tests {
 
         // An unknown task reads None (no row), not an error.
         assert_eq!(db.get_task_entries("absent").unwrap(), None);
+    }
+
+    // -- v2: thread attachments (inbound descriptor snapshot, P1-10b) -------
+
+    #[test]
+    fn thread_attachments_round_trip_without_consuming() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_thread(&thread_row("th-1", "t-1", None, "pending"))
+            .unwrap();
+
+        // A thread with no snapshot reads None (not an error).
+        assert_eq!(db.get_thread_attachments("th-1").unwrap(), None);
+
+        let descriptors = json!([{ "id": "att-1", "name": "spec.txt", "ref": "/agent/attachments/att-1" }]);
+        db.set_thread_attachments("th-1", &descriptors).unwrap();
+
+        // Reads never consume the snapshot: a retry sees the identical set.
+        let first = db.get_thread_attachments("th-1").unwrap().unwrap();
+        let second = db.get_thread_attachments("th-1").unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap(),
+            descriptors
+        );
+
+        // Re-recording replaces (upsert), never duplicates.
+        let updated = json!([{ "id": "att-2", "name": "other.txt", "ref": "/agent/attachments/att-2" }]);
+        db.set_thread_attachments("th-1", &updated).unwrap();
+        let read = db.get_thread_attachments("th-1").unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&read).unwrap(),
+            updated
+        );
     }
 
     // -- v2: inbox / outbox correlation ------------------------------------
