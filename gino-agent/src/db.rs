@@ -38,9 +38,14 @@
 //! [`TaskRow`] + the `set_task_entries`/`get_task_entries` accessors.
 //!
 //! The module keeps a `#[allow(dead_code)]` at its `mod db;` site in `lib.rs` for
-//! the **not-yet-wired v2 read-model CRUD** (cron-dirty sync, thread result-sync,
-//! cron-log reads) that no production caller drives yet; its own unit tests keep
-//! the surface honest. The v1 dead code above is removed, not suppressed.
+//! the **not-yet-wired v2 read-model CRUD** (cron-log reads) that no production
+//! caller drives yet; its own unit tests keep the surface honest. The v1 dead code
+//! above is removed, not suppressed. The write-only reconciliation plane
+//! (`threads.synced` / `crons.dirty` accessors) is removed outright: the result
+//! plane is transactional now ([`Db::immediate_transaction`]), so a terminal
+//! thread state and its outbox frame commit together and there is nothing left to
+//! reconcile after the fact. The columns stay in the schema — see the decision
+//! note there.
 //!
 //! ## Statement caching
 //!
@@ -123,6 +128,11 @@ CREATE TABLE IF NOT EXISTS crons (
   continuity     TEXT    NOT NULL DEFAULT 'isolated', -- isolated | shared
   run_count      INTEGER NOT NULL DEFAULT 0,        -- CACHE; truth = cron_logs (D4)
   status         TEXT    NOT NULL DEFAULT 'active',  -- active | paused | completed | cancelled
+  -- DECISION: retained-but-unused. `dirty` belonged to a write-only host-mirror
+  -- reconciliation plane that was never wired; with the fire path now running in
+  -- one transaction there is nothing to reconcile, so no code writes this column
+  -- anymore (it keeps its schema default). It stays only because the idempotent
+  -- CREATE TABLE cannot drop a column without a migration, which we avoid.
   dirty          INTEGER NOT NULL DEFAULT 1,
   created_at     TEXT    NOT NULL,
   updated_at     TEXT    NOT NULL
@@ -151,6 +161,12 @@ CREATE TABLE IF NOT EXISTS threads (
   duration_ms       INTEGER,
   result            TEXT,
   error             TEXT,
+  -- DECISION: retained-but-unused. `synced` was the designed post-crash repair
+  -- flag for terminal-result delivery, but the repair sweep was never wired and
+  -- the flag was write-only. The terminal state and its outbox frame now commit
+  -- in ONE transaction (executor finalize), so the outbox alone is the durable
+  -- delivery contract and no code writes this column anymore (it keeps its
+  -- schema default). It stays only to avoid a column-drop migration.
   synced            INTEGER NOT NULL DEFAULT 0,
   last_seq          INTEGER NOT NULL DEFAULT 0,     -- last per-thread executor seq; continues across a runner restart (host dedups on (thread_id, seq))
   created_at        TEXT NOT NULL
@@ -346,7 +362,8 @@ pub(crate) struct CronRow {
     pub(crate) run_count: i64,
     /// `active` | `paused` | `completed` | `cancelled`.
     pub(crate) status: String,
-    /// `true` when the row has local edits not yet synced to the host mirror.
+    /// Mirrors the retained-but-unused `crons.dirty` column (see the schema
+    /// decision note): read back as the column's default, never written.
     pub(crate) dirty: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -384,7 +401,8 @@ pub(crate) struct ThreadRow {
     pub(crate) duration_ms: Option<i64>,
     pub(crate) result: Option<String>,
     pub(crate) error: Option<String>,
-    /// `true` once the terminal result has been synced to the host.
+    /// Mirrors the retained-but-unused `threads.synced` column (see the schema
+    /// decision note): read back as the column's default, never written.
     pub(crate) synced: bool,
     pub(crate) created_at: String,
 }
@@ -489,6 +507,37 @@ impl Db {
     /// Apply the idempotent schema. Safe to call repeatedly.
     pub(crate) fn migrate(&self) -> DbResult<()> {
         self.conn.execute_batch(SCHEMA)?;
+        Ok(())
+    }
+
+    /// Run `f` inside one `BEGIN IMMEDIATE` transaction on the shared connection:
+    /// every write `f` makes commits atomically, and any error rolls the whole
+    /// batch back (the [`rusqlite::Transaction`] drop is a rollback). This is the
+    /// result-plane atomicity primitive (P1-8/P2-13): the scheduler wraps a whole
+    /// cron fire in it and the executor wraps the terminal persist+enqueue pair.
+    ///
+    /// The caller must hold the global DB mutex for the duration of the call
+    /// (i.e. call this through the usual `lock_db` guard) so no other statement
+    /// interleaves into the open transaction. `f` must only use the plain
+    /// single-statement accessors — nesting `immediate_transaction` would fail.
+    pub(crate) fn immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Self) -> DbResult<T>,
+    ) -> DbResult<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let value = f(self)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Execute raw SQL — test-only escape hatch for fault injection (dropping a
+    /// table mid-flight, toggling pragmas) in the transactional-plane tests.
+    #[cfg(test)]
+    pub(crate) fn exec_raw(&self, sql: &str) -> DbResult<()> {
+        self.conn.execute_batch(sql)?;
         Ok(())
     }
 
@@ -737,14 +786,15 @@ impl Db {
 
     // -- Crons (v2 triggers) -----------------------------------------------
 
-    /// Insert a new cron (trigger) row.
+    /// Insert a new cron (trigger) row. The retained-but-unused `dirty` column
+    /// takes its schema default (see the schema decision note).
     pub(crate) fn insert_cron(&self, cron: &CronRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
                 "INSERT INTO crons
                    (id, task_id, kind, prompt, schedule_type, schedule_value, next_run, last_fired_at,
-                    continuity, run_count, status, dirty, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    continuity, run_count, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?
             .execute(params![
                 cron.id,
@@ -758,21 +808,21 @@ impl Db {
                 cron.continuity,
                 cron.run_count,
                 cron.status,
-                cron.dirty,
                 cron.created_at,
                 cron.updated_at,
             ])?;
         Ok(())
     }
 
-    /// Update an existing cron's mutable columns by id (`created_at` is immutable).
+    /// Update an existing cron's mutable columns by id (`created_at` is immutable;
+    /// the retained-but-unused `dirty` column is never written).
     pub(crate) fn update_cron(&self, cron: &CronRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
                 "UPDATE crons SET
                    task_id = ?2, kind = ?3, prompt = ?4, schedule_type = ?5, schedule_value = ?6,
                    next_run = ?7, last_fired_at = ?8, continuity = ?9, run_count = ?10,
-                   status = ?11, dirty = ?12, updated_at = ?13
+                   status = ?11, updated_at = ?12
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -787,10 +837,43 @@ impl Db {
                 cron.continuity,
                 cron.run_count,
                 cron.status,
-                cron.dirty,
                 cron.updated_at,
             ])?;
         Ok(())
+    }
+
+    /// Advance a fired cron **in place**: a targeted UPDATE of only the
+    /// scheduling columns (`next_run`, `last_fired_at`, `run_count`, `status`,
+    /// `updated_at`), guarded by `status = 'active'` so a `cron_delete` /
+    /// `cron_upsert` that landed after the scheduler's tick-read is never
+    /// overwritten by stale full-row state (P2-13 — a deleted cron must not be
+    /// resurrected). Returns `false` when the guard rejected the advance (the
+    /// cron is gone or no longer active).
+    pub(crate) fn advance_cron(
+        &self,
+        id: &str,
+        next_run: Option<&str>,
+        last_fired_at: &str,
+        run_count: i64,
+        status: &str,
+        updated_at: &str,
+    ) -> DbResult<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE crons SET
+                   next_run = ?2, last_fired_at = ?3, run_count = ?4, status = ?5, updated_at = ?6
+                 WHERE id = ?1 AND status = 'active'",
+            )?
+            .execute(params![
+                id,
+                next_run,
+                last_fired_at,
+                run_count,
+                status,
+                updated_at
+            ])?;
+        Ok(changed == 1)
     }
 
     /// Read a single cron by id, or `None`.
@@ -831,24 +914,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// All crons flagged `dirty` — the set pending `cron_state` sync to the host.
-    pub(crate) fn list_dirty_crons(&self) -> DbResult<Vec<CronRow>> {
-        self.query_crons(
-            "SELECT id, task_id, kind, prompt, schedule_type, schedule_value, next_run, last_fired_at,
-                    continuity, run_count, status, dirty, created_at, updated_at
-               FROM crons WHERE dirty = 1 ORDER BY created_at, id",
-        )
-    }
-
-    /// Set a cron's `dirty` flag — `true` after a local edit, `false` once its
-    /// `cron_state` has been acknowledged by the host.
-    pub(crate) fn set_cron_dirty(&self, id: &str, dirty: bool) -> DbResult<()> {
-        self.conn
-            .prepare_cached("UPDATE crons SET dirty = ?2 WHERE id = ?1")?
-            .execute(params![id, dirty])?;
-        Ok(())
-    }
-
     fn query_crons(&self, sql: &str) -> DbResult<Vec<CronRow>> {
         let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt
@@ -878,15 +943,16 @@ impl Db {
 
     // -- Threads (v2 engine executions) ------------------------------------
 
-    /// Insert a new thread row.
+    /// Insert a new thread row. The retained-but-unused `synced` column takes
+    /// its schema default (see the schema decision note).
     pub(crate) fn insert_thread(&self, t: &ThreadRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
                 "INSERT INTO threads
                    (id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
                     failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                    duration_ms, result, error, synced, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    duration_ms, result, error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             )?
             .execute(params![
                 t.id,
@@ -906,21 +972,21 @@ impl Db {
                 t.duration_ms,
                 t.result,
                 t.error,
-                t.synced,
                 t.created_at,
             ])?;
         Ok(())
     }
 
     /// Update a thread's mutable columns by id (`id`/`task_id`/`cron_id`/
-    /// `source`/`engine`/`created_at` are immutable once the row is born).
+    /// `source`/`engine`/`created_at` are immutable once the row is born; the
+    /// retained-but-unused `synced` column is never written).
     pub(crate) fn update_thread(&self, t: &ThreadRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
                 "UPDATE threads SET
                    engine_session_id = ?2, status = ?3, failure_reason = ?4, attempt = ?5,
                    max_attempts = ?6, work_dir = ?7, started_at = ?8, finished_at = ?9,
-                   duration_ms = ?10, result = ?11, error = ?12, synced = ?13, prompt = ?14
+                   duration_ms = ?10, result = ?11, error = ?12, prompt = ?13
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -936,7 +1002,6 @@ impl Db {
                 t.duration_ms,
                 t.result,
                 t.error,
-                t.synced,
                 t.prompt,
             ])?;
         Ok(())
@@ -966,24 +1031,6 @@ impl Db {
                     duration_ms, result, error, synced, created_at
                FROM threads WHERE status = 'pending' ORDER BY created_at, id",
         )
-    }
-
-    /// All threads whose terminal result is not yet synced to the host, oldest first.
-    pub(crate) fn list_unsynced_threads(&self) -> DbResult<Vec<ThreadRow>> {
-        self.query_threads(
-            "SELECT id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
-                    failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                    duration_ms, result, error, synced, created_at
-               FROM threads WHERE synced = 0 ORDER BY created_at, id",
-        )
-    }
-
-    /// Mark a thread's terminal result synced to the host.
-    pub(crate) fn mark_thread_synced(&self, id: &str) -> DbResult<()> {
-        self.conn
-            .prepare_cached("UPDATE threads SET synced = 1 WHERE id = ?1")?
-            .execute(params![id])?;
-        Ok(())
     }
 
     /// Every thread in a given `status`, oldest first. The executor watchdog
@@ -1034,7 +1081,7 @@ impl Db {
     }
 
     /// Persist the highest `seq` emitted for a thread. A no-op (0 rows changed)
-    /// when the thread id is unknown, matching [`Self::mark_thread_synced`].
+    /// when the thread id is unknown.
     pub(crate) fn set_thread_last_seq(&self, thread_id: &str, seq: i64) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE threads SET last_seq = ?2 WHERE id = ?1")?
@@ -1522,13 +1569,14 @@ mod tests {
     // -- v2: crons ---------------------------------------------------------
 
     #[test]
-    fn cron_insert_get_update_and_dirty_and_active_filter() {
+    fn cron_insert_get_update_and_active_filter() {
         let db = Db::open_in_memory().unwrap();
         db.insert_task_row(&task_row("t-1", "active")).unwrap();
         db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
         db.insert_cron(&cron_row("cr-2", "t-1", "paused")).unwrap();
 
-        // Round-trips column-for-column.
+        // Round-trips column-for-column (`dirty` reads back as the schema
+        // default of the retained-but-unused column, matching the builder).
         assert_eq!(
             db.get_cron("cr-1").unwrap().as_ref(),
             Some(&cron_row("cr-1", "t-1", "active"))
@@ -1539,14 +1587,10 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, "cr-1");
 
-        // Both inserted dirty.
-        assert_eq!(db.list_dirty_crons().unwrap().len(), 2);
-
-        // Update mutates and bumps the run_count cache; clearing dirty post-sync.
+        // Update mutates and bumps the run_count cache.
         let mut updated = cron_row("cr-1", "t-1", "completed");
         updated.run_count = 5;
         updated.last_fired_at = Some("2026-06-22T12:05:00Z".to_owned());
-        updated.dirty = false;
         db.update_cron(&updated).unwrap();
 
         let reloaded = db.get_cron("cr-1").unwrap().unwrap();
@@ -1556,13 +1600,108 @@ mod tests {
             reloaded.last_fired_at.as_deref(),
             Some("2026-06-22T12:05:00Z")
         );
-        assert!(!reloaded.dirty);
         assert!(db.list_active_crons().unwrap().is_empty());
+    }
 
-        // set_cron_dirty toggles the flag back on.
-        db.set_cron_dirty("cr-1", true).unwrap();
-        assert!(db.get_cron("cr-1").unwrap().unwrap().dirty);
-        assert_eq!(db.list_dirty_crons().unwrap().len(), 2);
+    /// P2-13 regression: advancing a fired cron is a targeted UPDATE guarded on
+    /// `status = 'active'` — a cron deleted (soft-cancelled) or completed after
+    /// the scheduler's tick-read is left untouched, never resurrected.
+    #[test]
+    fn advance_cron_is_guarded_and_targeted() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
+
+        // An active cron advances: only the scheduling columns change.
+        assert!(
+            db.advance_cron(
+                "cr-1",
+                Some("2026-06-22T12:01:00Z"),
+                "2026-06-22T12:00:00Z",
+                1,
+                "active",
+                "2026-06-22T12:00:00Z",
+            )
+            .unwrap()
+        );
+        let advanced = db.get_cron("cr-1").unwrap().unwrap();
+        assert_eq!(advanced.next_run.as_deref(), Some("2026-06-22T12:01:00Z"));
+        assert_eq!(advanced.run_count, 1);
+        assert_eq!(advanced.prompt, "run the recurring job", "prompt untouched");
+
+        // Soft-delete lands between tick-read and advance: the guard rejects the
+        // stale advance and the cron stays cancelled with no next_run.
+        let mut deleted = db.get_cron("cr-1").unwrap().unwrap();
+        "cancelled".clone_into(&mut deleted.status);
+        deleted.next_run = None;
+        db.update_cron(&deleted).unwrap();
+        assert!(
+            !db.advance_cron(
+                "cr-1",
+                Some("2026-06-22T12:02:00Z"),
+                "2026-06-22T12:01:00Z",
+                2,
+                "active",
+                "2026-06-22T12:01:00Z",
+            )
+            .unwrap()
+        );
+        let untouched = db.get_cron("cr-1").unwrap().unwrap();
+        assert_eq!(untouched.status, "cancelled");
+        assert_eq!(untouched.next_run, None);
+
+        // A hard-deleted (absent) cron is likewise a rejected no-op.
+        assert!(
+            !db.advance_cron(
+                "cr-absent",
+                None,
+                "2026-06-22T12:00:00Z",
+                1,
+                "active",
+                "2026-06-22T12:00:00Z",
+            )
+            .unwrap()
+        );
+    }
+
+    /// The transactional-plane primitive: writes inside
+    /// [`Db::immediate_transaction`] commit together, and an error inside the
+    /// closure rolls every one of them back (P1-8/P2-13).
+    #[test]
+    fn immediate_transaction_commits_together_or_not_at_all() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&task_row("t-1", "active")).unwrap();
+        db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
+
+        // Commit path: both writes land.
+        db.immediate_transaction(|db| {
+            db.insert_thread(&thread_row("cr-1@1", "t-1", Some("cr-1"), "pending"))?;
+            db.insert_cron_log(&cron_log_row("cr-1", "t-1", 1, "2026-06-22T12:00:00Z"))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(db.get_thread("cr-1@1").unwrap().is_some());
+        assert_eq!(db.max_round_seq("cr-1").unwrap(), Some(1));
+
+        // Rollback path: the first write succeeds, the second hits the ledger
+        // UNIQUE(cron_id, scheduled_at) constraint — the thread insert must be
+        // rolled back with it, leaving no partial state.
+        let result = db.immediate_transaction(|db| {
+            db.insert_thread(&thread_row("cr-1@2", "t-1", Some("cr-1"), "pending"))?;
+            db.insert_cron_log(&cron_log_row("cr-1", "t-1", 2, "2026-06-22T12:00:00Z"))?;
+            Ok(())
+        });
+        assert!(result.is_err(), "duplicate ledger slot must error");
+        assert!(
+            db.get_thread("cr-1@2").unwrap().is_none(),
+            "the thread insert must roll back with the failed ledger insert"
+        );
+        assert_eq!(db.max_round_seq("cr-1").unwrap(), Some(1));
+
+        // The connection is usable again after the rollback.
+        db.insert_thread(&thread_row("cr-1@3", "t-1", Some("cr-1"), "pending"))
+            .unwrap();
+        assert!(db.get_thread("cr-1@3").unwrap().is_some());
     }
 
     #[test]
@@ -1615,7 +1754,7 @@ mod tests {
     // -- v2: threads -------------------------------------------------------
 
     #[test]
-    fn thread_insert_get_update_pending_and_synced() {
+    fn thread_insert_get_update_and_pending_filter() {
         let db = Db::open_in_memory().unwrap();
         db.insert_task_row(&task_row("t-1", "active")).unwrap();
         db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
@@ -1637,7 +1776,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "cr-1@1718");
 
-        // Drive a thread to a terminal, synced state.
+        // Drive a thread to a terminal state.
         let mut done = thread_row("cr-1@1718", "t-1", Some("cr-1"), "succeeded");
         done.engine_session_id = Some("sess-9".to_owned());
         done.work_dir = Some("/w/cr-1@1718".to_owned());
@@ -1655,13 +1794,6 @@ mod tests {
         // Immutable columns survive the update.
         assert_eq!(reloaded.cron_id.as_deref(), Some("cr-1"));
         assert_eq!(reloaded.source, "cron");
-
-        // Two unsynced threads; marking one leaves one.
-        assert_eq!(db.list_unsynced_threads().unwrap().len(), 2);
-        db.mark_thread_synced("cr-1@1718").unwrap();
-        let remaining = db.list_unsynced_threads().unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, "th-chat");
     }
 
     #[test]
