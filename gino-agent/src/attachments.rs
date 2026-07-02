@@ -498,7 +498,10 @@ impl AttachmentManager {
         };
         std::fs::create_dir_all(&self.cache_dir)?;
         let tmp = self.cache_dir.join(format!(".tmp.dl.{key}"));
-        let bytes = match self.download_verified_to(&descriptor, &key, max_bytes, &tmp).await {
+        let bytes = match self
+            .download_verified_to(&descriptor, &key, max_bytes, &tmp)
+            .await
+        {
             Ok(bytes) => bytes,
             Err(err) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -1038,6 +1041,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_negative_declared_size_before_any_transfer() {
+        // P1-10a: a negative declared size used to clamp to 0 via unwrap_or(0),
+        // sailing past every declared-size gate. It must be rejected explicitly,
+        // with zero byte transfer.
+        let ws = tempfile::tempdir().unwrap();
+        let backend = MemBackend::with("/agent/attachments/neg", b"whatever");
+        let mgr = manager(&backend, ws.path(), AttachmentsConfig::default());
+
+        let mut d = descriptor("neg.bin", b"whatever", "/agent/attachments/neg");
+        d.size = -1;
+        let err = mgr
+            .materialize_inputs(&ws.path().join("t"), &[d])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AttachmentError::InvalidDeclaredSize { size: -1 }),
+            "expected InvalidDeclaredSize, got {err:?}"
+        );
+        assert_eq!(backend.download_count(), 0, "no byte transfer on rejection");
+    }
+
+    #[tokio::test]
     async fn enforces_per_execution_size_limit() {
         let ws = tempfile::tempdir().unwrap();
         let backend = Arc::new(MemBackend::default());
@@ -1254,5 +1279,134 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AttachmentError::SizeLimitExceeded { .. }));
+    }
+
+    // -- Host-proxy streaming + same-origin token gating (P1-10a/c) ---------
+
+    use secrecy::SecretString;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::HostProxyBackend;
+    use crate::transport::http::HttpClient;
+
+    /// A manager whose byte plane is the REAL host-proxy backend over `base`.
+    fn host_proxy_manager(
+        base: &str,
+        ws: &std::path::Path,
+        config: AttachmentsConfig,
+    ) -> AttachmentManager {
+        let backend = HostProxyBackend::new(
+            HttpClient::new().unwrap(),
+            base.to_owned(),
+            SecretString::from("connect-tok"),
+        );
+        AttachmentManager::new(Box::new(backend), ws, config)
+    }
+
+    /// P1-10a regression: a body far larger than the cap (with a small LYING
+    /// declared size, so the descriptor pre-check passes) aborts mid-stream with
+    /// the size-limit failure — the body is never buffered whole, and no temp
+    /// file survives the abort.
+    #[tokio::test]
+    async fn host_proxy_aborts_oversized_body_mid_stream() {
+        let server = MockServer::start().await;
+        let body = vec![0xCD_u8; 1 << 20]; // 1 MiB served
+        Mock::given(method("GET"))
+            .and(path("/agent/attachments/huge"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let ws = tempfile::tempdir().unwrap();
+        let config = AttachmentsConfig {
+            max_single_bytes: 1024,
+            ..AttachmentsConfig::default()
+        };
+        let mgr = host_proxy_manager(&server.uri(), ws.path(), config);
+
+        let mut d = descriptor("huge.bin", b"lie", "/agent/attachments/huge");
+        d.size = 100; // declared small: the in-flight cap must trip, not the pre-check
+        let err = mgr
+            .materialize_inputs(&ws.path().join("t"), &[d])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AttachmentError::SizeLimitExceeded { limit: 1024, .. }),
+            "expected a mid-stream size abort, got {err:?}"
+        );
+        // The aborted temp file is cleaned up; nothing near body-size was kept.
+        let cache = ws.path().join("attachments-cache");
+        if cache.is_dir() {
+            for entry in std::fs::read_dir(&cache).unwrap().flatten() {
+                let meta = entry.metadata().unwrap();
+                assert!(
+                    meta.len() <= 1024,
+                    "no file beyond the cap may survive the abort ({:?} is {} bytes)",
+                    entry.path(),
+                    meta.len()
+                );
+            }
+        }
+        // Nothing was materialized into the thread inputs.
+        assert!(!ws.path().join("t").join("inputs").exists());
+    }
+
+    /// P1-10c regression, same-origin half: a host-proxy relative `ref` resolves
+    /// under the configured base and carries the connect token (the mock matches
+    /// the header, so a token-less request would 404 and fail the fetch).
+    #[tokio::test]
+    async fn host_proxy_attaches_token_to_same_origin_downloads() {
+        let server = MockServer::start().await;
+        let bytes = b"SAME-ORIGIN-DATA".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/agent/attachments/s1"))
+            .and(header("x-internal-token", "connect-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&server)
+            .await;
+
+        let ws = tempfile::tempdir().unwrap();
+        let mgr = host_proxy_manager(&server.uri(), ws.path(), AttachmentsConfig::default());
+        let d = descriptor("s1.txt", &bytes, "/agent/attachments/s1");
+        let written = mgr
+            .materialize_inputs(&ws.path().join("t"), &[d])
+            .await
+            .unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(std::fs::read(&written[0]).unwrap(), bytes);
+    }
+
+    /// P1-10c regression, cross-origin half: an absolute `ref` pointing at a
+    /// DIFFERENT origin is fetched WITHOUT the connect token (sha256 still gates
+    /// the content) — the token never travels to an arbitrary origin.
+    #[tokio::test]
+    async fn host_proxy_withholds_token_from_cross_origin_downloads() {
+        let host = MockServer::start().await;
+        let other = MockServer::start().await; // different port → different origin
+        let bytes = b"CDN-BYTES".to_vec();
+        Mock::given(method("GET"))
+            .and(path("/blob"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+            .mount(&other)
+            .await;
+
+        let ws = tempfile::tempdir().unwrap();
+        let mgr = host_proxy_manager(&host.uri(), ws.path(), AttachmentsConfig::default());
+        let d = descriptor("cdn.txt", &bytes, &format!("{}/blob", other.uri()));
+        let written = mgr
+            .materialize_inputs(&ws.path().join("t"), &[d])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&written[0]).unwrap(), bytes);
+
+        let requests = other.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0].headers.contains_key("x-internal-token"),
+            "the connect token must never travel to a cross-origin ref"
+        );
+        // And the host proxy itself was never contacted for this descriptor.
+        assert!(host.received_requests().await.unwrap().is_empty());
     }
 }

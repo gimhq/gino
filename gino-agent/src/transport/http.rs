@@ -198,14 +198,10 @@ impl HttpClient {
             });
         }
         let mut received = 0_u64;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|source| HttpError::Decode {
-                endpoint: ENDPOINT,
-                source,
-            })?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|source| HttpError::Decode {
+            endpoint: ENDPOINT,
+            source,
+        })? {
             received = received.saturating_add(chunk.len() as u64);
             if received > max_bytes {
                 return Err(HttpError::TooLarge {

@@ -2135,7 +2135,8 @@ mod tests {
         // A thread with no snapshot reads None (not an error).
         assert_eq!(db.get_thread_attachments("th-1").unwrap(), None);
 
-        let descriptors = json!([{ "id": "att-1", "name": "spec.txt", "ref": "/agent/attachments/att-1" }]);
+        let descriptors =
+            json!([{ "id": "att-1", "name": "spec.txt", "ref": "/agent/attachments/att-1" }]);
         db.set_thread_attachments("th-1", &descriptors).unwrap();
 
         // Reads never consume the snapshot: a retry sees the identical set.
@@ -2148,7 +2149,8 @@ mod tests {
         );
 
         // Re-recording replaces (upsert), never duplicates.
-        let updated = json!([{ "id": "att-2", "name": "other.txt", "ref": "/agent/attachments/att-2" }]);
+        let updated =
+            json!([{ "id": "att-2", "name": "other.txt", "ref": "/agent/attachments/att-2" }]);
         db.set_thread_attachments("th-1", &updated).unwrap();
         let read = db.get_thread_attachments("th-1").unwrap().unwrap();
         assert_eq!(

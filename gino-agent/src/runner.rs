@@ -1365,9 +1365,26 @@ mod tests {
         lock_db(&db)
             .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(7))
             .unwrap();
-
-        let prompts = InboxPromptSource { db: Arc::clone(&db) };
         let thread = chat_thread("th-1", "t-1");
+        {
+            // Seed the FK targets: the snapshot table references threads(id).
+            let guard = lock_db(&db);
+            guard
+                .insert_task_row(&TaskRow {
+                    id: "t-1".to_owned(),
+                    name: None,
+                    kind: None,
+                    status: "active".to_owned(),
+                    created_at: "2026-06-22T00:00:00Z".to_owned(),
+                    updated_at: "2026-06-22T00:00:00Z".to_owned(),
+                })
+                .unwrap();
+            guard.insert_thread(&thread).unwrap();
+        }
+
+        let prompts = InboxPromptSource {
+            db: Arc::clone(&db),
+        };
 
         // Resolving the prompt consumes the inbox message...
         assert_eq!(
@@ -1415,7 +1432,9 @@ mod tests {
             .record_inbound_correlated("message", &frame, Some("t-2"), Some("th-2"), None)
             .unwrap();
 
-        let prompts = InboxPromptSource { db: Arc::clone(&db) };
+        let prompts = InboxPromptSource {
+            db: Arc::clone(&db),
+        };
         let thread = chat_thread("th-2", "t-2");
         assert!(prompts.prompt_for(&thread).is_some());
 
@@ -1822,7 +1841,9 @@ mod tests {
                 ..WatchdogCfg::default()
             },
         );
-        let source = InboxPromptSource { db: Arc::clone(&db) };
+        let source = InboxPromptSource {
+            db: Arc::clone(&db),
+        };
 
         // First drain: runs turn 1 only; the second message sits queued.
         executor.drain_pending(&source).await;
@@ -1987,7 +2008,9 @@ mod tests {
                 ..WatchdogCfg::default()
             },
         ));
-        let prompts = Arc::new(InboxPromptSource { db: Arc::clone(&db) });
+        let prompts = Arc::new(InboxPromptSource {
+            db: Arc::clone(&db),
+        });
 
         // The runner's own planes: the real scheduler task + executor worker.
         let cancel = Arc::new(Cancel::new());
@@ -2159,7 +2182,9 @@ mod tests {
             )
             .with_shutdown(Arc::clone(&cancel)),
         );
-        let prompts = Arc::new(InboxPromptSource { db: Arc::clone(&db) });
+        let prompts = Arc::new(InboxPromptSource {
+            db: Arc::clone(&db),
+        });
         let worker = tokio::spawn(super::run_worker(
             Arc::clone(&executor),
             Arc::clone(&db),
