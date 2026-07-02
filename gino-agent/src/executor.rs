@@ -75,7 +75,7 @@ pub(crate) mod v2 {
     use chrono::{DateTime, TimeDelta, Utc};
     use futures_util::StreamExt;
     use futures_util::stream::BoxStream;
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
     use tokio::time::timeout;
     use tracing::{debug, warn};
 
@@ -222,6 +222,11 @@ pub(crate) mod v2 {
         /// `interrupt` takes: the active run settles within the bounded drain
         /// window and the pending drain stops starting new runs.
         shutdown: Option<Arc<Cancel>>,
+        /// The transport flush signal (P2-16); `None` until the runner wires it.
+        /// Poked after every persisted outbox frame so transcript events stream
+        /// to the host near-real-time during a long run instead of arriving in
+        /// one batch after the whole drain.
+        flush: Option<Arc<Notify>>,
     }
 
     impl std::fmt::Debug for ThreadExecutor {
@@ -252,7 +257,22 @@ pub(crate) mod v2 {
                 attachments: None,
                 provisioning: None,
                 shutdown: None,
+                flush: None,
             }
+        }
+
+        /// Wire the transport flush signal (P2-16): the executor pokes it after
+        /// each persisted outbox frame, so a `thread_message` streamed mid-run
+        /// ships over the live socket immediately rather than after the whole
+        /// drain. Builder-style so the existing [`Self::new`] call sites stay
+        /// unchanged.
+        #[cfg_attr(
+            not(test),
+            allow(dead_code, reason = "wired by the runner alongside the transport")
+        )]
+        pub(crate) fn with_flush(mut self, flush: Arc<Notify>) -> Self {
+            self.flush = Some(flush);
+            self
         }
 
         /// Wire the daemon shutdown token (P1-6). Builder-style so the existing
@@ -1147,6 +1167,19 @@ pub(crate) mod v2 {
                 Self::emit_message(&lock_db(&self.db), thread, kind, Some(content), None)
             {
                 warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
+            } else {
+                // P2-16: ship the frame over the live socket now — without the
+                // poke it would sit in the outbox until the post-drain flush.
+                self.poke_flush();
+            }
+        }
+
+        /// Poke the transport flush (when wired) so freshly enqueued outbox
+        /// frames transmit immediately (P2-16). `Notify::notify_one` stores a
+        /// permit, so a poke never blocks and never gets lost.
+        fn poke_flush(&self) {
+            if let Some(flush) = &self.flush {
+                flush.notify_one();
             }
         }
 
@@ -1236,6 +1269,9 @@ pub(crate) mod v2 {
             };
             if let Err(err) = committed {
                 warn!(thread = %thread.id, error = %err, "failed to commit thread state + outbox frame atomically");
+            } else {
+                // P2-16: the terminal frame is durable — stream it out now.
+                self.poke_flush();
             }
         }
 
@@ -1577,6 +1613,142 @@ pub(crate) mod v2 {
             assert_eq!(res[0].final_seq, 2);
             assert_eq!(res[0].result.as_deref(), Some("done"));
             assert_eq!(res[0].engine_session_id.as_deref(), Some("sess-1"));
+        }
+
+        // -- P2-16: per-message flush poke streams transcript mid-run --------
+
+        /// An engine whose session emits one message, BLOCKS until `gate` is
+        /// notified, then emits a second message and the result. The test
+        /// notifies the gate only once the mock host has RECEIVED the first
+        /// message over the live socket, so the run can only complete if
+        /// transcript frames stream out DURING the run (not after the drain).
+        struct GatedEngine {
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        struct GatedSession {
+            gate: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl Engine for GatedEngine {
+            fn name(&self) -> &'static str {
+                "mock"
+            }
+            async fn start_session(
+                &self,
+                _cfg: SessionCfg,
+            ) -> Result<Box<dyn Session>, EngineError> {
+                Ok(Box::new(GatedSession {
+                    gate: Arc::clone(&self.gate),
+                }))
+            }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                Ok(RunOutcome::errored("run_once is not used by this test"))
+            }
+        }
+
+        #[async_trait]
+        impl Session for GatedSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn interrupt(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn events(&self) -> BoxStream<'_, EngineEvent> {
+                let gate = Arc::clone(&self.gate);
+                Box::pin(
+                    stream::iter(vec![started("sess-live"), out("one")])
+                        .chain(stream::once(async move {
+                            gate.notified().await;
+                            out("two")
+                        }))
+                        .chain(stream::iter(vec![ok_result("done", "sess-live")])),
+                )
+            }
+        }
+
+        /// P2-16 regression: transcript frames reach the host DURING a
+        /// multi-message run. Without the executor's per-message flush poke the
+        /// first frame would sit in the outbox until after the drain, the gate
+        /// would never open, and this test would time out.
+        #[tokio::test]
+        async fn transcript_streams_to_the_host_during_the_run() {
+            use tokio_tungstenite::tungstenite::Message;
+
+            let db = test_db();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let gate = Arc::new(tokio::sync::Notify::new());
+
+            let server_gate = Arc::clone(&gate);
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let mut contents = Vec::new();
+                loop {
+                    let text = match ws.next().await {
+                        Some(Ok(Message::Text(text))) => text.as_str().to_owned(),
+                        Some(Ok(_)) => continue,
+                        other => panic!("connection ended before the result: {other:?}"),
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    match frame["type"].as_str() {
+                        Some("thread_message") => {
+                            let content = frame["data"]["content"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned();
+                            if content == "one" {
+                                // The first transcript frame arrived over the
+                                // live socket: release the still-running engine.
+                                server_gate.notify_one();
+                            }
+                            contents.push(content);
+                        }
+                        Some("thread_result") => break,
+                        _ => {}
+                    }
+                }
+                contents
+            });
+
+            let transport = crate::transport::Transport::open(
+                format!("ws://{addr}/agent/ws/agent-stream"),
+                secrecy::SecretString::from("tok"),
+                Arc::clone(&db),
+                crate::transport::TransportConfig::default(),
+            );
+
+            let engine: Arc<dyn Engine> = Arc::new(GatedEngine { gate });
+            let dir = tempfile::tempdir().unwrap();
+            let exec = ThreadExecutor::new(
+                engine,
+                Arc::clone(&db),
+                dir.path().to_path_buf(),
+                no_inactivity(),
+            )
+            .with_flush(transport.flush_handle());
+            lock(&db)
+                .insert_thread(&pending_thread("th-live", 1))
+                .unwrap();
+
+            let final_row = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                exec.run_thread(
+                    pending_thread("th-live", 1),
+                    "go".to_owned(),
+                    Continuity::Isolated,
+                ),
+            )
+            .await
+            .expect("the run must complete: transcript frames must stream during the run");
+
+            assert_eq!(final_row.status, "succeeded");
+            let contents = server.await.unwrap();
+            assert_eq!(contents, vec!["one".to_owned(), "two".to_owned()]);
+            transport.shutdown().await;
         }
 
         #[tokio::test]
