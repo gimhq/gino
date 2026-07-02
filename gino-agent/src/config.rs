@@ -34,8 +34,6 @@ use thiserror::Error;
 
 use crate::protocol::v2::ProvisioningEntry;
 
-/// Default tracing filter directive when neither `RUST_LOG` nor `-v` is set.
-const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default workspace directory (configurable; never a hardcoded Docker mount).
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
 /// Default SQLite filename within the workspace directory.
@@ -110,8 +108,10 @@ pub(crate) struct Config {
     pub(crate) heartbeat_interval_ms: u64,
     /// Filesystem layout (workspace + DB path).
     pub(crate) paths: Paths,
-    /// Tracing filter directive (e.g. `info`, `gino_agent=debug`).
-    pub(crate) log_level: String,
+    // No `log_level` here: the tracing filter is fixed at process start from
+    // `RUST_LOG`/`-v` (see `init_tracing`), before any host config layer exists;
+    // a host-sent `logLevel` was never consulted and is now just an ignored
+    // unknown field.
 }
 
 impl Default for Config {
@@ -130,7 +130,6 @@ impl Default for Config {
             config_version: None,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             paths: Paths::default(),
-            log_level: DEFAULT_LOG_LEVEL.to_owned(),
         }
     }
 }
@@ -187,16 +186,16 @@ impl Default for ExecutorConfig {
 
 /// Byte backend for the out-of-band attachment channel (agent-architecture §9,
 /// decision A2). **Host-proxy is the always-available default** (`GET`/`POST
-/// /agent/attachments`, connect-token auth); `Presigned` (URL/CDN) is selected
-/// only when object storage is configured and is **not implemented this
-/// campaign** — the runner returns an `unsupported` error for it.
+/// /agent/attachments`, connect-token auth). The spec's presigned-URL/CDN
+/// backend was never implemented — its selectable-but-unusable variant is
+/// deleted; re-add it here together with a real backend impl if object storage
+/// lands. An unrecognized `backend` string (including `"presigned"`) leaves the
+/// host-proxy selection untouched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AttachmentBackendKind {
     /// Host streams the bytes through `GET`/`POST /agent/attachments`.
     #[default]
     HostProxy,
-    /// Presigned URL / CDN (object storage). Not yet implemented.
-    Presigned,
 }
 
 /// Out-of-band attachment channel limits + backend selection (agent-architecture
@@ -286,7 +285,6 @@ impl Config {
             version,
             heartbeat_interval_ms,
             paths,
-            log_level,
         } = overlay;
 
         overlay_field(&mut self.host_url, host_url);
@@ -294,9 +292,6 @@ impl Config {
         overlay_field(&mut self.agent_id, agent_id);
         overlay_secret(&mut self.register_token, register_token);
         overlay_secret(&mut self.connect_token, connect_token);
-        if let Some(level) = log_level {
-            self.log_level = level;
-        }
         if let Some(ms) = heartbeat_interval_ms {
             self.heartbeat_interval_ms = ms;
         }
@@ -380,14 +375,10 @@ impl Config {
             content_type_allowlist,
             cache_max_bytes,
         } = overlay;
-        if let Some(kind) = backend {
-            match kind.as_str() {
-                "host_proxy" | "hostProxy" => {
-                    self.attachments.backend = AttachmentBackendKind::HostProxy;
-                }
-                "presigned" => self.attachments.backend = AttachmentBackendKind::Presigned,
-                _ => {}
-            }
+        if let Some(kind) = backend
+            && matches!(kind.as_str(), "host_proxy" | "hostProxy")
+        {
+            self.attachments.backend = AttachmentBackendKind::HostProxy;
         }
         if let Some(value) = max_single_bytes {
             self.attachments.max_single_bytes = value;
@@ -413,10 +404,7 @@ impl Config {
     }
 }
 
-/// Orchestrator URL derivation. These are part of the resolved config surface
-/// consumed by the register/transport modules added in later changes; they are
-/// already validated by unit tests here but not yet called from `main`.
-#[allow(dead_code)]
+/// Orchestrator URL derivation, consumed by the register/runner wiring.
 impl Config {
     /// The orchestrator HTTP base URL with any trailing slash trimmed.
     pub(crate) fn http_base(&self) -> Result<&str, ConfigError> {
@@ -482,7 +470,6 @@ pub(crate) struct ConfigOverlay {
     version: Option<i64>,
     heartbeat_interval_ms: Option<u64>,
     paths: PathsOverlay,
-    log_level: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -524,6 +511,11 @@ struct RetentionOverlay {
 #[serde(default, rename_all = "camelCase")]
 struct PathsOverlay {
     workspace_dir: Option<PathBuf>,
+    /// Settable only by the env/CLI bootstrap layer ([`ConfigOverlay::paths_bootstrap`]).
+    /// `#[serde(skip)]`: the DB is opened before any host layer applies, so a
+    /// host-sent `paths.dbPath` could never take effect — it is ignored instead
+    /// of silently accepted-and-dead.
+    #[serde(skip)]
     db_path: Option<PathBuf>,
 }
 
@@ -572,13 +564,13 @@ impl ConfigOverlay {
         }
     }
 
-    /// Parse a host-assigned config payload (register response / HTTP refresh /
-    /// WS `config_update`) into an overlay. Unknown fields are rejected so a
-    /// typo in a host payload surfaces loudly instead of being silently dropped.
-    ///
-    /// Consumed by the register/transport modules added in later changes; here
-    /// it is exercised only by unit tests.
-    #[allow(dead_code)]
+    /// Parse a host-assigned config payload into an overlay. Production callers
+    /// deserialize from an already-parsed `Value` (`serde_json::from_value`);
+    /// this string-input wrapper is test-only convenience.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "test-only convenience over serde_json::from_str")
+    )]
     pub(crate) fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(raw)
     }
@@ -627,7 +619,6 @@ mod tests {
     #[test]
     fn defaults_have_expected_values() {
         let config = Config::default();
-        assert_eq!(config.log_level, "info");
         assert_eq!(
             config.executor.max_attempts, 3,
             "shipped default must let retryable failures actually retry"
@@ -703,13 +694,13 @@ mod tests {
             ConfigOverlay::from_json(r#"{ "engine": { "model": "claude-sonnet-4-6" } }"#).unwrap(),
         );
 
-        // Layer 4 — live WS update: overrides only the log level.
-        config.apply(ConfigOverlay::from_json(r#"{ "logLevel": "debug" }"#).unwrap());
+        // Layer 4 — live WS update: overrides only the heartbeat cadence.
+        config.apply(ConfigOverlay::from_json(r#"{ "heartbeatIntervalMs": 5000 }"#).unwrap());
 
         // Latest writer wins for each field…
         assert_eq!(config.host_url.as_deref(), Some("https://new.example.com"));
         assert_eq!(config.engine.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.heartbeat_interval_ms, 5000);
         // …and fields a later layer left unset are preserved.
         assert_eq!(config.agent_name.as_deref(), Some("worker-1"));
         assert_eq!(config.agent_id.as_deref(), Some("agent-123"));
@@ -817,9 +808,12 @@ mod tests {
             )
             .unwrap(),
         );
+        // "presigned" was deleted with its unimplemented backend: it now parses
+        // as an unrecognized selection and host-proxy stays in effect, while the
+        // limits from the same overlay still apply.
         assert_eq!(
             config.attachments.backend,
-            super::AttachmentBackendKind::Presigned
+            super::AttachmentBackendKind::HostProxy
         );
         assert_eq!(config.attachments.max_single_bytes, 1_048_576);
         assert_eq!(config.attachments.max_execution_bytes, 4_194_304);
