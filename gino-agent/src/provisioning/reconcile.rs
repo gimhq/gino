@@ -262,6 +262,29 @@ impl Provisioner {
         Ok(())
     }
 
+    /// Release every manifest row for `scope` — the terminal-state cleanup half of
+    /// P1-11. Dropping the rows removes the scope from the repair/GC root set: the
+    /// store entries it referenced become refcount-orphans that the next
+    /// [`Self::gc`] collects, and [`Self::repair`] no longer rebuilds the scope's
+    /// symlink tree at startup. The on-disk symlinks are deliberately left in
+    /// place: a task scope's root lives inside a terminal thread's `work_dir`,
+    /// which is reclaimed as a whole by workspace lifecycle, not link by link.
+    pub(crate) async fn release_scope(&self, scope: &str) -> Result<(), ProvisioningError> {
+        // Serialize against GC / reconcile (Risk 4) so the row set GC refcounts
+        // against is never observed mid-release.
+        let _gc = self.gc_lock.lock().await;
+
+        let db = lock_db(&self.db);
+        let rows = db.list_config_entries(scope)?;
+        for row in &rows {
+            db.delete_config_entry(scope, &row.target)?;
+        }
+        if !rows.is_empty() {
+            debug!(scope, released = rows.len(), "released provisioning scope");
+        }
+        Ok(())
+    }
+
     /// Restart-repair (PLAN-007 §7, Risk 2): for each manifest row whose symlink is
     /// missing or dangling, recreate it from the present store entry, otherwise
     /// re-fetch and re-materialize the bytes and then link. Treats the FS as
@@ -726,6 +749,45 @@ mod tests {
         assert_eq!(fake.fetch_count(), before + 1, "store gone → re-fetch");
         assert!(store_path.is_dir());
         assert_eq!(std::fs::read(link.join("SKILL.md")).unwrap(), b"# demo\n");
+    }
+
+    /// P1-11: releasing a scope drops its manifest rows, which unroots the scope
+    /// from repair (a lost link stays gone, nothing re-fetched) and lets GC
+    /// collect the now-unreferenced store entry. The on-disk symlink itself is
+    /// left in place — the dead scope root is reclaimed wholesale elsewhere.
+    #[tokio::test]
+    async fn release_scope_unroots_rows_from_repair_and_gc() {
+        let ws = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeFetcher::default());
+        let (prov, db) = provisioner(ws.path(), &fake);
+        let scope_root = ws.path().join("t1-project");
+
+        let e = entry("task-claude", "CLAUDE.md", EntryKind::File, b"X\n");
+        fake.insert("/agent/attachments/task-claude", b"X\n");
+        prov.reconcile("t1", &scope_root, std::slice::from_ref(&e))
+            .await
+            .unwrap();
+        assert_eq!(rows(&db, "t1").len(), 1);
+
+        prov.release_scope("t1").await.unwrap();
+        assert!(rows(&db, "t1").is_empty());
+        let link = scope_root.join("CLAUDE.md");
+        assert!(link.exists(), "release leaves the on-disk link in place");
+
+        // Released rows no longer root repair: a removed link stays gone.
+        std::fs::remove_file(&link).unwrap();
+        let before = fake.fetch_count();
+        prov.repair().await.unwrap();
+        assert!(!link.exists(), "released scope must not be repaired");
+        assert_eq!(fake.fetch_count(), before, "repair must not re-fetch");
+
+        // ...and GC collects the now-unreferenced store entry.
+        prov.gc().await.unwrap();
+        assert!(
+            !store::store_path(ws.path(), "task-claude", &e.sha256)
+                .unwrap()
+                .exists()
+        );
     }
 
     #[tokio::test]
