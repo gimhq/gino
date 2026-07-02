@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 
-use crate::engine::{EngineEvent, LogLevel, RunOutcome, RunStatus};
+use crate::engine::{EngineEvent, LogLevel, RunErrorKind, RunOutcome, RunStatus};
 
 /// Map a parsed stdout stream-json line to an [`EngineEvent`], or `None` for
 /// lines the runner ignores (echoed `user` turns, unrecognised types). The caller
@@ -102,6 +102,7 @@ fn map_result(value: &Value) -> RunOutcome {
             result: text,
             session_id,
             error: None,
+            error_kind: None,
         }
     } else {
         // The error detail is the result text when present, else the subtype.
@@ -114,7 +115,20 @@ fn map_result(value: &Value) -> RunOutcome {
             result: text,
             session_id,
             error,
+            error_kind: error_kind_of(subtype),
         }
+    }
+}
+
+/// The structured error cause for a non-success `result.subtype`. Exact-match
+/// only over the subtypes the CLI emits; anything unrecognised (including a
+/// `success` subtype flagged `is_error`) carries no kind and is left to the
+/// classifier's conservative fallback.
+fn error_kind_of(subtype: &str) -> Option<RunErrorKind> {
+    match subtype {
+        "error_max_turns" => Some(RunErrorKind::MaxTurns),
+        "error_during_execution" => Some(RunErrorKind::Execution),
+        _ => None,
     }
 }
 
@@ -123,7 +137,7 @@ mod tests {
     use serde_json::json;
 
     use super::map_line;
-    use crate::engine::{EngineEvent, LogLevel, RunStatus};
+    use crate::engine::{EngineEvent, LogLevel, RunErrorKind, RunStatus};
 
     #[test]
     fn init_becomes_session_started() {
@@ -198,6 +212,39 @@ mod tests {
         assert_eq!(outcome.result.as_deref(), Some("all done"));
         assert_eq!(outcome.session_id.as_deref(), Some("sess-abc"));
         assert!(outcome.error.is_none());
+        assert!(outcome.error_kind.is_none());
+    }
+
+    #[test]
+    fn success_prose_never_carries_an_error_kind() {
+        // The audit's false positives: error-looking prose ("took 1500ms",
+        // "400") in a successful result must not surface a structured cause.
+        let value = json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "the request took 1500ms and returned 400 rows"
+        });
+        let Some(EngineEvent::Result(outcome)) = map_line(&value) else {
+            panic!("expected a result event");
+        };
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert!(outcome.error_kind.is_none());
+    }
+
+    #[test]
+    fn error_subtypes_map_to_structured_kinds() {
+        let cases = [
+            ("error_max_turns", Some(RunErrorKind::MaxTurns)),
+            ("error_during_execution", Some(RunErrorKind::Execution)),
+            ("error_never_heard_of", None),
+        ];
+        for (subtype, kind) in cases {
+            let value = json!({ "type": "result", "subtype": subtype, "is_error": true });
+            let Some(EngineEvent::Result(outcome)) = map_line(&value) else {
+                panic!("expected a result event for {subtype}");
+            };
+            assert_eq!(outcome.status, RunStatus::Error, "{subtype}");
+            assert_eq!(outcome.error_kind, kind, "{subtype}");
+        }
     }
 
     #[test]
@@ -212,6 +259,7 @@ mod tests {
         assert_eq!(outcome.status, RunStatus::Error);
         assert_eq!(outcome.error.as_deref(), Some("error_max_turns"));
         assert_eq!(outcome.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(outcome.error_kind, Some(RunErrorKind::MaxTurns));
     }
 
     #[test]
@@ -225,6 +273,10 @@ mod tests {
         };
         assert_eq!(outcome.status, RunStatus::Error);
         assert_eq!(outcome.error.as_deref(), Some("tool failure"));
+        assert!(
+            outcome.error_kind.is_none(),
+            "a success subtype flagged is_error has no structured cause"
+        );
     }
 
     #[test]

@@ -54,6 +54,20 @@ pub(crate) enum RunStatus {
     Error,
 }
 
+/// Structured cause of an errored turn, derived from the backend's structured
+/// result fields (Claude's `result.subtype`) — never from the result prose,
+/// which is (or quotes) model output and must not drive policy. `None` on an
+/// errored [`RunOutcome`] means the backend reported no structured cause the
+/// runner recognises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunErrorKind {
+    /// The engine hit its own turn/iteration cap (`error_max_turns`).
+    MaxTurns,
+    /// The engine reported a generic in-run failure (`error_during_execution`)
+    /// with no more specific structured cause.
+    Execution,
+}
+
 /// Severity of an [`EngineEvent::Log`] line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogLevel {
@@ -121,6 +135,10 @@ pub(crate) struct RunOutcome {
     pub(crate) session_id: Option<String>,
     /// Error detail when `status` is [`RunStatus::Error`].
     pub(crate) error: Option<String>,
+    /// Structured cause when `status` is [`RunStatus::Error`], if the backend
+    /// reported one. This — never `error`/`result` prose — is what failure
+    /// classification keys off.
+    pub(crate) error_kind: Option<RunErrorKind>,
 }
 
 impl RunOutcome {
@@ -132,6 +150,7 @@ impl RunOutcome {
             result: None,
             session_id: None,
             error: Some(message.into()),
+            error_kind: None,
         }
     }
 }
