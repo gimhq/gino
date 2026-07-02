@@ -709,7 +709,7 @@ impl Scheduler {
         };
         let Some(scheduled_at) = parse_iso(&scheduled_iso) else {
             warn!(cron = %cron.id, value = %scheduled_iso, "unparseable next_run; advancing without firing");
-            self.advance_cron(db, cron, now)?;
+            Self::advance_cron(db, cron, now)?;
             return Ok(false);
         };
 
@@ -720,7 +720,8 @@ impl Scheduler {
 
         // Shared continuity needs the open thread's state to decide overlap.
         let shared_status = if cron.continuity == "shared" {
-            db.get_thread(&shared_thread_id(&cron.id))?.map(|t| t.status)
+            db.get_thread(&shared_thread_id(&cron.id))?
+                .map(|t| t.status)
         } else {
             None
         };
@@ -756,7 +757,7 @@ impl Scheduler {
             debug!(cron = %cron.id, scheduled_at = %scheduled_iso, "duplicate fire ignored (already logged)");
             // A crash between logging and advancing leaves next_run on the old slot;
             // advance now so the loop moves on without re-dispatching.
-            self.advance_cron(db, cron, now)?;
+            Self::advance_cron(db, cron, now)?;
             return Ok(false);
         }
 
@@ -781,8 +782,8 @@ impl Scheduler {
         // Emit `cron_state` only when the guarded advance accepted — when the
         // cron was deleted/edited between the tick-read and this fire there is
         // no current row worth advertising to the host.
-        if let Some(updated) = self.advance_cron(db, cron, now)? {
-            self.emit_cron_state(db, &updated, round_seq, entry)?;
+        if let Some(updated) = Self::advance_cron(db, cron, now)? {
+            Self::emit_cron_state(db, &updated, round_seq, entry)?;
         }
         Ok(true)
     }
@@ -846,7 +847,6 @@ impl Scheduler {
     /// deleted cron is never resurrected (P2-13). Returns the advanced row (for
     /// `cron_state`), or `None` when the guard rejected the stale advance.
     fn advance_cron(
-        &self,
         db: &Db,
         cron: &CronRow,
         now: DateTime<Utc>,
@@ -893,7 +893,6 @@ impl Scheduler {
     /// column (`thread_id`); the transport's `build_envelope` keys it back to
     /// `cronId` for a `cron_state` row (Lane E), so the cron id rides that column.
     fn emit_cron_state(
-        &self,
         db: &Db,
         cron: &CronRow,
         round_count: i64,
@@ -1379,7 +1378,10 @@ mod tests {
                 sched.fire_slot(d, &stale, at("2026-06-22T12:00:05Z"), &mut HashMap::new())
             })
         };
-        assert!(result.is_err(), "the read error must propagate, not become 0");
+        assert!(
+            result.is_err(),
+            "the read error must propagate, not become 0"
+        );
 
         // Nothing moved: no thread was materialized and the cron did not advance.
         let tid = isolated_thread_id("c-1", at(scheduled));
@@ -1923,18 +1925,16 @@ mod tests {
             Some("2026-06-22T12:01:00.000Z"),
         );
         lock_db(&db).insert_cron(&c).unwrap();
-        let sched = make_scheduler(Arc::clone(&db));
-        sched
-            .emit_cron_state(
-                &lock_db(&db),
-                &c,
-                1,
-                &CronTally {
-                    skipped: 0,
-                    last_status: Some("dispatched".to_owned()),
-                },
-            )
-            .unwrap();
+        Scheduler::emit_cron_state(
+            &lock_db(&db),
+            &c,
+            1,
+            &CronTally {
+                skipped: 0,
+                last_status: Some("dispatched".to_owned()),
+            },
+        )
+        .unwrap();
         let rows = lock_db(&db).list_unacked_outbox().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].msg_type, "cron_state");

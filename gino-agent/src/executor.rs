@@ -762,15 +762,7 @@ pub(crate) mod v2 {
                         session_id = Some(id);
                     }
                     Some(EngineEvent::Output { text }) => {
-                        if let Err(err) = Self::emit_message(
-                            &lock_db(&self.db),
-                            thread,
-                            MessageKind::AssistantText,
-                            Some(text),
-                            None,
-                        ) {
-                            warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
-                        }
+                        self.stream_message(thread, MessageKind::AssistantText, text);
                     }
                     Some(EngineEvent::Log { level, message }) => {
                         let kind = if matches!(level, LogLevel::Error) {
@@ -778,11 +770,7 @@ pub(crate) mod v2 {
                         } else {
                             MessageKind::Status
                         };
-                        if let Err(err) =
-                            Self::emit_message(&lock_db(&self.db), thread, kind, Some(message), None)
-                        {
-                            warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
-                        }
+                        self.stream_message(thread, kind, message);
                     }
                     Some(EngineEvent::Usage { .. }) => {}
                     Some(EngineEvent::Result(outcome)) => {
@@ -1102,9 +1090,19 @@ pub(crate) mod v2 {
 
         // -- Outbox emission (frame data only; envelope rebuilt by transport) --
 
+        /// Enqueue one streamed transcript message from a live run, logging (not
+        /// propagating) a failure — a lost transcript line must not abort the run.
+        fn stream_message(&self, thread: &ThreadRow, kind: MessageKind, content: String) {
+            if let Err(err) =
+                Self::emit_message(&lock_db(&self.db), thread, kind, Some(content), None)
+            {
+                warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
+            }
+        }
+
         /// Stream one `thread_message` transcript event (per-thread monotonic
         /// `seq`), correlated by `task_id`/`thread_id`, on the caller-held `db`
-        /// (a lone lock guard from [`Self::drive`], or the open finalize
+        /// (a lone lock guard from [`Self::stream_message`], or the open finalize
         /// transaction from [`Self::persist_and_emit`]).
         fn emit_message(
             db: &Db,
@@ -2207,12 +2205,9 @@ pub(crate) mod v2 {
             // Force the transaction's outbox write to fail mid-finalize.
             lock(&db).exec_raw("DROP TABLE outbox").unwrap();
 
+            let pending = lock(&db).get_thread("th-atomic").unwrap().unwrap();
             let returned = exec
-                .run_thread(
-                    lock(&db).get_thread("th-atomic").unwrap().unwrap(),
-                    "go".to_owned(),
-                    Continuity::Isolated,
-                )
+                .run_thread(pending, "go".to_owned(), Continuity::Isolated)
                 .await;
             assert_eq!(returned.status, "succeeded", "the run itself concluded");
 
@@ -2230,12 +2225,9 @@ pub(crate) mod v2 {
             let mut repend = persisted;
             "pending".clone_into(&mut repend.status);
             lock(&db).update_thread(&repend).unwrap();
-            exec.run_thread(
-                lock(&db).get_thread("th-atomic").unwrap().unwrap(),
-                "go".to_owned(),
-                Continuity::Isolated,
-            )
-            .await;
+            let repended = lock(&db).get_thread("th-atomic").unwrap().unwrap();
+            exec.run_thread(repended, "go".to_owned(), Continuity::Isolated)
+                .await;
             let persisted = lock(&db).get_thread("th-atomic").unwrap().unwrap();
             assert_eq!(persisted.status, "succeeded");
             assert_eq!(
