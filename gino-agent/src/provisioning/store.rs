@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use super::{ProvisioningError, safe_link_path, safe_name, short_id};
+use super::{ProvisioningError, safe_link_path, short_id};
+use crate::paths::safe_component;
 
 /// Fixed sub-directory of the workspace `store_root` holding the store tree.
 const STORE_SUBDIR: &str = "store";
@@ -73,7 +74,7 @@ pub(crate) fn store_path(
     name: &str,
     sha256: &str,
 ) -> Result<PathBuf, ProvisioningError> {
-    let safe = safe_name(name)?;
+    let safe = safe_component(name)?;
     Ok(store_root
         .join(STORE_SUBDIR)
         .join(safe)

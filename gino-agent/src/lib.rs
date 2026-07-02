@@ -32,6 +32,7 @@ mod engine;
 mod executor;
 mod failure;
 mod gino_cli;
+mod paths;
 mod protocol;
 mod provisioning;
 mod register;

@@ -102,6 +102,12 @@ pub(crate) enum AttachmentError {
     Io(#[from] std::io::Error),
 }
 
+impl From<crate::paths::UnsafeName> for AttachmentError {
+    fn from(err: crate::paths::UnsafeName) -> Self {
+        AttachmentError::UnsafeName { name: err.name }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Byte backend (A2): host-proxy default; presigned/CDN left unimplemented.
 // ---------------------------------------------------------------------------
@@ -367,7 +373,7 @@ impl AttachmentManager {
             if is_outbound(descriptor) {
                 continue;
             }
-            let safe = sanitize_name(&descriptor.name)?;
+            let safe = crate::paths::safe_component(&descriptor.name)?;
             let bytes = self.fetch(descriptor).await?;
             let size = bytes.len();
             total = total.saturating_add(size as u64);
@@ -378,7 +384,7 @@ impl AttachmentManager {
                 });
             }
             // 100 MB-scale write → blocking pool, not the async worker (P2-15).
-            let dest = inputs_dir.join(&safe);
+            let dest = inputs_dir.join(safe);
             let dir = inputs_dir.clone();
             let write_dest = dest.clone();
             run_blocking(move || {
@@ -811,25 +817,6 @@ fn is_outbound(descriptor: &AttachmentDescriptor) -> bool {
     descriptor.direction.as_deref() == Some(DIRECTION_OUTBOUND)
 }
 
-/// Validate an attacker-supplied attachment name down to a single safe path
-/// component: reject empties, NULs, separators (`/`/`\`), `.`/`..`, so it can be
-/// joined under `inputs/` without `../`/absolute-path escape (PLAN-005 risk 3).
-fn sanitize_name(name: &str) -> Result<String, AttachmentError> {
-    let unsafe_name = || AttachmentError::UnsafeName {
-        name: name.to_owned(),
-    };
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('\0')
-        || name.contains('/')
-        || name.contains('\\')
-    {
-        return Err(unsafe_name());
-    }
-    Ok(name.to_owned())
-}
-
 /// Bump a cache file's modified time to now so it survives LRU GC longer
 /// (best-effort; failure is ignored — GC still works off insertion time).
 fn touch(path: &Path) {
@@ -901,7 +888,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{AttachmentBackend, AttachmentError, AttachmentManager, sanitize_name, sha256_hex};
+    use super::{AttachmentBackend, AttachmentError, AttachmentManager, sha256_hex};
     use crate::config::AttachmentsConfig;
     use crate::protocol::v2::AttachmentDescriptor;
     use crate::transport::http::UploadedAttachment;
@@ -1148,28 +1135,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AttachmentError::ContentTypeNotAllowed { .. }));
-    }
-
-    #[test]
-    fn sanitize_name_rejects_traversal_and_absolute_paths() {
-        for bad in [
-            "../escape",
-            "/etc/passwd",
-            "..",
-            ".",
-            "",
-            "a/b",
-            "a\\b",
-            "x\0y",
-        ] {
-            assert!(
-                matches!(sanitize_name(bad), Err(AttachmentError::UnsafeName { .. })),
-                "expected {bad:?} to be rejected"
-            );
-        }
-        for good in ["report.txt", "data-1.json", "a_b.csv", "naïve.txt"] {
-            assert_eq!(sanitize_name(good).unwrap(), good);
-        }
     }
 
     #[tokio::test]
