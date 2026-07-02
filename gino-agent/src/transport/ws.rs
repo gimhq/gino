@@ -1039,6 +1039,70 @@ mod tests {
         );
     }
 
+    const CONFIG_UPDATE_FRAME: &str =
+        r#"{"type":"config_update","data":{"engine":{"anthropicApiKey":"sk-new"}},"msgId":11}"#;
+
+    /// P2-19 regression: a `config_update` flows through the SAME at-least-once
+    /// pipeline as every other inbound frame — persisted verbatim under its wire
+    /// type, acked, and deduped by `msg_id` (a redelivery is re-acked without a
+    /// second row) — instead of being silently dropped at the WS layer.
+    #[test]
+    fn config_update_is_persisted_acked_and_deduped_like_other_frames() {
+        let db = test_db();
+
+        let first = classify_inbound(CONFIG_UPDATE_FRAME, &db);
+        assert!(
+            matches!(
+                first,
+                InboundDisposition::Deliver {
+                    msg_id: Some(11),
+                    ..
+                }
+            ),
+            "first delivery persists, acks and delivers: {first:?}"
+        );
+        let rows = db.lock().unwrap().list_unprocessed_inbox().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].msg_type, INBOX_TYPE_CONFIG_UPDATE);
+
+        let dup = classify_inbound(CONFIG_UPDATE_FRAME, &db);
+        assert!(
+            matches!(dup, InboundDisposition::AckOnly { msg_id: 11 }),
+            "redelivery is re-acked without a second row: {dup:?}"
+        );
+        assert_eq!(
+            db.lock().unwrap().list_unprocessed_inbox().unwrap().len(),
+            1
+        );
+    }
+
+    /// P2-19: a malformed `config_update` (missing its required `data`) follows
+    /// the established dead-letter policy — acked away, never queued — so it
+    /// cannot head-of-line-block the stream.
+    #[test]
+    fn malformed_config_update_is_dead_lettered_with_ack() {
+        let db = test_db();
+        let disposition = classify_inbound(r#"{"type":"config_update","msgId":12}"#, &db);
+        assert!(
+            matches!(disposition, InboundDisposition::AckOnly { msg_id: 12 }),
+            "malformed config_update is acked per the dead-letter policy: {disposition:?}"
+        );
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty(),
+            "a dead-lettered frame is not queued for processing"
+        );
+
+        // A well-formed frame right after flows normally — no blocking.
+        assert!(matches!(
+            classify_inbound(CONFIG_UPDATE_FRAME, &db),
+            InboundDisposition::Deliver { .. }
+        ));
+    }
+
     /// P1-12 regression: a KNOWN-type frame with a malformed body is acked away
     /// (dead-lettered) rather than left unpersisted+unacked, where the host
     /// would resend it forever and head-of-line-block the stream.

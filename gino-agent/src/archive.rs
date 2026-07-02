@@ -600,6 +600,145 @@ mod tests {
         assert!(index.entries[0].full_path.ends_with(&archive));
     }
 
+    /// P2-19 regression: a summary with no ASCII alphanumerics used to slug to
+    /// the EMPTY string, so every such same-day archive shared one name. The
+    /// content-hash fallback yields distinct, non-empty, deterministic slugs.
+    #[test]
+    fn non_ascii_summary_slugs_to_distinct_nonempty_names() {
+        let first = sanitize_filename("éàü");
+        let second = sanitize_filename("çß");
+        assert!(
+            first.starts_with("conversation-") && first.len() > "conversation-".len(),
+            "hash fallback must be non-empty: {first:?}"
+        );
+        assert!(second.starts_with("conversation-"));
+        assert_ne!(first, second, "distinct summaries must not collide");
+        // Deterministic: the same summary keeps its name.
+        assert_eq!(first, sanitize_filename("éàü"));
+    }
+
+    /// P2-19 regression: two same-day archives with the SAME summary get
+    /// distinct file names (counter suffix) instead of overwriting each other,
+    /// and both land in the index.
+    #[test]
+    fn same_day_identical_summaries_produce_distinct_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript_path = project.join("t.jsonl");
+        std::fs::write(
+            &transcript_path,
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("sessions-index.json"),
+            json!({ "entries": [
+                { "sessionId": "sess-1", "fullPath": "", "summary": "Build a Thing", "firstPrompt": "" },
+                { "sessionId": "sess-2", "fullPath": "", "summary": "Build a Thing", "firstPrompt": "" }
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        for session in ["sess-1", "sess-2"] {
+            let input = json!({
+                "transcript_path": transcript_path.display().to_string(),
+                "session_id": session
+            })
+            .to_string();
+            run(workspace, Cursor::new(input)).unwrap();
+        }
+
+        let conversations = workspace.join("conversations");
+        let names: Vec<String> = std::fs::read_dir(&conversations)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| std::path::Path::new(name).extension() == Some("md".as_ref()))
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "the second archive must not overwrite the first: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("build-a-thing.md") && !name.contains("thing-2")),
+            "base name present: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("build-a-thing-2.md")),
+            "collision gets a counter suffix: {names:?}"
+        );
+
+        let index: SessionsIndex = serde_json::from_str(
+            &std::fs::read_to_string(conversations.join("sessions-index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index.entries.len(), 2);
+        assert_ne!(
+            index.entries[0].full_path, index.entries[1].full_path,
+            "index entries point at distinct archives"
+        );
+    }
+
+    /// P2-19 regression: the index update is a read-modify-write; two archive
+    /// hooks racing it used to lose entries (a stale read clobbers the other
+    /// writer's insert). The conversations-dir advisory lock serializes the
+    /// whole archive write, so every concurrent run's entry survives.
+    #[test]
+    fn concurrent_runs_do_not_lose_index_entries() {
+        const PER_THREAD: usize = 20;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let project = workspace.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript_path = project.join("t.jsonl");
+        std::fs::write(
+            &transcript_path,
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string(),
+        )
+        .unwrap();
+
+        let workers: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|prefix| {
+                let workspace = workspace.clone();
+                let transcript = transcript_path.display().to_string();
+                let prefix = (*prefix).to_owned();
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let input = json!({
+                            "transcript_path": transcript,
+                            "session_id": format!("sess-{prefix}-{i}")
+                        })
+                        .to_string();
+                        run(&workspace, Cursor::new(input)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let index: SessionsIndex = serde_json::from_str(
+            &std::fs::read_to_string(workspace.join("conversations/sessions-index.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            index.entries.len(),
+            2 * PER_THREAD,
+            "no interleaved index update may lose an entry"
+        );
+    }
+
     #[test]
     fn run_is_a_noop_for_empty_input() {
         let dir = tempfile::tempdir().unwrap();
