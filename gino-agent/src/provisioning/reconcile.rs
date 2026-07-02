@@ -166,9 +166,12 @@ impl Provisioner {
 
         let kind = store_kind(entry.kind);
         let store_path = store::store_path(&self.workspace_dir, &entry.id, &entry.sha256)?;
-        // Only fetch when the content-addressed store entry is absent — this is
-        // what keeps a re-reconcile fetch-free (and the store itself idempotent).
-        if !store_entry_present(&store_path, kind) {
+        // Reuse requires full-hash re-verification (P2-17): the short-id path
+        // plus a shape check is not identity — a truncated post-crash file or a
+        // tampered entry passes `is_file()` forever. A verified entry keeps the
+        // re-reconcile fetch-free; anything else is evicted and re-fetched.
+        if !store::verify_entry(&store_path, kind, &entry.sha256) {
+            store::remove_store_entry(&self.workspace_dir, &entry.id, &entry.sha256)?;
             let bytes = self
                 .fetcher
                 .fetch(&Self::reference_for(&entry.id), &entry.sha256)
@@ -285,10 +288,12 @@ impl Provisioner {
         Ok(())
     }
 
-    /// Restart-repair (PLAN-007 §7, Risk 2): for each manifest row whose symlink is
-    /// missing or dangling, recreate it from the present store entry, otherwise
-    /// re-fetch and re-materialize the bytes and then link. Treats the FS as
-    /// authoritative for bytes and the table as the index. Held under the GC lock.
+    /// Restart-repair (PLAN-007 §7, Risk 2; P2-17): for each manifest row,
+    /// full-hash verify the store entry — a missing/truncated/tampered entry is
+    /// evicted, re-fetched and re-materialized; an intact one has its read-only
+    /// sealing healed (a chmod'ed-back entry is re-sealed). A missing or dangling
+    /// symlink is then recreated. Treats the FS as authoritative for bytes and
+    /// the table as the index. Held under the GC lock.
     pub(crate) async fn repair(&self) -> Result<(), ProvisioningError> {
         let _gc = self.gc_lock.lock().await;
 
@@ -297,24 +302,18 @@ impl Provisioner {
             db.list_all_config_entries()?
         };
         for row in rows {
-            let link_path = PathBuf::from(&row.link_path);
-            if !link_broken(&link_path) {
-                continue;
-            }
             let Some(kind) = parse_kind(&row.kind) else {
                 warn!(scope = %row.scope, target = %row.target, kind = %row.kind,
                     "repair: unknown entry kind, skipping");
                 continue;
             };
-            let Some(scope_root) = scope_root_of(&link_path, &row.target) else {
-                warn!(target = %row.target, link = %row.link_path,
-                    "repair: cannot derive scope root from link path, skipping");
-                continue;
-            };
             // Recompute the store path under the current workspace dir (robust to a
             // relocated workspace; the table stores an absolute snapshot only).
             let store_path = store::store_path(&self.workspace_dir, &row.name, &row.sha256)?;
-            if !store_entry_present(&store_path, kind) {
+            if store::verify_entry(&store_path, kind, &row.sha256) {
+                store::seal_entry(&store_path, kind)?;
+            } else {
+                store::remove_store_entry(&self.workspace_dir, &row.name, &row.sha256)?;
                 let bytes = self
                     .fetcher
                     .fetch(&Self::reference_for(&row.name), &row.sha256)
@@ -337,7 +336,18 @@ impl Provisioner {
                         )?;
                     }
                 }
+                warn!(scope = %row.scope, target = %row.target,
+                    "repair re-fetched a missing or corrupt store entry");
             }
+            let link_path = PathBuf::from(&row.link_path);
+            if !link_broken(&link_path) {
+                continue;
+            }
+            let Some(scope_root) = scope_root_of(&link_path, &row.target) else {
+                warn!(target = %row.target, link = %row.link_path,
+                    "repair: cannot derive scope root from link path, skipping");
+                continue;
+            };
             store::link(&scope_root, &row.target, &store_path, kind)?;
             debug!(scope = %row.scope, target = %row.target, "repair recreated symlink");
         }
@@ -383,15 +393,6 @@ fn parse_kind(kind: &str) -> Option<EntryKind> {
         "file" => Some(EntryKind::File),
         "dir" => Some(EntryKind::Dir),
         _ => None,
-    }
-}
-
-/// Whether the store entry at `store_path` is present **and** of the right shape
-/// for `kind` (a file for `File`, a directory for `Dir`).
-fn store_entry_present(store_path: &Path, kind: EntryKind) -> bool {
-    match kind {
-        EntryKind::File => store_path.is_file(),
-        EntryKind::Dir => store_path.is_dir(),
     }
 }
 
@@ -788,6 +789,119 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// P2-17 acceptance: a post-crash zero-length store file passes `is_file()`
+    /// but fails full-hash re-verification — reconcile evicts and re-fetches it
+    /// instead of silently reusing the corrupt entry.
+    #[tokio::test]
+    async fn reconcile_heals_truncated_store_file() {
+        let ws = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeFetcher::default());
+        let (prov, _db) = provisioner(ws.path(), &fake);
+        let scope_root = ws.path().join("global");
+
+        let bytes = b"# CLAUDE.md\n";
+        let e = entry("claude-md", "CLAUDE.md", EntryKind::File, bytes);
+        fake.insert("/agent/attachments/claude-md", bytes);
+        let desired = vec![e.clone()];
+        prov.reconcile("global", &scope_root, &desired)
+            .await
+            .unwrap();
+        let store_file = store::store_path(ws.path(), "claude-md", &e.sha256).unwrap();
+
+        // Simulate the crash artifact: replace the entry with a zero-length file.
+        std::fs::remove_file(&store_file).unwrap();
+        std::fs::write(&store_file, b"").unwrap();
+        assert!(store_file.is_file(), "the corrupt entry passes is_file()");
+        let before = fake.fetch_count();
+
+        prov.reconcile("global", &scope_root, &desired)
+            .await
+            .unwrap();
+
+        assert_eq!(fake.fetch_count(), before + 1, "hash mismatch → re-fetch");
+        assert_eq!(std::fs::read(&store_file).unwrap(), bytes);
+        assert_eq!(std::fs::read(scope_root.join("CLAUDE.md")).unwrap(), bytes);
+        assert_eq!(mode_of(&store_file), 0o444, "healed entry is re-sealed");
+    }
+
+    /// P2-17 acceptance: an entry tampered through the store path (the symlink
+    /// write-through poisoning scenario) is detected by repair's full-hash
+    /// verification, evicted, and re-fetched.
+    #[tokio::test]
+    async fn repair_heals_tampered_entry() {
+        let ws = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeFetcher::default());
+        let (prov, _db) = provisioner(ws.path(), &fake);
+        let scope_root = ws.path().join("global");
+
+        let bytes = b"# CLAUDE.md\n";
+        let e = entry("claude-md", "CLAUDE.md", EntryKind::File, bytes);
+        fake.insert("/agent/attachments/claude-md", bytes);
+        prov.reconcile("global", &scope_root, std::slice::from_ref(&e))
+            .await
+            .unwrap();
+        let store_file = store::store_path(ws.path(), "claude-md", &e.sha256).unwrap();
+        let link = scope_root.join("CLAUDE.md");
+
+        // Tamper through the store path after a chmod-back (a same-uid process
+        // can always do this — the read-only bits only stop casual writes).
+        chmod(&store_file, 0o644);
+        std::fs::write(&link, b"# CLAUDE.md\nEVIL APPENDED\n").unwrap();
+        let before = fake.fetch_count();
+
+        prov.repair().await.unwrap();
+
+        assert_eq!(fake.fetch_count(), before + 1, "tampered → re-fetch");
+        assert_eq!(std::fs::read(&store_file).unwrap(), bytes);
+        assert_eq!(std::fs::read(&link).unwrap(), bytes);
+        assert_eq!(mode_of(&store_file), 0o444, "healed entry is re-sealed");
+    }
+
+    /// P2-17 acceptance: an intact entry whose read-only sealing was chmod'ed
+    /// back is re-sealed by repair without any re-fetch.
+    #[tokio::test]
+    async fn repair_reseals_chmod_back_entry_without_refetch() {
+        let ws = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeFetcher::default());
+        let (prov, _db) = provisioner(ws.path(), &fake);
+        let scope_root = ws.path().join("global");
+
+        let file_bytes = b"# CLAUDE.md\n";
+        let tar = build_tar(&[("SKILL.md", b"# demo\n")]);
+        let fe = entry("claude-md", "CLAUDE.md", EntryKind::File, file_bytes);
+        let de = entry("demo-skill", ".claude/skills/demo", EntryKind::Dir, &tar);
+        fake.insert("/agent/attachments/claude-md", file_bytes);
+        fake.insert("/agent/attachments/demo-skill", &tar);
+        prov.reconcile("global", &scope_root, &[fe.clone(), de.clone()])
+            .await
+            .unwrap();
+        let store_file = store::store_path(ws.path(), "claude-md", &fe.sha256).unwrap();
+        let store_dir = store::store_path(ws.path(), "demo-skill", &de.sha256).unwrap();
+
+        // Chmod back (content intact).
+        chmod(&store_file, 0o644);
+        chmod(&store_dir, 0o755);
+        chmod(&store_dir.join("SKILL.md"), 0o644);
+        let before = fake.fetch_count();
+
+        prov.repair().await.unwrap();
+
+        assert_eq!(fake.fetch_count(), before, "intact content → no re-fetch");
+        assert_eq!(mode_of(&store_file), 0o444);
+        assert_eq!(mode_of(&store_dir), 0o555);
+        assert_eq!(mode_of(&store_dir.join("SKILL.md")), 0o444);
     }
 
     #[tokio::test]
