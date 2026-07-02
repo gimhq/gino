@@ -762,7 +762,7 @@ pub(crate) mod v2 {
                         session_id = Some(id);
                     }
                     Some(EngineEvent::Output { text }) => {
-                        self.emit_message(thread, MessageKind::AssistantText, Some(text), None);
+                        self.stream_message(thread, MessageKind::AssistantText, text);
                     }
                     Some(EngineEvent::Log { level, message }) => {
                         let kind = if matches!(level, LogLevel::Error) {
@@ -770,7 +770,7 @@ pub(crate) mod v2 {
                         } else {
                             MessageKind::Status
                         };
-                        self.emit_message(thread, kind, Some(message), None);
+                        self.stream_message(thread, kind, message);
                     }
                     Some(EngineEvent::Usage { .. }) => {}
                     Some(EngineEvent::Result(outcome)) => {
@@ -875,16 +875,18 @@ pub(crate) mod v2 {
                     done.engine_session_id.clone_from(&session_id);
                     done.finished_at = Some(to_iso(finished));
                     done.duration_ms = Some(duration_ms);
-                    self.persist(&done);
-                    self.emit_result(
-                        &done,
-                        ThreadStatus::Succeeded,
-                        result,
-                        None,
-                        None,
-                        session_id,
-                        outbound,
-                    );
+                    self.persist_and_emit(&done, |db| {
+                        Self::emit_result(
+                            db,
+                            &done,
+                            ThreadStatus::Succeeded,
+                            result,
+                            None,
+                            None,
+                            session_id,
+                            outbound,
+                        )
+                    });
                     done
                 }
                 Conclusion::Failure {
@@ -927,16 +929,18 @@ pub(crate) mod v2 {
                     done.failure_reason = None;
                     done.finished_at = Some(to_iso(finished));
                     done.duration_ms = Some(duration_ms);
-                    self.persist(&done);
-                    self.emit_result(
-                        &done,
-                        ThreadStatus::Cancelled,
-                        None,
-                        None,
-                        None,
-                        session_id,
-                        outbound,
-                    );
+                    self.persist_and_emit(&done, |db| {
+                        Self::emit_result(
+                            db,
+                            &done,
+                            ThreadStatus::Cancelled,
+                            None,
+                            None,
+                            None,
+                            session_id,
+                            outbound,
+                        )
+                    });
                     done
                 }
             }
@@ -964,8 +968,9 @@ pub(crate) mod v2 {
             retry.result = None;
             retry.error = Some(error);
             retry.failure_reason = None;
-            self.persist(&retry);
-            self.emit_message(&retry, MessageKind::Status, Some(note), None);
+            self.persist_and_emit(&retry, |db| {
+                Self::emit_message(db, &retry, MessageKind::Status, Some(note), None)
+            });
             retry
         }
 
@@ -988,16 +993,18 @@ pub(crate) mod v2 {
             failed.engine_session_id.clone_from(&kept_session);
             failed.finished_at = Some(to_iso(now()));
             failed.duration_ms = Some(duration_ms);
-            self.persist(&failed);
-            self.emit_result(
-                &failed,
-                ThreadStatus::Failed,
-                None,
-                Some(error),
-                Some(reason),
-                kept_session,
-                None,
-            );
+            self.persist_and_emit(&failed, |db| {
+                Self::emit_result(
+                    db,
+                    &failed,
+                    ThreadStatus::Failed,
+                    None,
+                    Some(error),
+                    Some(reason),
+                    kept_session,
+                    None,
+                )
+            });
             failed
         }
 
@@ -1083,17 +1090,29 @@ pub(crate) mod v2 {
 
         // -- Outbox emission (frame data only; envelope rebuilt by transport) --
 
+        /// Enqueue one streamed transcript message from a live run, logging (not
+        /// propagating) a failure — a lost transcript line must not abort the run.
+        fn stream_message(&self, thread: &ThreadRow, kind: MessageKind, content: String) {
+            if let Err(err) =
+                Self::emit_message(&lock_db(&self.db), thread, kind, Some(content), None)
+            {
+                warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
+            }
+        }
+
         /// Stream one `thread_message` transcript event (per-thread monotonic
-        /// `seq`), correlated by `task_id`/`thread_id`.
+        /// `seq`), correlated by `task_id`/`thread_id`, on the caller-held `db`
+        /// (a lone lock guard from [`Self::stream_message`], or the open finalize
+        /// transaction from [`Self::persist_and_emit`]).
         fn emit_message(
-            &self,
+            db: &Db,
             thread: &ThreadRow,
             kind: MessageKind,
             content: Option<String>,
             tool: Option<String>,
-        ) {
+        ) -> DbResult<()> {
             let data = ThreadMessageData {
-                seq: self.next_seq(&thread.id),
+                seq: Self::next_seq(db, &thread.id)?,
                 kind,
                 role: None,
                 content,
@@ -1101,18 +1120,18 @@ pub(crate) mod v2 {
                 input: None,
                 output: None,
             };
-            if let Err(err) = lock_db(&self.db).enqueue_outbox_correlated(
+            db.enqueue_outbox_correlated(
                 "thread_message",
                 &data,
                 Some(&thread.task_id),
                 Some(&thread.id),
-            ) {
-                warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
-            }
+            )?;
+            Ok(())
         }
 
         /// Emit the terminal `thread_result`, carrying `final_seq` = the last `seq`
-        /// streamed on the thread.
+        /// streamed on the thread. Runs on the caller-held `db` — in production
+        /// always inside the [`Self::persist_and_emit`] transaction (P1-8).
         // One argument per `thread_result` `data` field (status/result/error/
         // failure_reason/engine_session_id/attachments); bundling them into a
         // struct here would only move the same fields behind one more name.
@@ -1121,7 +1140,7 @@ pub(crate) mod v2 {
             reason = "mirrors the thread_result frame fields one-to-one"
         )]
         fn emit_result(
-            &self,
+            db: &Db,
             thread: &ThreadRow,
             status: ThreadStatus,
             result: Option<String>,
@@ -1129,7 +1148,7 @@ pub(crate) mod v2 {
             reason: Option<FailureReason>,
             session_id: Option<String>,
             attachments: Option<Vec<AttachmentDescriptor>>,
-        ) {
+        ) -> DbResult<()> {
             let data = ThreadResultData {
                 status,
                 result,
@@ -1137,24 +1156,36 @@ pub(crate) mod v2 {
                 failure_reason: reason.map(|r| r.as_str().to_owned()),
                 engine_session_id: session_id,
                 duration_ms: thread.duration_ms.unwrap_or(0),
-                final_seq: self.last_seq(&thread.id),
+                final_seq: db.get_thread_last_seq(&thread.id)?,
                 attachments,
             };
-            if let Err(err) = lock_db(&self.db).enqueue_outbox_correlated(
+            db.enqueue_outbox_correlated(
                 "thread_result",
                 &data,
                 Some(&thread.task_id),
                 Some(&thread.id),
-            ) {
-                warn!(thread = %thread.id, error = %err, "failed to enqueue thread_result");
-            }
+            )?;
+            Ok(())
         }
 
         // -- Small helpers --------------------------------------------------
 
-        fn persist(&self, thread: &ThreadRow) {
-            if let Err(err) = lock_db(&self.db).update_thread(thread) {
-                warn!(thread = %thread.id, error = %err, "failed to persist thread state");
+        /// Persist a thread transition and enqueue its outbox frame in ONE
+        /// `BEGIN IMMEDIATE` transaction (P1-8): the thread row and the frame
+        /// commit together or not at all, so a crash between them can no longer
+        /// strand a terminal thread the host never hears about. On error nothing
+        /// is written — the row keeps its previous state for the watchdog /
+        /// next drain to pick up again.
+        fn persist_and_emit(&self, thread: &ThreadRow, emit: impl FnOnce(&Db) -> DbResult<()>) {
+            let committed = {
+                let guard = lock_db(&self.db);
+                guard.immediate_transaction(|db| {
+                    db.update_thread(thread)?;
+                    emit(db)
+                })
+            };
+            if let Err(err) = committed {
+                warn!(thread = %thread.id, error = %err, "failed to commit thread state + outbox frame atomically");
             }
         }
 
@@ -1188,22 +1219,12 @@ pub(crate) mod v2 {
         /// Next per-thread `seq` (monotonic, starts at 1). Persisted to
         /// `threads.last_seq` so numbering **continues across a runner restart** —
         /// the host dedups on `(thread_id, seq)`, so restarting from 1 would collide
-        /// and drop emits (agent-architecture §5/§6). A read+bump under one DB lock.
-        fn next_seq(&self, thread_id: &str) -> i64 {
-            let guard = lock_db(&self.db);
-            let next = guard.get_thread_last_seq(thread_id).unwrap_or(0) + 1;
-            if let Err(err) = guard.set_thread_last_seq(thread_id, next) {
-                warn!(thread = %thread_id, error = %err, "failed to persist last_seq");
-            }
-            next
-        }
-
-        /// The last `seq` emitted for a thread (the persisted `threads.last_seq`, 0
-        /// if none) — the `final_seq` reported on the terminal `thread_result`.
-        fn last_seq(&self, thread_id: &str) -> i64 {
-            lock_db(&self.db)
-                .get_thread_last_seq(thread_id)
-                .unwrap_or(0)
+        /// and drop emits (agent-architecture §5/§6). A read+bump on the
+        /// caller-held `db` (one lock guard / open transaction).
+        fn next_seq(db: &Db, thread_id: &str) -> DbResult<i64> {
+            let next = db.get_thread_last_seq(thread_id)? + 1;
+            db.set_thread_last_seq(thread_id, next)?;
+            Ok(next)
         }
     }
 
@@ -2164,6 +2185,55 @@ pub(crate) mod v2 {
                 res.last().unwrap().final_seq,
                 2,
                 "seq continued, did not reset"
+            );
+        }
+
+        /// P1-8 regression: finalize commits the terminal thread row and its
+        /// `thread_result` outbox frame in ONE transaction — they appear
+        /// together or not at all. A failure enqueuing the frame (forced by
+        /// dropping the outbox table) must roll the terminal persist back too,
+        /// so a crash between the two writes can never strand a terminal
+        /// thread the host is never told about.
+        #[tokio::test]
+        async fn finalize_commits_thread_state_and_result_frame_atomically() {
+            let db = test_db();
+            let script = vec![started("sess-1"), ok_result("done", "sess-1")];
+            let exec = build(&db, script, false, no_inactivity());
+            lock(&db)
+                .insert_thread(&pending_thread("th-atomic", 1))
+                .unwrap();
+            // Force the transaction's outbox write to fail mid-finalize.
+            lock(&db).exec_raw("DROP TABLE outbox").unwrap();
+
+            let pending = lock(&db).get_thread("th-atomic").unwrap().unwrap();
+            let returned = exec
+                .run_thread(pending, "go".to_owned(), Continuity::Isolated)
+                .await;
+            assert_eq!(returned.status, "succeeded", "the run itself concluded");
+
+            // NOT terminal in the DB: the terminal persist rolled back with the
+            // failed enqueue (previously it committed alone — the P1-8 defect).
+            let persisted = lock(&db).get_thread("th-atomic").unwrap().unwrap();
+            assert_eq!(
+                persisted.status, "running",
+                "terminal state must not commit without its thread_result frame"
+            );
+
+            // Restore the outbox (empty) and re-run the thread: now BOTH commit.
+            lock(&db).migrate().unwrap();
+            assert!(results(&db).is_empty(), "no orphan thread_result frame");
+            let mut repend = persisted;
+            "pending".clone_into(&mut repend.status);
+            lock(&db).update_thread(&repend).unwrap();
+            let repended = lock(&db).get_thread("th-atomic").unwrap().unwrap();
+            exec.run_thread(repended, "go".to_owned(), Continuity::Isolated)
+                .await;
+            let persisted = lock(&db).get_thread("th-atomic").unwrap().unwrap();
+            assert_eq!(persisted.status, "succeeded");
+            assert_eq!(
+                results(&db).len(),
+                1,
+                "the terminal row and its frame land together"
             );
         }
 
