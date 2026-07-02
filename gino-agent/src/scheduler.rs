@@ -411,10 +411,13 @@ enum FireAction {
 }
 
 /// The deterministic thread id an *isolated* fire mints (agent-architecture §4):
-/// `"<cron_id>@<scheduled_epoch_seconds>"` — stable across replays so a re-fire of
-/// the same slot maps to the same row.
+/// `"<cron_id>@<scheduled_epoch_millis>"` — stable across replays so a re-fire of
+/// the same slot maps to the same row. Millisecond precision (audit P3): slots are
+/// at least one interval-millisecond apart, so distinct slots always mint distinct
+/// ids — at second precision a sub-second interval collided two slots onto one
+/// thread and cross-wired the second fire onto the first fire's run.
 fn isolated_thread_id(cron_id: &str, scheduled_at: DateTime<Utc>) -> String {
-    format!("{cron_id}@{}", scheduled_at.timestamp())
+    format!("{cron_id}@{}", scheduled_at.timestamp_millis())
 }
 
 /// The stable thread id a *shared* cron reuses across its turns.
@@ -1234,6 +1237,31 @@ mod tests {
         assert_eq!(scheduler.poll_interval, Duration::from_millis(25));
     }
 
+    /// Audit P3: distinct slots must mint distinct thread ids even within the
+    /// same second (a sub-second interval collided two slots onto one thread at
+    /// second precision, cross-wiring the second fire onto the first fire's
+    /// run), while a replay of the SAME slot keeps minting the same id.
+    #[test]
+    fn isolated_mint_is_distinct_per_slot_and_stable_per_replay() {
+        let slot_a = at("2026-06-22T12:00:00.200Z");
+        let slot_b = at("2026-06-22T12:00:00.700Z");
+        assert_ne!(
+            isolated_thread_id("c-1", slot_a),
+            isolated_thread_id("c-1", slot_b),
+            "two sub-second slots of one cron must not share a thread id"
+        );
+        assert_eq!(
+            isolated_thread_id("c-1", slot_a),
+            isolated_thread_id("c-1", slot_a),
+            "a replayed slot maps to the same row"
+        );
+        assert_ne!(
+            isolated_thread_id("c-1", slot_a),
+            isolated_thread_id("c-2", slot_a),
+            "two crons firing at the same instant mint distinct ids"
+        );
+    }
+
     #[test]
     fn decide_fire_classifies_each_outcome() {
         let now = at("2026-06-22T12:00:00Z");
@@ -1300,7 +1328,7 @@ mod tests {
         let now = at("2026-06-22T12:00:05Z");
         sched.tick(now, &mut HashMap::new());
 
-        let tid = format!("c-1@{}", at(scheduled).timestamp());
+        let tid = format!("c-1@{}", at(scheduled).timestamp_millis());
         assert_eq!(tid, isolated_thread_id("c-1", at(scheduled)));
         let thread = lock_db(&db)
             .get_thread(&tid)
@@ -1503,7 +1531,7 @@ mod tests {
         assert!(row.next_run.is_none());
         let log = lock_db(&db).get_cron_log(1).unwrap().unwrap();
         assert_eq!(log.status, "dispatched");
-        let tid = format!("c-once@{}", at(scheduled).timestamp());
+        let tid = format!("c-once@{}", at(scheduled).timestamp_millis());
         assert!(lock_db(&db).get_thread(&tid).unwrap().is_some());
     }
 
@@ -1530,7 +1558,7 @@ mod tests {
         assert!(log.thread_id.is_none());
         let row = lock_db(&db).get_cron("c-once").unwrap().unwrap();
         assert_eq!(row.status, "completed");
-        let tid = format!("c-once@{}", at(scheduled).timestamp());
+        let tid = format!("c-once@{}", at(scheduled).timestamp_millis());
         assert!(
             lock_db(&db).get_thread(&tid).unwrap().is_none(),
             "missed fire creates no thread"

@@ -485,7 +485,7 @@ async fn attachment_round_trip() {
 
 /// A whole-second cron slot `secs_ago` seconds before now: its RFC3339 (millis, `Z`)
 /// timestamp (a `next_run` / `schedule_value`) **and** its unix-epoch seconds. The
-/// pair agree exactly with the scheduler's `parse_iso(next_run).timestamp()`, so the
+/// pair agree exactly with the scheduler's `parse_iso(next_run)`, so the
 /// deterministic isolated thread id ([`isolated_thread_id`]) the fire mints is
 /// predictable from the test side. Anchored in the past so the slot is immediately
 /// due (`next_run <= now`).
@@ -496,9 +496,10 @@ fn past_slot(secs_ago: i64) -> (String, i64) {
 }
 
 /// The deterministic thread id an *isolated* cron fire mints (agent-architecture
-/// §4): `"<cron_id>@<scheduled_epoch_seconds>"`.
+/// §4): `"<cron_id>@<scheduled_epoch_millis>"` (whole-second slots here, so the
+/// epoch seconds scale by 1000).
 fn isolated_thread_id(cron_id: &str, epoch: i64) -> String {
-    format!("{cron_id}@{epoch}")
+    format!("{cron_id}@{}", epoch * 1000)
 }
 
 // ---------------------------------------------------------------------------
