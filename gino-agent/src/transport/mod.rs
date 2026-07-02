@@ -6,8 +6,8 @@
 //! * [`http`] — the `reqwest` client for `POST /agent/register`,
 //!   `GET /agent/config/:id`, and the `POST /agent/output/:id` fallback.
 //! * [`ws`] — the reconnecting `tokio-tungstenite` client with outbox-backed
-//!   at-least-once delivery, inbox dedup/replay, bounded-backoff reconnect, and a
-//!   periodic heartbeat.
+//!   at-least-once delivery, inbox dedup/replay, capped-backoff reconnect (the
+//!   delay is bounded, the attempts are not — P0-2), and a periodic heartbeat.
 //!
 //! [`Transport`] is the engine-agnostic facade over the WS side: it works purely
 //! on [`crate::protocol::v2`] frames and the [`crate::db`] outbox/inbox, so the
@@ -53,7 +53,7 @@ use crate::db::{Db, DbError};
 use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
 
 pub(crate) use self::ws::MAX_INBOX_RETRIES;
-use self::ws::{WsDriver, WsError};
+use self::ws::WsDriver;
 
 /// Default liveness ping cadence. The TS runner sent no heartbeat; the Rust
 /// runner adds one so a silently dead half-open socket is noticed promptly.
@@ -63,22 +63,22 @@ const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 // Public configuration / values
 // ---------------------------------------------------------------------------
 
-/// Reconnect backoff schedule. Ported from the TS runner: exponential from
-/// `base`, capped at `max`, giving up after `max_retries` consecutive failures.
+/// Reconnect backoff schedule: exponential from `base`, capped at `max`. The
+/// TS runner gave up after 60 consecutive failures; this runner never does
+/// (P0-2, spec §1: the daemon must outlive any host outage) — only the delay
+/// is bounded, never the attempts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BackoffConfig {
     base: Duration,
     max: Duration,
-    max_retries: u32,
 }
 
 impl Default for BackoffConfig {
     fn default() -> Self {
-        // TS parity: 1 s base, 10 s ceiling, 60 attempts.
+        // TS parity for the delay shape: 1 s base, 10 s ceiling.
         Self {
             base: Duration::from_secs(1),
             max: Duration::from_secs(10),
-            max_retries: 60,
         }
     }
 }
@@ -90,7 +90,6 @@ impl BackoffConfig {
         Self {
             base: Duration::from_millis(10),
             max: Duration::from_millis(40),
-            max_retries: 8,
         }
     }
 }
@@ -124,12 +123,9 @@ pub(crate) struct Inbound {
     pub(crate) frame: InboundFrameV2,
 }
 
-/// Errors raised while opening or driving the transport.
+/// Errors raised while driving the transport.
 #[derive(Debug, Error)]
 pub(crate) enum TransportError {
-    /// The initial WebSocket dial failed.
-    #[error("websocket connect: {0}")]
-    Connect(#[from] WsError),
     /// Persisting an outbound frame to the outbox failed.
     #[error(transparent)]
     Db(#[from] DbError),
@@ -161,16 +157,18 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    /// Dial `ws_url` (with `connect_token` in the `x-internal-token` header) and
-    /// spawn the manager task that drains the outbox, dedups the inbox, reconnects
-    /// with backoff, and heartbeats. Returns once the *first* connection is up.
-    pub(crate) async fn open(
+    /// Spawn the manager task that dials `ws_url` (with `connect_token` in the
+    /// `x-internal-token` header) **in the background**, drains the outbox, dedups
+    /// the inbox, reconnects with capped backoff, and heartbeats. Returns
+    /// immediately — the daemon boots and serves local work while the host is
+    /// unreachable (P0-2); outbound frames queue durably in the outbox and replay
+    /// once a connection is up.
+    pub(crate) fn open(
         ws_url: String,
         connect_token: SecretString,
         db: Arc<Mutex<Db>>,
         config: TransportConfig,
-    ) -> Result<Self, TransportError> {
-        let initial = ws::dial(&ws_url, &connect_token).await?;
+    ) -> Self {
         let (immediate_tx, immediate_rx) = mpsc::unbounded_channel();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(Cancel::new());
@@ -186,15 +184,15 @@ impl Transport {
             heartbeat: config.heartbeat,
             backoff: Backoff::new(config.backoff),
         };
-        let manager = tokio::spawn(driver.run(initial));
-        Ok(Self {
+        let manager = tokio::spawn(run_manager(driver));
+        Self {
             db,
             immediate_tx,
             inbound_rx,
             cancel,
             flush,
             manager,
-        })
+        }
     }
 
     /// A handle that, when notified, makes the manager replay the unacked outbox
@@ -248,8 +246,8 @@ impl Transport {
     }
 
     /// Await the next inbound frame. Returns `None` once the manager task has
-    /// stopped (reconnect exhausted or shutdown) — the signal for the caller to
-    /// wind down.
+    /// stopped — which reconnect never causes (P0-2); only shutdown (or an
+    /// unexpected task death) closes the channel.
     pub(crate) async fn recv(&mut self) -> Option<Inbound> {
         self.inbound_rx.recv().await
     }
@@ -261,6 +259,33 @@ impl Transport {
             warn!("transport manager task panicked during shutdown");
         }
     }
+}
+
+/// The manager task body: dial the *first* connection here — in the background,
+/// retrying forever with capped backoff — then hand it to the driver's
+/// serve/reconnect loop. Only a shutdown cancel ends the task; an unreachable
+/// host never does (P0-2), so the daemon boots and runs regardless.
+async fn run_manager(mut driver: WsDriver) {
+    let initial = loop {
+        let dialed = tokio::select! {
+            () = driver.cancel.cancelled() => return,
+            dialed = ws::dial(&driver.ws_url, &driver.connect_token) => dialed,
+        };
+        match dialed {
+            Ok(stream) => break stream,
+            Err(err) => warn!(error = %err, "dial failed; retrying with capped backoff"),
+        }
+        // Always `Some`: the delay is capped but the attempts are unbounded.
+        let Some(delay) = driver.backoff.next_delay() else {
+            return;
+        };
+        tokio::select! {
+            () = driver.cancel.cancelled() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
+    };
+    driver.backoff.reset();
+    driver.run(initial).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,8 +448,9 @@ impl Cancel {
 // ---------------------------------------------------------------------------
 
 /// Stateful reconnect backoff. [`Self::next_delay`] yields the delay before the
-/// next attempt, or `None` once `max_retries` is exhausted; [`Self::reset`] is
-/// called after a successful (re)connect.
+/// next attempt — always `Some`, since the retry ceiling was removed (P0-2:
+/// reconnect never gives up; the `Option` shape is kept for the driver's call
+/// sites). [`Self::reset`] is called after a successful (re)connect.
 #[derive(Debug)]
 pub(super) struct Backoff {
     config: BackoffConfig,
@@ -440,11 +466,12 @@ impl Backoff {
         self.attempt = 0;
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the `Option` shape is kept for the ws driver's reconnect call site"
+    )]
     pub(super) fn next_delay(&mut self) -> Option<Duration> {
-        if self.attempt >= self.config.max_retries {
-            return None;
-        }
-        self.attempt += 1;
+        self.attempt = self.attempt.saturating_add(1);
         let factor = 2u64.checked_pow(self.attempt - 1).unwrap_or(u64::MAX);
         let base_ms = u64::try_from(self.config.base.as_millis()).unwrap_or(u64::MAX);
         let max_ms = u64::try_from(self.config.max.as_millis()).unwrap_or(u64::MAX);
@@ -473,19 +500,21 @@ mod tests {
 
     // -- pure helpers ------------------------------------------------------
 
+    /// P0-2 regression: the delay schedule keeps the TS shape (exponential,
+    /// 10 s cap) but never exhausts — the old `max_retries: 60` ceiling turned
+    /// a ~10 min host outage into a daemon exit.
     #[test]
-    fn backoff_schedule_matches_ts_runner() {
+    fn backoff_caps_delay_and_never_gives_up() {
         let mut backoff = Backoff::new(BackoffConfig::default());
         // 1 s, 2 s, 4 s, 8 s, then clamped at the 10 s ceiling.
         assert_eq!(backoff.next_delay(), Some(Duration::from_secs(1)));
         assert_eq!(backoff.next_delay(), Some(Duration::from_secs(2)));
         assert_eq!(backoff.next_delay(), Some(Duration::from_secs(4)));
         assert_eq!(backoff.next_delay(), Some(Duration::from_secs(8)));
-        for _ in 5..=60 {
+        // Far past the old 60-attempt budget the delay stays at the cap.
+        for _ in 5..=500 {
             assert_eq!(backoff.next_delay(), Some(Duration::from_secs(10)));
         }
-        // 60 attempts exhausted.
-        assert_eq!(backoff.next_delay(), None);
         // reset restarts the schedule.
         backoff.reset();
         assert_eq!(backoff.next_delay(), Some(Duration::from_secs(1)));
@@ -705,9 +734,7 @@ mod tests {
             SecretString::from("connect-secret"),
             Arc::clone(&db),
             test_config(),
-        )
-        .await
-        .unwrap();
+        );
 
         let (first, second) = server.await.unwrap();
         let first: Value = serde_json::from_str(&first).unwrap();
@@ -760,9 +787,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
-        )
-        .await
-        .unwrap();
+        );
 
         let inbound = transport.recv().await.unwrap();
         match &inbound.frame {
@@ -840,9 +865,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
-        )
-        .await
-        .unwrap();
+        );
 
         let (first, second) = server.await.unwrap();
         let first: Value = serde_json::from_str(&first).unwrap();
@@ -885,9 +908,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
-        )
-        .await
-        .unwrap();
+        );
 
         let (first_ack, second_ack) = server.await.unwrap();
         let expected = json!({ "type": "msg_ack", "msgId": 7 });
@@ -941,9 +962,7 @@ mod tests {
                 heartbeat: Duration::ZERO,
                 backoff: BackoffConfig::for_tests(),
             },
-        )
-        .await
-        .unwrap();
+        );
 
         // The frame flows through a live (un-panicked) driver task.
         let inbound = transport.recv().await.unwrap();
@@ -953,6 +972,109 @@ mod tests {
         ));
         let ack: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(ack, json!({ "type": "msg_ack", "msgId": 1 }));
+        transport.shutdown().await;
+    }
+
+    /// P0-2 regression: opening the transport against an unreachable host must
+    /// not fail or block — the daemon side stays fully functional (frames
+    /// enqueue durably) and the manager task keeps dialing instead of exiting.
+    #[tokio::test]
+    async fn open_with_unreachable_host_boots_and_keeps_dialing() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        // Bind-then-drop: the freed port refuses every dial.
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-off"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            test_config(),
+        );
+
+        // The producer path works while offline: the frame lands in the outbox.
+        let id = transport
+            .send(&OutboundFrameV2::ThreadMessage {
+                task_id: "t-1".to_owned(),
+                thread_id: "c-1".to_owned(),
+                data: sample_message_data(),
+                outbox_id: None,
+            })
+            .unwrap();
+        assert_eq!(id, Some(1));
+        assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 1);
+
+        // Well past the fast schedule's old 8-attempt test budget: the manager
+        // task must still be dialing, not exited (the old code gave up here).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !transport.manager.is_finished(),
+            "the manager task must keep retrying, never exit"
+        );
+        // And shutdown still completes promptly out of the retry loop.
+        transport.shutdown().await;
+    }
+
+    /// P0-2 regression: the transport survives a failure window far past the
+    /// old 60-retry budget, then — once the host comes up — establishes the
+    /// connection and flushes the pending outbox as on any reconnect.
+    #[tokio::test]
+    async fn retries_past_old_budget_then_flushes_outbox_when_host_returns() {
+        // More consecutive failures than the removed `max_retries: 60` ceiling.
+        const OUTAGE_DIALS: usize = 70;
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        {
+            db.lock()
+                .unwrap()
+                .enqueue_outbox_correlated(
+                    "thread_result",
+                    &json!({ "status": "succeeded", "duration_ms": 1, "final_seq": 0 }),
+                    Some("t-1"),
+                    Some("c-1"),
+                )
+                .unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Failure window: refuse the WS handshake on the first dials.
+            for _ in 0..OUTAGE_DIALS {
+                let (tcp, _) = listener.accept().await.unwrap();
+                drop(tcp);
+            }
+            // Host is back: accept, expect the replayed outbox row, ack it.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let frame = next_text(&mut ws).await;
+            ws.send(Message::text(r#"{"type":"ack","id":1}"#.to_owned()))
+                .await
+                .unwrap();
+            frame
+        });
+
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-6"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            TransportConfig {
+                heartbeat: Duration::from_secs(50),
+                // Tiny delays so 70 failed attempts stay well under a second.
+                backoff: BackoffConfig {
+                    base: Duration::from_millis(1),
+                    max: Duration::from_millis(2),
+                },
+            },
+        );
+
+        let frame: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(frame["type"], json!("thread_result"));
+        assert_eq!(frame["outboxId"], json!(1));
+        assert_eq!(frame["threadId"], json!("c-1"));
+        wait_until(|| db.lock().unwrap().list_unacked_outbox().unwrap().is_empty()).await;
         transport.shutdown().await;
     }
 }
