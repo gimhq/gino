@@ -365,9 +365,13 @@ fn cron_list(db: &Db, a: TaskFilterArg) -> Result<()> {
 /// the unscoped (all-tasks) form is labeled and carries a `task=` column so the
 /// wide scope is never mistaken for the current task's triggers.
 fn render_cron_list(crons: &[CronRow], scoped: bool) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::new();
     if !scoped {
-        out.push_str("(no task id — listing ACTIVE crons across ALL tasks; pass --task-id to scope)\n");
+        out.push_str(
+            "(no task id — listing ACTIVE crons across ALL tasks; pass --task-id to scope)\n",
+        );
     }
     if crons.is_empty() {
         out.push_str("(no crons)\n");
@@ -379,8 +383,9 @@ fn render_cron_list(crons: &[CronRow], scoped: bool) -> String {
         } else {
             format!("task={}\t", c.task_id)
         };
-        out.push_str(&format!(
-            "{id}\t{task}{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}\n",
+        let _ = writeln!(
+            out,
+            "{id}\t{task}{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}",
             id = c.id,
             status = c.status,
             ty = c.schedule_type.as_deref().unwrap_or("-"),
@@ -389,7 +394,7 @@ fn render_cron_list(crons: &[CronRow], scoped: bool) -> String {
             cont = c.continuity,
             runs = c.run_count,
             prompt = c.prompt,
-        ));
+        );
     }
     out
 }

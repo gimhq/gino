@@ -886,7 +886,7 @@ mod smoke {
     use std::time::Duration;
 
     use super::{ClaudeEngine, ClaudeSettings};
-    use crate::engine::{Engine, Payload, RunStatus};
+    use crate::engine::{Engine, EngineError, Payload, RunStatus};
 
     /// Write an executable bash stub that speaks just enough control protocol to
     /// require — and prove — the host's auto-allow.
@@ -970,16 +970,28 @@ fi
             ..ClaudeSettings::default()
         });
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            engine.run_once(Payload {
-                prompt: "hi".to_owned(),
-                cwd: dir.path().to_path_buf(),
-            }),
-        )
-        .await
-        .expect("run_once timed out")
-        .expect("spawn itself succeeds; the failure is in the outcome");
+        // ETXTBSY retry: a concurrently-spawning test child can briefly hold
+        // the just-written script's fd, failing exec with "text file busy".
+        let outcome = loop {
+            let res = tokio::time::timeout(
+                Duration::from_secs(10),
+                engine.run_once(Payload {
+                    prompt: "hi".to_owned(),
+                    cwd: dir.path().to_path_buf(),
+                }),
+            )
+            .await
+            .expect("run_once timed out");
+            match res {
+                Ok(outcome) => break outcome,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        };
 
         assert_eq!(outcome.status, RunStatus::Error);
         let error = outcome.error.unwrap_or_default();
