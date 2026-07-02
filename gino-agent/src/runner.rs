@@ -65,6 +65,13 @@ const ENGINE_CONFIG_SUBDIR: &str = "engine-config";
 /// acked.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Bounded graceful drain at shutdown (P1-6): how long the executor worker gets
+/// to settle the interrupted active run (post-interrupt drain, output collection,
+/// finalize) before it is aborted and the leftover engine session killed.
+/// Comfortably above the executor's in-run `cancel_drain_timeout` and inside
+/// systemd's default `TimeoutStopSec` (90 s).
+const SHUTDOWN_DRAIN_WINDOW: Duration = Duration::from_secs(15);
+
 /// Create the DB/workspace directories, then restrict the workspace to
 /// owner-only (`0700`): it holds the DB (connect token), engine work dirs and
 /// the provisioning store. Hardening runs on every startup so pre-existing
@@ -165,13 +172,19 @@ async fn run_async(
         )
     })?;
 
+    // One shutdown token for every plane (P1-6): the serve loop, the scheduler,
+    // the executor worker AND the active engine run (via the executor's converged
+    // cancel path) all watch this token, so a shutdown signal cancels an in-flight
+    // turn instead of waiting out its running_timeout.
+    let cancel = Arc::new(Cancel::new());
+
     // The v2 execution plane: the source-agnostic pending-thread drainer, its
     // out-of-band attachment plane (PLAN-005, Lane Z1) and the global config/skills
     // provisioner (PLAN-007) — all over one shared content-addressed manager — then
     // the startup global reconcile. The shared stash hands a resolved message's
     // inbound descriptors from the prompt drainer to the executor.
     let (executor, inbound_attachments, provisioner) =
-        build_execution_plane(&config, &http, &db, &engine_config_dir).await;
+        build_execution_plane(&config, &http, &db, &engine_config_dir, &cancel).await;
     let prompts = Arc::new(InboxPromptSource {
         db: Arc::clone(&db),
         inbound: inbound_attachments,
@@ -187,7 +200,6 @@ async fn run_async(
 
     // One retry budget for every thread source (cron fires + chat messages).
     let max_attempts = config.executor.max_attempts;
-    let cancel = Arc::new(Cancel::new());
     let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), max_attempts);
     let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let flush = transport.flush_handle();
@@ -215,12 +227,11 @@ async fn run_async(
     };
     serve(&mut transport, &context, &cancel).await;
 
-    // Shutdown: stop the scheduler + worker, fail any in-flight threads (so the host
-    // sees a terminal result rather than a silent gap), then drain the transport.
-    cancel.cancel();
-    if worker.await.is_err_and(|err| err.is_panic()) {
-        warn!("executor worker panicked during shutdown");
-    }
+    // Shutdown (P1-6): drain the execution plane within a bounded window (the
+    // active run is cancelled, not waited out), stop the scheduler, fail any
+    // leftover in-flight threads (so the host sees a terminal result rather than
+    // a silent gap), then drain the transport. No engine child survives this.
+    shutdown_worker(&cancel, &executor, worker, SHUTDOWN_DRAIN_WINDOW).await;
     if scheduler_task.await.is_err_and(|err| err.is_panic()) {
         warn!("scheduler task panicked during shutdown");
     }
@@ -232,6 +243,36 @@ async fn run_async(
     transport.shutdown().await;
     info!("gino-agent stopped");
     Ok(())
+}
+
+/// Stop the execution plane within a bounded drain window (P1-6): trip the
+/// shutdown token (stops the worker loop and, through the executor's converged
+/// cancel path, the active run), gracefully interrupt the running engine turn
+/// (the same [`ThreadExecutor::interrupt`] machinery a host `interrupt` frame
+/// uses), then await the worker. A worker that has not settled when the window
+/// closes is aborted, and any leftover engine session is dropped — killing the
+/// engine child (`kill_on_drop`) — so no engine process survives the daemon.
+async fn shutdown_worker(
+    cancel: &Cancel,
+    executor: &ThreadExecutor,
+    mut worker: tokio::task::JoinHandle<()>,
+    window: Duration,
+) {
+    cancel.cancel();
+    executor.interrupt().await;
+    match tokio::time::timeout(window, &mut worker).await {
+        Ok(joined) => {
+            if joined.is_err_and(|err| err.is_panic()) {
+                warn!("executor worker panicked during shutdown");
+            }
+        }
+        Err(_elapsed) => {
+            warn!("executor worker did not settle within the shutdown drain window; aborting it");
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+    executor.kill_active().await;
 }
 
 /// The executor worker: drains every `pending` thread on each scheduler/route
@@ -413,13 +454,16 @@ fn resolve_inbox_message(
 }
 
 /// Map the [`ExecutorConfig`] knobs onto the executor's watchdog thresholds. A
-/// zero `inactivity_timeout_secs` disables the in-run inactivity watchdog.
+/// zero `inactivity_timeout_secs` disables the in-run inactivity watchdog only —
+/// the total-time watchdog still bounds a silent engine on wall clock (P2-19),
+/// so the serial plane can never wedge indefinitely.
 fn watchdog_cfg(cfg: &ExecutorConfig) -> WatchdogCfg {
     WatchdogCfg {
         dispatched_timeout: TimeDelta::seconds(cfg.dispatched_timeout_secs),
         running_timeout: TimeDelta::seconds(cfg.running_timeout_secs),
         inactivity_timeout: (cfg.inactivity_timeout_secs > 0)
             .then(|| Duration::from_secs(cfg.inactivity_timeout_secs)),
+        ..WatchdogCfg::default()
     }
 }
 
@@ -481,6 +525,7 @@ async fn build_execution_plane(
     http: &HttpClient,
     db: &Arc<Mutex<Db>>,
     engine_config_dir: &Path,
+    shutdown: &Arc<Cancel>,
 ) -> (
     Arc<ThreadExecutor>,
     InboundAttachments,
@@ -507,6 +552,7 @@ async fn build_execution_plane(
         engine_config_dir,
         manager,
         provisioner.clone(),
+        Arc::clone(shutdown),
     );
 
     if let Some(provisioner) = &provisioner {
@@ -535,14 +581,18 @@ fn build_executor(
     engine_config_dir: &Path,
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
+    shutdown: Arc<Cancel>,
 ) -> (Arc<ThreadExecutor>, InboundAttachments) {
     let engine = build_engine(config, engine_config_dir);
+    // The daemon shutdown token (P1-6): a shutdown cancels the active run through
+    // the executor's converged cancel path and stops the pending drain.
     let mut executor = ThreadExecutor::new(
         engine,
         db,
         config.paths.workspace_dir.clone(),
         watchdog_cfg(&config.executor),
-    );
+    )
+    .with_shutdown(shutdown);
     let inbound = InboundAttachments::default();
     if let Some(manager) = manager {
         info!("attachment plane active (host-proxy byte backend)");
@@ -717,8 +767,39 @@ struct ServeContext {
     engine_config_dir: PathBuf,
 }
 
-/// Pump inbound v2 frames until Ctrl-C or a `close`. Outbound frames are
-/// produced straight into the durable outbox by the executor/scheduler and
+/// Resolve when a daemon shutdown signal arrives (P1-6): SIGINT (Ctrl-C) and —
+/// on unix — SIGTERM (what systemd `stop`/`restart` sends) are handled
+/// identically. A listener that cannot be installed is logged and disabled;
+/// the other signal and the internal cancel/`close` paths still shut down.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = %err, "failed to listen for SIGINT; that signal cannot trigger shutdown");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to listen for SIGTERM; that signal cannot trigger shutdown");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Pump inbound v2 frames until a shutdown signal or a `close`. Outbound frames
+/// are produced straight into the durable outbox by the executor/scheduler and
 /// shipped by the transport (flush/replay), so the serve loop has no outbound
 /// branch. Transport loss never ends the loop (P0-2): the manager reconnects
 /// forever, and even a dead manager task only stops the frame pump — the
@@ -727,10 +808,7 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
     loop {
         tokio::select! {
             biased;
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(err) = signal {
-                    warn!(error = %err, "failed to listen for shutdown signal");
-                }
+            () = shutdown_signal() => {
                 info!("shutdown signal received");
                 break;
             }
@@ -753,15 +831,13 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
     }
 }
 
-/// Block until Ctrl-C or an internal cancel — the tail of [`serve`] once the
-/// transport channel has closed (P0-2: transport death must not shut the
-/// daemon down; the scheduler and executor keep running until a real shutdown).
+/// Block until a shutdown signal or an internal cancel — the tail of [`serve`]
+/// once the transport channel has closed (P0-2: transport death must not shut
+/// the daemon down; the scheduler and executor keep running until a real
+/// shutdown).
 async fn wait_for_shutdown(cancel: &Cancel) {
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(err) = signal {
-                warn!(error = %err, "failed to listen for shutdown signal");
-            }
+        () = shutdown_signal() => {
             info!("shutdown signal received");
         }
         () = cancel.cancelled() => {}
@@ -1970,6 +2046,170 @@ mod tests {
         worker.await.unwrap();
         scheduler_task.await.unwrap();
         transport.shutdown().await;
+    }
+
+    /// P1-6 regression: SIGTERM (what systemd `stop` sends) resolves the
+    /// shutdown-signal future — the old code handled only SIGINT and left
+    /// SIGTERM on the default handler. The OS edge is exercised in-process:
+    /// tokio's listener registration replaces the default disposition, so
+    /// raising SIGTERM here notifies the future instead of killing the test
+    /// runner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_resolves_the_shutdown_signal() {
+        use std::time::Duration;
+
+        // Install the process-wide SIGTERM handler BEFORE raising, so a lost
+        // registration race cannot kill the test binary (tokio never restores
+        // the default disposition once a listener has existed).
+        let _armed = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing the SIGTERM listener");
+        let task = tokio::spawn(super::shutdown_signal());
+        // Let the spawned future register its own listeners before the raise.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("raising SIGTERM");
+        assert!(status.success());
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shutdown_signal did not resolve on SIGTERM")
+            .unwrap();
+    }
+
+    /// P1-6 regression, over the runner's own shutdown sequence: a shutdown
+    /// while a run is ACTIVE trips the run's cancellation and the worker
+    /// settles within the bounded drain window — the old code awaited the
+    /// worker unconditionally, blocking up to running_timeout (30 min) until
+    /// the supervisor SIGKILLed the daemon and orphaned the engine child.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the in-test engine stub is the bulk; splitting it would obscure the scenario"
+    )]
+    #[tokio::test]
+    async fn shutdown_cancels_the_active_run_within_the_drain_window() {
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use futures_util::StreamExt;
+        use futures_util::stream::{self, BoxStream};
+
+        use crate::engine::{
+            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, Session, SessionCfg,
+        };
+        use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
+        use crate::scheduler::Cancel;
+
+        /// Announces a session then stalls forever, ignoring the interrupt —
+        /// the engine shape that used to pin shutdown until running_timeout.
+        struct StallingEngine;
+        struct StallingSession;
+
+        #[async_trait]
+        impl Engine for StallingEngine {
+            fn name(&self) -> &'static str {
+                "stalling"
+            }
+            async fn start_session(
+                &self,
+                _cfg: SessionCfg,
+            ) -> Result<Box<dyn Session>, EngineError> {
+                Ok(Box::new(StallingSession))
+            }
+            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                unreachable!("the executor drives sessions, not run_once")
+            }
+        }
+
+        #[async_trait]
+        impl Session for StallingSession {
+            async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                Ok(())
+            }
+            async fn interrupt(&self) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn events(&self) -> BoxStream<'_, EngineEvent> {
+                let head = stream::iter(vec![EngineEvent::SessionStarted {
+                    session_id: "sess-stall".to_owned(),
+                }]);
+                Box::pin(head.chain(stream::pending::<EngineEvent>()))
+            }
+        }
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        lock_db(&db)
+            .insert_task_row(&TaskRow {
+                id: "t-1".to_owned(),
+                name: None,
+                kind: None,
+                status: "active".to_owned(),
+                created_at: "2026-06-22T09:00:00.000Z".to_owned(),
+                updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
+            })
+            .unwrap();
+        // A pending thread with a prompt snapshot: the drain runs it directly.
+        let mut thread = chat_thread("th-stall", "t-1");
+        thread.prompt = "keep busy".to_owned();
+        lock_db(&db).insert_thread(&thread).unwrap();
+
+        let cancel = Arc::new(Cancel::new());
+        let engine: Arc<dyn Engine> = Arc::new(StallingEngine);
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Arc::new(
+            ThreadExecutor::new(
+                engine,
+                Arc::clone(&db),
+                dir.path().to_path_buf(),
+                WatchdogCfg {
+                    inactivity_timeout: None,
+                    cancel_drain_timeout: Duration::from_millis(100),
+                    ..WatchdogCfg::default()
+                },
+            )
+            .with_shutdown(Arc::clone(&cancel)),
+        );
+        let prompts = Arc::new(InboxPromptSource {
+            db: Arc::clone(&db),
+            inbound: InboundAttachments::default(),
+        });
+        let worker = tokio::spawn(super::run_worker(
+            Arc::clone(&executor),
+            Arc::clone(&db),
+            prompts,
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::clone(&cancel),
+            1,
+        ));
+
+        // Wait until the run is live (the engine is stalling inside it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while lock_db(&db).get_thread("th-stall").unwrap().unwrap().status != "running" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stalling run never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The full shutdown sequence must settle in seconds, not 30 minutes.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::shutdown_worker(&cancel, &executor, worker, Duration::from_secs(10)),
+        )
+        .await
+        .expect("shutdown did not settle within the drain window");
+
+        let row = lock_db(&db).get_thread("th-stall").unwrap().unwrap();
+        assert_eq!(row.status, "cancelled", "the active run was cancelled");
+        assert!(
+            row.engine_session_id.is_none(),
+            "the hard-killed turn keeps no resume handle"
+        );
     }
 }
 

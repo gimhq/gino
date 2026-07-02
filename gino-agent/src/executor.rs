@@ -116,7 +116,10 @@ pub(crate) mod v2 {
     /// (claimed but the engine never started) past `dispatched_timeout`, or
     /// `running` past `running_timeout`, is failed with `runner.timeout`. The
     /// in-run `inactivity_timeout` kills a live engine that stops emitting events
-    /// ("kill only when the engine emits no events").
+    /// ("kill only when the engine emits no events"). The total-time budget is
+    /// enforced on wall clock inside the run (the event wait is bounded by the
+    /// remaining budget), so a silent engine cannot wedge the serial plane even
+    /// with the inactivity watchdog disabled (P2-19).
     #[derive(Clone, Copy, Debug)]
     // The shared `_timeout` suffix is the meaningful distinction here (vs a count);
     // dropping it would make `watchdog.running`/`dispatched` ambiguous at use sites.
@@ -127,8 +130,13 @@ pub(crate) mod v2 {
         /// Max total wall-clock for a `running` thread before it is reaped (Tr).
         pub(crate) running_timeout: TimeDelta,
         /// Max gap between engine events before a live run is killed; `None`
-        /// disables the in-run inactivity watchdog.
+        /// disables the in-run inactivity watchdog (the total-time budget still
+        /// bounds the run).
         pub(crate) inactivity_timeout: Option<std::time::Duration>,
+        /// Bounded post-cancel drain (P1-6/P2-17): how long a cancelled turn may
+        /// keep streaming (to settle with its own `result`) before the engine
+        /// child is hard-killed by the session drop.
+        pub(crate) cancel_drain_timeout: std::time::Duration,
     }
 
     impl Default for WatchdogCfg {
@@ -137,6 +145,7 @@ pub(crate) mod v2 {
                 dispatched_timeout: TimeDelta::seconds(60),
                 running_timeout: TimeDelta::minutes(30),
                 inactivity_timeout: Some(std::time::Duration::from_mins(5)),
+                cancel_drain_timeout: std::time::Duration::from_secs(5),
             }
         }
     }
@@ -206,6 +215,11 @@ pub(crate) mod v2 {
         /// into `work_dir/project/` and the engine cwd becomes that `project/` dir;
         /// when absent the executor behaves as before (cwd = `work_dir`).
         provisioning: Option<Arc<Provisioner>>,
+        /// The daemon shutdown token (P1-6); `None` until the runner wires it.
+        /// When tripped it converges onto the same cancelled path a host
+        /// `interrupt` takes: the active run settles within the bounded drain
+        /// window and the pending drain stops starting new runs.
+        shutdown: Option<Arc<Cancel>>,
     }
 
     impl std::fmt::Debug for ThreadExecutor {
@@ -235,7 +249,17 @@ pub(crate) mod v2 {
                 active: AsyncMutex::new(None),
                 attachments: None,
                 provisioning: None,
+                shutdown: None,
             }
+        }
+
+        /// Wire the daemon shutdown token (P1-6). Builder-style so the existing
+        /// [`Self::new`] call sites (unit tests) stay unchanged. When the token
+        /// trips, the active run is cancelled through the same path a host
+        /// `interrupt` takes and [`Self::drain_pending`] stops starting new runs.
+        pub(crate) fn with_shutdown(mut self, shutdown: Arc<Cancel>) -> Self {
+            self.shutdown = Some(shutdown);
+            self
         }
 
         /// Wire the out-of-band attachment plane (PLAN-005, Lane F): inbound
@@ -279,6 +303,12 @@ pub(crate) mod v2 {
             };
             let mut dispatched = 0;
             for thread in pending {
+                // Daemon shutdown (P1-6): stop starting new runs; the still-pending
+                // threads re-run on the next boot.
+                if self.shutdown_requested() {
+                    debug!("shutdown tripped; stopping the pending drain");
+                    break;
+                }
                 let Some((thread, prompt)) = self.resolve_prompt(thread, prompts) else {
                     continue; // unrunnable: already failed `runner.invalid_request`
                 };
@@ -568,9 +598,10 @@ pub(crate) mod v2 {
             }
         }
 
-        /// Gracefully cancel the in-flight turn (host `interrupt`): trip its
-        /// [`Cancel`] so [`Self::drive`] settles the thread `cancelled`, and ask the
-        /// engine to interrupt the current turn (no kill). A no-op when idle.
+        /// Gracefully cancel the in-flight turn (host `interrupt`, and the daemon
+        /// shutdown path in [`crate::runner`]): trip its [`Cancel`] so
+        /// [`Self::drive`] settles the thread `cancelled`, and ask the engine to
+        /// interrupt the current turn (no kill). A no-op when idle.
         pub(crate) async fn interrupt(&self) {
             let active = self.active.lock().await;
             if let Some(run) = active.as_ref() {
@@ -580,6 +611,39 @@ pub(crate) mod v2 {
                 }
             } else {
                 debug!("interrupt received with no active thread; ignoring");
+            }
+        }
+
+        /// Drop any leftover active-run handle at shutdown, after the worker task
+        /// has stopped (P1-6): releasing the session `Arc` kills the engine child
+        /// (`kill_on_drop`), so no engine process survives the daemon.
+        pub(crate) async fn kill_active(&self) {
+            if let Some(run) = self.active.lock().await.take() {
+                warn!(thread = %run.thread_id, "killing leftover engine session at shutdown");
+            }
+        }
+
+        /// Whether the daemon shutdown token is wired and tripped.
+        fn shutdown_requested(&self) -> bool {
+            self.shutdown.as_deref().is_some_and(Cancel::is_cancelled)
+        }
+
+        /// Whether this run should stop: its own [`Cancel`] (host `interrupt`) or
+        /// the daemon shutdown token — both cancellation sources converge on the
+        /// one cancelled path (P1-6).
+        fn cancel_requested(&self, cancel: &Cancel) -> bool {
+            cancel.is_cancelled() || self.shutdown_requested()
+        }
+
+        /// Resolve once the run is cancelled by either source (see
+        /// [`Self::cancel_requested`]).
+        async fn run_cancelled(&self, cancel: &Cancel) {
+            match self.shutdown.as_deref() {
+                Some(shutdown) => tokio::select! {
+                    () = cancel.cancelled() => {}
+                    () = shutdown.cancelled() => {}
+                },
+                None => cancel.cancelled().await,
             }
         }
 
@@ -623,7 +687,9 @@ pub(crate) mod v2 {
         }
 
         /// Consume engine events until a terminal conclusion: a `Result`, an
-        /// inactivity/total-time watchdog trip, or the stream closing early.
+        /// inactivity/total-time watchdog trip, a cancel (host `interrupt` or
+        /// daemon shutdown — see [`Self::drain_cancelled`]), or the stream closing
+        /// early.
         async fn drive(
             &self,
             thread: &ThreadRow,
@@ -634,42 +700,55 @@ pub(crate) mod v2 {
         ) -> Conclusion {
             let mut session_id = prior_session;
             loop {
-                // Host interrupt: settle the thread `cancelled` (graceful, no retry).
-                if cancel.is_cancelled() {
-                    return Conclusion::Cancelled { session_id };
+                // Host interrupt or daemon shutdown: settle `cancelled` after the
+                // bounded post-cancel drain (graceful, no retry).
+                if self.cancel_requested(cancel) {
+                    return self.drain_cancelled(stream, session_id).await;
                 }
-                // Total-time watchdog (Tr): a run that never settles is failed.
-                if now() - started > self.watchdog.running_timeout {
+                // Total-time watchdog (Tr), on WALL CLOCK: the event wait below is
+                // bounded by the remaining budget, so a silent engine cannot wedge
+                // the serial plane even with the inactivity watchdog off (P2-19).
+                let Some(remaining) =
+                    Self::remaining_budget(started, self.watchdog.running_timeout)
+                else {
                     return Conclusion::Failure {
                         reason: FailureReason::Runner(RunnerFailure::Timeout),
                         error: "watchdog: running exceeded the total time budget".to_owned(),
                         session_id,
                     };
-                }
-                // Await the next event, racing the interrupt (so a cancel mid-turn
-                // settles promptly) and the inactivity watchdog (fail only when the
-                // engine emits no event).
-                let event = if let Some(gap) = self.watchdog.inactivity_timeout {
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Conclusion::Cancelled { session_id },
-                        res = timeout(gap, stream.next()) => match res {
-                            Ok(event) => event,
-                            Err(_elapsed) => {
-                                return Conclusion::Failure {
-                                    reason: FailureReason::Runner(RunnerFailure::Timeout),
-                                    error: "watchdog: engine inactive (no events)".to_owned(),
-                                    session_id,
-                                };
-                            }
-                        },
+                };
+                // Await the next event, racing the cancel (so a cancel mid-turn
+                // settles promptly). The wait is bounded by the inactivity gap
+                // (when enabled) capped to the remaining total budget.
+                let gap = self
+                    .watchdog
+                    .inactivity_timeout
+                    .map_or(remaining, |gap| gap.min(remaining));
+                let event = tokio::select! {
+                    biased;
+                    () = self.run_cancelled(cancel) => {
+                        return self.drain_cancelled(stream, session_id).await;
                     }
-                } else {
-                    tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Conclusion::Cancelled { session_id },
-                        event = stream.next() => event,
-                    }
+                    res = timeout(gap, stream.next()) => match res {
+                        Ok(event) => event,
+                        Err(_elapsed) => {
+                            let exhausted = Self::remaining_budget(
+                                started,
+                                self.watchdog.running_timeout,
+                            )
+                            .is_none();
+                            let error = if exhausted {
+                                "watchdog: running exceeded the total time budget"
+                            } else {
+                                "watchdog: engine inactive (no events)"
+                            };
+                            return Conclusion::Failure {
+                                reason: FailureReason::Runner(RunnerFailure::Timeout),
+                                error: error.to_owned(),
+                                session_id,
+                            };
+                        }
+                    },
                 };
                 match event {
                     None => {
@@ -714,6 +793,52 @@ pub(crate) mod v2 {
                             }
                         };
                     }
+                }
+            }
+        }
+
+        /// Wall-clock time left in the total run budget; `None` once exhausted.
+        fn remaining_budget(
+            started: DateTime<Utc>,
+            budget: TimeDelta,
+        ) -> Option<std::time::Duration> {
+            (started + budget - now())
+                .to_std()
+                .ok()
+                .filter(|remaining| !remaining.is_zero())
+        }
+
+        /// Bounded post-cancel drain (P1-6, P2-17). The turn was cancelled — by a
+        /// host `interrupt` or the daemon shutdown — and [`Self::interrupt`] asked
+        /// the engine to stop gracefully. Give it `cancel_drain_timeout` to settle
+        /// with its own `result`: an engine that settles has flushed its session
+        /// state, so the resume handle it reports is trustworthy and KEPT. An
+        /// engine that does not settle in the window (or exits without a result)
+        /// is hard-killed by the session drop in [`Self::run_thread`]; the kill
+        /// can tear session persistence mid-write, so the unverified resume
+        /// handle is DROPPED — a hard-killed turn is never resumed.
+        async fn drain_cancelled(
+            &self,
+            stream: &mut BoxStream<'_, EngineEvent>,
+            mut session_id: Option<String>,
+        ) -> Conclusion {
+            let deadline = tokio::time::Instant::now() + self.watchdog.cancel_drain_timeout;
+            loop {
+                let Ok(event) = tokio::time::timeout_at(deadline, stream.next()).await else {
+                    debug!("cancelled turn did not settle within the drain window; hard-killing");
+                    return Conclusion::Cancelled { session_id: None };
+                };
+                match event {
+                    None => return Conclusion::Cancelled { session_id: None },
+                    Some(EngineEvent::SessionStarted { session_id: id }) => {
+                        session_id = Some(id);
+                    }
+                    Some(EngineEvent::Result(outcome)) => {
+                        return Conclusion::Cancelled {
+                            session_id: outcome.session_id.or(session_id),
+                        };
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -788,9 +913,12 @@ pub(crate) mod v2 {
                     }
                 }
                 Conclusion::Cancelled { session_id } => {
-                    // Graceful host interrupt: terminal `cancelled`, no retry. The
-                    // session is kept (informational) — the turn was aborted, not
-                    // poisoned — so the host can correlate the resume handle.
+                    // Terminal `cancelled`, no retry. Resume-handle policy (P2-17):
+                    // `session_id` is `Some` only when the engine settled its own
+                    // `result` inside the post-cancel drain window (state flushed,
+                    // handle verified — see `drain_cancelled`); a hard-killed turn
+                    // arrives here with `None`, dropping the handle so the next
+                    // turn never resumes a session SIGKILL may have torn mid-write.
                     let mut done = thread;
                     CANCELLED.clone_into(&mut done.status);
                     done.engine_session_id.clone_from(&session_id);
@@ -1682,6 +1810,7 @@ pub(crate) mod v2 {
                 dispatched_timeout: TimeDelta::seconds(60),
                 running_timeout: TimeDelta::minutes(30),
                 inactivity_timeout: None,
+                ..WatchdogCfg::default()
             };
             let exec = build(&db, vec![], false, watchdog);
 
@@ -1743,12 +1872,18 @@ pub(crate) mod v2 {
         async fn interrupt_settles_the_running_thread_cancelled() {
             let db = test_db();
             // SessionStarted then the stream pends forever, so the run is live until
-            // the interrupt trips the cancel and settles it `cancelled`.
+            // the interrupt trips the cancel and settles it `cancelled`. The engine
+            // ignores the interrupt (no post-cancel result), so the drain window
+            // expires and the turn is hard-killed — keep the window short.
             let exec = Arc::new(build(
                 &db,
                 vec![started("sess-cancel")],
                 true,
-                no_inactivity(),
+                WatchdogCfg {
+                    inactivity_timeout: None,
+                    cancel_drain_timeout: std::time::Duration::from_millis(100),
+                    ..WatchdogCfg::default()
+                },
             ));
             lock(&db)
                 .insert_thread(&pending_thread("th-cancel", 1))
@@ -1777,9 +1912,213 @@ pub(crate) mod v2 {
             let row = handle.await.unwrap();
             assert_eq!(row.status, "cancelled");
             assert!(row.failure_reason.is_none(), "cancel is not a failure");
+            // P2-17 policy: the engine never settled, so the turn was hard-killed
+            // and the unverified resume handle is dropped.
+            assert!(
+                row.engine_session_id.is_none(),
+                "a hard-killed turn keeps no resume handle"
+            );
             let res = results(&db);
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].status, ThreadStatus::Cancelled);
+        }
+
+        /// P2-17: a cancelled turn whose engine settles gracefully (its own
+        /// `result` arrives inside the post-cancel drain window) KEEPS the
+        /// verified resume handle instead of dropping it.
+        #[tokio::test]
+        async fn cancelled_turn_that_settles_gracefully_keeps_the_resume_handle() {
+            use tokio::sync::mpsc;
+
+            /// Stalls until interrupted, then settles like a live engine does on
+            /// a graceful turn cancel: its own post-interrupt `result`.
+            struct SettlingEngine;
+            struct SettlingSession {
+                tx: mpsc::UnboundedSender<EngineEvent>,
+                rx: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
+            }
+
+            #[async_trait]
+            impl Engine for SettlingEngine {
+                fn name(&self) -> &'static str {
+                    "settling"
+                }
+                async fn start_session(
+                    &self,
+                    _cfg: SessionCfg,
+                ) -> Result<Box<dyn Session>, EngineError> {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    tx.send(EngineEvent::SessionStarted {
+                        session_id: "sess-live".to_owned(),
+                    })
+                    .unwrap();
+                    Ok(Box::new(SettlingSession {
+                        tx,
+                        rx: Mutex::new(Some(rx)),
+                    }))
+                }
+                async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+                    unreachable!("the executor drives sessions")
+                }
+            }
+
+            #[async_trait]
+            impl Session for SettlingSession {
+                async fn send(&self, _input: Input) -> Result<(), EngineError> {
+                    Ok(())
+                }
+                async fn interrupt(&self) -> Result<(), EngineError> {
+                    let _ = self.tx.send(EngineEvent::Result(RunOutcome {
+                        status: RunStatus::Error,
+                        result: None,
+                        session_id: Some("sess-settled".to_owned()),
+                        error: Some("aborted by user".to_owned()),
+                    }));
+                    Ok(())
+                }
+                fn events(&self) -> BoxStream<'_, EngineEvent> {
+                    match self.rx.lock().unwrap().take() {
+                        Some(rx) => Box::pin(stream::unfold(rx, |mut rx| async move {
+                            rx.recv().await.map(|event| (event, rx))
+                        })),
+                        None => Box::pin(stream::empty()),
+                    }
+                }
+            }
+
+            let db = test_db();
+            let engine: Arc<dyn Engine> = Arc::new(SettlingEngine);
+            let dir = tempfile::tempdir().unwrap();
+            let exec = Arc::new(ThreadExecutor::new(
+                engine,
+                Arc::clone(&db),
+                dir.path().to_path_buf(),
+                no_inactivity(),
+            ));
+            lock(&db)
+                .insert_thread(&pending_thread("th-settle", 1))
+                .unwrap();
+
+            let runner = Arc::clone(&exec);
+            let handle = tokio::spawn(async move {
+                runner
+                    .run_thread(
+                        pending_thread("th-settle", 1),
+                        "go".to_owned(),
+                        Continuity::Isolated,
+                    )
+                    .await
+            });
+            for _ in 0..200 {
+                if lock(&db).get_thread("th-settle").unwrap().unwrap().status == "running" {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            exec.interrupt().await;
+
+            let row = handle.await.unwrap();
+            assert_eq!(row.status, "cancelled");
+            assert_eq!(
+                row.engine_session_id.as_deref(),
+                Some("sess-settled"),
+                "a gracefully settled cancel keeps the verified resume handle"
+            );
+        }
+
+        /// P1-6 regression: a daemon shutdown while a run is active cancels the
+        /// run through the same path as a host interrupt (bounded drain — no
+        /// `running_timeout` wait) and stops the pending drain from starting new
+        /// runs (the still-pending threads re-run on the next boot).
+        #[tokio::test]
+        async fn shutdown_cancels_the_active_run_and_stops_the_drain() {
+            let db = test_db();
+            let shutdown = Arc::new(crate::scheduler::Cancel::new());
+            let engine: Arc<dyn Engine> = Arc::new(MockEngine {
+                script: vec![started("s")],
+                stall: true,
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let exec = Arc::new(
+                ThreadExecutor::new(
+                    engine,
+                    Arc::clone(&db),
+                    dir.path().to_path_buf(),
+                    WatchdogCfg {
+                        inactivity_timeout: None,
+                        cancel_drain_timeout: std::time::Duration::from_millis(100),
+                        ..WatchdogCfg::default()
+                    },
+                )
+                .with_shutdown(Arc::clone(&shutdown)),
+            );
+            lock(&db).insert_thread(&pending_thread("th-a", 1)).unwrap();
+            lock(&db).insert_thread(&pending_thread("th-b", 1)).unwrap();
+
+            let drainer = Arc::clone(&exec);
+            let handle =
+                tokio::spawn(async move { drainer.drain_pending(&StaticPrompt("go")).await });
+
+            // Wait until one thread is live, then shut down.
+            for _ in 0..200 {
+                if !lock(&db)
+                    .list_threads_by_status("running")
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            shutdown.cancel();
+
+            // The drain settles within seconds — nowhere near running_timeout.
+            let dispatched = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("shutdown did not settle the pending drain")
+                .unwrap();
+            assert_eq!(dispatched, 1, "only the in-flight thread was dispatched");
+            let mut statuses = vec![
+                lock(&db).get_thread("th-a").unwrap().unwrap().status,
+                lock(&db).get_thread("th-b").unwrap().unwrap().status,
+            ];
+            statuses.sort();
+            assert_eq!(
+                statuses,
+                ["cancelled", "pending"],
+                "the active run settles cancelled; the queued thread is left for the next boot"
+            );
+        }
+
+        /// P2-19 regression: with the inactivity watchdog DISABLED (config 0) a
+        /// silent engine must still be bounded by the total-time watchdog on wall
+        /// clock — the old code only evaluated it on event arrival, wedging the
+        /// serial execution plane forever.
+        #[tokio::test]
+        async fn total_time_watchdog_fires_on_wall_clock_without_events() {
+            let db = test_db();
+            let watchdog = WatchdogCfg {
+                running_timeout: TimeDelta::milliseconds(200),
+                inactivity_timeout: None,
+                ..WatchdogCfg::default()
+            };
+            let exec = build(&db, vec![started("s")], true, watchdog);
+            lock(&db)
+                .insert_thread(&pending_thread("th-wedge", 1))
+                .unwrap();
+
+            let row = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                exec.run_thread(
+                    pending_thread("th-wedge", 1),
+                    "go".to_owned(),
+                    Continuity::Isolated,
+                ),
+            )
+            .await
+            .expect("a wedged engine must be reaped on wall clock");
+            assert_eq!(row.status, "failed");
+            assert_eq!(row.failure_reason.as_deref(), Some("runner.timeout"));
         }
 
         #[tokio::test]
@@ -2168,6 +2507,123 @@ pub(crate) mod v2 {
                 !work_dir.join("project").exists(),
                 "no project/ without the provisioning rig"
             );
+        }
+
+        // -- Shutdown/cancel child-kill path (P1-6) --------------------------
+
+        /// P1-6 regression, against the REAL Claude engine plumbing: an engine
+        /// child that ignores the graceful interrupt is killed once the
+        /// post-cancel drain window expires — it must not keep executing past the
+        /// cancelled turn. Linux-only: child liveness is observed via `/proc`.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn drain_window_expiry_kills_the_engine_child() {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+
+            use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
+
+            let db = test_db();
+            let dir = tempfile::tempdir().unwrap();
+            let pid_path = dir.path().join("child.pid");
+
+            // A fake `claude` that announces itself, records its pid, then
+            // ignores stdin (including the interrupt) forever.
+            let stub = dir.path().join("stubborn-claude.sh");
+            let script = format!(
+                "#!/usr/bin/env bash\n\
+                 echo $$ > {pid}\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-kill\",\"model\":\"m\",\"tools\":[]}}'\n\
+                 exec sleep 600\n",
+                pid = pid_path.display()
+            );
+            {
+                let mut file = std::fs::File::create(&stub).unwrap();
+                file.write_all(script.as_bytes()).unwrap();
+                let mut perms = file.metadata().unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&stub, perms).unwrap();
+            }
+
+            let engine: Arc<dyn Engine> = Arc::new(ClaudeEngine::new(ClaudeSettings {
+                binary: stub,
+                ..ClaudeSettings::default()
+            }));
+            let exec = Arc::new(ThreadExecutor::new(
+                engine,
+                Arc::clone(&db),
+                dir.path().to_path_buf(),
+                WatchdogCfg {
+                    inactivity_timeout: None,
+                    cancel_drain_timeout: std::time::Duration::from_millis(200),
+                    ..WatchdogCfg::default()
+                },
+            ));
+            lock(&db)
+                .insert_thread(&pending_thread("th-kill", 1))
+                .unwrap();
+
+            let runner = Arc::clone(&exec);
+            let handle = tokio::spawn(async move {
+                runner
+                    .run_thread(
+                        pending_thread("th-kill", 1),
+                        "go".to_owned(),
+                        Continuity::Isolated,
+                    )
+                    .await
+            });
+
+            // Wait for the child to announce its pid, then interrupt the run.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let pid = loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "engine child never started"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            exec.interrupt().await;
+
+            // The run settles cancelled within the drain window (hard kill: no
+            // resume handle), not after running_timeout.
+            let row = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("cancelled run did not settle within the drain window")
+                .unwrap();
+            assert_eq!(row.status, "cancelled");
+            assert!(
+                row.engine_session_id.is_none(),
+                "a hard-killed turn keeps no resume handle"
+            );
+
+            // The child received the kill: it leaves the process table (or sits
+            // as a zombie awaiting reap — either way it is no longer executing).
+            let dead_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|stat| {
+                        stat.rsplit(')')
+                            .next()
+                            .and_then(|tail| tail.trim_start().chars().next())
+                    });
+                match state {
+                    None | Some('Z') => break,
+                    Some(_) => {
+                        assert!(
+                            std::time::Instant::now() < dead_by,
+                            "engine child survived the drain-window kill"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
         }
     }
 }
