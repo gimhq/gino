@@ -262,6 +262,29 @@ impl Provisioner {
         Ok(())
     }
 
+    /// Release every manifest row for `scope` — the terminal-state cleanup half of
+    /// P1-11. Dropping the rows removes the scope from the repair/GC root set: the
+    /// store entries it referenced become refcount-orphans that the next
+    /// [`Self::gc`] collects, and [`Self::repair`] no longer rebuilds the scope's
+    /// symlink tree at startup. The on-disk symlinks are deliberately left in
+    /// place: a task scope's root lives inside a terminal thread's `work_dir`,
+    /// which is reclaimed as a whole by workspace lifecycle, not link by link.
+    pub(crate) async fn release_scope(&self, scope: &str) -> Result<(), ProvisioningError> {
+        // Serialize against GC / reconcile (Risk 4) so the row set GC refcounts
+        // against is never observed mid-release.
+        let _gc = self.gc_lock.lock().await;
+
+        let db = lock_db(&self.db);
+        let rows = db.list_config_entries(scope)?;
+        for row in &rows {
+            db.delete_config_entry(scope, &row.target)?;
+        }
+        if !rows.is_empty() {
+            debug!(scope, released = rows.len(), "released provisioning scope");
+        }
+        Ok(())
+    }
+
     /// Restart-repair (PLAN-007 §7, Risk 2): for each manifest row whose symlink is
     /// missing or dangling, recreate it from the present store entry, otherwise
     /// re-fetch and re-materialize the bytes and then link. Treats the FS as

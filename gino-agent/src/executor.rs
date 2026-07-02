@@ -278,8 +278,8 @@ pub(crate) mod v2 {
 
         /// Wire the per-thread task provisioning plane (PLAN-007 §3/§6): before each
         /// run the task's desired entries are materialized into `work_dir/project/`
-        /// (scope = thread id), the isolated git working area `project/workspace/` is
-        /// created, and the engine cwd becomes `project/`. Builder-style so the
+        /// (scope = task id, §9b), the isolated git working area `project/workspace/`
+        /// is created, and the engine cwd becomes `project/`. Builder-style so the
         /// existing [`Self::new`] call sites (unit tests) stay on the back-compat path
         /// (cwd = `work_dir`, no `project/`).
         pub(crate) fn with_provisioning(mut self, provisioner: Arc<Provisioner>) -> Self {
@@ -400,7 +400,9 @@ pub(crate) mod v2 {
             // 1b. Materialize inbound attachments into work_dir/inputs (A3) before
             // the engine starts. Unavailable inputs fail the thread terminally.
             if let Err(conclusion) = self.materialize_inbound(&thread).await {
-                return self.finalize(thread, conclusion, started, continuity, Vec::new());
+                return self
+                    .conclude(thread, conclusion, started, continuity, Vec::new())
+                    .await;
             }
 
             // 2. dispatched → running, then start the engine session.
@@ -431,7 +433,9 @@ pub(crate) mod v2 {
                         error: format!("start_session failed: {err}"),
                         session_id: thread.engine_session_id.clone(),
                     };
-                    return self.finalize(thread, conclusion, started, continuity, Vec::new());
+                    return self
+                        .conclude(thread, conclusion, started, continuity, Vec::new())
+                        .await;
                 }
             };
 
@@ -458,7 +462,42 @@ pub(crate) mod v2 {
             // apply retry / resume-safety, persist, and emit the terminal result
             // carrying the outbound descriptors.
             let outputs = self.collect_outbound(&thread, &conclusion).await;
-            self.finalize(thread, conclusion, started, continuity, outputs)
+            self.conclude(thread, conclusion, started, continuity, outputs)
+                .await
+        }
+
+        /// [`Self::finalize`] plus terminal-state provisioning cleanup (P1-11):
+        /// when the run settles into a terminal state (not `active`, not a retry
+        /// re-pend), the task-scope manifest rows are released — the scope's link
+        /// tree lives under this thread's now-dead `work_dir`, so keeping the rows
+        /// would make every startup repair rebuild symlinks inside dead work dirs
+        /// and would pin the referenced store entries against GC forever.
+        /// Decision (§9b is silent on scope death): cleanup keys on the THREAD's
+        /// terminal state rather than task deletion, because the manifest's
+        /// `link_path` roots at the thread's `project/`; a shared thread parks
+        /// `active` between turns, so its scope survives until it truly ends. The
+        /// next fire re-materializes from the still-cached bytes (store hit or
+        /// attachment cache), so releasing costs no network round trip. The sync
+        /// watchdog/offline reapers keep calling bare [`Self::finalize`]; a scope
+        /// they leave behind is bounded (one row set per task, `UNIQUE(scope,
+        /// target)`) and is replaced-then-released by the task's next fire.
+        async fn conclude(
+            &self,
+            thread: ThreadRow,
+            conclusion: Conclusion,
+            started: DateTime<Utc>,
+            continuity: Continuity,
+            outputs: Vec<AttachmentDescriptor>,
+        ) -> ThreadRow {
+            let done = self.finalize(thread, conclusion, started, continuity, outputs);
+            if matches!(done.status.as_str(), SUCCEEDED | FAILED | CANCELLED)
+                && let Some(provisioner) = self.provisioning.as_ref()
+                && let Err(err) = provisioner.release_scope(&done.task_id).await
+            {
+                warn!(thread = %done.id, task = %done.task_id, error = %err,
+                    "terminal provisioning cleanup failed (continuing)");
+            }
+            done
         }
 
         /// Materialize inbound attachments into `work_dir/inputs` (A3) before the
@@ -547,11 +586,16 @@ pub(crate) mod v2 {
             if let Err(err) = std::fs::create_dir_all(project_dir.join("workspace")) {
                 warn!(thread = %thread.id, error = %err, "failed to create project dir (continuing)");
             }
-            // Materialize the task's desired entries into `project/` (scope = thread
-            // id; `project/` is per-thread). A reconcile error degrades — see above.
+            // Materialize the task's desired entries into `project/` under the TASK
+            // id scope (§9b: scope = 'global' | <task_id> — P1-11 fix; thread-id
+            // scoping left one immortal row set per fire). `project/` itself stays
+            // per-thread: a successive fire reconciles the same scope against its
+            // new root, upserting the rows (UNIQUE(scope, target)) to point at the
+            // fresh tree instead of accumulating. A reconcile error degrades — see
+            // above.
             let entries = self.task_entries(&thread.task_id);
             if let Err(err) = provisioner
-                .reconcile(&thread.id, &project_dir, &entries)
+                .reconcile(&thread.task_id, &project_dir, &entries)
                 .await
             {
                 warn!(thread = %thread.id, error = %err, "task provisioning reconcile failed (continuing)");
@@ -2447,10 +2491,25 @@ pub(crate) mod v2 {
         }
 
         /// A single-blob [`BlobFetcher`] for the provisioning rig: serves `bytes` at
-        /// `reference`, verifying the requested `sha256` (the real fetcher's contract).
+        /// `reference`, verifying the requested `sha256` (the real fetcher's
+        /// contract) and counting fetches (to prove store hits skip the fetch).
         struct OneBlob {
             reference: String,
             bytes: Vec<u8>,
+            fetches: std::sync::atomic::AtomicUsize,
+        }
+
+        impl OneBlob {
+            fn new(reference: &str, bytes: Vec<u8>) -> Self {
+                Self {
+                    reference: reference.to_owned(),
+                    bytes,
+                    fetches: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+            fn fetch_count(&self) -> usize {
+                self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+            }
         }
 
         #[async_trait]
@@ -2460,6 +2519,8 @@ pub(crate) mod v2 {
                 reference: &str,
                 sha256: &str,
             ) -> Result<Vec<u8>, ProvisioningError> {
+                self.fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 assert_eq!(reference, self.reference, "unexpected fetch reference");
                 assert_eq!(sha256_hex(&self.bytes), sha256, "blob sha mismatch");
                 Ok(self.bytes.clone())
@@ -2467,7 +2528,7 @@ pub(crate) mod v2 {
         }
 
         /// With the provisioning rig wired, a run materializes the task scope into
-        /// `work_dir/project/` (scope = thread id), creates the isolated
+        /// `work_dir/project/` (scope = task id, P1-11), creates the isolated
         /// `project/workspace/` git area, and launches the engine with cwd=`project/`.
         #[tokio::test]
         async fn provisioned_run_materializes_task_scope_in_project_dir() {
@@ -2486,10 +2547,8 @@ pub(crate) mod v2 {
                 .set_task_entries("task-1", Some(&serde_json::to_string(&[entry]).unwrap()))
                 .unwrap();
 
-            let fetcher: Arc<dyn BlobFetcher> = Arc::new(OneBlob {
-                reference: "/agent/attachments/task-claude".to_owned(),
-                bytes: bytes.clone(),
-            });
+            let fetcher: Arc<dyn BlobFetcher> =
+                Arc::new(OneBlob::new("/agent/attachments/task-claude", bytes.clone()));
             let provisioner = Arc::new(Provisioner::new(
                 ws.path().to_path_buf(),
                 Arc::clone(&db),
@@ -2537,10 +2596,10 @@ pub(crate) mod v2 {
                 "CLAUDE.md must be a symlink into the store"
             );
             assert_eq!(std::fs::read(&link).unwrap(), bytes);
-            // Materialized under the THREAD-ID scope (project/ is per-thread).
-            let rows = lock(&db).list_config_entries("th-prov").unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].target, "CLAUDE.md");
+            // P1-11: nothing is scoped by thread id, and the isolated run's terminal
+            // cleanup already released the task scope — the manifest is empty.
+            assert!(lock(&db).list_config_entries("th-prov").unwrap().is_empty());
+            assert!(lock(&db).list_all_config_entries().unwrap().is_empty());
         }
 
         /// Without the provisioning rig the engine cwd stays the `work_dir` itself and
