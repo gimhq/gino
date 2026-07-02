@@ -2078,10 +2078,11 @@ pub(crate) mod v2 {
                 .expect("shutdown did not settle the pending drain")
                 .unwrap();
             assert_eq!(dispatched, 1, "only the in-flight thread was dispatched");
-            let mut statuses = vec![
-                lock(&db).get_thread("th-a").unwrap().unwrap().status,
-                lock(&db).get_thread("th-b").unwrap().unwrap().status,
-            ];
+            // One lock per statement: two `lock(&db)` temporaries in a single
+            // expression deadlock on the non-reentrant mutex.
+            let status_a = lock(&db).get_thread("th-a").unwrap().unwrap().status;
+            let status_b = lock(&db).get_thread("th-b").unwrap().unwrap().status;
+            let mut statuses = [status_a, status_b];
             statuses.sort();
             assert_eq!(
                 statuses,
