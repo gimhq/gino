@@ -2527,6 +2527,45 @@ pub(crate) mod v2 {
             }
         }
 
+        /// Build an executor + provisioning rig over one desired `task-1` entry
+        /// (`task-claude` → `CLAUDE.md` with `bytes`), returning the handles the
+        /// P1-11 regression tests inspect.
+        fn provisioning_rig(
+            db: &Arc<Mutex<Db>>,
+            ws: &std::path::Path,
+            bytes: &[u8],
+        ) -> (ThreadExecutor, Arc<Provisioner>, Arc<OneBlob>) {
+            let entry = ProvisioningEntry {
+                id: "task-claude".to_owned(),
+                sha256: sha256_hex(bytes),
+                target: "CLAUDE.md".to_owned(),
+                kind: EntryKind::File,
+            };
+            lock(db)
+                .set_task_entries("task-1", Some(&serde_json::to_string(&[entry]).unwrap()))
+                .unwrap();
+            let blob = Arc::new(OneBlob::new(
+                "/agent/attachments/task-claude",
+                bytes.to_vec(),
+            ));
+            // Clone the concrete handle, then coerce to the trait object (unsizing
+            // happens at the `let`, not inside `Arc::clone`).
+            let concrete = Arc::clone(&blob);
+            let fetcher: Arc<dyn BlobFetcher> = concrete;
+            let provisioner = Arc::new(Provisioner::new(
+                ws.to_path_buf(),
+                Arc::clone(db),
+                fetcher,
+            ));
+            let engine: Arc<dyn Engine> = Arc::new(CwdProbe {
+                seen: Arc::new(Mutex::new(None)),
+            });
+            let exec =
+                ThreadExecutor::new(engine, Arc::clone(db), ws.to_path_buf(), no_inactivity())
+                    .with_provisioning(Arc::clone(&provisioner));
+            (exec, provisioner, blob)
+        }
+
         /// With the provisioning rig wired, a run materializes the task scope into
         /// `work_dir/project/` (scope = task id, P1-11), creates the isolated
         /// `project/workspace/` git area, and launches the engine with cwd=`project/`.
@@ -2600,6 +2639,124 @@ pub(crate) mod v2 {
             // cleanup already released the task scope — the manifest is empty.
             assert!(lock(&db).list_config_entries("th-prov").unwrap().is_empty());
             assert!(lock(&db).list_all_config_entries().unwrap().is_empty());
+        }
+
+        /// P1-11 regression (accumulation): two successive isolated fires of the
+        /// same task reconcile and then release the SAME task-id scope — no
+        /// `config_entries` rows pile up (the old thread-id scoping left one
+        /// immortal row set per fire), and the second fire hits the store instead
+        /// of re-fetching the blob.
+        #[tokio::test]
+        async fn successive_isolated_fires_do_not_accumulate_config_entries() {
+            let db = test_db();
+            let ws = tempfile::tempdir().unwrap();
+            let bytes = b"# task CLAUDE.md\n".to_vec();
+            let (exec, _prov, blob) = provisioning_rig(&db, ws.path(), &bytes);
+
+            for id in ["th-fire-1", "th-fire-2"] {
+                lock(&db).insert_thread(&pending_thread(id, 1)).unwrap();
+                let row = exec
+                    .run_thread(pending_thread(id, 1), "go".to_owned(), Continuity::Isolated)
+                    .await;
+                assert_eq!(row.status, "succeeded");
+            }
+
+            // No rows survive under any scope — neither task- nor thread-keyed.
+            assert!(lock(&db).list_all_config_entries().unwrap().is_empty());
+            // The second fire reused the store entry: one fetch across both fires.
+            assert_eq!(blob.fetch_count(), 1, "store hit must skip the re-fetch");
+        }
+
+        /// P1-11 regression (replace semantics): rows are keyed by TASK id — a
+        /// shared thread parks `active` (non-terminal), so its scope survives —
+        /// and a later fire of the same task repoints the one row per target
+        /// (`UNIQUE(scope, target)`) at its fresh `project/` tree instead of
+        /// accumulating a second row set.
+        #[tokio::test]
+        async fn task_scope_rows_replace_across_fires() {
+            let db = test_db();
+            let ws = tempfile::tempdir().unwrap();
+            let bytes = b"# task CLAUDE.md\n".to_vec();
+            let (exec, _prov, _blob) = provisioning_rig(&db, ws.path(), &bytes);
+
+            lock(&db).insert_thread(&pending_thread("th-s1", 1)).unwrap();
+            let first = exec
+                .run_thread(
+                    pending_thread("th-s1", 1),
+                    "go".to_owned(),
+                    Continuity::Shared,
+                )
+                .await;
+            assert_eq!(first.status, "active");
+            let rows = lock(&db).list_config_entries("task-1").unwrap();
+            assert_eq!(rows.len(), 1, "scope is the task id: one row per target");
+            assert!(lock(&db).list_config_entries("th-s1").unwrap().is_empty());
+            let first_link = rows[0].link_path.clone();
+
+            lock(&db).insert_thread(&pending_thread("th-s2", 1)).unwrap();
+            let second = exec
+                .run_thread(
+                    pending_thread("th-s2", 1),
+                    "go".to_owned(),
+                    Continuity::Shared,
+                )
+                .await;
+            assert_eq!(second.status, "active");
+            let rows = lock(&db).list_config_entries("task-1").unwrap();
+            assert_eq!(rows.len(), 1, "second fire replaced, not accumulated");
+            assert_ne!(
+                rows[0].link_path, first_link,
+                "row repointed to the new thread's project tree"
+            );
+        }
+
+        /// P1-11 regression (terminal cleanup unroots repair + GC): once a thread
+        /// is terminal its scope rows are gone, so startup repair does NOT rebuild
+        /// the dead thread's symlink tree (no re-fetch either) and a subsequent GC
+        /// removes the now-unreferenced store entry.
+        #[tokio::test]
+        async fn terminal_cleanup_unroots_store_gc_and_repair() {
+            let db = test_db();
+            let ws = tempfile::tempdir().unwrap();
+            let bytes = b"# task CLAUDE.md\n".to_vec();
+            let sha = sha256_hex(&bytes);
+            let (exec, prov, blob) = provisioning_rig(&db, ws.path(), &bytes);
+
+            lock(&db)
+                .insert_thread(&pending_thread("th-dead", 1))
+                .unwrap();
+            let row = exec
+                .run_thread(
+                    pending_thread("th-dead", 1),
+                    "go".to_owned(),
+                    Continuity::Isolated,
+                )
+                .await;
+            assert_eq!(row.status, "succeeded");
+
+            // Terminal cleanup released the scope; the store entry is unrooted but
+            // survives until GC.
+            assert!(lock(&db).list_all_config_entries().unwrap().is_empty());
+            let store_path =
+                crate::provisioning::store::store_path(ws.path(), "task-claude", &sha).unwrap();
+            assert!(store_path.is_file(), "store entry survives until GC");
+
+            // Repair roots on live rows only: a lost link inside the dead thread's
+            // project tree is not rebuilt and nothing is re-fetched.
+            let link = PathBuf::from(row.work_dir.clone().unwrap()).join("project/CLAUDE.md");
+            std::fs::remove_file(&link).unwrap();
+            let fetched = blob.fetch_count();
+            prov.repair().await.unwrap();
+            assert!(!link.exists(), "repair must not rebuild a dead thread's tree");
+            assert_eq!(
+                blob.fetch_count(),
+                fetched,
+                "repair must not re-fetch for a dead scope"
+            );
+
+            // GC ages the unreferenced store entry out.
+            prov.gc().await.unwrap();
+            assert!(!store_path.exists(), "gc removes the unrooted store entry");
         }
 
         /// Without the provisioning rig the engine cwd stays the `work_dir` itself and
