@@ -2552,11 +2552,7 @@ pub(crate) mod v2 {
             // happens at the `let`, not inside `Arc::clone`).
             let concrete = Arc::clone(&blob);
             let fetcher: Arc<dyn BlobFetcher> = concrete;
-            let provisioner = Arc::new(Provisioner::new(
-                ws.to_path_buf(),
-                Arc::clone(db),
-                fetcher,
-            ));
+            let provisioner = Arc::new(Provisioner::new(ws.to_path_buf(), Arc::clone(db), fetcher));
             let engine: Arc<dyn Engine> = Arc::new(CwdProbe {
                 seen: Arc::new(Mutex::new(None)),
             });
@@ -2586,8 +2582,10 @@ pub(crate) mod v2 {
                 .set_task_entries("task-1", Some(&serde_json::to_string(&[entry]).unwrap()))
                 .unwrap();
 
-            let fetcher: Arc<dyn BlobFetcher> =
-                Arc::new(OneBlob::new("/agent/attachments/task-claude", bytes.clone()));
+            let fetcher: Arc<dyn BlobFetcher> = Arc::new(OneBlob::new(
+                "/agent/attachments/task-claude",
+                bytes.clone(),
+            ));
             let provisioner = Arc::new(Provisioner::new(
                 ws.path().to_path_buf(),
                 Arc::clone(&db),
@@ -2679,7 +2677,9 @@ pub(crate) mod v2 {
             let bytes = b"# task CLAUDE.md\n".to_vec();
             let (exec, _prov, _blob) = provisioning_rig(&db, ws.path(), &bytes);
 
-            lock(&db).insert_thread(&pending_thread("th-s1", 1)).unwrap();
+            lock(&db)
+                .insert_thread(&pending_thread("th-s1", 1))
+                .unwrap();
             let first = exec
                 .run_thread(
                     pending_thread("th-s1", 1),
@@ -2693,7 +2693,9 @@ pub(crate) mod v2 {
             assert!(lock(&db).list_config_entries("th-s1").unwrap().is_empty());
             let first_link = rows[0].link_path.clone();
 
-            lock(&db).insert_thread(&pending_thread("th-s2", 1)).unwrap();
+            lock(&db)
+                .insert_thread(&pending_thread("th-s2", 1))
+                .unwrap();
             let second = exec
                 .run_thread(
                     pending_thread("th-s2", 1),
@@ -2747,7 +2749,10 @@ pub(crate) mod v2 {
             std::fs::remove_file(&link).unwrap();
             let fetched = blob.fetch_count();
             prov.repair().await.unwrap();
-            assert!(!link.exists(), "repair must not rebuild a dead thread's tree");
+            assert!(
+                !link.exists(),
+                "repair must not rebuild a dead thread's tree"
+            );
             assert_eq!(
                 blob.fetch_count(),
                 fetched,
