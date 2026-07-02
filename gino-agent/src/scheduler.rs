@@ -311,7 +311,6 @@ pub(crate) fn apply_cron_delete(db: &Mutex<Db>, cron_id: &str) -> Result<bool, D
     };
     "cancelled".clone_into(&mut cron.status);
     cron.next_run = None;
-    cron.dirty = true;
     cron.updated_at = to_iso(now());
     guard.update_cron(&cron)?;
     Ok(true)
@@ -601,7 +600,7 @@ impl Scheduler {
 
     /// Reconcile each active cron's `run_count` cache to the ledger truth
     /// (`cron_logs MAX(round_seq)`, D4). A pure cache correction — it preserves the
-    /// cron's `dirty`/`updated_at` so it does not provoke a spurious sync.
+    /// cron's `updated_at` so it does not provoke a spurious sync.
     fn reconcile_run_counts(&self) -> Result<(), DbError> {
         let crons = lock_db(&self.db).list_active_crons()?;
         for cron in crons {
@@ -663,41 +662,68 @@ impl Scheduler {
         }
     }
 
-    /// Fire one due cron: dedup via the ledger `UNIQUE(cron_id, scheduled_at)`,
-    /// materialize/reuse the driven thread, advance the cron, and emit `cron_state`.
+    /// Fire one due cron **atomically** (P1-8/P2-13): the whole fire — ledger
+    /// append, driven-thread mutation, cron advance, `cron_state` enqueue — runs
+    /// in one `BEGIN IMMEDIATE` transaction under one DB-mutex hold, so a crash
+    /// or error anywhere leaves no partial state; the slot simply retries on the
+    /// next tick. On a committed fresh fire the executor drain is signalled.
     fn fire_cron(
         &self,
         cron: &CronRow,
         now: DateTime<Utc>,
         tally: &mut HashMap<String, CronTally>,
     ) {
+        let fired = {
+            let guard = lock_db(&self.db);
+            guard.immediate_transaction(|db| self.fire_slot(db, cron, now, tally))
+        };
+        match fired {
+            // Tell the runner's executor to drain the freshly-pending thread and
+            // flush the `cron_state` this fire enqueued. Cheap when the fire was
+            // a skip/missed (the drain finds nothing new but still flushes the
+            // ledger summary).
+            Ok(true) => self.drain.notify_one(),
+            Ok(false) => {}
+            Err(err) => {
+                warn!(cron = %cron.id, error = %err, "fire rolled back; the slot retries next tick");
+            }
+        }
+    }
+
+    /// The body of one fire, run inside [`Db::immediate_transaction`]: dedup via
+    /// the ledger `UNIQUE(cron_id, scheduled_at)`, materialize/reuse the driven
+    /// thread, advance the cron (targeted, guarded), and enqueue `cron_state`.
+    /// Every DB error propagates — rolling the whole fire back — instead of the
+    /// old warn-and-continue that could leave partial state. Returns `true` when
+    /// a fresh slot fired (dispatch, skip or miss all count; the caller signals
+    /// the executor drain), `false` on the advance-only paths.
+    fn fire_slot(
+        &self,
+        db: &Db,
+        cron: &CronRow,
+        now: DateTime<Utc>,
+        tally: &mut HashMap<String, CronTally>,
+    ) -> Result<bool, DbError> {
         let Some(scheduled_iso) = cron.next_run.clone() else {
-            return;
+            return Ok(false);
         };
         let Some(scheduled_at) = parse_iso(&scheduled_iso) else {
             warn!(cron = %cron.id, value = %scheduled_iso, "unparseable next_run; advancing without firing");
-            self.advance_cron(cron, now);
-            return;
+            self.advance_cron(db, cron, now)?;
+            return Ok(false);
         };
 
-        // Round-count truth = cron_logs MAX(round_seq); this fire is the next round.
-        let round_seq = lock_db(&self.db)
-            .max_round_seq(&cron.id)
-            .ok()
-            .flatten()
-            .unwrap_or(0)
-            + 1;
+        // Round-count truth = cron_logs MAX(round_seq); this fire is the next
+        // round. A read error PROPAGATES (rolling the fire back) rather than
+        // silently restarting the round count at 0 (P2-13).
+        let round_seq = db.max_round_seq(&cron.id)?.unwrap_or(0) + 1;
 
         // Shared continuity needs the open thread's state to decide overlap.
-        let shared_status = (cron.continuity == "shared")
-            .then(|| {
-                lock_db(&self.db)
-                    .get_thread(&shared_thread_id(&cron.id))
-                    .ok()
-                    .flatten()
-                    .map(|t| t.status)
-            })
-            .flatten();
+        let shared_status = if cron.continuity == "shared" {
+            db.get_thread(&shared_thread_id(&cron.id))?.map(|t| t.status)
+        } else {
+            None
+        };
         let action = decide_fire(cron, scheduled_at, now, shared_status.as_deref());
 
         let (status, skip_reason, thread_id) = match &action {
@@ -710,7 +736,7 @@ impl Scheduler {
         // exists. The thread id is deterministic (isolated) / stable (shared), so
         // this is idempotent: a replay re-ensures the same row, never a duplicate.
         if let FireAction::Dispatch { thread_id, .. } = &action {
-            self.ensure_thread(cron, thread_id, now);
+            self.ensure_thread(db, cron, thread_id, now)?;
         }
 
         // Durable dedup: a replay of the same (cron_id, scheduled_at) is IGNORE'd.
@@ -726,19 +752,12 @@ impl Scheduler {
             thread_id: thread_id.clone(),
             created_at: String::new(),
         };
-        let inserted = match lock_db(&self.db).try_insert_cron_log(&log) {
-            Ok(v) => v,
-            Err(err) => {
-                warn!(cron = %cron.id, error = %err, "cron_log insert failed; advancing to avoid a hot loop");
-                None
-            }
-        };
-        if inserted.is_none() {
+        if db.try_insert_cron_log(&log)?.is_none() {
             debug!(cron = %cron.id, scheduled_at = %scheduled_iso, "duplicate fire ignored (already logged)");
             // A crash between logging and advancing leaves next_run on the old slot;
             // advance now so the loop moves on without re-dispatching.
-            self.advance_cron(cron, now);
-            return;
+            self.advance_cron(db, cron, now)?;
+            return Ok(false);
         }
 
         // A fresh (deduped) shared fire drives a NEW turn on the ongoing thread:
@@ -749,7 +768,7 @@ impl Scheduler {
             isolated: false,
         } = &action
         {
-            self.repend_shared_thread(thread_id);
+            self.repend_shared_thread(db, thread_id)?;
         }
 
         // Tally + summary (process-local skip/last-status; round_count is the truth).
@@ -759,13 +778,13 @@ impl Scheduler {
         }
         entry.last_status = Some(status.to_owned());
 
-        let updated = self.advance_cron(cron, now);
-        self.emit_cron_state(updated.as_ref().unwrap_or(cron), round_seq, entry);
-
-        // Tell the runner's executor to drain the freshly-pending thread and flush
-        // the `cron_state` this fire enqueued. Cheap when the fire was a skip/missed
-        // (the drain finds nothing new but still flushes the ledger summary).
-        self.drain.notify_one();
+        // Emit `cron_state` only when the guarded advance accepted — when the
+        // cron was deleted/edited between the tick-read and this fire there is
+        // no current row worth advertising to the host.
+        if let Some(updated) = self.advance_cron(db, cron, now)? {
+            self.emit_cron_state(db, &updated, round_seq, entry)?;
+        }
+        Ok(true)
     }
 
     /// Ensure the thread a fire drives exists: insert the deterministic
@@ -773,22 +792,18 @@ impl Scheduler {
     /// existing row is reused as-is; making a resting shared thread runnable
     /// again is [`Self::repend_shared_thread`]'s job, gated on the fire passing
     /// the ledger dedup so a replayed slot never re-runs.
-    fn ensure_thread(&self, cron: &CronRow, thread_id: &str, now: DateTime<Utc>) {
-        let guard = lock_db(&self.db);
-        match guard.get_thread(thread_id) {
-            Ok(Some(_)) => {
-                debug!(thread = %thread_id, "thread already present; reusing");
-            }
-            Ok(None) => {
-                let row = new_pending_thread(cron, thread_id, now, self.max_attempts);
-                if let Err(err) = guard.insert_thread(&row) {
-                    warn!(thread = %thread_id, error = %err, "failed to insert pending thread");
-                }
-            }
-            Err(err) => {
-                warn!(thread = %thread_id, error = %err, "thread lookup before fire failed");
-            }
+    fn ensure_thread(
+        &self,
+        db: &Db,
+        cron: &CronRow,
+        thread_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), DbError> {
+        if db.get_thread(thread_id)?.is_some() {
+            debug!(thread = %thread_id, "thread already present; reusing");
+            return Ok(());
         }
+        db.insert_thread(&new_pending_thread(cron, thread_id, now, self.max_attempts))
     }
 
     /// Re-set a resting shared thread `pending` so a fresh fire actually runs a
@@ -798,44 +813,44 @@ impl Scheduler {
     /// config. An in-flight (`pending`/`dispatched`/`running`) thread is left
     /// as-is — [`decide_fire`] skips those fires, so that arm only guards a
     /// replay race. Called only after the fire passed the ledger dedup.
-    fn repend_shared_thread(&self, thread_id: &str) {
-        let guard = lock_db(&self.db);
-        match guard.get_thread(thread_id) {
-            Ok(Some(existing)) => {
-                if matches!(
-                    existing.status.as_str(),
-                    "pending" | "dispatched" | "running"
-                ) {
-                    debug!(thread = %thread_id, status = %existing.status, "shared thread in flight; not re-pending");
-                    return;
-                }
-                let mut turn = existing;
-                "pending".clone_into(&mut turn.status);
-                turn.attempt = 0;
-                turn.max_attempts = self.max_attempts;
-                turn.failure_reason = None;
-                turn.started_at = None;
-                turn.finished_at = None;
-                turn.duration_ms = None;
-                turn.result = None;
-                turn.error = None;
-                if let Err(err) = guard.update_thread(&turn) {
-                    warn!(thread = %thread_id, error = %err, "failed to re-pend shared thread");
-                }
-            }
-            Ok(None) => {
-                warn!(thread = %thread_id, "shared thread missing at re-pend");
-            }
-            Err(err) => {
-                warn!(thread = %thread_id, error = %err, "shared thread lookup at re-pend failed");
-            }
+    fn repend_shared_thread(&self, db: &Db, thread_id: &str) -> Result<(), DbError> {
+        let Some(existing) = db.get_thread(thread_id)? else {
+            warn!(thread = %thread_id, "shared thread missing at re-pend");
+            return Ok(());
+        };
+        if matches!(
+            existing.status.as_str(),
+            "pending" | "dispatched" | "running"
+        ) {
+            debug!(thread = %thread_id, status = %existing.status, "shared thread in flight; not re-pending");
+            return Ok(());
         }
+        let mut turn = existing;
+        "pending".clone_into(&mut turn.status);
+        turn.attempt = 0;
+        turn.max_attempts = self.max_attempts;
+        turn.failure_reason = None;
+        turn.started_at = None;
+        turn.finished_at = None;
+        turn.duration_ms = None;
+        turn.result = None;
+        turn.error = None;
+        db.update_thread(&turn)
     }
 
     /// Advance a cron after a fire: `next_run` recomputed (catch-up aware),
     /// `last_fired_at` stamped, `run_count` cache set to the ledger truth (D4), and
-    /// a `once` marked `completed`. Returns the updated row (for `cron_state`).
-    fn advance_cron(&self, cron: &CronRow, now: DateTime<Utc>) -> Option<CronRow> {
+    /// a `once` marked `completed`. The write is [`Db::advance_cron`] — a targeted
+    /// UPDATE of the scheduling columns only, guarded on `status = 'active'`, so a
+    /// `cron_delete`/`cron_upsert` that landed after the tick-read wins and a
+    /// deleted cron is never resurrected (P2-13). Returns the advanced row (for
+    /// `cron_state`), or `None` when the guard rejected the stale advance.
+    fn advance_cron(
+        &self,
+        db: &Db,
+        cron: &CronRow,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CronRow>, DbError> {
         let is_once = cron.schedule_type.as_deref() == Some("once");
         let next_run = next_run_after_fire(
             &cron.id,
@@ -844,27 +859,30 @@ impl Scheduler {
             cron.next_run.as_deref(),
             now,
         );
-        let truth = lock_db(&self.db)
-            .max_round_seq(&cron.id)
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+        let truth = db.max_round_seq(&cron.id)?.unwrap_or(0);
+        let stamp = to_iso(now);
 
         let mut updated = cron.clone();
         updated.next_run = next_run;
-        updated.last_fired_at = Some(to_iso(now));
+        updated.last_fired_at = Some(stamp.clone());
         updated.run_count = truth;
         if is_once {
             "completed".clone_into(&mut updated.status);
         }
-        updated.dirty = true;
-        updated.updated_at = to_iso(now);
-        match lock_db(&self.db).update_cron(&updated) {
-            Ok(()) => Some(updated),
-            Err(err) => {
-                warn!(cron = %cron.id, error = %err, "failed to advance cron");
-                None
-            }
+        updated.updated_at.clone_from(&stamp);
+        let advanced = db.advance_cron(
+            &cron.id,
+            updated.next_run.as_deref(),
+            &stamp,
+            truth,
+            &updated.status,
+            &stamp,
+        )?;
+        if advanced {
+            Ok(Some(updated))
+        } else {
+            debug!(cron = %cron.id, "advance rejected: cron no longer active (deleted/edited concurrently)");
+            Ok(None)
         }
     }
 
@@ -874,16 +892,16 @@ impl Scheduler {
     /// (agent-architecture §10). The `outbox` keeps a single secondary correlation
     /// column (`thread_id`); the transport's `build_envelope` keys it back to
     /// `cronId` for a `cron_state` row (Lane E), so the cron id rides that column.
-    fn emit_cron_state(&self, cron: &CronRow, round_count: i64, tally: &CronTally) {
+    fn emit_cron_state(
+        &self,
+        db: &Db,
+        cron: &CronRow,
+        round_count: i64,
+        tally: &CronTally,
+    ) -> Result<(), DbError> {
         let data = cron_state_data(cron, round_count, tally);
-        if let Err(err) = lock_db(&self.db).enqueue_outbox_correlated(
-            "cron_state",
-            &data,
-            Some(&cron.task_id),
-            Some(&cron.id),
-        ) {
-            warn!(cron = %cron.id, error = %err, "failed to enqueue cron_state");
-        }
+        db.enqueue_outbox_correlated("cron_state", &data, Some(&cron.task_id), Some(&cron.id))?;
+        Ok(())
     }
 }
 
@@ -1251,6 +1269,123 @@ mod tests {
             lock_db(&db).get_cron_log(2).unwrap().is_none(),
             "no second cron_log row"
         );
+    }
+
+    /// P1-8/P2-13 regression: a fire is ONE transaction. A failure on its last
+    /// write (the `cron_state` outbox enqueue — forced here by dropping the
+    /// outbox table) must roll back the whole fire: no pending thread, no
+    /// ledger row, no cron advance — never the old partial state.
+    #[test]
+    fn fire_is_atomic_mid_fire_failure_leaves_no_partial_state() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        lock_db(&db).exec_raw("DROP TABLE outbox").unwrap();
+
+        let sched = make_scheduler(Arc::clone(&db));
+        sched.tick(at("2026-06-22T12:00:05Z"), &mut HashMap::new());
+
+        let tid = isolated_thread_id("c-1", at(scheduled));
+        assert!(
+            lock_db(&db).get_thread(&tid).unwrap().is_none(),
+            "the pending thread must roll back with the failed fire"
+        );
+        assert_eq!(
+            lock_db(&db).max_round_seq("c-1").unwrap(),
+            None,
+            "the ledger row must roll back with the failed fire"
+        );
+        let untouched = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        assert_eq!(
+            untouched.next_run.as_deref(),
+            Some(scheduled),
+            "the cron must not advance past a rolled-back slot"
+        );
+
+        // Restore the outbox: the SAME slot now fires cleanly (retry semantics).
+        lock_db(&db).migrate().unwrap();
+        sched.tick(at("2026-06-22T12:00:06Z"), &mut HashMap::new());
+        assert!(lock_db(&db).get_thread(&tid).unwrap().is_some());
+        assert_eq!(lock_db(&db).max_round_seq("c-1").unwrap(), Some(1));
+    }
+
+    /// P2-13 regression: a `cron_delete` landing between the scheduler's
+    /// tick-read and the fire's advance must win — the guarded targeted UPDATE
+    /// rejects the stale advance instead of resurrecting the cancelled cron to
+    /// `active` with a fresh `next_run`.
+    #[test]
+    fn cron_deleted_between_tick_read_and_advance_is_not_resurrected() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        let sched = make_scheduler(Arc::clone(&db));
+
+        // The tick-read snapshot (status='active', next_run due) …
+        let stale = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        // … then the host's cron_delete lands (soft delete: cancelled, no slot).
+        assert!(apply_cron_delete(&db, "c-1").unwrap());
+
+        // The racing fire proceeds from the stale snapshot.
+        sched.fire_cron(&stale, at("2026-06-22T12:00:05Z"), &mut HashMap::new());
+
+        let reloaded = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        assert_eq!(reloaded.status, "cancelled", "delete wins over the fire");
+        assert_eq!(reloaded.next_run, None, "no resurrected next_run");
+    }
+
+    /// P2-13 regression: a `max_round_seq` read error aborts the fire (and rolls
+    /// it back) instead of being swallowed to round 0 and corrupting the round
+    /// accounting.
+    #[test]
+    fn max_round_seq_error_propagates_and_aborts_the_fire() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        // Force every cron_logs read/write to fail.
+        lock_db(&db).exec_raw("DROP TABLE cron_logs").unwrap();
+
+        let sched = make_scheduler(Arc::clone(&db));
+        let stale = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        let result = {
+            let guard = lock_db(&db);
+            guard.immediate_transaction(|d| {
+                sched.fire_slot(d, &stale, at("2026-06-22T12:00:05Z"), &mut HashMap::new())
+            })
+        };
+        assert!(result.is_err(), "the read error must propagate, not become 0");
+
+        // Nothing moved: no thread was materialized and the cron did not advance.
+        let tid = isolated_thread_id("c-1", at(scheduled));
+        assert!(lock_db(&db).get_thread(&tid).unwrap().is_none());
+        let untouched = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        assert_eq!(untouched.next_run.as_deref(), Some(scheduled));
     }
 
     #[test]
@@ -1789,14 +1924,17 @@ mod tests {
         );
         lock_db(&db).insert_cron(&c).unwrap();
         let sched = make_scheduler(Arc::clone(&db));
-        sched.emit_cron_state(
-            &c,
-            1,
-            &CronTally {
-                skipped: 0,
-                last_status: Some("dispatched".to_owned()),
-            },
-        );
+        sched
+            .emit_cron_state(
+                &lock_db(&db),
+                &c,
+                1,
+                &CronTally {
+                    skipped: 0,
+                    last_status: Some("dispatched".to_owned()),
+                },
+            )
+            .unwrap();
         let rows = lock_db(&db).list_unacked_outbox().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].msg_type, "cron_state");
