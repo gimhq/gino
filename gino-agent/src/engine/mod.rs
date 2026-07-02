@@ -108,20 +108,6 @@ pub(crate) struct RunOutcome {
     pub(crate) error_kind: Option<RunErrorKind>,
 }
 
-impl RunOutcome {
-    /// An error outcome carrying just a message — used when the engine fails
-    /// before (or instead of) producing a backend `result`.
-    pub(crate) fn errored(message: impl Into<String>) -> Self {
-        Self {
-            status: RunStatus::Error,
-            result: None,
-            session_id: None,
-            error: Some(message.into()),
-            error_kind: None,
-        }
-    }
-}
-
 /// An event emitted while a [`Session`] runs (PLAN-003 §5 `EngineEvent`). The
 /// runner forwards these to the orchestrator (mapping `Result` → `output`, the
 /// rest → logs) and persists the session id from `SessionStarted`.
@@ -193,23 +179,14 @@ pub(crate) trait Session: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, EngineEvent, LogLevel, RunOutcome, RunStatus, Session};
+    use super::{Engine, EngineEvent, LogLevel, Session};
 
     // Compile-time proof that both traits are object-safe (`dyn`-compatible):
     // if either method were not, these signatures would fail to compile.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "compile-time object-safety proof, never called")]
     fn object_safe_engine(_engine: &dyn Engine) {}
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "compile-time object-safety proof, never called")]
     fn object_safe_session(_session: Box<dyn Session>) {}
-
-    #[test]
-    fn errored_outcome_is_an_error_with_message() {
-        let outcome = RunOutcome::errored("boom");
-        assert_eq!(outcome.status, RunStatus::Error);
-        assert_eq!(outcome.error.as_deref(), Some("boom"));
-        assert!(outcome.result.is_none());
-        assert!(outcome.session_id.is_none());
-    }
 
     #[test]
     fn engine_event_equality_distinguishes_variants() {

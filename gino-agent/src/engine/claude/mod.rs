@@ -29,7 +29,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use futures_util::stream::{BoxStream, Stream};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
@@ -863,14 +862,26 @@ fi
             ..ClaudeSettings::default()
         });
 
-        let session = engine
-            .start_session(SessionCfg {
-                cwd: dir.path().to_path_buf(),
-                initial_prompt: Some("hi".to_owned()),
-                ..SessionCfg::default()
-            })
-            .await
-            .expect("start_session errored");
+        // ETXTBSY retry: a concurrently-spawning test child can briefly hold
+        // the just-written script's fd, failing exec with "text file busy".
+        let session = loop {
+            match engine
+                .start_session(SessionCfg {
+                    cwd: dir.path().to_path_buf(),
+                    initial_prompt: Some("hi".to_owned()),
+                    ..SessionCfg::default()
+                })
+                .await
+            {
+                Ok(session) => break session,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        };
 
         // Drain the stream to the single `result` — it only arrives if the stub
         // saw our auto-allow.

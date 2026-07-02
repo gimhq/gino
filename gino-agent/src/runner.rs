@@ -2196,7 +2196,7 @@ mod tests {
         use futures_util::StreamExt;
         use futures_util::stream::{self, BoxStream};
 
-        use crate::engine::{Engine, EngineError, EngineEvent, RunOutcome, Session, SessionCfg};
+        use crate::engine::{Engine, EngineError, EngineEvent, Session, SessionCfg};
         use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
         use crate::scheduler::Cancel;
 

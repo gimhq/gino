@@ -19,14 +19,6 @@
 //! Risk 3), the store `name` is sanitized to a single safe component (mirroring
 //! [`crate::attachments::sanitize_name`]), and tar unpack refuses any member that
 //! escapes the store dir.
-//!
-//! The whole surface is driven by the reconcile L3, not yet by a production caller
-//! in this crate, so the module keeps a `dead_code` allow (mirroring the
-//! attachments module); the unit tests in [`store`] and below exercise it.
-#![allow(
-    dead_code,
-    reason = "store/symlink primitives are driven by the reconcile engine (a later PLAN-007 L3); tests cover the surface"
-)]
 
 use std::path::{Component, Path, PathBuf};
 
