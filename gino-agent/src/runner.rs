@@ -1843,8 +1843,7 @@ mod tests {
         use futures_util::stream::{self, BoxStream};
 
         use crate::engine::{
-            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
-            SessionCfg,
+            Engine, EngineError, EngineEvent, RunOutcome, RunStatus, Session, SessionCfg,
         };
         use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
 
@@ -1869,22 +1868,10 @@ mod tests {
                     .push(cfg.initial_prompt.unwrap_or_default());
                 Ok(Box::new(OkSession))
             }
-            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
-                Ok(RunOutcome {
-                    status: RunStatus::Success,
-                    result: None,
-                    session_id: None,
-                    error: None,
-                    error_kind: None,
-                })
-            }
         }
 
         #[async_trait]
         impl Session for OkSession {
-            async fn send(&self, _input: Input) -> Result<(), EngineError> {
-                Ok(())
-            }
             async fn interrupt(&self) -> Result<(), EngineError> {
                 Ok(())
             }
@@ -2006,8 +1993,7 @@ mod tests {
 
         use crate::db::CronRow;
         use crate::engine::{
-            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
-            SessionCfg,
+            Engine, EngineError, EngineEvent, RunOutcome, RunStatus, Session, SessionCfg,
         };
         use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
         use crate::scheduler::{Cancel, Scheduler};
@@ -2031,16 +2017,10 @@ mod tests {
                 self.runs.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(OkSession))
             }
-            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
-                unreachable!("the executor drives sessions, not run_once")
-            }
         }
 
         #[async_trait]
         impl Session for OkSession {
-            async fn send(&self, _input: Input) -> Result<(), EngineError> {
-                Ok(())
-            }
             async fn interrupt(&self) -> Result<(), EngineError> {
                 Ok(())
             }
@@ -2216,9 +2196,7 @@ mod tests {
         use futures_util::StreamExt;
         use futures_util::stream::{self, BoxStream};
 
-        use crate::engine::{
-            Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, Session, SessionCfg,
-        };
+        use crate::engine::{Engine, EngineError, EngineEvent, RunOutcome, Session, SessionCfg};
         use crate::executor::v2::{ThreadExecutor, WatchdogCfg};
         use crate::scheduler::Cancel;
 
@@ -2238,16 +2216,10 @@ mod tests {
             ) -> Result<Box<dyn Session>, EngineError> {
                 Ok(Box::new(StallingSession))
             }
-            async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
-                unreachable!("the executor drives sessions, not run_once")
-            }
         }
 
         #[async_trait]
         impl Session for StallingSession {
-            async fn send(&self, _input: Input) -> Result<(), EngineError> {
-                Ok(())
-            }
             async fn interrupt(&self) -> Result<(), EngineError> {
                 Ok(())
             }
