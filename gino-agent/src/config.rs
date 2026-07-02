@@ -78,8 +78,6 @@ pub(crate) struct Config {
     pub(crate) connect_token: Option<SecretString>,
     /// Engine environment and defaults handed to the execution backend.
     pub(crate) engine: EngineConfig,
-    /// Local scheduler limits.
-    pub(crate) scheduler: SchedulerConfig,
     /// Thread-executor limits (watchdog thresholds, retry budget).
     pub(crate) executor: ExecutorConfig,
     /// Out-of-band attachment channel limits + backend selection (PLAN-005).
@@ -119,7 +117,6 @@ impl Default for Config {
             register_token: None,
             connect_token: None,
             engine: EngineConfig::default(),
-            scheduler: SchedulerConfig::default(),
             executor: ExecutorConfig::default(),
             attachments: AttachmentsConfig::default(),
             entries: Vec::new(),
@@ -149,24 +146,6 @@ pub(crate) struct EngineConfig {
     pub(crate) allowed_tools: Vec<String>,
 }
 
-/// Local scheduler limits.
-#[derive(Clone, Debug)]
-pub(crate) struct SchedulerConfig {
-    /// Maximum number of executors running concurrently.
-    pub(crate) max_concurrent_tasks: u32,
-    /// Maximum number of tasks held in the local queue.
-    pub(crate) max_queued_tasks: u32,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent_tasks: 4,
-            max_queued_tasks: 128,
-        }
-    }
-}
-
 /// Thread-executor limits (agent-architecture §5/§6). These promote the executor's
 /// in-file `WatchdogCfg`/retry defaults to host-overridable config so a deployment
 /// can tune the reap thresholds and retry budget; the runner maps them onto the
@@ -187,12 +166,14 @@ pub(crate) struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         // Mirrors the executor's `WatchdogCfg::default` (Td 60s, Tr 30m, inactivity
-        // 5m) and the schema's `max_attempts` default of 1.
+        // 5m). The retry budget defaults to 3 so retryable (`runner.*`) failures
+        // actually retry under the shipped config — the gate is
+        // `attempt < max_attempts`, so 1 would make every failure terminal.
         Self {
             dispatched_timeout_secs: 60,
             running_timeout_secs: 1_800,
             inactivity_timeout_secs: 300,
-            max_attempts: 1,
+            max_attempts: 3,
         }
     }
 }
@@ -272,7 +253,6 @@ impl Config {
             register_token,
             connect_token,
             engine,
-            scheduler,
             executor,
             attachments,
             entries,
@@ -310,17 +290,6 @@ impl Config {
         overlay_field(&mut self.engine.model, model);
         if let Some(tools) = allowed_tools {
             self.engine.allowed_tools = tools;
-        }
-
-        let SchedulerOverlay {
-            max_concurrent_tasks,
-            max_queued_tasks,
-        } = scheduler;
-        if let Some(value) = max_concurrent_tasks {
-            self.scheduler.max_concurrent_tasks = value;
-        }
-        if let Some(value) = max_queued_tasks {
-            self.scheduler.max_queued_tasks = value;
         }
 
         let ExecutorOverlay {
@@ -468,7 +437,6 @@ pub(crate) struct ConfigOverlay {
     register_token: Option<String>,
     connect_token: Option<String>,
     engine: EngineOverlay,
-    scheduler: SchedulerOverlay,
     executor: ExecutorOverlay,
     attachments: AttachmentsOverlay,
     /// Full desired global provisioning set (PLAN-007 §5). Unlike `register_token`
@@ -492,13 +460,6 @@ struct EngineOverlay {
     anthropic_base_url: Option<String>,
     model: Option<String>,
     allowed_tools: Option<Vec<String>>,
-}
-
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct SchedulerOverlay {
-    max_concurrent_tasks: Option<u32>,
-    max_queued_tasks: Option<u32>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -628,8 +589,10 @@ mod tests {
     fn defaults_have_expected_values() {
         let config = Config::default();
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.scheduler.max_concurrent_tasks, 4);
-        assert_eq!(config.scheduler.max_queued_tasks, 128);
+        assert_eq!(
+            config.executor.max_attempts, 3,
+            "shipped default must let retryable failures actually retry"
+        );
         assert_eq!(
             config.paths.workspace_dir,
             std::path::PathBuf::from("/var/lib/gino-agent")
@@ -733,7 +696,7 @@ mod tests {
                         "anthropicBaseUrl": "https://proxy.example.com",
                         "allowedTools": ["Bash", "Read", "Write"]
                     },
-                    "scheduler": { "maxConcurrentTasks": 8 },
+                    "executor": { "maxAttempts": 5 },
                     "paths": { "workspaceDir": "/data/ws" }
                 }"#,
             )
@@ -749,9 +712,9 @@ mod tests {
             Some("https://proxy.example.com")
         );
         assert_eq!(config.engine.allowed_tools, ["Bash", "Read", "Write"]);
-        assert_eq!(config.scheduler.max_concurrent_tasks, 8);
+        assert_eq!(config.executor.max_attempts, 5);
         // A field the payload omitted keeps its default.
-        assert_eq!(config.scheduler.max_queued_tasks, 128);
+        assert_eq!(config.executor.dispatched_timeout_secs, 60);
         assert_eq!(
             config.paths.workspace_dir,
             std::path::PathBuf::from("/data/ws")
@@ -764,8 +727,10 @@ mod tests {
         // unknown fields are accepted (ignored), never rejected. The host's
         // register config legitimately carries `wsUrl`/`configUrl`/`outputUrl`/
         // `protocolVersion` (docs/protocol.md §3) that this overlay does not model.
+        // The retired `scheduler` block (`maxConcurrentTasks`/`maxQueuedTasks` —
+        // execution is strictly serial) is likewise just an unknown field now.
         let overlay = ConfigOverlay::from_json(
-            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 2, "bogusField": 1, "engine": { "model": "m" } }"#,
+            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 2, "bogusField": 1, "scheduler": { "maxConcurrentTasks": 8, "maxQueuedTasks": 16 }, "engine": { "model": "m" } }"#,
         )
         .expect("unknown host config fields must be ignored, not rejected");
         assert_eq!(overlay.engine.model.as_deref(), Some("m"));

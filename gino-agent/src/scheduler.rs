@@ -478,8 +478,14 @@ pub(crate) fn cron_state_data(
 }
 
 /// A fresh `pending` thread row for a cron fire (agent-architecture §5),
-/// snapshotting the cron's `prompt` into the thread at attempt 0 (D10).
-fn new_pending_thread(cron: &CronRow, thread_id: &str, now: DateTime<Utc>) -> ThreadRow {
+/// snapshotting the cron's `prompt` into the thread at attempt 0 (D10). The
+/// retry budget comes from `config.executor.max_attempts` via the scheduler.
+fn new_pending_thread(
+    cron: &CronRow,
+    thread_id: &str,
+    now: DateTime<Utc>,
+    max_attempts: i64,
+) -> ThreadRow {
     ThreadRow {
         id: thread_id.to_owned(),
         task_id: cron.task_id.clone(),
@@ -494,7 +500,7 @@ fn new_pending_thread(cron: &CronRow, thread_id: &str, now: DateTime<Utc>) -> Th
         status: "pending".to_owned(),
         failure_reason: None,
         attempt: 0,
-        max_attempts: 1,
+        max_attempts,
         work_dir: None,
         started_at: None,
         finished_at: None,
@@ -524,20 +530,26 @@ pub(crate) struct Scheduler {
     /// thread and flushes the `cron_state` the fire enqueued.
     drain: Arc<Notify>,
     poll_interval: Duration,
+    /// Per-thread retry budget stamped on cron-fired threads
+    /// (`config.executor.max_attempts`).
+    max_attempts: i64,
 }
 
 impl Scheduler {
-    /// Build a scheduler over the shared DB. `cancel` stops the loop. The v2
-    /// scheduler is scheduling-plane only: it fires triggers into `cron_logs` +
-    /// pending `threads` and signals [`Self::drain_signal`]; the runner's executor
-    /// owns execution.
-    pub(crate) fn new(db: Arc<Mutex<Db>>, cancel: Arc<Cancel>) -> Self {
+    /// Build a scheduler over the shared DB. `cancel` stops the loop;
+    /// `max_attempts` is the retry budget stamped on the threads its fires
+    /// create (`config.executor.max_attempts`). The v2 scheduler is
+    /// scheduling-plane only: it fires triggers into `cron_logs` + pending
+    /// `threads` and signals [`Self::drain_signal`]; the runner's executor owns
+    /// execution.
+    pub(crate) fn new(db: Arc<Mutex<Db>>, cancel: Arc<Cancel>, max_attempts: i64) -> Self {
         Self {
             db,
             cancel,
             nudge: Arc::new(Notify::new()),
             drain: Arc::new(Notify::new()),
             poll_interval: DEFAULT_POLL_INTERVAL,
+            max_attempts,
         }
     }
 
@@ -697,12 +709,8 @@ impl Scheduler {
         // Materialize the driven thread first so the ledger's `thread_id` FK target
         // exists. The thread id is deterministic (isolated) / stable (shared), so
         // this is idempotent: a replay re-ensures the same row, never a duplicate.
-        if let FireAction::Dispatch {
-            thread_id,
-            isolated,
-        } = &action
-        {
-            self.ensure_thread(cron, thread_id, *isolated, now);
+        if let FireAction::Dispatch { thread_id, .. } = &action {
+            self.ensure_thread(cron, thread_id, now);
         }
 
         // Durable dedup: a replay of the same (cron_id, scheduled_at) is IGNORE'd.
@@ -733,6 +741,17 @@ impl Scheduler {
             return;
         }
 
+        // A fresh (deduped) shared fire drives a NEW turn on the ongoing thread:
+        // re-pend it, keeping the engine session (P0-1). After the dedup so a
+        // replayed slot never re-runs a turn that already executed.
+        if let FireAction::Dispatch {
+            thread_id,
+            isolated: false,
+        } = &action
+        {
+            self.repend_shared_thread(thread_id);
+        }
+
         // Tally + summary (process-local skip/last-status; round_count is the truth).
         let entry = tally.entry(cron.id.clone()).or_default();
         if status != "dispatched" {
@@ -749,24 +768,66 @@ impl Scheduler {
         self.drain.notify_one();
     }
 
-    /// Ensure the thread a fire drives exists. Isolated: insert the deterministic
-    /// row if absent (idempotent on replay). Shared: insert on the first fire; on
-    /// later fires the ongoing thread is reused as-is — *appending the new turn*
-    /// (re-pending / inbox message) is the executor's job (Lane D).
-    fn ensure_thread(&self, cron: &CronRow, thread_id: &str, isolated: bool, now: DateTime<Utc>) {
+    /// Ensure the thread a fire drives exists: insert the deterministic
+    /// (isolated) / stable (shared) row if absent. Idempotent on replay — an
+    /// existing row is reused as-is; making a resting shared thread runnable
+    /// again is [`Self::repend_shared_thread`]'s job, gated on the fire passing
+    /// the ledger dedup so a replayed slot never re-runs.
+    fn ensure_thread(&self, cron: &CronRow, thread_id: &str, now: DateTime<Utc>) {
         let guard = lock_db(&self.db);
         match guard.get_thread(thread_id) {
             Ok(Some(_)) => {
-                debug!(thread = %thread_id, isolated, "thread already present; reusing");
+                debug!(thread = %thread_id, "thread already present; reusing");
             }
             Ok(None) => {
-                let row = new_pending_thread(cron, thread_id, now);
+                let row = new_pending_thread(cron, thread_id, now, self.max_attempts);
                 if let Err(err) = guard.insert_thread(&row) {
                     warn!(thread = %thread_id, error = %err, "failed to insert pending thread");
                 }
             }
             Err(err) => {
                 warn!(thread = %thread_id, error = %err, "thread lookup before fire failed");
+            }
+        }
+    }
+
+    /// Re-set a resting shared thread `pending` so a fresh fire actually runs a
+    /// new turn (P0-1): the `engine_session_id` (continuity) and the prompt
+    /// snapshot are KEPT, the per-turn fields (attempt counter, failure fields,
+    /// timestamps, result) are cleared, and the retry budget is refreshed from
+    /// config. An in-flight (`pending`/`dispatched`/`running`) thread is left
+    /// as-is — [`decide_fire`] skips those fires, so that arm only guards a
+    /// replay race. Called only after the fire passed the ledger dedup.
+    fn repend_shared_thread(&self, thread_id: &str) {
+        let guard = lock_db(&self.db);
+        match guard.get_thread(thread_id) {
+            Ok(Some(existing)) => {
+                if matches!(
+                    existing.status.as_str(),
+                    "pending" | "dispatched" | "running"
+                ) {
+                    debug!(thread = %thread_id, status = %existing.status, "shared thread in flight; not re-pending");
+                    return;
+                }
+                let mut turn = existing;
+                "pending".clone_into(&mut turn.status);
+                turn.attempt = 0;
+                turn.max_attempts = self.max_attempts;
+                turn.failure_reason = None;
+                turn.started_at = None;
+                turn.finished_at = None;
+                turn.duration_ms = None;
+                turn.result = None;
+                turn.error = None;
+                if let Err(err) = guard.update_thread(&turn) {
+                    warn!(thread = %thread_id, error = %err, "failed to re-pend shared thread");
+                }
+            }
+            Ok(None) => {
+                warn!(thread = %thread_id, "shared thread missing at re-pend");
+            }
+            Err(err) => {
+                warn!(thread = %thread_id, error = %err, "shared thread lookup at re-pend failed");
             }
         }
     }
@@ -844,12 +905,21 @@ mod tests {
 
     use chrono::{DateTime, TimeDelta, Utc};
 
+    use async_trait::async_trait;
+    use futures_util::stream::{self, BoxStream};
+
     use super::{
         Cancel, CronTally, FireAction, SKIP_SHARED_BUSY, Scheduler, apply_cron_delete,
         apply_cron_upsert, cron_state_data, decide_fire, isolated_thread_id, lock_db,
         next_run_at_creation, parse_iso, shared_thread_id,
     };
+    use crate::config::ExecutorConfig;
     use crate::db::{CronLogRow, CronRow, Db, TaskRow, ThreadRow};
+    use crate::engine::{
+        Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, RunStatus, Session,
+        SessionCfg,
+    };
+    use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
     use crate::protocol::v2::CronUpsertData;
 
     fn at(value: &str) -> DateTime<Utc> {
@@ -949,7 +1019,13 @@ mod tests {
     }
 
     fn make_scheduler(db: Arc<Mutex<Db>>) -> Scheduler {
-        Scheduler::new(db, Arc::new(Cancel::new()))
+        // The retry budget cron threads are stamped with comes from
+        // `config.executor.max_attempts`; tests use the shipped default.
+        Scheduler::new(
+            db,
+            Arc::new(Cancel::new()),
+            ExecutorConfig::default().max_attempts,
+        )
     }
 
     fn cron_upsert_data(
@@ -1282,6 +1358,14 @@ mod tests {
         assert_eq!(log.skip_reason.as_deref(), Some(SKIP_SHARED_BUSY));
         assert!(log.thread_id.is_none());
         assert_eq!(tally.get("c-sh").unwrap().skipped, 1);
+
+        // The in-flight turn is untouched: no re-pend, so no double execution.
+        let thread = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(
+            thread.status, "running",
+            "busy shared thread is not re-pended"
+        );
+        assert_eq!(thread.attempt, 0);
     }
 
     #[test]
@@ -1321,6 +1405,311 @@ mod tests {
             "shared thread reused across rounds"
         );
         assert_eq!(lock_db(&db).max_round_seq("c-sh").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn shared_fire_repends_resting_thread_keeping_session_clearing_turn_fields() {
+        // P0-1: a later shared fire must make the ongoing thread runnable again
+        // (`pending`), KEEPING engine_session_id (continuity) and the prompt
+        // snapshot while clearing every per-turn field.
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let slot1 = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron("c-sh", "interval", "60000", "shared", Some(slot1)))
+            .unwrap();
+        let sched = make_scheduler(Arc::clone(&db));
+        let mut tally = HashMap::new();
+        sched.tick(at("2026-06-22T12:00:01Z"), &mut tally);
+
+        // Simulate the executor finishing turn 1: parked resting with a session
+        // and stale per-turn residue (as a prior failed attempt would leave).
+        let tid = shared_thread_id("c-sh");
+        let mut t = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        "active".clone_into(&mut t.status);
+        t.engine_session_id = Some("sess-1".to_owned());
+        t.attempt = 2;
+        t.failure_reason = Some("runner.timeout".to_owned());
+        t.error = Some("stale error".to_owned());
+        t.result = Some("turn 1 result".to_owned());
+        t.started_at = Some("2026-06-22T12:00:01.000Z".to_owned());
+        t.finished_at = Some("2026-06-22T12:00:02.000Z".to_owned());
+        t.duration_ms = Some(1_000);
+        lock_db(&db).update_thread(&t).unwrap();
+
+        let advanced = lock_db(&db).get_cron("c-sh").unwrap().unwrap();
+        let slot2 = parse_iso(advanced.next_run.as_deref().unwrap()).unwrap();
+        sched.tick(slot2 + TimeDelta::seconds(1), &mut tally);
+
+        let turn = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(turn.status, "pending", "second fire re-pends the thread");
+        assert_eq!(
+            turn.engine_session_id.as_deref(),
+            Some("sess-1"),
+            "engine session continuity is preserved"
+        );
+        assert_eq!(
+            turn.prompt, "run the recurring job",
+            "the prompt snapshot survives across turns"
+        );
+        assert_eq!(turn.attempt, 0, "attempt counter reset for the new turn");
+        assert_eq!(
+            turn.max_attempts,
+            ExecutorConfig::default().max_attempts,
+            "retry budget refreshed from config"
+        );
+        assert!(turn.failure_reason.is_none());
+        assert!(turn.error.is_none());
+        assert!(turn.result.is_none());
+        assert!(turn.started_at.is_none());
+        assert!(turn.finished_at.is_none());
+        assert!(turn.duration_ms.is_none());
+    }
+
+    #[test]
+    fn replayed_shared_slot_does_not_repend() {
+        // A replay of an already-logged slot (crash between the cron_log insert
+        // and the advance) is dedup'd by the ledger and must NOT re-pend the
+        // shared thread — the turn for that slot already ran.
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let slot1 = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron("c-sh", "interval", "60000", "shared", Some(slot1)))
+            .unwrap();
+        let sched = make_scheduler(Arc::clone(&db));
+        let mut tally = HashMap::new();
+        sched.tick(at("2026-06-22T12:00:01Z"), &mut tally);
+
+        // Turn 1 executed and the thread is resting.
+        let tid = shared_thread_id("c-sh");
+        let mut t = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        "active".clone_into(&mut t.status);
+        t.engine_session_id = Some("sess-1".to_owned());
+        lock_db(&db).update_thread(&t).unwrap();
+
+        // Rewind next_run to the already-logged slot and replay it.
+        let mut rewound = lock_db(&db).get_cron("c-sh").unwrap().unwrap();
+        rewound.next_run = Some(slot1.to_owned());
+        lock_db(&db).update_cron(&rewound).unwrap();
+        sched.tick(at("2026-06-22T12:00:02Z"), &mut tally);
+
+        let thread = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(
+            thread.status, "active",
+            "replayed slot must not re-pend the shared thread"
+        );
+        assert_eq!(lock_db(&db).max_round_seq("c-sh").unwrap(), Some(1));
+    }
+
+    // ===== scheduler + executor integration (P0-1 / P1-5 regressions) =====
+
+    /// Records the `resume` handle of every session the engine is asked to
+    /// start, then replays a successful turn on `session_id`.
+    struct RecordingEngine {
+        session_id: &'static str,
+        resumes: Mutex<Vec<Option<String>>>,
+    }
+
+    /// A scripted session (mirrors the executor tests' mock).
+    struct ScriptSession(Vec<EngineEvent>);
+
+    #[async_trait]
+    impl Session for ScriptSession {
+        async fn send(&self, _input: Input) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn interrupt(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn events(&self) -> BoxStream<'_, EngineEvent> {
+            Box::pin(stream::iter(self.0.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl Engine for RecordingEngine {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+            self.resumes.lock().unwrap().push(cfg.resume);
+            Ok(Box::new(ScriptSession(vec![
+                EngineEvent::SessionStarted {
+                    session_id: self.session_id.to_owned(),
+                },
+                EngineEvent::Result(RunOutcome {
+                    status: RunStatus::Success,
+                    result: Some("turn done".to_owned()),
+                    session_id: Some(self.session_id.to_owned()),
+                    error: None,
+                }),
+            ])))
+        }
+        async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+            unreachable!("the executor drives sessions, not run_once")
+        }
+    }
+
+    /// Cron threads carry their prompt snapshot, so the drainer never consults
+    /// the prompt source in these scenarios.
+    struct NoPrompt;
+    impl PromptSource for NoPrompt {
+        fn prompt_for(&self, _thread: &ThreadRow) -> Option<String> {
+            None
+        }
+    }
+
+    fn executor_over(db: &Arc<Mutex<Db>>, engine: Arc<dyn Engine>) -> ThreadExecutor {
+        let dir = tempfile::tempdir().unwrap();
+        ThreadExecutor::new(
+            engine,
+            Arc::clone(db),
+            dir.path().to_path_buf(),
+            WatchdogCfg {
+                inactivity_timeout: None,
+                ..WatchdogCfg::default()
+            },
+        )
+    }
+
+    /// The audit's named blind spot (P0-1): the SECOND fire of a
+    /// shared-continuity cron must actually EXECUTE an engine run — resuming
+    /// the same engine session — not merely write a `dispatched` ledger row.
+    #[tokio::test]
+    async fn shared_cron_second_fire_executes_a_second_engine_run() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let slot1 = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron("c-sh", "interval", "60000", "shared", Some(slot1)))
+            .unwrap();
+        let engine = Arc::new(RecordingEngine {
+            session_id: "sess-shared",
+            resumes: Mutex::new(Vec::new()),
+        });
+        let exec = executor_over(&db, Arc::clone(&engine) as Arc<dyn Engine>);
+        let sched = make_scheduler(Arc::clone(&db));
+        let mut tally = HashMap::new();
+        let tid = shared_thread_id("c-sh");
+
+        // Fire 1 + drain: turn 1 runs fresh (no resume) and parks `active`.
+        sched.tick(at("2026-06-22T12:00:01Z"), &mut tally);
+        exec.drain_pending(&NoPrompt).await;
+        let after1 = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(after1.status, "active");
+        assert_eq!(after1.engine_session_id.as_deref(), Some("sess-shared"));
+        assert_eq!(*engine.resumes.lock().unwrap(), vec![None]);
+
+        // Fire 2 + drain: the second fire EXECUTES a second engine run that
+        // resumes the recorded session — the P0-1 defect was that no run
+        // happened at all despite a `dispatched` cron_logs row.
+        let advanced = lock_db(&db).get_cron("c-sh").unwrap().unwrap();
+        let slot2 = parse_iso(advanced.next_run.as_deref().unwrap()).unwrap();
+        sched.tick(slot2 + TimeDelta::seconds(1), &mut tally);
+        exec.drain_pending(&NoPrompt).await;
+
+        assert_eq!(
+            *engine.resumes.lock().unwrap(),
+            vec![None, Some("sess-shared".to_owned())],
+            "the second fire must run the engine again, resuming the session"
+        );
+        let after2 = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(after2.status, "active");
+        assert_eq!(
+            after2.engine_session_id.as_deref(),
+            Some("sess-shared"),
+            "engine_session_id continuity kept across turns"
+        );
+        assert_eq!(lock_db(&db).max_round_seq("c-sh").unwrap(), Some(2));
+    }
+
+    /// A session-counting engine whose first run fails retryably
+    /// (`runner.iteration_limit`) and whose second succeeds.
+    struct FlakyEngine {
+        sessions: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Engine for FlakyEngine {
+        fn name(&self) -> &'static str {
+            "flaky"
+        }
+        async fn start_session(&self, _cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+            let first = self
+                .sessions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0;
+            let script = if first {
+                vec![EngineEvent::Result(RunOutcome {
+                    status: RunStatus::Error,
+                    result: None,
+                    session_id: Some("sess-flaky".to_owned()),
+                    error: Some("run aborted: max turns reached".to_owned()),
+                })]
+            } else {
+                vec![EngineEvent::Result(RunOutcome {
+                    status: RunStatus::Success,
+                    result: Some("done on retry".to_owned()),
+                    session_id: Some("sess-flaky".to_owned()),
+                    error: None,
+                })]
+            };
+            Ok(Box::new(ScriptSession(script)))
+        }
+        async fn run_once(&self, _payload: Payload) -> Result<RunOutcome, EngineError> {
+            unreachable!("the executor drives sessions, not run_once")
+        }
+    }
+
+    /// P1-5: under the shipped default config a cron thread's retryable failure
+    /// must actually retry — the config retry budget reaches cron threads
+    /// (no more hardcoded `max_attempts: 1`) and attempt 2 happens.
+    #[tokio::test]
+    async fn cron_thread_retryable_failure_retries_under_default_config() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        let engine = Arc::new(FlakyEngine {
+            sessions: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let exec = executor_over(&db, Arc::clone(&engine) as Arc<dyn Engine>);
+        let sched = make_scheduler(Arc::clone(&db));
+        sched.tick(at("2026-06-22T12:00:01Z"), &mut HashMap::new());
+
+        let tid = isolated_thread_id("c-1", at(scheduled));
+        let minted = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(
+            minted.max_attempts,
+            ExecutorConfig::default().max_attempts,
+            "config.executor.max_attempts reaches cron threads"
+        );
+
+        // Attempt 1 fails retryably → re-pended, not terminal.
+        exec.drain_pending(&NoPrompt).await;
+        let after1 = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(after1.status, "pending", "retryable failure is re-pended");
+        assert_eq!(after1.attempt, 1);
+
+        // Attempt 2 happens and succeeds.
+        exec.drain_pending(&NoPrompt).await;
+        let after2 = lock_db(&db).get_thread(&tid).unwrap().unwrap();
+        assert_eq!(after2.status, "succeeded", "attempt 2 ran to success");
+        assert_eq!(after2.result.as_deref(), Some("done on retry"));
+        assert_eq!(
+            engine.sessions.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the engine ran twice"
+        );
     }
 
     #[test]
