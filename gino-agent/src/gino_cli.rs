@@ -350,17 +350,37 @@ fn cron_resume(db: &Db, id: &str) -> Result<()> {
 }
 
 fn cron_list(db: &Db, a: TaskFilterArg) -> Result<()> {
-    let crons = match resolve_task_id(a.task_id) {
-        Ok(task_id) => db.list_crons_by_task(&task_id)?,
-        Err(_) => db.list_active_crons()?,
+    // Without a task id the scope silently used to widen to EVERY task's
+    // active crons (audit P3) — keep the wide fallback (useful outside a task)
+    // but label it explicitly and show which task each cron belongs to.
+    let (crons, scoped) = match resolve_task_id(a.task_id) {
+        Ok(task_id) => (db.list_crons_by_task(&task_id)?, true),
+        Err(_) => (db.list_active_crons()?, false),
     };
+    print!("{}", render_cron_list(&crons, scoped));
+    Ok(())
+}
+
+/// Render `cron list` output. `scoped` means the list was filtered to one task;
+/// the unscoped (all-tasks) form is labeled and carries a `task=` column so the
+/// wide scope is never mistaken for the current task's triggers.
+fn render_cron_list(crons: &[CronRow], scoped: bool) -> String {
+    let mut out = String::new();
+    if !scoped {
+        out.push_str("(no task id — listing ACTIVE crons across ALL tasks; pass --task-id to scope)\n");
+    }
     if crons.is_empty() {
-        println!("(no crons)");
-        return Ok(());
+        out.push_str("(no crons)\n");
+        return out;
     }
     for c in crons {
-        println!(
-            "{id}\t{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}",
+        let task = if scoped {
+            String::new()
+        } else {
+            format!("task={}\t", c.task_id)
+        };
+        out.push_str(&format!(
+            "{id}\t{task}{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}\n",
             id = c.id,
             status = c.status,
             ty = c.schedule_type.as_deref().unwrap_or("-"),
@@ -369,9 +389,9 @@ fn cron_list(db: &Db, a: TaskFilterArg) -> Result<()> {
             cont = c.continuity,
             runs = c.run_count,
             prompt = c.prompt,
-        );
+        ));
     }
-    Ok(())
+    out
 }
 
 /// Enqueue a `cron_state` so the host's read-only mirror reflects this change
@@ -417,4 +437,56 @@ fn env_or(key: &str) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "-".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_cron_list;
+    use crate::db::CronRow;
+
+    fn cron(id: &str, task_id: &str) -> CronRow {
+        CronRow {
+            id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            kind: "schedule".to_owned(),
+            prompt: "do the thing".to_owned(),
+            schedule_type: Some("interval".to_owned()),
+            schedule_value: Some("60000".to_owned()),
+            next_run: None,
+            last_fired_at: None,
+            continuity: "isolated".to_owned(),
+            run_count: 0,
+            status: "active".to_owned(),
+            dirty: false,
+            created_at: "2026-07-02T00:00:00.000Z".to_owned(),
+            updated_at: "2026-07-02T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    /// Audit P3: without a task id, `cron list` used to widen to every task's
+    /// crons with output indistinguishable from the scoped form. The wide form
+    /// must be labeled and carry the owning task per line.
+    #[test]
+    fn unscoped_cron_list_labels_the_wide_scope() {
+        let crons = [cron("cron-1", "t-a"), cron("cron-2", "t-b")];
+        let out = render_cron_list(&crons, false);
+        assert!(out.starts_with("(no task id — listing ACTIVE crons across ALL tasks"));
+        assert!(out.contains("cron-1\ttask=t-a\t"));
+        assert!(out.contains("cron-2\ttask=t-b\t"));
+    }
+
+    #[test]
+    fn scoped_cron_list_has_no_banner_and_no_task_column() {
+        let crons = [cron("cron-1", "t-a")];
+        let out = render_cron_list(&crons, true);
+        assert!(out.starts_with("cron-1\tactive\t"));
+        assert!(!out.contains("task="));
+    }
+
+    #[test]
+    fn empty_lists_state_so_in_both_scopes() {
+        assert_eq!(render_cron_list(&[], true), "(no crons)\n");
+        let wide = render_cron_list(&[], false);
+        assert!(wide.contains("across ALL tasks") && wide.ends_with("(no crons)\n"));
+    }
 }
