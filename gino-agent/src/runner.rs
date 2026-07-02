@@ -42,7 +42,7 @@ use crate::attachments::{self, AttachmentManager, AttachmentSource};
 use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
-use crate::engine::{Engine, EngineError, Payload, RunOutcome, Session, SessionCfg};
+use crate::engine::{Engine, EngineError, Session, SessionCfg};
 use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
 use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
@@ -722,10 +722,6 @@ impl Engine for ReloadableEngine {
 
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         self.snapshot().start_session(cfg).await
-    }
-
-    async fn run_once(&self, payload: Payload) -> Result<RunOutcome, EngineError> {
-        self.snapshot().run_once(payload).await
     }
 }
 
