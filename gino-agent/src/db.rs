@@ -758,6 +758,13 @@ impl Db {
 
     /// Persist a message to the outbox before sending (no correlation ids).
     /// Returns the new row id.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "test-only convenience over enqueue_outbox_correlated (production always correlates); keeps the surface honest"
+        )
+    )]
     pub(crate) fn enqueue_outbox<T: Serialize>(
         &self,
         msg_type: &str,
@@ -1354,6 +1361,13 @@ impl Db {
     /// [`DbError::Sqlite`]) — this is the durable firing-dedup contract. Use
     /// [`Self::try_insert_cron_log`] for the idempotent (no-error) variant.
     /// `created_at` is DB-defaulted. Returns the new row id.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "test-only writer of the cron ledger (production fires through try_insert_cron_log); keeps the surface honest"
+        )
+    )]
     pub(crate) fn insert_cron_log(&self, log: &CronLogRow) -> DbResult<i64> {
         self.conn
             .prepare_cached(
@@ -1400,6 +1414,13 @@ impl Db {
     }
 
     /// Read a single cron-log row by id, or `None`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "test-only reader of the cron ledger (its own and the scheduler's unit tests); keeps the surface honest"
+        )
+    )]
     pub(crate) fn get_cron_log(&self, id: i64) -> DbResult<Option<CronLogRow>> {
         let log = self
             .conn
@@ -1508,6 +1529,13 @@ impl Db {
     /// The GC refcount: how many installed entries reference one store artifact
     /// `store/<name>/<sha256[:12]>` (keyed by full `(name, sha256)`, across all
     /// scopes). `store/<name>/<short>` is removable once this drops to 0.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "test-only read model (the provisioner GC refcounts in bulk via list_config_entries); keeps the surface honest"
+        )
+    )]
     pub(crate) fn count_store_refs(&self, name: &str, sha256: &str) -> DbResult<i64> {
         let count = self
             .conn
