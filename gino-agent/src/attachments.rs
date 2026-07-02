@@ -56,6 +56,24 @@ const CACHE_SUBDIR: &str = "attachments-cache";
 /// `direction` marker for an agent-produced (outbound) artifact descriptor.
 const DIRECTION_OUTBOUND: &str = "outbound";
 
+/// Run a blocking filesystem/hash closure on the tokio blocking pool, off the
+/// async worker threads (audit P2-15). The large-byte work in this crate —
+/// 100 MB-scale reads/writes, full-buffer hashing, store scans — must not run
+/// inline in an async fn; this is the one seam the provisioning/attachment
+/// paths hop through. A panic inside `task` is resumed on the caller (same
+/// observable behavior as running inline); a cancelled task (runtime shutdown)
+/// surfaces as an `io::Error`, which both [`AttachmentError`] and
+/// `ProvisioningError` absorb via their `Io` variants.
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    task: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<T> {
+    match tokio::task::spawn_blocking(task).await {
+        Ok(value) => Ok(value),
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(std::io::Error::other(err)),
+    }
+}
+
 /// Errors raised by the attachment layer. Byte content is never included.
 #[derive(Debug, Error)]
 pub(crate) enum AttachmentError {
@@ -384,17 +402,24 @@ impl AttachmentManager {
             }
             let safe = sanitize_name(&descriptor.name)?;
             let bytes = self.fetch(descriptor).await?;
-            total = total.saturating_add(bytes.len() as u64);
+            let size = bytes.len();
+            total = total.saturating_add(size as u64);
             if total > self.config.max_execution_bytes {
                 return Err(AttachmentError::ExecutionLimitExceeded {
                     total,
                     limit: self.config.max_execution_bytes,
                 });
             }
-            std::fs::create_dir_all(&inputs_dir)?;
+            // 100 MB-scale write → blocking pool, not the async worker (P2-15).
             let dest = inputs_dir.join(&safe);
-            std::fs::write(&dest, &bytes)?;
-            debug!(name = %safe, bytes = bytes.len(), "materialized inbound attachment");
+            let dir = inputs_dir.clone();
+            let write_dest = dest.clone();
+            run_blocking(move || {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(&write_dest, &bytes)
+            })
+            .await??;
+            debug!(name = %safe, bytes = size, "materialized inbound attachment");
             written.push(dest);
         }
         Ok(written)
@@ -407,7 +432,11 @@ impl AttachmentManager {
     /// per-execution budget caps the total. Symlinks are ignored (no traversal).
     pub(crate) async fn collect_outputs(&self, work_dir: &Path) -> Vec<AttachmentDescriptor> {
         let output_dir = work_dir.join(OUTPUT_SUBDIR);
-        let files = match list_files(&output_dir) {
+        // The recursive dir walk is a filesystem scan → blocking pool (P2-15).
+        let scan = run_blocking(move || list_files(&output_dir))
+            .await
+            .and_then(|listed| listed);
+        let files = match scan {
             Ok(files) => files,
             Err(err) => {
                 warn!(error = %err, "failed to scan output dir for attachments");
@@ -474,7 +503,14 @@ impl AttachmentManager {
         sha256: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, AttachmentError> {
-        if let Some(bytes) = self.cache_get(sha256) {
+        // The cache probe re-hashes the whole cached blob (verification sweep) —
+        // off the async worker (P2-15).
+        let cached = {
+            let cache_dir = self.cache_dir.clone();
+            let sha = sha256.to_owned();
+            run_blocking(move || cache_get(&cache_dir, &sha)).await?
+        };
+        if let Some(bytes) = cached {
             debug!(sha256 = %sha256, "content-addressed artifact cache hit");
             return Ok(bytes);
         }
@@ -509,11 +545,21 @@ impl AttachmentManager {
             }
         };
         // Promote the verified temp file into the cache by rename (same dir, so
-        // same filesystem); an over-cache-cap blob is simply not cached.
-        if bytes.len() as u64 <= self.config.cache_max_bytes
-            && std::fs::rename(&tmp, self.cache_dir.join(&key)).is_ok()
-        {
-            self.gc();
+        // same filesystem); an over-cache-cap blob is simply not cached. The
+        // rename is cheap but the follow-up LRU pass scans the whole cache dir —
+        // run the pair on the blocking pool (P2-15).
+        if bytes.len() as u64 <= self.config.cache_max_bytes {
+            let cache_dir = self.cache_dir.clone();
+            let cap = self.config.cache_max_bytes;
+            let tmp = tmp.clone();
+            run_blocking(move || {
+                if std::fs::rename(&tmp, cache_dir.join(&key)).is_ok() {
+                    cache_gc(&cache_dir, cap);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            })
+            .await?;
         } else {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -548,7 +594,9 @@ impl AttachmentManager {
             });
         }
         // Bounded read-back: the in-flight cap guarantees the file ≤ max_bytes.
-        Ok(std::fs::read(tmp)?)
+        // Still up to 100 MB — read on the blocking pool (P2-15).
+        let tmp = tmp.to_path_buf();
+        Ok(run_blocking(move || std::fs::read(&tmp)).await??)
     }
 
     /// Fetch one descriptor's verified bytes: enforce the single-file cap + the
@@ -586,19 +634,35 @@ impl AttachmentManager {
         abs: &Path,
         rel: &str,
     ) -> Result<AttachmentDescriptor, AttachmentError> {
-        let bytes = std::fs::read(abs)?;
-        let size = bytes.len();
-        if size as u64 > self.config.max_single_bytes {
-            return Err(AttachmentError::SizeLimitExceeded {
-                size: size as u64,
-                limit: self.config.max_single_bytes,
-            });
-        }
+        // The content-type gate needs only the name — run it before touching the
+        // bytes, so the blocking hop below is not wasted on a rejected file.
         let content_type = guess_content_type(rel);
         self.check_content_type(&content_type)?;
-        let sha256 = sha256_hex(&bytes);
-        // Cache before the move so a later inbound fetch of the same bytes hits.
-        self.cache_put(&sha256, &bytes);
+        // Full read + full-buffer hash + cache write (incl. the LRU scan inside
+        // cache_put) of a 100 MB-scale artifact → blocking pool (P2-15).
+        let (bytes, sha256) = {
+            let abs = abs.to_path_buf();
+            let max_single = self.config.max_single_bytes;
+            let cache_dir = self.cache_dir.clone();
+            let cache_cap = self.config.cache_max_bytes;
+            run_blocking(move || -> Result<(Vec<u8>, String), AttachmentError> {
+                let bytes = std::fs::read(&abs)?;
+                let size = bytes.len() as u64;
+                if size > max_single {
+                    return Err(AttachmentError::SizeLimitExceeded {
+                        size,
+                        limit: max_single,
+                    });
+                }
+                let sha256 = sha256_hex(&bytes);
+                // Cache before the move so a later inbound fetch of the same
+                // bytes hits.
+                cache_put(&cache_dir, cache_cap, &sha256, &bytes);
+                Ok((bytes, sha256))
+            })
+            .await??
+        };
+        let size = bytes.len();
         let uploaded = self
             .backend
             .upload(rel, &content_type, &sha256, bytes)
@@ -629,88 +693,92 @@ impl AttachmentManager {
             })
         }
     }
+}
 
-    // -- Content-addressed cache (A4) -----------------------------------------
+// ---------------------------------------------------------------------------
+// Content-addressed cache (A4). Free functions (not methods) so the async call
+// sites can move an owned `cache_dir` + cap into a `spawn_blocking` closure
+// (P2-15) — every one of these touches the filesystem, and `cache_get`/
+// `cache_put`/`cache_gc` do full-blob hashing or a whole-dir scan.
+// ---------------------------------------------------------------------------
 
-    /// Read cached bytes for `sha256` (verifying they still hash correctly; a
-    /// corrupt entry is removed). `None` on miss or unsafe key.
-    fn cache_get(&self, sha256: &str) -> Option<Vec<u8>> {
-        let key = cache_key(sha256)?;
-        let path = self.cache_dir.join(&key);
-        let bytes = std::fs::read(&path).ok()?;
-        if sha256_hex(&bytes) == key {
-            touch(&path);
-            Some(bytes)
-        } else {
-            let _ = std::fs::remove_file(&path);
-            None
-        }
+/// Read cached bytes for `sha256` (verifying they still hash correctly; a
+/// corrupt entry is removed). `None` on miss or unsafe key.
+fn cache_get(cache_dir: &Path, sha256: &str) -> Option<Vec<u8>> {
+    let key = cache_key(sha256)?;
+    let path = cache_dir.join(&key);
+    let bytes = std::fs::read(&path).ok()?;
+    if sha256_hex(&bytes) == key {
+        touch(&path);
+        Some(bytes)
+    } else {
+        let _ = std::fs::remove_file(&path);
+        None
     }
+}
 
-    /// Store `bytes` under their `sha256` (content-addressed), then GC the cache
-    /// back under the size cap. Best-effort: any failure leaves the cache intact
-    /// and the caller keeps the bytes it already has.
-    fn cache_put(&self, sha256: &str, bytes: &[u8]) {
-        let Some(key) = cache_key(sha256) else {
-            return;
-        };
-        // A single blob larger than the whole cap can never fit; skip caching it.
-        if bytes.len() as u64 > self.config.cache_max_bytes {
-            return;
-        }
-        if std::fs::create_dir_all(&self.cache_dir).is_err() {
-            return;
-        }
-        let tmp = self.cache_dir.join(format!(".tmp.{key}"));
-        if std::fs::write(&tmp, bytes).is_err() {
-            return;
-        }
-        let final_path = self.cache_dir.join(&key);
-        if std::fs::rename(&tmp, &final_path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        self.gc();
+/// Store `bytes` under their `sha256` (content-addressed), then GC the cache
+/// back under the size cap. Best-effort: any failure leaves the cache intact
+/// and the caller keeps the bytes it already has.
+fn cache_put(cache_dir: &Path, cache_max_bytes: u64, sha256: &str, bytes: &[u8]) {
+    let Some(key) = cache_key(sha256) else {
+        return;
+    };
+    // A single blob larger than the whole cap can never fit; skip caching it.
+    if bytes.len() as u64 > cache_max_bytes {
+        return;
     }
+    if std::fs::create_dir_all(cache_dir).is_err() {
+        return;
+    }
+    let tmp = cache_dir.join(format!(".tmp.{key}"));
+    if std::fs::write(&tmp, bytes).is_err() {
+        return;
+    }
+    let final_path = cache_dir.join(&key);
+    if std::fs::rename(&tmp, &final_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    cache_gc(cache_dir, cache_max_bytes);
+}
 
-    /// Evict least-recently-used cache entries until total size ≤ the cap (A4).
-    /// Recency is the file `modified` time, bumped on each cache hit by [`touch`].
-    fn gc(&self) {
-        let cap = self.config.cache_max_bytes;
-        let Ok(entries) = std::fs::read_dir(&self.cache_dir) else {
-            return;
+/// Evict least-recently-used cache entries until total size ≤ the cap (A4).
+/// Recency is the file `modified` time, bumped on each cache hit by [`touch`].
+fn cache_gc(cache_dir: &Path, cap: u64) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total = 0_u64;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
         };
-        let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-        let mut total = 0_u64;
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            // Only real cache entries count; skip `.tmp.*` and anything stray.
-            if cache_key(&name).is_none() {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            total = total.saturating_add(meta.len());
-            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            files.push((entry.path(), meta.len(), modified));
+        // Only real cache entries count; skip `.tmp.*` and anything stray.
+        if cache_key(&name).is_none() {
+            continue;
         }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        total = total.saturating_add(meta.len());
+        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        files.push((entry.path(), meta.len(), modified));
+    }
+    if total <= cap {
+        return;
+    }
+    files.sort_by_key(|(_, _, modified)| *modified);
+    for (path, len, _) in files {
         if total <= cap {
-            return;
+            break;
         }
-        files.sort_by_key(|(_, _, modified)| *modified);
-        for (path, len, _) in files {
-            if total <= cap {
-                break;
-            }
-            if std::fs::remove_file(&path).is_ok() {
-                total = total.saturating_sub(len);
-            }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
         }
     }
 }
@@ -1251,6 +1319,56 @@ mod tests {
             .unwrap();
         assert_eq!(second, b"# CLAUDE.md\n");
         assert_eq!(backend.download_count(), 1, "second fetch is a cache hit");
+    }
+
+    /// P2-15 seam: the blocking-pool hops (cache probe, streamed read-back,
+    /// cache promote + LRU GC) return correct results under concurrent load —
+    /// distinct blobs fetched in parallel each verify and cache independently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_verified_is_correct_under_concurrent_load() {
+        let ws = tempfile::tempdir().unwrap();
+        let backend = Arc::new(MemBackend::default());
+        let blobs: Vec<Vec<u8>> = (0..8).map(|i| format!("BLOB-{i}").into_bytes()).collect();
+        for (i, bytes) in blobs.iter().enumerate() {
+            backend
+                .store
+                .lock()
+                .unwrap()
+                .insert(format!("/r/{i}"), bytes.clone());
+        }
+        let mgr = Arc::new(manager(&backend, ws.path(), AttachmentsConfig::default()));
+
+        let handles: Vec<_> = blobs
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                let mgr = Arc::clone(&mgr);
+                let sha = sha256_hex(bytes);
+                let want = bytes.clone();
+                tokio::spawn(async move {
+                    let got = mgr
+                        .fetch_verified(&format!("/r/{i}"), &sha, 1 << 20)
+                        .await
+                        .unwrap();
+                    assert_eq!(got, want);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(backend.download_count(), 8, "each blob downloaded once");
+
+        // A second pass resolves everything from the cache — the blocking-pool
+        // cache probe still hits after the concurrent fills.
+        for (i, bytes) in blobs.iter().enumerate() {
+            let got = mgr
+                .fetch_verified(&format!("/r/{i}"), &sha256_hex(bytes), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(&got, bytes);
+        }
+        assert_eq!(backend.download_count(), 8, "second pass is all cache hits");
     }
 
     #[tokio::test]
