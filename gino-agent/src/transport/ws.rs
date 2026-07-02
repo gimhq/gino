@@ -1,9 +1,11 @@
 //! Reconnecting WebSocket client (PLAN-003 §2, PLAN-001 `ws.rs`).
 //!
-//! A faithful Rust port of the TypeScript runner's [`ws.ts`](../../../container/gino-agent/src/ws.ts):
-//! outbox-backed at-least-once delivery, inbox dedup/replay, bounded-backoff
-//! reconnect, and (new here) a periodic heartbeat. The connection is **outbound
-//! only** — the runner always dials the orchestrator, never the reverse.
+//! A Rust port of the TypeScript runner's [`ws.ts`](../../../container/gino-agent/src/ws.ts):
+//! outbox-backed at-least-once delivery, inbox dedup/replay, capped-backoff
+//! reconnect (the delay is bounded, the attempts never are — P0-2), and (new
+//! here) a periodic heartbeat plus read-liveness detection of half-open sockets
+//! (P2-16). The connection is **outbound only** — the runner always dials the
+//! orchestrator, never the reverse.
 //!
 //! ## Authentication
 //!
@@ -15,12 +17,16 @@
 //!
 //! * **Outbound** — every data frame is persisted to the `outbox` before it is
 //!   sent (by [`super::Transport::send`]), storing the frame's `data` plus its
-//!   correlation ids in the indexed columns. The driver transmits the freshly
-//!   queued envelope immediately and, on every (re)connect, replays *all* unacked
-//!   rows oldest-first — rebuilding each `{type, …ids, data, outboxId}` envelope
-//!   from the columns via [`build_envelope`], byte-identical to the live send. The
-//!   host's `ack {id}` marks a row acked. Stale immediate sends queued while
-//!   disconnected are discarded on reconnect so replay does not double-transmit.
+//!   correlation ids in the indexed columns. On every (re)connect the driver
+//!   replays *all* unacked rows oldest-first — rebuilding each `{type, …ids,
+//!   data, outboxId}` envelope from the columns via [`build_envelope`],
+//!   byte-identical to the live send. Between reconnects a flush poke transmits
+//!   only the rows **not yet sent on this connection** (a per-connection
+//!   watermark — P2-16: flushing under ack lag must not retransmit the whole
+//!   backlog every time); rows whose acks stall for a full ack window are
+//!   retransmitted in bulk. The host's `ack {id}` marks a row acked. Stale
+//!   immediate sends queued while disconnected are discarded on reconnect so
+//!   replay does not double-transmit.
 //! * **Inbound** — every frame (bar `ack`, and unknown forward-compat frames) is
 //!   recorded to the `inbox` *verbatim* (the full received frame is the payload;
 //!   the `type` column classifies it and the correlation ids index it), a
@@ -44,9 +50,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, warn};
 
@@ -72,6 +78,10 @@ pub(crate) const MAX_OUTBOX_RETRIES: i64 = 10;
 /// `tokio::time::interval`, and an absurdly large value would silence liveness.
 const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_HEARTBEAT: Duration = Duration::from_hours(1);
+/// Per-attempt dial bound (P2-16): a black-holed TCP connect (or a peer that
+/// accepts but never completes the WS handshake) must not stall a reconnect
+/// attempt indefinitely — the backoff loop moves on to the next attempt.
+pub(super) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pre-serialized liveness ping; equal to the v2 `OutboundFrameV2::Heartbeat`
 /// with no `activeThreads` summary (asserted by a unit test) so the constant
 /// never drifts from the type. The runner-driven periodic heartbeat carries no
@@ -101,16 +111,28 @@ pub(crate) enum WsError {
     /// The handshake/TLS/TCP dial failed.
     #[error("dial: {0}")]
     Dial(TungsteniteError),
+    /// The dial did not complete within the per-attempt bound.
+    #[error("dial timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Dial `ws_url`, authenticating with `connect_token` in the `x-internal-token`
-/// header. Used for both the initial connection and every reconnect.
-pub(super) async fn dial(ws_url: &str, connect_token: &SecretString) -> Result<WsStream, WsError> {
+/// header, bounded by `timeout` per attempt (P2-16: a black-holed connect must
+/// not stall the reconnect loop). Used for both the initial connection and
+/// every reconnect, with [`DIAL_TIMEOUT`].
+pub(super) async fn dial(
+    ws_url: &str,
+    connect_token: &SecretString,
+    timeout: Duration,
+) -> Result<WsStream, WsError> {
     let mut request = ws_url.into_client_request().map_err(WsError::Request)?;
     let value =
         HeaderValue::from_str(connect_token.expose_secret()).map_err(|_| WsError::Header)?;
     request.headers_mut().insert(INTERNAL_TOKEN_HEADER, value);
-    let (stream, _response) = connect_async(request).await.map_err(WsError::Dial)?;
+    let (stream, _response) = tokio::time::timeout(timeout, connect_async(request))
+        .await
+        .map_err(|_elapsed| WsError::Timeout(timeout))?
+        .map_err(WsError::Dial)?;
     Ok(stream)
 }
 
@@ -119,7 +141,8 @@ pub(super) async fn dial(ws_url: &str, connect_token: &SecretString) -> Result<W
 // ---------------------------------------------------------------------------
 
 /// Owns the connection lifecycle. Built by [`super::Transport::open`] and run on
-/// a spawned task; it never returns until cancelled or reconnect is exhausted.
+/// a spawned task; it never returns until cancelled — reconnect never gives up
+/// (P0-2).
 #[derive(Debug)]
 pub(super) struct WsDriver {
     pub(super) ws_url: String,
@@ -130,12 +153,14 @@ pub(super) struct WsDriver {
     pub(super) cancel: Arc<Cancel>,
     pub(super) flush: Arc<Notify>,
     pub(super) heartbeat: Duration,
+    pub(super) read_timeout: Duration,
+    pub(super) ack_timeout: Duration,
     pub(super) backoff: Backoff,
 }
 
 impl WsDriver {
-    /// Drive `initial` until it drops, then reconnect-with-backoff in a loop until
-    /// cancelled or the backoff is exhausted.
+    /// Drive `initial` until it drops, then reconnect-with-backoff in a loop
+    /// until cancelled.
     pub(super) async fn run(mut self, initial: WsStream) {
         let mut current = initial;
         loop {
@@ -158,20 +183,41 @@ impl WsDriver {
     }
 
     /// Serve a single live connection: replay outbox + inbox on connect, then
-    /// multiplex inbound reads, queued outbound sends, and the heartbeat until the
-    /// socket drops or shutdown is requested.
+    /// multiplex inbound reads, queued outbound sends, the heartbeat, the
+    /// ack-progress check, and the read-liveness deadline until the socket drops
+    /// or shutdown is requested.
     async fn serve(&mut self, stream: WsStream) {
         let (mut sink, mut read) = stream.split();
 
-        if let Err(err) = replay_outbox(&mut sink, &self.db).await {
-            warn!(error = %err, "outbox replay failed on connect; reconnecting");
-            return;
-        }
+        // Full replay on (re)connect — the one moment every unacked row is
+        // retransmitted. The returned watermark makes later flushes incremental.
+        let mut sent_watermark = match replay_outbox(&mut sink, &self.db, 0).await {
+            Ok(watermark) => watermark,
+            Err(err) => {
+                warn!(error = %err, "outbox replay failed on connect; reconnecting");
+                return;
+            }
+        };
         replay_inbox(&self.db, &self.inbound_tx);
 
-        let mut heartbeat = tokio::time::interval(heartbeat_period(self.heartbeat));
+        let heartbeat_period = clamp_period(self.heartbeat);
+        let mut heartbeat = tokio::time::interval(heartbeat_period);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await; // consume the immediate first tick
+
+        // Ack-progress check (P2-16): if the oldest transmitted-but-unacked row
+        // is unchanged across two consecutive ticks, retransmit the backlog.
+        let mut ack_check = tokio::time::interval(clamp_period(self.ack_timeout));
+        ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ack_check.tick().await;
+        let mut stalled_oldest: Option<i64> = None;
+
+        // Read-liveness (P2-16): every heartbeat also sends a WS ping, so a live
+        // peer produces at least pong traffic; a window with nothing received at
+        // all means a half-open socket — tear down instead of waiting for the
+        // ~15-minute TCP retransmit timeout.
+        let read_window = read_window(self.read_timeout, heartbeat_period);
+        let mut last_rx = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -180,6 +226,7 @@ impl WsDriver {
                     return;
                 }
                 message = read.next() => {
+                    last_rx = tokio::time::Instant::now();
                     match message {
                         Some(Ok(message)) => {
                             if !self.on_message(message, &mut sink).await {
@@ -202,18 +249,42 @@ impl WsDriver {
                     }
                 }
                 () = self.flush.notified() => {
-                    // A producer enqueued frames straight to the outbox; replay the
-                    // unacked rows over the live socket so they ship now (the host
-                    // dedups, exactly as on a reconnect replay).
-                    if let Err(err) = replay_outbox(&mut sink, &self.db).await {
-                        warn!(error = %err, "outbox flush failed; reconnecting");
-                        return;
+                    // A producer enqueued frames straight to the outbox; ship the
+                    // rows not yet sent on this connection (incremental — already
+                    // transmitted rows wait for an ack, a stall, or a reconnect).
+                    match replay_outbox(&mut sink, &self.db, sent_watermark).await {
+                        Ok(watermark) => sent_watermark = watermark,
+                        Err(err) => {
+                            warn!(error = %err, "outbox flush failed; reconnecting");
+                            return;
+                        }
                     }
                 }
                 _ = heartbeat.tick() => {
                     if sink.send(Message::text(HEARTBEAT_FRAME.to_owned())).await.is_err() {
                         return;
                     }
+                    // Solicit a pong so read-liveness sees traffic from a peer
+                    // that has nothing else to send.
+                    if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                        return;
+                    }
+                }
+                _ = ack_check.tick() => {
+                    if ack_stalled(&self.db, sent_watermark, &mut stalled_oldest) {
+                        debug!("no ack progress within the ack window; retransmitting unacked outbox");
+                        match replay_outbox(&mut sink, &self.db, 0).await {
+                            Ok(watermark) => sent_watermark = watermark,
+                            Err(err) => {
+                                warn!(error = %err, "outbox retransmit failed; reconnecting");
+                                return;
+                            }
+                        }
+                    }
+                }
+                () = tokio::time::sleep_until(last_rx + read_window) => {
+                    warn!("nothing received within the read-liveness window; treating the connection as dead");
+                    return;
                 }
             }
         }
@@ -241,8 +312,8 @@ impl WsDriver {
         }
     }
 
-    /// Reconnect with bounded backoff. Returns the new stream, or `None` if
-    /// cancelled or the backoff is exhausted.
+    /// Reconnect with capped backoff (the delay is bounded, the attempts are
+    /// not). Returns the new stream, or `None` once cancelled.
     async fn reconnect(&mut self) -> Option<WsStream> {
         loop {
             let delay = self.backoff.next_delay()?;
@@ -253,7 +324,7 @@ impl WsDriver {
             if self.cancel.is_cancelled() {
                 return None;
             }
-            match dial(&self.ws_url, &self.connect_token).await {
+            match dial(&self.ws_url, &self.connect_token, DIAL_TIMEOUT).await {
                 Ok(stream) => {
                     debug!("reconnected; replaying unacked state");
                     return Some(stream);
@@ -268,37 +339,51 @@ impl WsDriver {
 // Outbox / inbox replay
 // ---------------------------------------------------------------------------
 
-/// Transmit every unacked outbox row, oldest-first, bumping each row's retry
-/// counter. DB read/write errors are logged and skipped; only a socket send
-/// failure propagates (the caller reconnects).
-async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), TungsteniteError> {
-    let envelopes = collect_outbox_replay(db);
+/// Transmit the unacked outbox rows with id above `after_id`, oldest-first,
+/// bumping each transmitted row's retry counter. `after_id = 0` is the full
+/// replay (reconnect / ack-stall retransmit); a flush passes the connection's
+/// send watermark so only fresh rows ship (P2-16). Returns the new watermark —
+/// the highest row id considered. DB read/write errors are logged and skipped;
+/// only a socket send failure propagates (the caller reconnects).
+async fn replay_outbox(
+    sink: &mut WsSink,
+    db: &Arc<Mutex<Db>>,
+    after_id: i64,
+) -> Result<i64, TungsteniteError> {
+    let (envelopes, watermark) = collect_outbox_replay(db, after_id);
     let count = envelopes.len();
     for envelope in envelopes {
         sink.send(Message::text(envelope)).await?;
     }
     if count > 0 {
-        debug!(count, "replayed unacked outbox rows");
+        debug!(count, after_id, "transmitted unacked outbox rows");
     }
-    Ok(())
+    Ok(watermark)
 }
 
-/// Build the envelope for every replayable unacked outbox row, oldest-first,
-/// bumping each row's retry counter. A row whose payload fails to parse is
-/// skipped, and — since that failure is deterministic and will recur on every
-/// replay — dead-lettered once its replay count reaches [`MAX_OUTBOX_RETRIES`]
-/// (the outbound poison policy, audit P3). Split from [`replay_outbox`] so the
-/// per-row policy is unit-testable without a live socket.
-fn collect_outbox_replay(db: &Arc<Mutex<Db>>) -> Vec<String> {
+/// Build the envelope for every replayable unacked outbox row with id above
+/// `after_id`, oldest-first, bumping each row's retry counter. A row whose
+/// payload fails to parse is skipped, and — since that failure is deterministic
+/// and will recur on every replay — dead-lettered once its replay count reaches
+/// [`MAX_OUTBOX_RETRIES`] (the outbound poison policy, audit P3). Returns the
+/// envelopes plus the new send watermark (the highest row id considered, or
+/// `after_id` when none qualified). Split from [`replay_outbox`] so the per-row
+/// policy is unit-testable without a live socket.
+fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i64) {
     let rows = match lock_db(db).list_unacked_outbox() {
         Ok(rows) => rows,
         Err(err) => {
             warn!(error = %err, "failed to list outbox for replay");
-            return Vec::new();
+            return (Vec::new(), after_id);
         }
     };
+    let mut watermark = after_id;
     let mut envelopes = Vec::with_capacity(rows.len());
     for row in rows {
+        if row.id <= after_id {
+            continue;
+        }
+        watermark = watermark.max(row.id);
         let _ = lock_db(db).increment_outbox_retry(row.id);
         let attempts = row.retry_count + 1;
         let Ok(data) = serde_json::from_str::<Value>(&row.payload) else {
@@ -326,7 +411,30 @@ fn collect_outbox_replay(db: &Arc<Mutex<Db>>) -> Vec<String> {
         );
         envelopes.push(envelope.to_string());
     }
-    envelopes
+    (envelopes, watermark)
+}
+
+/// Whether ack progress has stalled (P2-16): `stalled` carries the oldest
+/// transmitted-but-unacked row id observed on the previous check; seeing the
+/// SAME id again means the host acked nothing for a full ack window, so the
+/// caller retransmits the backlog. Any progress (a different oldest, or no
+/// outstanding rows at all) just records the new observation.
+fn ack_stalled(db: &Arc<Mutex<Db>>, watermark: i64, stalled: &mut Option<i64>) -> bool {
+    let oldest = match lock_db(db).list_unacked_outbox() {
+        // Rows are ordered by id, so the first at-or-below the watermark is the
+        // oldest row already transmitted on this connection.
+        Ok(rows) => rows.iter().map(|row| row.id).find(|id| *id <= watermark),
+        Err(err) => {
+            warn!(error = %err, "failed to inspect outbox for ack progress");
+            None
+        }
+    };
+    if oldest.is_some() && *stalled == oldest {
+        *stalled = None;
+        return true;
+    }
+    *stalled = oldest;
+    false
 }
 
 /// Re-deliver every unprocessed inbox row to the consumer (dedup: rows are not
@@ -530,11 +638,20 @@ async fn send_msg_ack(sink: &mut WsSink, msg_id: i64) -> Result<(), TungsteniteE
     Ok(())
 }
 
-/// The effective heartbeat cadence: the host-supplied interval clamped into
-/// [`MIN_HEARTBEAT`, `MAX_HEARTBEAT`] so `heartbeatIntervalMs: 0` (which would
-/// panic `tokio::time::interval`) or an absurd value cannot break the transport.
-fn heartbeat_period(requested: Duration) -> Duration {
+/// The effective cadence for a periodic driver timer (heartbeat / ack check):
+/// the supplied interval clamped into [`MIN_HEARTBEAT`, `MAX_HEARTBEAT`] so
+/// `heartbeatIntervalMs: 0` (which would panic `tokio::time::interval`) or an
+/// absurd value cannot break the transport.
+fn clamp_period(requested: Duration) -> Duration {
     requested.clamp(MIN_HEARTBEAT, MAX_HEARTBEAT)
+}
+
+/// The effective read-liveness window: the (clamped) configured window, but
+/// never below two heartbeat periods — the pongs the heartbeat solicits are the
+/// guaranteed inbound traffic, so a window shorter than their cadence would
+/// declare every healthy-but-quiet connection dead.
+fn read_window(requested: Duration, heartbeat: Duration) -> Duration {
+    clamp_period(requested).max(heartbeat.saturating_mul(2))
 }
 
 /// Forward a frame to the consumer. `close` is marked processed *before* delivery
@@ -623,8 +740,9 @@ mod tests {
 
     use super::{
         HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, InboundDisposition,
-        MAX_HEARTBEAT, MAX_OUTBOX_RETRIES, MIN_HEARTBEAT, classify_inbound, collect_outbox_replay,
-        correlation_of, heartbeat_period, inbox_type, msg_id_of,
+        MAX_HEARTBEAT, MAX_OUTBOX_RETRIES, MIN_HEARTBEAT, ack_stalled, clamp_period,
+        classify_inbound, collect_outbox_replay, correlation_of, inbox_type, msg_id_of,
+        read_window,
     };
     use crate::db::Db;
     use crate::protocol::v2::{InboundFrameV2, MessageInData};
@@ -659,22 +777,97 @@ mod tests {
         };
 
         // Below the limit: the malformed row is skipped (never an envelope) but
-        // stays queued; the healthy row replays every time.
+        // stays queued; the healthy row replays on every full replay.
         for _ in 0..MAX_OUTBOX_RETRIES - 1 {
-            let envelopes = collect_outbox_replay(&db);
+            let (envelopes, _) = collect_outbox_replay(&db, 0);
             assert_eq!(envelopes.len(), 1);
             assert!(envelopes[0].contains("heartbeat"));
             assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 2);
         }
 
         // The attempt that reaches the limit dead-letters the poison row…
-        assert_eq!(collect_outbox_replay(&db).len(), 1);
+        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
         let unacked = db.lock().unwrap().list_unacked_outbox().unwrap();
         assert_eq!(unacked.len(), 1);
         assert_eq!(unacked[0].id, healthy);
 
         // …and the healthy row continues to replay afterwards.
-        assert_eq!(collect_outbox_replay(&db).len(), 1);
+        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
+    }
+
+    /// P2-16 regression: `after_id` makes replay incremental — rows at or below
+    /// the send watermark are not rebuilt (so a flush cannot retransmit them),
+    /// and the returned watermark advances to the highest row considered.
+    #[test]
+    fn collect_outbox_replay_skips_rows_at_or_below_the_watermark() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        {
+            let guard = db.lock().unwrap();
+            guard
+                .enqueue_outbox("thread_message", &json!({"seq": 1}))
+                .unwrap();
+            guard
+                .enqueue_outbox("thread_message", &json!({"seq": 2}))
+                .unwrap();
+        }
+
+        // Full replay sends both and reports watermark 2.
+        let (all, watermark) = collect_outbox_replay(&db, 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(watermark, 2);
+
+        // A flush at that watermark has nothing new to send…
+        let (incremental, watermark) = collect_outbox_replay(&db, watermark);
+        assert!(incremental.is_empty());
+        assert_eq!(watermark, 2);
+
+        // …and a freshly enqueued row is the only thing the next flush sends.
+        db.lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 3}))
+            .unwrap();
+        let (fresh, watermark) = collect_outbox_replay(&db, watermark);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].contains("\"seq\":3"));
+        assert_eq!(watermark, 3);
+    }
+
+    /// P2-16: the ack-progress check trips only when the SAME oldest
+    /// transmitted-but-unacked row survives two consecutive checks; acked
+    /// progress or untransmitted rows never trip it.
+    #[test]
+    fn ack_stall_requires_the_same_oldest_row_across_two_checks() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let first = db
+            .lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 1}))
+            .unwrap();
+        let second = db
+            .lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 2}))
+            .unwrap();
+
+        // Rows beyond the watermark (never transmitted) are not "stalled".
+        let mut stalled = None;
+        assert!(!ack_stalled(&db, 0, &mut stalled));
+        assert!(!ack_stalled(&db, 0, &mut stalled));
+
+        // First check under the watermark only records the observation…
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        // …the second check with zero ack progress trips the retransmit.
+        assert!(ack_stalled(&db, second, &mut stalled));
+
+        // Ack progress between checks (oldest changes) does not trip.
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        db.lock().unwrap().mark_outbox_acked(first).unwrap();
+        assert!(!ack_stalled(&db, second, &mut stalled));
+
+        // Everything acked: nothing outstanding, never trips.
+        db.lock().unwrap().mark_outbox_acked(second).unwrap();
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        assert!(!ack_stalled(&db, second, &mut stalled));
     }
 
     #[test]
@@ -777,16 +970,34 @@ mod tests {
     /// value) is clamped, never handed to `tokio::time::interval` (which panics
     /// on zero).
     #[test]
-    fn heartbeat_period_clamps_zero_and_absurd_values() {
-        assert_eq!(heartbeat_period(Duration::ZERO), MIN_HEARTBEAT);
-        assert_eq!(
-            heartbeat_period(Duration::from_hours(24 * 365)),
-            MAX_HEARTBEAT
-        );
+    fn clamp_period_clamps_zero_and_absurd_values() {
+        assert_eq!(clamp_period(Duration::ZERO), MIN_HEARTBEAT);
+        assert_eq!(clamp_period(Duration::from_hours(24 * 365)), MAX_HEARTBEAT);
         // A sane value passes through unchanged.
         assert_eq!(
-            heartbeat_period(Duration::from_secs(30)),
+            clamp_period(Duration::from_secs(30)),
             Duration::from_secs(30)
+        );
+    }
+
+    /// P2-16: the read-liveness window is clamped and never drops below two
+    /// heartbeat periods (the guaranteed pong cadence).
+    #[test]
+    fn read_window_never_undercuts_the_pong_cadence() {
+        // Wider than two heartbeats: passes through (clamped only).
+        assert_eq!(
+            read_window(Duration::from_secs(90), Duration::from_secs(30)),
+            Duration::from_secs(90)
+        );
+        // Narrower than two heartbeats: floored at 2× so pongs can arrive.
+        assert_eq!(
+            read_window(Duration::from_secs(90), Duration::from_hours(1)),
+            Duration::from_hours(2)
+        );
+        // Zero is clamped before the floor applies.
+        assert_eq!(
+            read_window(Duration::ZERO, Duration::from_millis(100)),
+            MIN_HEARTBEAT
         );
     }
 
@@ -855,6 +1066,33 @@ mod tests {
             classify_inbound(MESSAGE_FRAME, &db),
             InboundDisposition::Deliver { .. }
         ));
+    }
+
+    /// P2-16: a peer that accepts TCP but never completes the WS handshake must
+    /// not stall a dial attempt past the per-attempt bound.
+    #[tokio::test]
+    async fn dial_times_out_when_the_handshake_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            // Accept and hold the raw TCP connection, never answering the
+            // upgrade request, so the dial can only end via its timeout.
+            let _tcp = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let err = super::dial(
+            &format!("ws://{addr}/agent/ws/stall"),
+            &secrecy::SecretString::from("tok"),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, super::WsError::Timeout(_)),
+            "expected a dial timeout, got {err:?}"
+        );
+        hold.abort();
     }
 
     /// Junk with no extractable `msgId` (or non-JSON) has nothing to ack: dropped.

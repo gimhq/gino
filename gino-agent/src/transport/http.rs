@@ -23,6 +23,8 @@
 //! All TLS is rustls (the manifest pins `reqwest` to rustls + OS roots); this
 //! module never touches the openssl/native-tls path banned by `deny.toml`.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
 use secrecy::{ExposeSecret, SecretString};
@@ -39,6 +41,15 @@ const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
 const ATTACHMENT_NAME_HEADER: &str = "x-attachment-name";
 /// Content hash of an uploaded attachment, so the host can dedup/verify too.
 const ATTACHMENT_SHA256_HEADER: &str = "x-attachment-sha256";
+/// Bound on establishing the TCP/TLS connection (audit P2-16: the client
+/// previously had no timeouts at all, so registration could hang forever).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle guard between successive reads of a response (headers or body chunks).
+/// DECISION (P2-16): connect + idle-read timeouts, deliberately NO whole-request
+/// `timeout` — attachment transfers stream arbitrarily large bodies, so a total
+/// -duration cap would abort legitimate slow transfers, while the idle guard
+/// still bounds a stalled response on every endpoint.
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Errors raised by the HTTP client. Secrets are never included in any message.
 #[derive(Debug, Error)]
@@ -86,9 +97,22 @@ pub(crate) struct HttpClient {
 }
 
 impl HttpClient {
-    /// Build a client with the default (rustls) TLS stack.
+    /// Build a client with the default (rustls) TLS stack and the production
+    /// [`CONNECT_TIMEOUT`] / [`READ_TIMEOUT`] bounds.
     pub(crate) fn new() -> Result<Self, HttpError> {
-        let client = Client::builder().build().map_err(HttpError::Build)?;
+        Self::with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT)
+    }
+
+    /// The builder seam behind [`Self::new`]: every production request flows
+    /// through a client built here, so a test can exercise the timeout policy
+    /// with short bounds. See [`READ_TIMEOUT`] for why there is no
+    /// whole-request timeout.
+    fn with_timeouts(connect: Duration, read: Duration) -> Result<Self, HttpError> {
+        let client = Client::builder()
+            .connect_timeout(connect)
+            .read_timeout(read)
+            .build()
+            .map_err(HttpError::Build)?;
         Ok(Self { client })
     }
 
@@ -292,12 +316,62 @@ fn error_for_status(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use secrecy::SecretString;
     use serde_json::{Value, json};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::HttpClient;
+
+    /// P2-16: the production client is built with bounded connect/read
+    /// timeouts (through the same seam the test below exercises), so no
+    /// endpoint can hang forever.
+    #[test]
+    fn production_timeouts_are_bounded_and_sane() {
+        assert!(super::CONNECT_TIMEOUT >= Duration::from_secs(1));
+        assert!(super::CONNECT_TIMEOUT <= Duration::from_secs(30));
+        assert!(super::READ_TIMEOUT >= Duration::from_secs(10));
+        assert!(super::READ_TIMEOUT <= Duration::from_mins(5));
+    }
+
+    /// P2-16: a host that accepts the request but never answers is bounded by
+    /// the idle-read guard — the call errors out instead of hanging forever
+    /// (the old client had no timeouts at all).
+    #[tokio::test]
+    async fn stalled_response_is_bounded_by_the_read_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/agent/config/agent-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({}))
+                    .set_delay(Duration::from_mins(1)),
+            )
+            .mount(&server)
+            .await;
+
+        let http =
+            HttpClient::with_timeouts(Duration::from_secs(5), Duration::from_millis(100)).unwrap();
+        let url = format!("{}/agent/config/agent-1", server.uri());
+        let started = std::time::Instant::now();
+        let err = http
+            .fetch_config(&url, &SecretString::from("tok"))
+            .await
+            .unwrap_err();
+        match &err {
+            super::HttpError::Request { endpoint, source } => {
+                assert_eq!(*endpoint, "config");
+                assert!(source.is_timeout(), "expected a timeout, got {source:?}");
+            }
+            other => panic!("expected a request timeout, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the request must fail fast, not wait out the response delay"
+        );
+    }
 
     #[tokio::test]
     async fn fetch_config_sends_token_header_and_returns_json() {

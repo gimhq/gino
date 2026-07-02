@@ -7,7 +7,8 @@
 //!   `GET /agent/config/:id`, and the `POST /agent/output/:id` fallback.
 //! * [`ws`] — the reconnecting `tokio-tungstenite` client with outbox-backed
 //!   at-least-once delivery, inbox dedup/replay, capped-backoff reconnect (the
-//!   delay is bounded, the attempts are not — P0-2), and a periodic heartbeat.
+//!   delay is bounded, the attempts are not — P0-2), a periodic heartbeat, and
+//!   read-liveness detection of half-open sockets (P2-16).
 //!
 //! [`Transport`] is the engine-agnostic facade over the WS side: it works purely
 //! on [`crate::protocol::v2`] frames and the [`crate::db`] outbox/inbox, so the
@@ -58,6 +59,13 @@ use self::ws::WsDriver;
 /// Default liveness ping cadence. The TS runner sent no heartbeat; the Rust
 /// runner adds one so a silently dead half-open socket is noticed promptly.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
+/// Default read-liveness window (P2-16): three heartbeat periods with nothing
+/// received (each heartbeat also sends a WS ping, so a live peer's pongs keep
+/// arriving even when the host has no frames to send).
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Default ack-progress window (P2-16): transmitted outbox rows that see no ack
+/// progress for a full window are retransmitted over the live socket.
+const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Public configuration / values
@@ -99,6 +107,15 @@ impl BackoffConfig {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TransportConfig {
     pub(crate) heartbeat: Duration,
+    /// Read-liveness window (P2-16): when nothing at all (data or pong) arrives
+    /// within it, the connection is treated as dead and redialed. The effective
+    /// window never drops below two heartbeat periods, so a slow-heartbeat
+    /// configuration cannot starve itself of the pongs it solicits.
+    pub(crate) read_timeout: Duration,
+    /// Ack-progress window (P2-16): already-transmitted outbox rows whose acks
+    /// make no progress for a full window are retransmitted on the live socket
+    /// (flushes alone never resend them — see [`Transport::flush_handle`]).
+    pub(crate) ack_timeout: Duration,
     pub(crate) backoff: BackoffConfig,
 }
 
@@ -106,6 +123,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             heartbeat: DEFAULT_HEARTBEAT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            ack_timeout: DEFAULT_ACK_TIMEOUT,
             backoff: BackoffConfig::default(),
         }
     }
@@ -182,6 +201,8 @@ impl Transport {
             cancel: Arc::clone(&cancel),
             flush: Arc::clone(&flush),
             heartbeat: config.heartbeat,
+            read_timeout: config.read_timeout,
+            ack_timeout: config.ack_timeout,
             backoff: Backoff::new(config.backoff),
         };
         let manager = tokio::spawn(run_manager(driver));
@@ -195,12 +216,14 @@ impl Transport {
         }
     }
 
-    /// A handle that, when notified, makes the manager replay the unacked outbox
-    /// over the current live connection. The executor/scheduler enqueue result-plane
-    /// frames straight to the durable outbox; the runner pokes this after a drain so
+    /// A handle that, when notified, makes the manager transmit the unacked outbox
+    /// rows **not yet sent on the current connection**. The executor/scheduler
+    /// enqueue result-plane frames straight to the durable outbox and poke this so
     /// those frames stream out promptly instead of waiting for the next reconnect.
-    /// Replay is idempotent on the host (it dedups on `(thread_id, seq)`), matching
-    /// the reconnect replay.
+    /// A flush never resends already-transmitted rows (P2-16: flushing under ack
+    /// lag used to be O(n²)); full retransmission happens only on reconnect or
+    /// when ack progress stalls for a whole ack window — the host dedups on
+    /// `(thread_id, seq)` either way.
     pub(crate) fn flush_handle(&self) -> Arc<Notify> {
         Arc::clone(&self.flush)
     }
@@ -269,7 +292,7 @@ async fn run_manager(mut driver: WsDriver) {
     let initial = loop {
         let dialed = tokio::select! {
             () = driver.cancel.cancelled() => return,
-            dialed = ws::dial(&driver.ws_url, &driver.connect_token) => dialed,
+            dialed = ws::dial(&driver.ws_url, &driver.connect_token, ws::DIAL_TIMEOUT) => dialed,
         };
         match dialed {
             Ok(stream) => break stream,
@@ -647,8 +670,11 @@ mod tests {
 
     fn test_config() -> TransportConfig {
         TransportConfig {
-            // Far longer than any test runs, so no heartbeat fires mid-test.
+            // Far longer than any test runs, so no heartbeat, read-liveness
+            // check, or ack-stall retransmit fires mid-test.
             heartbeat: Duration::from_secs(50),
+            read_timeout: Duration::from_mins(2),
+            ack_timeout: Duration::from_mins(2),
             backoff: BackoffConfig::for_tests(),
         }
     }
@@ -960,7 +986,7 @@ mod tests {
             Arc::clone(&db),
             TransportConfig {
                 heartbeat: Duration::ZERO,
-                backoff: BackoffConfig::for_tests(),
+                ..test_config()
             },
         );
 
@@ -1061,12 +1087,12 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             TransportConfig {
-                heartbeat: Duration::from_secs(50),
                 // Tiny delays so 70 failed attempts stay well under a second.
                 backoff: BackoffConfig {
                     base: Duration::from_millis(1),
                     max: Duration::from_millis(2),
                 },
+                ..test_config()
             },
         );
 
@@ -1075,6 +1101,210 @@ mod tests {
         assert_eq!(frame["outboxId"], json!(1));
         assert_eq!(frame["threadId"], json!("c-1"));
         wait_until(|| db.lock().unwrap().list_unacked_outbox().unwrap().is_empty()).await;
+        transport.shutdown().await;
+    }
+
+    /// P2-16 regression: under ack lag a flush transmits ONLY the rows not yet
+    /// sent on this connection (the old driver replayed the entire unacked
+    /// outbox on every flush — O(n²)); a reconnect still replays everything
+    /// unacked.
+    #[tokio::test]
+    async fn flush_is_incremental_under_ack_lag_but_reconnect_replays_all() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Every frame the mock host receives, tagged with its connection index.
+        let received = Arc::new(std::sync::Mutex::new(Vec::<(usize, Value)>::new()));
+        let drop_gate = Arc::new(tokio::sync::Notify::new());
+
+        let (srv_received, srv_gate) = (Arc::clone(&received), Arc::clone(&drop_gate));
+        let server = tokio::spawn(async move {
+            // Connection 1: record frames (acking NOTHING — sustained ack lag)
+            // until the test asks for a dropped connection.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            loop {
+                tokio::select! {
+                    () = srv_gate.notified() => break,
+                    message = ws.next() => {
+                        if let Some(Ok(Message::Text(text))) = message {
+                            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                            srv_received.lock().unwrap().push((1, frame));
+                        }
+                    }
+                }
+            }
+            drop(ws);
+
+            // Connection 2: the reconnect replay.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 0..2 {
+                let text = next_text(&mut ws).await;
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                srv_received.lock().unwrap().push((2, frame));
+            }
+        });
+
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-lag"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            test_config(),
+        );
+        let flush = transport.flush_handle();
+
+        // Flush 1 ships row 1; the host holds its ack.
+        db.lock()
+            .unwrap()
+            .enqueue_outbox_correlated(
+                "thread_message",
+                &json!({ "seq": 1 }),
+                Some("t-1"),
+                Some("c-1"),
+            )
+            .unwrap();
+        flush.notify_one();
+        wait_until(|| received.lock().unwrap().len() == 1).await;
+
+        // Flush 2 must carry ONLY the fresh row 2 — not retransmit row 1.
+        db.lock()
+            .unwrap()
+            .enqueue_outbox_correlated(
+                "thread_message",
+                &json!({ "seq": 2 }),
+                Some("t-1"),
+                Some("c-1"),
+            )
+            .unwrap();
+        flush.notify_one();
+        wait_until(|| received.lock().unwrap().len() == 2).await;
+        {
+            let frames = received.lock().unwrap();
+            assert_eq!(frames[0].1["outboxId"], json!(1));
+            assert_eq!(
+                frames[1].1["outboxId"],
+                json!(2),
+                "a flush under ack lag must not retransmit the already-sent backlog"
+            );
+        }
+
+        // Reconnect: BOTH still-unacked rows replay on the fresh connection.
+        drop_gate.notify_one();
+        wait_until(|| received.lock().unwrap().len() == 4).await;
+        {
+            let frames = received.lock().unwrap();
+            assert_eq!(
+                frames[2].0, 2,
+                "the replay arrives on the second connection"
+            );
+            assert_eq!(
+                frames[2].1["outboxId"],
+                json!(1),
+                "reconnect replays all unacked"
+            );
+            assert_eq!(frames[3].1["outboxId"], json!(2));
+        }
+
+        server.await.unwrap();
+        transport.shutdown().await;
+    }
+
+    /// P2-16: a half-open connection — the peer completes the handshake and
+    /// then goes completely silent, never reading or writing — is detected by
+    /// the read-liveness window and redialed (the old write-only heartbeat left
+    /// this to the ~15-minute TCP retransmit timeout).
+    #[tokio::test]
+    async fn silent_half_open_connection_is_detected_and_redialed() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Connection 1: handshake, then total silence — the stream is held
+            // open (TCP stays established) but never read or written again.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let silent = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+            // A second connection arriving proves the client declared the
+            // silent one dead and redialed.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _redialed = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            drop(silent);
+        });
+
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-silent"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            TransportConfig {
+                // A fast heartbeat keeps the effective read window at the 1 s
+                // clamp floor, so the dead connection is declared quickly.
+                heartbeat: Duration::from_millis(100),
+                read_timeout: Duration::from_millis(200),
+                ..test_config()
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the client must redial within the read-liveness window")
+            .unwrap();
+        transport.shutdown().await;
+    }
+
+    /// P2-16: when ack progress stalls for a full ack window on a live
+    /// connection, the transmitted backlog is retransmitted — the at-least-once
+    /// safety valve that incremental flushing removed from the per-flush path.
+    #[tokio::test]
+    async fn stalled_acks_trigger_a_retransmit_on_the_live_connection() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        {
+            db.lock()
+                .unwrap()
+                .enqueue_outbox_correlated(
+                    "thread_message",
+                    &json!({ "seq": 1 }),
+                    Some("t-1"),
+                    Some("c-1"),
+                )
+                .unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let first = next_text(&mut ws).await; // the connect replay
+            let second = next_text(&mut ws).await; // the ack-stall retransmit
+            (first, second)
+        });
+
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-stall"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            TransportConfig {
+                // Clamped to the 1 s floor; the stall trips on the second tick.
+                ack_timeout: Duration::from_millis(100),
+                ..test_config()
+            },
+        );
+
+        let (first, second) = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the stalled ack must trigger a retransmit on the live socket")
+            .unwrap();
+        let first: Value = serde_json::from_str(&first).unwrap();
+        let second: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(first["outboxId"], json!(1));
+        assert_eq!(
+            second["outboxId"],
+            json!(1),
+            "the same unacked row is retransmitted once acks stall"
+        );
         transport.shutdown().await;
     }
 }
