@@ -169,10 +169,11 @@ async fn run_async(
         info!(recovered, "recovered crash-orphan threads at startup");
     }
 
+    // One retry budget for every thread source (cron fires + chat messages).
+    let max_attempts = config.executor.max_attempts;
     let cancel = Arc::new(Cancel::new());
-    let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel));
-    let nudge = scheduler.nudge();
-    let drain = scheduler.drain_signal();
+    let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel), max_attempts);
+    let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let flush = transport.flush_handle();
     let scheduler_task = tokio::spawn(scheduler.run());
 
@@ -183,7 +184,7 @@ async fn run_async(
         Arc::clone(&drain),
         Arc::clone(&flush),
         Arc::clone(&cancel),
-        config.executor.max_attempts,
+        max_attempts,
     ));
     info!("scheduler + executor running; serving inbound/outbound frames");
 
@@ -192,7 +193,7 @@ async fn run_async(
         db: Arc::clone(&db),
         nudge,
         drain: Arc::clone(&drain),
-        chat_max_attempts: config.executor.max_attempts,
+        chat_max_attempts: max_attempts,
         provisioner,
         engine_config_dir,
     };
