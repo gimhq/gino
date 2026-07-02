@@ -375,9 +375,10 @@ fn file_hash_hex(path: &Path) -> std::io::Result<String> {
     Ok(hex_digest(hasher))
 }
 
-/// Stream `reader` into `hasher` in [`HASH_CHUNK`] chunks.
+/// Stream `reader` into `hasher` in [`HASH_CHUNK`] chunks (heap buffer — the
+/// chunk size is above the lint's stack-array cap).
 fn hash_reader_into(hasher: &mut Sha256, reader: &mut impl Read) -> std::io::Result<()> {
-    let mut buf = [0u8; HASH_CHUNK];
+    let mut buf = vec![0u8; HASH_CHUNK];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {

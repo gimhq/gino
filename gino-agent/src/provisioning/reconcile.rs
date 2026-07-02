@@ -310,7 +310,9 @@ impl Provisioner {
             // Recompute the store path under the current workspace dir (robust to a
             // relocated workspace; the table stores an absolute snapshot only).
             let store_path = store::store_path(&self.workspace_dir, &row.name, &row.sha256)?;
-            if !store::verify_entry(&store_path, kind, &row.sha256) {
+            if store::verify_entry(&store_path, kind, &row.sha256) {
+                store::seal_entry(&store_path, kind)?;
+            } else {
                 store::remove_store_entry(&self.workspace_dir, &row.name, &row.sha256)?;
                 let bytes = self
                     .fetcher
@@ -336,8 +338,6 @@ impl Provisioner {
                 }
                 warn!(scope = %row.scope, target = %row.target,
                     "repair re-fetched a missing or corrupt store entry");
-            } else {
-                store::seal_entry(&store_path, kind)?;
             }
             let link_path = PathBuf::from(&row.link_path);
             if !link_broken(&link_path) {
