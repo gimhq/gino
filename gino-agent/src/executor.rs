@@ -266,13 +266,15 @@ pub(crate) mod v2 {
         /// ships over the live socket immediately rather than after the whole
         /// drain. Builder-style so the existing [`Self::new`] call sites stay
         /// unchanged.
-        #[cfg_attr(
-            not(test),
-            allow(dead_code, reason = "wired by the runner alongside the transport")
-        )]
         pub(crate) fn with_flush(mut self, flush: Arc<Notify>) -> Self {
             self.flush = Some(flush);
             self
+        }
+
+        /// Whether the transport flush signal is wired (runner wiring seam).
+        #[cfg(test)]
+        pub(crate) fn flush_wired(&self) -> bool {
+            self.flush.is_some()
         }
 
         /// Wire the daemon shutdown token (P1-6). Builder-style so the existing
@@ -837,7 +839,14 @@ pub(crate) mod v2 {
                         session_id = Some(id);
                     }
                     Some(EngineEvent::Output { text }) => {
-                        self.stream_message(thread, MessageKind::AssistantText, text);
+                        // A tool-use-only assistant turn maps to an empty text
+                        // chunk (audit P3): emitting it would burn an outbox seq
+                        // on a contentless frame. Suppressed HERE (not in the
+                        // engine mapping) so the event still arrives and feeds
+                        // the inactivity watchdog above.
+                        if !text.is_empty() {
+                            self.stream_message(thread, MessageKind::AssistantText, text);
+                        }
                     }
                     Some(EngineEvent::Log { level, message }) => {
                         let kind = if matches!(level, LogLevel::Error) {
@@ -1622,6 +1631,39 @@ pub(crate) mod v2 {
             assert_eq!(res[0].final_seq, 2);
             assert_eq!(res[0].result.as_deref(), Some("done"));
             assert_eq!(res[0].engine_session_id.as_deref(), Some("sess-1"));
+        }
+
+        /// Audit P3: a tool-use-only assistant turn maps to an EMPTY `Output`
+        /// chunk — it must not burn an outbox seq on a contentless
+        /// `assistant_text` frame.
+        #[tokio::test]
+        async fn empty_assistant_text_is_not_emitted() {
+            let db = test_db();
+            let script = vec![
+                started("sess-1"),
+                out(""),
+                out("real content"),
+                ok_result("done", "sess-1"),
+            ];
+            let exec = build(&db, script, false, no_inactivity());
+            lock(&db)
+                .insert_thread(&pending_thread("th-empty", 1))
+                .unwrap();
+
+            let final_row = exec
+                .run_thread(
+                    pending_thread("th-empty", 1),
+                    "go".to_owned(),
+                    Continuity::Isolated,
+                )
+                .await;
+            assert_eq!(final_row.status, "succeeded");
+
+            let msgs = messages(&db);
+            assert_eq!(msgs.len(), 1, "the empty chunk is suppressed");
+            assert_eq!(msgs[0].content.as_deref(), Some("real content"));
+            assert_eq!(msgs[0].seq, 1, "no seq was wasted on the empty chunk");
+            assert_eq!(results(&db)[0].final_seq, 1);
         }
 
         // -- P2-16: per-message flush poke streams transcript mid-run --------

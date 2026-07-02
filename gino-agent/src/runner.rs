@@ -229,8 +229,16 @@ async fn run_async(
     // provisioner (PLAN-007) — all over one shared content-addressed manager — then
     // the startup global reconcile. A resolved message's inbound descriptors reach
     // the executor through the durable `thread_attachments` snapshot (P1-10b).
-    let (executor, provisioner) =
-        build_execution_plane(&config, &http, &db, &engine_config_dir, &cancel).await;
+    let flush = transport.flush_handle();
+    let (executor, provisioner) = build_execution_plane(
+        &config,
+        &http,
+        &db,
+        &engine_config_dir,
+        &cancel,
+        Arc::clone(&flush),
+    )
+    .await;
     let prompts = Arc::new(InboxPromptSource {
         db: Arc::clone(&db),
     });
@@ -252,7 +260,6 @@ async fn run_async(
         config.retention.days,
     );
     let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
-    let flush = transport.flush_handle();
     let scheduler_task = tokio::spawn(scheduler.run());
 
     let worker = tokio::spawn(run_worker(
@@ -571,6 +578,7 @@ async fn build_execution_plane(
     db: &Arc<Mutex<Db>>,
     engine_config_dir: &Path,
     shutdown: &Arc<Cancel>,
+    flush: Arc<Notify>,
 ) -> (Arc<ThreadExecutor>, Option<Arc<Provisioner>>) {
     let manager = build_attachment_manager(config, http);
 
@@ -594,6 +602,7 @@ async fn build_execution_plane(
         manager,
         provisioner.clone(),
         Arc::clone(shutdown),
+        flush,
     );
 
     if let Some(provisioner) = &provisioner {
@@ -624,17 +633,21 @@ fn build_executor(
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
     shutdown: Arc<Cancel>,
+    flush: Arc<Notify>,
 ) -> Arc<ThreadExecutor> {
     let engine = build_engine(config, engine_config_dir);
     // The daemon shutdown token (P1-6): a shutdown cancels the active run through
-    // the executor's converged cancel path and stops the pending drain.
+    // the executor's converged cancel path and stops the pending drain. The
+    // transport flush signal (P2-16): the executor pokes it after each persisted
+    // frame so transcript events stream mid-run over the live socket.
     let mut executor = ThreadExecutor::new(
         engine,
         Arc::clone(&db),
         config.paths.workspace_dir.clone(),
         watchdog_cfg(&config.executor),
     )
-    .with_shutdown(shutdown);
+    .with_shutdown(shutdown)
+    .with_flush(flush);
     if let Some(manager) = manager {
         info!("attachment plane active (host-proxy byte backend)");
         let source: Arc<dyn AttachmentSource> = Arc::new(DbAttachmentSource::new(db));
@@ -1373,6 +1386,28 @@ mod tests {
         // Released on drop (any process exit): a new daemon can start.
         drop(held);
         acquire_daemon_lock(dir.path()).unwrap();
+    }
+
+    /// Audit P3 wiring: the daemon path builds its executor with the transport
+    /// flush signal attached, so transcript frames stream mid-run in production
+    /// (the P2-16 behavior the executor's own tests pin down).
+    #[tokio::test]
+    async fn build_execution_plane_wires_the_transport_flush() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let http = crate::transport::http::HttpClient::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(crate::scheduler::Cancel::new());
+        let flush = Arc::new(tokio::sync::Notify::new());
+        let (executor, _provisioner) = super::build_execution_plane(
+            &crate::config::Config::default(),
+            &http,
+            &db,
+            dir.path(),
+            &cancel,
+            Arc::clone(&flush),
+        )
+        .await;
+        assert!(executor.flush_wired());
     }
 
     fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
