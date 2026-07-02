@@ -23,7 +23,7 @@
 //! the descriptors on retry and on restart, silently running the thread with
 //! zero attachments (P1-10b).
 //!
-//! [`ThreadExecutor::run_thread`]: crate::executor::v2::ThreadExecutor
+//! [`ThreadExecutor::run_thread`]: crate::executor::ThreadExecutor
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 

@@ -15,22 +15,14 @@
 mod archive;
 mod attachment_source;
 mod attachments;
+mod chat;
 mod config;
-// The scheduler/executor/transport/runner wire the live v2 persistence surface;
-// the v1 strangler tables and the write-only reconciliation state
-// (threads.synced / crons.dirty and their accessors) are gone. The module keeps
-// one dead-code allow for the handful of read-model accessors only its own and
-// the scheduler's unit tests drive (insert_cron_log/get_cron_log — production
-// fires through try_insert_cron_log), which keep the surface honest.
-#[allow(
-    dead_code,
-    reason = "insert_cron_log/get_cron_log are test-only readers of the cron ledger"
-)]
 mod db;
 mod engine;
 mod executor;
 mod failure;
 mod gino_cli;
+mod paths;
 mod protocol;
 mod provisioning;
 mod register;
