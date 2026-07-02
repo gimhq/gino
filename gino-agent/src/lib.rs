@@ -17,23 +17,16 @@ mod attachment_source;
 mod attachments;
 mod config;
 // The scheduler/executor/transport/runner wire the live v2 persistence surface;
-// the v1 strangler tables (session_state, task_runs) and helpers are removed
-// (PLAN-006 §4). The module keeps one dead-code allow for the not-yet-wired v2
-// read-model CRUD that no production caller drives yet — thread result-sync
-// (list_unsynced_threads/mark_thread_synced), cron-dirty sync
-// (list_dirty_crons/set_cron_dirty), and cron-log reads
-// (insert_cron_log/get_cron_log) — exercised by db unit tests, which keep the
-// surface honest.
-#[allow(dead_code)]
+// the v1 strangler tables and the write-only reconciliation state
+// (threads.synced / crons.dirty and their accessors) are gone. The module keeps
+// one dead-code allow for the handful of read-model accessors only its own and
+// the scheduler's unit tests drive (insert_cron_log/get_cron_log — production
+// fires through try_insert_cron_log), which keep the surface honest.
+#[allow(
+    dead_code,
+    reason = "insert_cron_log/get_cron_log are test-only readers of the cron ledger"
+)]
 mod db;
-// The engine abstraction and its Claude backend are now driven by the executor.
-// A few defined-but-not-yet-emitted arms remain (`EngineEvent::Usage`,
-// `LogLevel::{Info,Error}`, `EngineError::Io`, the `ClaudeEngine::from_config`
-// convenience — the runner builds settings then layers env, so it uses
-// `ClaudeSettings::from_config` + `ClaudeEngine::new` instead). `engine/` is out of
-// this change's edit scope, so the module keeps one dead-code allow; its unit +
-// control-protocol smoke tests keep it honest.
-#[allow(dead_code)]
 mod engine;
 mod executor;
 mod failure;
