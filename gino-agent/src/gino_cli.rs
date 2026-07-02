@@ -94,9 +94,27 @@ pub(crate) struct IdArg {
 
 // ─── dispatch ────────────────────────────────────────────────────────────────
 
+/// Open the daemon's database for a CLI invocation.
+///
+/// DECISION (audit P2-18): the CLI must NOT migrate. Every subcommand used to
+/// call the migrating open, so any CLI invocation from a mismatched binary
+/// could rewrite the schema underneath a live daemon. [`Db::open_existing`]
+/// neither creates nor migrates: a missing file or a schema version other than
+/// this binary's fails fast with a clear error — only the daemon startup path
+/// (which holds the single-instance lock) migrates.
+fn open_db() -> Result<Db> {
+    let path = resolve_db_path();
+    Db::open_existing(&path).with_context(|| {
+        format!(
+            "opening the agent database at {} (is the daemon set up on this machine?)",
+            path.display()
+        )
+    })
+}
+
 /// `gino-agent system` — identity, version, host, paths, live counts.
 pub(crate) fn system() -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     let identity = db.get_identity()?;
     let tasks = db.list_tasks()?;
     let active_crons = db.list_active_crons()?;
@@ -125,7 +143,7 @@ pub(crate) fn system() -> Result<()> {
 }
 
 pub(crate) fn cron(cmd: CronCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         CronCommand::Create(a) => cron_create(&db, a),
         CronCommand::List(a) => cron_list(&db, a),
@@ -136,7 +154,7 @@ pub(crate) fn cron(cmd: CronCommand) -> Result<()> {
 }
 
 pub(crate) fn task(cmd: TaskCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         TaskCommand::List => {
             let tasks = db.list_tasks()?;
@@ -193,7 +211,7 @@ pub(crate) fn task(cmd: TaskCommand) -> Result<()> {
 }
 
 pub(crate) fn thread(cmd: ThreadCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         ThreadCommand::List(a) => {
             let task_id = resolve_task_id(a.task_id)?;
