@@ -15,29 +15,14 @@
 mod archive;
 mod attachment_source;
 mod attachments;
+mod chat;
 mod config;
-// The scheduler/executor/transport/runner wire the live v2 persistence surface;
-// the v1 strangler tables (session_state, task_runs) and helpers are removed
-// (PLAN-006 §4). The module keeps one dead-code allow for the not-yet-wired v2
-// read-model CRUD that no production caller drives yet — thread result-sync
-// (list_unsynced_threads/mark_thread_synced), cron-dirty sync
-// (list_dirty_crons/set_cron_dirty), and cron-log reads
-// (insert_cron_log/get_cron_log) — exercised by db unit tests, which keep the
-// surface honest.
-#[allow(dead_code)]
 mod db;
-// The engine abstraction and its Claude backend are now driven by the executor.
-// A few defined-but-not-yet-emitted arms remain (`EngineEvent::Usage`,
-// `LogLevel::{Info,Error}`, `EngineError::Io`, the `ClaudeEngine::from_config`
-// convenience — the runner builds settings then layers env, so it uses
-// `ClaudeSettings::from_config` + `ClaudeEngine::new` instead). `engine/` is out of
-// this change's edit scope, so the module keeps one dead-code allow; its unit +
-// control-protocol smoke tests keep it honest.
-#[allow(dead_code)]
 mod engine;
 mod executor;
 mod failure;
 mod gino_cli;
+mod paths;
 mod protocol;
 mod provisioning;
 mod register;
@@ -79,8 +64,11 @@ struct BootstrapArgs {
 
     /// Enrollment token — a bootstrap credential used only to register. The
     /// per-agent connect token used for the WebSocket is negotiated at
-    /// registration and is never this value.
-    #[arg(long, env = "GINO_REGISTER_TOKEN", global = true)]
+    /// registration and is never this value. DEPRECATED as a flag (argv is
+    /// world-readable via /proc/*/cmdline): prefer GINO_REGISTER_TOKEN or
+    /// GINO_REGISTER_TOKEN_FILE, both resolved in [`register`] and taking
+    /// precedence over this flag.
+    #[arg(long, global = true)]
     register_token: Option<String>,
 
     /// Human-readable agent name.
@@ -128,7 +116,7 @@ pub fn run() -> Result<()> {
         Command::Run => {
             runner::run_daemon(
                 cli.bootstrap.host,
-                cli.bootstrap.register_token,
+                register::resolve_register_token(cli.bootstrap.register_token),
                 cli.bootstrap.name,
             )?;
         }

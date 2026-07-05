@@ -16,17 +16,9 @@
 //!
 //! Safety: `target` is host-influenced, so [`safe_link_path`] confines every link
 //! under its scope root (rejecting absolute / `..` / `.` / empty / NUL, PLAN-007
-//! Risk 3), the store `name` is sanitized to a single safe component (mirroring
-//! [`crate::attachments::sanitize_name`]), and tar unpack refuses any member that
+//! Risk 3), the store `name` is sanitized to a single safe component (the shared
+//! [`crate::paths::safe_component`]), and tar unpack refuses any member that
 //! escapes the store dir.
-//!
-//! The whole surface is driven by the reconcile L3, not yet by a production caller
-//! in this crate, so the module keeps a `dead_code` allow (mirroring the
-//! attachments module); the unit tests in [`store`] and below exercise it.
-#![allow(
-    dead_code,
-    reason = "store/symlink primitives are driven by the reconcile engine (a later PLAN-007 L3); tests cover the surface"
-)]
 
 use std::path::{Component, Path, PathBuf};
 
@@ -94,23 +86,10 @@ pub(crate) fn short_id(sha256: &str) -> &str {
     }
 }
 
-/// Validate an attacker-influenced store `name` down to a single safe path
-/// component — reject empties, `.`/`..`, separators (`/`/`\`) and NUL — so it can
-/// be joined under `store/` without escaping (mirrors
-/// [`crate::attachments::sanitize_name`]). Returns the name borrowed on success.
-pub(crate) fn safe_name(name: &str) -> Result<&str, ProvisioningError> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('\0')
-        || name.contains('/')
-        || name.contains('\\')
-    {
-        return Err(ProvisioningError::UnsafeName {
-            name: name.to_owned(),
-        });
+impl From<crate::paths::UnsafeName> for ProvisioningError {
+    fn from(err: crate::paths::UnsafeName) -> Self {
+        ProvisioningError::UnsafeName { name: err.name }
     }
-    Ok(name)
 }
 
 /// Resolve a host-influenced `target` to a concrete link path under `scope_root`,
@@ -155,7 +134,7 @@ pub(crate) fn safe_link_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProvisioningError, safe_link_path, safe_name, short_id};
+    use super::{ProvisioningError, safe_link_path, short_id};
 
     #[test]
     fn short_id_is_first_twelve_chars() {
@@ -206,15 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn safe_name_rejects_separators_and_traversal() {
-        for bad in ["", ".", "..", "a/b", "a\\b", "x\0y"] {
-            assert!(
-                matches!(safe_name(bad), Err(ProvisioningError::UnsafeName { .. })),
-                "expected {bad:?} to be rejected"
-            );
-        }
-        for good in ["CLAUDE.md", "demo-skill", "my_config.json"] {
-            assert_eq!(safe_name(good).unwrap(), good);
-        }
+    fn unsafe_store_name_maps_to_the_provisioning_error() {
+        // The validation itself lives in `crate::paths::safe_component` (and is
+        // pinned there); this pins the store-facing error mapping.
+        let err: ProvisioningError = crate::paths::safe_component("a/b").unwrap_err().into();
+        assert!(matches!(err, ProvisioningError::UnsafeName { .. }));
     }
 }

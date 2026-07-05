@@ -14,10 +14,10 @@
 //!   frames de-dup on `(threadId, seq)` (no dup messages, no re-run).
 //! * `parallel_interleave_ordering` (§5b #5) — ≥2 threads reassembled by
 //!   `(taskId, threadId, seq)`; `final_seq` == per-thread count.
-//! * `failure_timeout_is_retried`, `failure_invalid_request_drops_session`,
+//! * `failure_timeout_is_retried`, `failure_prose_400_keeps_session`,
 //!   `failure_agent_error_not_retried` (§5b #6) — `runner.timeout` (retried),
-//!   `runner.invalid_request` (resume-unsafe → session dropped),
-//!   `agent.provider_auth` (not retried).
+//!   error prose never classified (P2-14: a "400"-looking message keeps the
+//!   session), unclassified engine errors → `agent.unknown` (not retried).
 //! * `attachment_round_trip` (§5b #7) — inbound descriptor → `inputs/` → engine
 //!   reads → `output/` → upload → host `attachments`; sha256 verified; cache hit
 //!   on repeat.
@@ -316,15 +316,18 @@ async fn failure_timeout_is_retried() {
     runner.shutdown().await;
 }
 
-/// A resume-unsafe failure (`runner.invalid_request`) is terminal at `max=1` and
-/// drops the engine session id so the next turn starts fresh.
+/// P2-14 regression: an errored result whose PROSE looks like a malformed
+/// request ("HTTP 400", "invalid request") carries no structured cause, so it
+/// classifies `agent.unknown` — NOT `runner.invalid_request` — and the healthy
+/// engine session id survives for resume instead of being discarded on a
+/// substring false positive.
 #[tokio::test]
-async fn failure_invalid_request_drops_session() {
+async fn failure_prose_400_keeps_session() {
     let config = json!({ "executor": { "maxAttempts": 1 } });
     let host = StubHost::start(config).await;
     let behavior = Behavior::Fail {
         session_id: "sess-inv".to_owned(),
-        error: "invalid request: malformed body".to_owned(),
+        error: "HTTP 400 invalid request: took 1500ms".to_owned(),
     };
     let runner = RunnerProc::spawn(&host, &behavior).await;
     assert!(host.wait_connected(SETTLE).await, "runner never connected");
@@ -337,20 +340,19 @@ async fn failure_invalid_request_drops_session() {
         .await
         .expect("no terminal thread_result");
     assert_eq!(run.status, "failed", "run: {run:?}");
+    assert_eq!(run.failure_reason.as_deref(), Some("agent.unknown"));
     assert_eq!(
-        run.failure_reason.as_deref(),
-        Some("runner.invalid_request")
-    );
-    assert_eq!(
-        run.engine_session_id, None,
-        "resume-unsafe failure must drop engine_session_id"
+        run.engine_session_id.as_deref(),
+        Some("sess-inv"),
+        "a prose false positive must not drop the resume handle"
     );
 
     runner.shutdown().await;
 }
 
 /// An `agent.*` failure is never retried, even with attempts remaining, and (being
-/// resume-safe) keeps the session id.
+/// resume-safe) keeps the session id. The error prose (a 401 message) is never
+/// sniffed: with no structured cause the reason is the `agent.unknown` fallback.
 #[tokio::test]
 async fn failure_agent_error_not_retried() {
     let config = json!({ "executor": { "maxAttempts": 3 } });
@@ -370,7 +372,7 @@ async fn failure_agent_error_not_retried() {
         .await
         .expect("no terminal thread_result");
     assert_eq!(run.status, "failed", "run: {run:?}");
-    assert_eq!(run.failure_reason.as_deref(), Some("agent.provider_auth"));
+    assert_eq!(run.failure_reason.as_deref(), Some("agent.unknown"));
     // Not retried (no reschedule status note), despite max_attempts == 3.
     let retried = host
         .messages_for("t-auth", "th-auth")
@@ -483,7 +485,7 @@ async fn attachment_round_trip() {
 
 /// A whole-second cron slot `secs_ago` seconds before now: its RFC3339 (millis, `Z`)
 /// timestamp (a `next_run` / `schedule_value`) **and** its unix-epoch seconds. The
-/// pair agree exactly with the scheduler's `parse_iso(next_run).timestamp()`, so the
+/// pair agree exactly with the scheduler's `parse_iso(next_run)`, so the
 /// deterministic isolated thread id ([`isolated_thread_id`]) the fire mints is
 /// predictable from the test side. Anchored in the past so the slot is immediately
 /// due (`next_run <= now`).
@@ -494,9 +496,10 @@ fn past_slot(secs_ago: i64) -> (String, i64) {
 }
 
 /// The deterministic thread id an *isolated* cron fire mints (agent-architecture
-/// §4): `"<cron_id>@<scheduled_epoch_seconds>"`.
+/// §4): `"<cron_id>@<scheduled_epoch_millis>"` (whole-second slots here, so the
+/// epoch seconds scale by 1000).
 fn isolated_thread_id(cron_id: &str, epoch: i64) -> String {
-    format!("{cron_id}@{epoch}")
+    format!("{cron_id}@{}", epoch * 1000)
 }
 
 // ---------------------------------------------------------------------------

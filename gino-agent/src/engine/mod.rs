@@ -1,18 +1,19 @@
 //! The engine abstraction (PLAN-003 §5).
 //!
 //! An [`Engine`] is a backend that runs agent work; a [`Session`] is one
-//! long-lived conversation driven by that backend. The runner's transport,
-//! scheduler and persistence are all engine-agnostic — they speak only the types
-//! in this module, never a backend's wire format — so a new backend is added as a
-//! fresh [`Engine`] impl without touching anything else.
+//! conversation driven by that backend. The runner's transport, scheduler and
+//! persistence are all engine-agnostic — they speak only the types in this
+//! module, never a backend's wire format — so a new backend is added as a fresh
+//! [`Engine`] impl without touching anything else.
 //!
-//! Two shapes of work map onto the two entry points:
-//!
-//! * [`Engine::start_session`] opens a **long-lived group session** — a process
-//!   that stays alive across many turns, taking follow-up [`Input`]s via
-//!   [`Session::send`] and surfacing [`EngineEvent`]s on [`Session::events`].
-//! * [`Engine::run_once`] runs an **isolated one-shot**: a fresh session, a single
-//!   [`Payload`], one [`RunOutcome`], then exit.
+//! The trait is deliberately the **spawn/events/interrupt** shape the executor
+//! actually drives: [`Engine::start_session`] spawns a session process (fresh or
+//! resumed, with an optional initial prompt), [`Session::events`] streams its
+//! [`EngineEvent`]s to the single `Result`, and [`Session::interrupt`] cancels a
+//! turn gracefully. The abandoned turn-append half (an `Input`/`Session::send`
+//! design plus a `run_once` one-shot) was removed — every turn starts a session
+//! via [`SessionCfg`] (resuming by session id where continuity is wanted), so
+//! there is no live-session follow-up delivery to model.
 //!
 //! ## Object safety
 //!
@@ -34,15 +35,6 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use thiserror::Error;
 
-/// Execution mode for a unit of work (PLAN-003 §4 `context.mode`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// A turn on the long-lived group session.
-    Group,
-    /// An isolated, one-shot run.
-    Isolated,
-}
-
 /// Status of a completed engine turn. Engine-agnostic mirror of the host
 /// `output` status (`success`/`error`); the wire mapping lives in the transport
 /// layer, not here.
@@ -54,16 +46,28 @@ pub(crate) enum RunStatus {
     Error,
 }
 
+/// Structured cause of an errored turn, derived from the backend's structured
+/// result fields (Claude's `result.subtype`) — never from the result prose,
+/// which is (or quotes) model output and must not drive policy. `None` on an
+/// errored [`RunOutcome`] means the backend reported no structured cause the
+/// runner recognises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunErrorKind {
+    /// The engine hit its own turn/iteration cap (`error_max_turns`).
+    MaxTurns,
+    /// The engine reported a generic in-run failure (`error_during_execution`)
+    /// with no more specific structured cause.
+    Execution,
+}
+
 /// Severity of an [`EngineEvent::Log`] line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LogLevel {
     /// Verbose, diagnostic detail.
     Debug,
-    /// Ordinary progress information.
-    Info,
     /// A recoverable concern (e.g. an API retry).
     Warn,
-    /// An error the engine surfaced but recovered from.
+    /// An error the engine surfaced (e.g. the stderr tail of a dead child).
     Error,
 }
 
@@ -85,29 +89,6 @@ pub(crate) struct SessionCfg {
     pub(crate) thread_id: Option<String>,
 }
 
-/// Input for an isolated [`Engine::run_once`] (PLAN-003 §5 `Payload`).
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Payload {
-    /// The single user prompt to run.
-    pub(crate) prompt: String,
-    /// Working directory the engine runs in. Empty means the current directory.
-    pub(crate) cwd: PathBuf,
-}
-
-/// A follow-up user message for a live [`Session`] (PLAN-003 §5 `Input`).
-#[derive(Clone, Debug)]
-pub(crate) struct Input {
-    /// The message text to deliver to the running session.
-    pub(crate) text: String,
-}
-
-impl Input {
-    /// Wrap a string as a session input.
-    pub(crate) fn text(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
-    }
-}
-
 /// The result of a completed turn (PLAN-003 §5 `RunOutcome`). Carries the
 /// host-output triple `{status, result, newSessionId}` plus an optional error
 /// detail; the transport maps this onto an `output` frame.
@@ -121,19 +102,10 @@ pub(crate) struct RunOutcome {
     pub(crate) session_id: Option<String>,
     /// Error detail when `status` is [`RunStatus::Error`].
     pub(crate) error: Option<String>,
-}
-
-impl RunOutcome {
-    /// An error outcome carrying just a message — used when the engine fails
-    /// before (or instead of) producing a backend `result`.
-    pub(crate) fn errored(message: impl Into<String>) -> Self {
-        Self {
-            status: RunStatus::Error,
-            result: None,
-            session_id: None,
-            error: Some(message.into()),
-        }
-    }
+    /// Structured cause when `status` is [`RunStatus::Error`], if the backend
+    /// reported one. This — never `error`/`result` prose — is what failure
+    /// classification keys off.
+    pub(crate) error_kind: Option<RunErrorKind>,
 }
 
 /// An event emitted while a [`Session`] runs (PLAN-003 §5 `EngineEvent`). The
@@ -154,13 +126,6 @@ pub(crate) enum EngineEvent {
     },
     /// The turn completed (Claude `result`).
     Result(RunOutcome),
-    /// Token accounting for the turn, when the backend reports it.
-    Usage {
-        /// Prompt/input tokens consumed.
-        input_tokens: u64,
-        /// Completion/output tokens produced.
-        output_tokens: u64,
-    },
     /// A diagnostic line (API retries, hook activity, raw assistant traffic).
     Log {
         /// Severity of the line.
@@ -176,9 +141,6 @@ pub(crate) enum EngineError {
     /// The backend process could not be spawned.
     #[error("spawning engine process: {0}")]
     Spawn(#[source] std::io::Error),
-    /// An I/O error while talking to the backend process.
-    #[error("engine i/o: {0}")]
-    Io(#[source] std::io::Error),
     /// A control or input message could not be serialized.
     #[error("serialize engine message: {0}")]
     Serialize(#[from] serde_json::Error),
@@ -197,20 +159,14 @@ pub(crate) trait Engine: Send + Sync {
     /// The backend's stable name (e.g. `"claude"`).
     fn name(&self) -> &'static str;
 
-    /// Open a long-lived group session. The returned [`Session`] stays alive
-    /// across turns until dropped or interrupted.
+    /// Open a session (fresh or resumed per [`SessionCfg`]). The returned
+    /// [`Session`] stays alive until dropped or interrupted.
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError>;
-
-    /// Run an isolated one-shot: a fresh session, a single payload, one outcome.
-    async fn run_once(&self, payload: Payload) -> Result<RunOutcome, EngineError>;
 }
 
 /// A live conversation driven by an [`Engine`]. Object-safe.
 #[async_trait]
 pub(crate) trait Session: Send + Sync {
-    /// Deliver a follow-up user message to the running session.
-    async fn send(&self, input: Input) -> Result<(), EngineError>;
-
     /// Gracefully cancel the current turn without killing the session (the
     /// process stays alive for the next turn).
     async fn interrupt(&self) -> Result<(), EngineError>;
@@ -223,23 +179,14 @@ pub(crate) trait Session: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, EngineEvent, LogLevel, RunOutcome, RunStatus, Session};
+    use super::{Engine, EngineEvent, LogLevel, Session};
 
     // Compile-time proof that both traits are object-safe (`dyn`-compatible):
     // if either method were not, these signatures would fail to compile.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "compile-time object-safety proof, never called")]
     fn object_safe_engine(_engine: &dyn Engine) {}
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "compile-time object-safety proof, never called")]
     fn object_safe_session(_session: Box<dyn Session>) {}
-
-    #[test]
-    fn errored_outcome_is_an_error_with_message() {
-        let outcome = RunOutcome::errored("boom");
-        assert_eq!(outcome.status, RunStatus::Error);
-        assert_eq!(outcome.error.as_deref(), Some("boom"));
-        assert!(outcome.result.is_none());
-        assert!(outcome.session_id.is_none());
-    }
 
     #[test]
     fn engine_event_equality_distinguishes_variants() {

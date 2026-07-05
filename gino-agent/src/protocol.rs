@@ -97,7 +97,12 @@ pub(crate) struct RegisterRequest {
 
 /// Successful `POST /agent/register` response: the host-generated `agentId`, a
 /// freshly minted per-agent `connectToken`, and the assigned config overlay.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Deliberately `Deserialize`-only: this DTO carries the connect token, and the
+/// agent only ever *receives* it. Not deriving `Serialize` removes a whole
+/// token-leak surface (accidentally re-serializing the secret into a log, an
+/// outbox payload, or a frame).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RegisterOk {
     pub(crate) agent_id: String,
@@ -123,7 +128,8 @@ pub(crate) struct RegisterError {
 /// The two shapes a register response can take. Untagged: a body with
 /// `agentId`/`connectToken`/`config` parses as [`RegisterResponse::Ok`];
 /// `{register_error: …}` parses as [`RegisterResponse::Error`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// `Deserialize`-only, like the secret-bearing [`RegisterOk`] it contains.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RegisterResponse {
     Ok(RegisterOk),
@@ -180,7 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn register_ok_response_round_trips_and_redacts() {
+    fn register_ok_response_parses_and_redacts() {
+        // Parse-only by design: RegisterOk carries the connect token and does not
+        // implement Serialize (see the type's doc), so there is no re-serialize
+        // round trip to assert here.
         let raw = r#"{
             "agentId": "agent-123",
             "connectToken": "connect-secret",
@@ -194,26 +203,22 @@ mod tests {
         assert_eq!(ok.connect_token.expose(), "connect-secret");
         assert_eq!(ok.config["engine"]["model"], json!("claude-sonnet-4-6"));
         assert!(!format!("{resp:?}").contains("connect-secret"));
-
-        let again: RegisterResponse =
-            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
-        assert_eq!(again, resp);
     }
 
     #[test]
     fn register_error_response_round_trips() {
         let raw = r#"{ "register_error": { "reason": "invalid register token" } }"#;
         let resp: RegisterResponse = serde_json::from_str(raw).unwrap();
+        let envelope = RegisterErrorEnvelope {
+            register_error: RegisterError {
+                reason: "invalid register token".to_owned(),
+            },
+        };
+        assert_eq!(resp, RegisterResponse::Error(envelope.clone()));
+        // The secret-free error envelope still serializes (only the enum and the
+        // secret-bearing Ok variant are Deserialize-only).
         assert_eq!(
-            resp,
-            RegisterResponse::Error(RegisterErrorEnvelope {
-                register_error: RegisterError {
-                    reason: "invalid register token".to_owned(),
-                },
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(&resp).unwrap(),
+            serde_json::to_value(&envelope).unwrap(),
             json!({ "register_error": { "reason": "invalid register token" } })
         );
     }

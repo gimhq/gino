@@ -94,9 +94,27 @@ pub(crate) struct IdArg {
 
 // ─── dispatch ────────────────────────────────────────────────────────────────
 
+/// Open the daemon's database for a CLI invocation.
+///
+/// DECISION (audit P2-18): the CLI must NOT migrate. Every subcommand used to
+/// call the migrating open, so any CLI invocation from a mismatched binary
+/// could rewrite the schema underneath a live daemon. [`Db::open_existing`]
+/// neither creates nor migrates: a missing file or a schema version other than
+/// this binary's fails fast with a clear error — only the daemon startup path
+/// (which holds the single-instance lock) migrates.
+fn open_db() -> Result<Db> {
+    let path = resolve_db_path();
+    Db::open_existing(&path).with_context(|| {
+        format!(
+            "opening the agent database at {} (is the daemon set up on this machine?)",
+            path.display()
+        )
+    })
+}
+
 /// `gino-agent system` — identity, version, host, paths, live counts.
 pub(crate) fn system() -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     let identity = db.get_identity()?;
     let tasks = db.list_tasks()?;
     let active_crons = db.list_active_crons()?;
@@ -105,7 +123,9 @@ pub(crate) fn system() -> Result<()> {
     println!("version       : {}", env!("CARGO_PKG_VERSION"));
     println!(
         "agent_id      : {}",
-        identity.as_ref().map_or("(not registered)", |i| i.agent_id.as_str())
+        identity
+            .as_ref()
+            .map_or("(not registered)", |i| i.agent_id.as_str())
     );
     println!("name          : {}", env_or("GINO_AGENT_NAME"));
     println!("host_url      : {}", env_or("GINO_HOST_URL"));
@@ -114,12 +134,16 @@ pub(crate) fn system() -> Result<()> {
     println!("capabilities  : claude");
     println!("tasks         : {}", tasks.len());
     println!("active_crons  : {}", active_crons.len());
-    println!("threads       : pending={} running={}", pending.len(), running.len());
+    println!(
+        "threads       : pending={} running={}",
+        pending.len(),
+        running.len()
+    );
     Ok(())
 }
 
 pub(crate) fn cron(cmd: CronCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         CronCommand::Create(a) => cron_create(&db, a),
         CronCommand::List(a) => cron_list(&db, a),
@@ -130,7 +154,7 @@ pub(crate) fn cron(cmd: CronCommand) -> Result<()> {
 }
 
 pub(crate) fn task(cmd: TaskCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         TaskCommand::List => {
             let tasks = db.list_tasks()?;
@@ -187,7 +211,7 @@ pub(crate) fn task(cmd: TaskCommand) -> Result<()> {
 }
 
 pub(crate) fn thread(cmd: ThreadCommand) -> Result<()> {
-    let db = Db::open(&resolve_db_path()).context("opening the agent database")?;
+    let db = open_db()?;
     match cmd {
         ThreadCommand::List(a) => {
             let task_id = resolve_task_id(a.task_id)?;
@@ -225,7 +249,10 @@ pub(crate) fn thread(cmd: ThreadCommand) -> Result<()> {
                 println!("failure_reason: {reason}");
             }
             println!("engine        : {}", th.engine);
-            println!("session_id    : {}", th.engine_session_id.as_deref().unwrap_or("-"));
+            println!(
+                "session_id    : {}",
+                th.engine_session_id.as_deref().unwrap_or("-")
+            );
             println!("attempt       : {}/{}", th.attempt, th.max_attempts);
             if let Some(ms) = th.duration_ms {
                 println!("duration_ms   : {ms}");
@@ -251,8 +278,12 @@ fn cron_create(db: &Db, a: CreateArgs) -> Result<()> {
         other => bail!("--continuity must be 'isolated' or 'shared' (got '{other}')"),
     };
     // Seed the first fire (and validate the schedule) the same way the host path does.
-    let next_run = next_run_at_creation(&a.schedule_type, &a.value, now())
-        .with_context(|| format!("invalid schedule: --type {} --value {}", a.schedule_type, a.value))?;
+    let next_run = next_run_at_creation(&a.schedule_type, &a.value, now()).with_context(|| {
+        format!(
+            "invalid schedule: --type {} --value {}",
+            a.schedule_type, a.value
+        )
+    })?;
     let now_iso = to_iso(now());
     let row = CronRow {
         id: format!("cron-{}", Uuid::new_v4()),
@@ -279,7 +310,9 @@ fn cron_create(db: &Db, a: CreateArgs) -> Result<()> {
 }
 
 fn cron_set_status(db: &Db, id: &str, status: &str, clear_next: bool) -> Result<()> {
-    let mut cron = db.get_cron(id)?.ok_or_else(|| anyhow!("no such cron: {id}"))?;
+    let mut cron = db
+        .get_cron(id)?
+        .ok_or_else(|| anyhow!("no such cron: {id}"))?;
     status.clone_into(&mut cron.status);
     if clear_next {
         cron.next_run = None;
@@ -293,32 +326,66 @@ fn cron_set_status(db: &Db, id: &str, status: &str, clear_next: bool) -> Result<
 }
 
 fn cron_resume(db: &Db, id: &str) -> Result<()> {
-    let mut cron = db.get_cron(id)?.ok_or_else(|| anyhow!("no such cron: {id}"))?;
+    let mut cron = db
+        .get_cron(id)?
+        .ok_or_else(|| anyhow!("no such cron: {id}"))?;
     "active".clone_into(&mut cron.status);
     // Recompute the next fire forward from now (don't replay a backlog).
-    if let (Some(ty), Some(val)) = (cron.schedule_type.as_deref(), cron.schedule_value.as_deref()) {
+    if let (Some(ty), Some(val)) = (
+        cron.schedule_type.as_deref(),
+        cron.schedule_value.as_deref(),
+    ) {
         cron.next_run = next_run_at_creation(ty, val, now()).ok().flatten();
     }
     cron.dirty = true;
     cron.updated_at = to_iso(now());
     db.update_cron(&cron).context("updating the cron")?;
     push_cron_state(db, &cron);
-    println!("{} -> active (next={})", cron.id, cron.next_run.as_deref().unwrap_or("-"));
+    println!(
+        "{} -> active (next={})",
+        cron.id,
+        cron.next_run.as_deref().unwrap_or("-")
+    );
     Ok(())
 }
 
 fn cron_list(db: &Db, a: TaskFilterArg) -> Result<()> {
-    let crons = match resolve_task_id(a.task_id) {
-        Ok(task_id) => db.list_crons_by_task(&task_id)?,
-        Err(_) => db.list_active_crons()?,
+    // Without a task id the scope silently used to widen to EVERY task's
+    // active crons (audit P3) — keep the wide fallback (useful outside a task)
+    // but label it explicitly and show which task each cron belongs to.
+    let (crons, scoped) = match resolve_task_id(a.task_id) {
+        Ok(task_id) => (db.list_crons_by_task(&task_id)?, true),
+        Err(_) => (db.list_active_crons()?, false),
     };
+    print!("{}", render_cron_list(&crons, scoped));
+    Ok(())
+}
+
+/// Render `cron list` output. `scoped` means the list was filtered to one task;
+/// the unscoped (all-tasks) form is labeled and carries a `task=` column so the
+/// wide scope is never mistaken for the current task's triggers.
+fn render_cron_list(crons: &[CronRow], scoped: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if !scoped {
+        out.push_str(
+            "(no task id — listing ACTIVE crons across ALL tasks; pass --task-id to scope)\n",
+        );
+    }
     if crons.is_empty() {
-        println!("(no crons)");
-        return Ok(());
+        out.push_str("(no crons)\n");
+        return out;
     }
     for c in crons {
-        println!(
-            "{id}\t{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}",
+        let task = if scoped {
+            String::new()
+        } else {
+            format!("task={}\t", c.task_id)
+        };
+        let _ = writeln!(
+            out,
+            "{id}\t{task}{status}\t{ty} {val}\tnext={next}\tcontinuity={cont}\truns={runs}\tprompt={prompt}",
             id = c.id,
             status = c.status,
             ty = c.schedule_type.as_deref().unwrap_or("-"),
@@ -329,7 +396,7 @@ fn cron_list(db: &Db, a: TaskFilterArg) -> Result<()> {
             prompt = c.prompt,
         );
     }
-    Ok(())
+    out
 }
 
 /// Enqueue a `cron_state` so the host's read-only mirror reflects this change
@@ -340,7 +407,10 @@ fn push_cron_state(db: &Db, row: &CronRow) {
     if let Err(err) =
         db.enqueue_outbox_correlated("cron_state", &data, Some(&row.task_id), Some(&row.id))
     {
-        eprintln!("warning: failed to enqueue cron_state for {}: {err}", row.id);
+        eprintln!(
+            "warning: failed to enqueue cron_state for {}: {err}",
+            row.id
+        );
     }
 }
 
@@ -372,4 +442,56 @@ fn env_or(key: &str) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "-".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_cron_list;
+    use crate::db::CronRow;
+
+    fn cron(id: &str, task_id: &str) -> CronRow {
+        CronRow {
+            id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            kind: "schedule".to_owned(),
+            prompt: "do the thing".to_owned(),
+            schedule_type: Some("interval".to_owned()),
+            schedule_value: Some("60000".to_owned()),
+            next_run: None,
+            last_fired_at: None,
+            continuity: "isolated".to_owned(),
+            run_count: 0,
+            status: "active".to_owned(),
+            dirty: false,
+            created_at: "2026-07-02T00:00:00.000Z".to_owned(),
+            updated_at: "2026-07-02T00:00:00.000Z".to_owned(),
+        }
+    }
+
+    /// Audit P3: without a task id, `cron list` used to widen to every task's
+    /// crons with output indistinguishable from the scoped form. The wide form
+    /// must be labeled and carry the owning task per line.
+    #[test]
+    fn unscoped_cron_list_labels_the_wide_scope() {
+        let crons = [cron("cron-1", "t-a"), cron("cron-2", "t-b")];
+        let out = render_cron_list(&crons, false);
+        assert!(out.starts_with("(no task id — listing ACTIVE crons across ALL tasks"));
+        assert!(out.contains("cron-1\ttask=t-a\t"));
+        assert!(out.contains("cron-2\ttask=t-b\t"));
+    }
+
+    #[test]
+    fn scoped_cron_list_has_no_banner_and_no_task_column() {
+        let crons = [cron("cron-1", "t-a")];
+        let out = render_cron_list(&crons, true);
+        assert!(out.starts_with("cron-1\tactive\t"));
+        assert!(!out.contains("task="));
+    }
+
+    #[test]
+    fn empty_lists_state_so_in_both_scopes() {
+        assert_eq!(render_cron_list(&[], true), "(no crons)\n");
+        let wide = render_cron_list(&[], false);
+        assert!(wide.contains("across ALL tasks") && wide.ends_with("(no crons)\n"));
+    }
 }

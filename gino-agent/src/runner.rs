@@ -32,27 +32,28 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::TimeDelta;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::attachment_source::{InboundAttachments, InboxAttachmentSource};
+use crate::attachment_source::DbAttachmentSource;
 use crate::attachments::{self, AttachmentManager, AttachmentSource};
+use crate::chat::{
+    InboxPromptSource, drain_with_queued_messages, ensure_chat_thread, minted_thread_id,
+    seed_task_if_missing,
+};
 use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
-use crate::engine::Engine;
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
-use crate::executor::v2::{PromptSource, ThreadExecutor, WatchdogCfg};
-use crate::protocol::v2::{InboundFrameV2, ProvisioningEntry, TaskUpsertData};
+use crate::engine::{Engine, EngineError, Session, SessionCfg};
+use crate::executor::{ThreadExecutor, WatchdogCfg};
+use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
 use crate::register::{self, ResolvedIdentity};
 use crate::scheduler::{Cancel, Scheduler, apply_cron_delete, apply_cron_upsert, now, to_iso};
 use crate::transport::http::HttpClient;
-use crate::transport::{Inbound, Transport, TransportConfig};
-
-/// Engine a chat/api thread defaults to (the only engine today; sourced from the
-/// task/config when more engines land).
-const DEFAULT_ENGINE: &str = "claude";
+use crate::transport::{Inbound, MAX_INBOX_RETRIES, Transport, TransportConfig};
 
 /// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root
 /// (PLAN-007 §1/§6): the runner materializes the global instruction file + skills
@@ -64,6 +65,78 @@ const ENGINE_CONFIG_SUBDIR: &str = "engine-config";
 /// up freshly-pending threads and flushes any outbox rows the host has not yet
 /// acked.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Bounded graceful drain at shutdown (P1-6): how long the executor worker gets
+/// to settle the interrupted active run (post-interrupt drain, output collection,
+/// finalize) before it is aborted and the leftover engine session killed.
+/// Comfortably above the executor's in-run `cancel_drain_timeout` and inside
+/// systemd's default `TimeoutStopSec` (90 s).
+const SHUTDOWN_DRAIN_WINDOW: Duration = Duration::from_secs(15);
+
+/// Lockfile inside the (0700-hardened) workspace dir backing the daemon's
+/// single-instance flock.
+const DAEMON_LOCK_FILE: &str = "agent.lock";
+
+/// The daemon's single-instance guard (audit P2-18): an exclusive advisory
+/// lock (`flock`-style, via [`std::fs::File::try_lock`]) on a lockfile in the
+/// state dir, held for the daemon's whole lifetime and released by the OS on
+/// any exit, clean or not. A second daemon fails fast instead of racing the
+/// first over migrations and thread claims. CLI subcommands never take this
+/// lock — they are short-lived readers/writers of the shared WAL DB.
+#[derive(Debug)]
+struct DaemonLock {
+    /// The open lockfile handle; dropping it releases the lock.
+    _file: std::fs::File,
+}
+
+/// Acquire the exclusive daemon lock, failing fast (no blocking wait) when
+/// another process — or another handle in this one — already holds it. The
+/// lock is advisory and per open-file-description, so it works across
+/// processes and is testable with two handles in one.
+fn acquire_daemon_lock(workspace_dir: &Path) -> Result<DaemonLock> {
+    let path = workspace_dir.join(DAEMON_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening daemon lockfile {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(DaemonLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
+            "another gino-agent daemon is already running (exclusive lock on {} is held); \
+             stop it before starting a new one",
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("locking daemon lockfile {}", path.display()))
+        }
+    }
+}
+
+/// Create the DB/workspace directories, then restrict the workspace to
+/// owner-only (`0700`): it holds the DB (connect token), engine work dirs and
+/// the provisioning store. Hardening runs on every startup so pre-existing
+/// world-readable deployments are healed, not only fresh installs.
+fn prepare_state_dirs(paths: &crate::config::Paths) -> Result<()> {
+    if let Some(parent) = paths.db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating db directory {}", parent.display()))?;
+    }
+    std::fs::create_dir_all(&paths.workspace_dir).with_context(|| {
+        format!(
+            "creating workspace directory {}",
+            paths.workspace_dir.display()
+        )
+    })?;
+    crate::db::harden_state_dir(&paths.workspace_dir).with_context(|| {
+        format!(
+            "hardening workspace directory permissions {}",
+            paths.workspace_dir.display()
+        )
+    })?;
+    Ok(())
+}
 
 /// Build the tokio runtime and drive the daemon to completion. Kept sync so the
 /// CLI dispatcher in [`crate`] stays sync.
@@ -97,16 +170,12 @@ async fn run_async(
     ));
     config.validate()?;
 
-    if let Some(parent) = config.paths.db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating db directory {}", parent.display()))?;
-    }
-    std::fs::create_dir_all(&config.paths.workspace_dir).with_context(|| {
-        format!(
-            "creating workspace directory {}",
-            config.paths.workspace_dir.display()
-        )
-    })?;
+    prepare_state_dirs(&config.paths)?;
+
+    // Single-instance guard (P2-18), taken BEFORE the DB open so a second
+    // daemon can never run migrations — let alone claim threads — against a
+    // live instance's database. Held (via the binding) until run_async returns.
+    let _daemon_lock = acquire_daemon_lock(&config.paths.workspace_dir)?;
 
     let db = Db::open(&config.paths.db_path)
         .with_context(|| format!("opening db at {}", config.paths.db_path.display()))?;
@@ -129,15 +198,16 @@ async fn run_async(
         heartbeat: Duration::from_millis(config.heartbeat_interval_ms),
         ..TransportConfig::default()
     };
+    // The dial happens in the background (P0-2): the daemon boots and serves
+    // local work while the host is unreachable; outbound frames queue durably
+    // and replay once a connection is up.
     let mut transport = Transport::open(
         ws_url,
         identity.connect_token,
         Arc::clone(&db),
         transport_config,
-    )
-    .await
-    .context("opening the websocket transport")?;
-    info!("transport connected");
+    );
+    info!("transport started; connecting in the background");
 
     // The GLOBAL provisioning scope root (PLAN-007 §1/§6). Created up front so the
     // engine always launches with a stable config dir — even with no entries.
@@ -149,16 +219,29 @@ async fn run_async(
         )
     })?;
 
+    // One shutdown token for every plane (P1-6): the serve loop, the scheduler,
+    // the executor worker AND the active engine run (via the executor's converged
+    // cancel path) all watch this token, so a shutdown signal cancels an in-flight
+    // turn instead of waiting out its running_timeout.
+    let cancel = Arc::new(Cancel::new());
+
     // The v2 execution plane: the source-agnostic pending-thread drainer, its
     // out-of-band attachment plane (PLAN-005, Lane Z1) and the global config/skills
     // provisioner (PLAN-007) — all over one shared content-addressed manager — then
-    // the startup global reconcile. The shared stash hands a resolved message's
-    // inbound descriptors from the prompt drainer to the executor.
-    let (executor, inbound_attachments, provisioner) =
-        build_execution_plane(&config, &http, &db, &engine_config_dir).await;
+    // the startup global reconcile. A resolved message's inbound descriptors reach
+    // the executor through the durable `thread_attachments` snapshot (P1-10b).
+    let flush = transport.flush_handle();
+    let (executor, provisioner, settings) = build_execution_plane(
+        &config,
+        &http,
+        &db,
+        &engine_config_dir,
+        &cancel,
+        Arc::clone(&flush),
+    )
+    .await;
     let prompts = Arc::new(InboxPromptSource {
         db: Arc::clone(&db),
-        inbound: inbound_attachments,
     });
 
     // Crash recovery: any thread left `dispatched`/`running`/`active` by a previous
@@ -169,11 +252,15 @@ async fn run_async(
         info!(recovered, "recovered crash-orphan threads at startup");
     }
 
-    let cancel = Arc::new(Cancel::new());
-    let scheduler = Scheduler::new(Arc::clone(&db), Arc::clone(&cancel));
-    let nudge = scheduler.nudge();
-    let drain = scheduler.drain_signal();
-    let flush = transport.flush_handle();
+    // One retry budget for every thread source (cron fires + chat messages).
+    let max_attempts = config.executor.max_attempts;
+    let scheduler = Scheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&cancel),
+        max_attempts,
+        config.retention.days,
+    );
+    let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let scheduler_task = tokio::spawn(scheduler.run());
 
     let worker = tokio::spawn(run_worker(
@@ -183,6 +270,7 @@ async fn run_async(
         Arc::clone(&drain),
         Arc::clone(&flush),
         Arc::clone(&cancel),
+        max_attempts,
     ));
     info!("scheduler + executor running; serving inbound/outbound frames");
 
@@ -191,18 +279,19 @@ async fn run_async(
         db: Arc::clone(&db),
         nudge,
         drain: Arc::clone(&drain),
-        chat_max_attempts: config.executor.max_attempts,
+        chat_max_attempts: max_attempts,
         provisioner,
         engine_config_dir,
+        config: Mutex::new(config),
+        engine_settings: settings,
     };
     serve(&mut transport, &context, &cancel).await;
 
-    // Shutdown: stop the scheduler + worker, fail any in-flight threads (so the host
-    // sees a terminal result rather than a silent gap), then drain the transport.
-    cancel.cancel();
-    if worker.await.is_err_and(|err| err.is_panic()) {
-        warn!("executor worker panicked during shutdown");
-    }
+    // Shutdown (P1-6): drain the execution plane within a bounded window (the
+    // active run is cancelled, not waited out), stop the scheduler, fail any
+    // leftover in-flight threads (so the host sees a terminal result rather than
+    // a silent gap), then drain the transport. No engine child survives this.
+    shutdown_worker(&cancel, &executor, worker, SHUTDOWN_DRAIN_WINDOW).await;
     if scheduler_task.await.is_err_and(|err| err.is_panic()) {
         warn!("scheduler task panicked during shutdown");
     }
@@ -216,6 +305,36 @@ async fn run_async(
     Ok(())
 }
 
+/// Stop the execution plane within a bounded drain window (P1-6): trip the
+/// shutdown token (stops the worker loop and, through the executor's converged
+/// cancel path, the active run), gracefully interrupt the running engine turn
+/// (the same [`ThreadExecutor::interrupt`] machinery a host `interrupt` frame
+/// uses), then await the worker. A worker that has not settled when the window
+/// closes is aborted, and any leftover engine session is dropped — killing the
+/// engine child (`kill_on_drop`) — so no engine process survives the daemon.
+async fn shutdown_worker(
+    cancel: &Cancel,
+    executor: &ThreadExecutor,
+    mut worker: tokio::task::JoinHandle<()>,
+    window: Duration,
+) {
+    cancel.cancel();
+    executor.interrupt().await;
+    match tokio::time::timeout(window, &mut worker).await {
+        Ok(joined) => {
+            if joined.is_err_and(|err| err.is_panic()) {
+                warn!("executor worker panicked during shutdown");
+            }
+        }
+        Err(_elapsed) => {
+            warn!("executor worker did not settle within the shutdown drain window; aborting it");
+            worker.abort();
+            let _ = worker.await;
+        }
+    }
+    executor.kill_active().await;
+}
+
 /// The executor worker: drains every `pending` thread on each scheduler/route
 /// nudge (or a bounded poll), runs a periodic stale-thread reap, then pokes the
 /// transport flush so the result-plane frames the drain enqueued stream out.
@@ -226,6 +345,7 @@ async fn run_worker(
     drain: Arc<Notify>,
     flush: Arc<Notify>,
     cancel: Arc<Cancel>,
+    chat_max_attempts: i64,
 ) {
     loop {
         // Register drain interest before draining so a fire that lands mid-drain
@@ -246,7 +366,7 @@ async fn run_worker(
         // live here and there is nothing to race. Live runs are bounded by the
         // in-run watchdog inside [`ThreadExecutor::drive`].
         executor.reap_stale(&in_flight_threads(&db));
-        executor.drain_pending(prompts.as_ref()).await;
+        drain_with_queued_messages(&executor, &db, prompts.as_ref(), chat_max_attempts).await;
         flush.notify_one();
     }
     debug!("executor worker stopped");
@@ -265,84 +385,17 @@ fn in_flight_threads(db: &Mutex<Db>) -> Vec<ThreadRow> {
     rows
 }
 
-/// Resolves engine prompts for the drainer. This is consulted **only at attempt 0
-/// for a thread with no snapshot** — the executor reuses `threads.prompt` for cron
-/// threads (snapshotted at fire time) and for every retry/resume (D10). A `cron`
-/// thread runs its trigger's `crons.prompt` (the recurring instruction, D10:(a) —
-/// no longer the v1 `tasks.prompt` shim); a `chat`/`api` thread runs the text of
-/// its oldest unprocessed inbox `message`, which it **consumes** (marks processed)
-/// so the row neither replays nor re-resolves. `None` (no runnable prompt) fails
-/// the thread `runner.invalid_request`.
-struct InboxPromptSource {
-    db: Arc<Mutex<Db>>,
-    /// Shared stash the executor's attachment plane reads: resolving a chat/api
-    /// message also lifts its inbound descriptors off the same `MessageInData` and
-    /// records them here, since consuming the message hides it from a later inbox
-    /// query (see [`crate::attachment_source`]).
-    inbound: InboundAttachments,
-}
-
-impl PromptSource for InboxPromptSource {
-    fn prompt_for(&self, thread: &ThreadRow) -> Option<String> {
-        match thread.source.as_str() {
-            // A cron thread's instruction is its trigger's crons.prompt (D10:(a)).
-            "cron" => thread
-                .cron_id
-                .as_deref()
-                .and_then(|cron_id| lock_db(&self.db).get_cron(cron_id).ok().flatten())
-                .map(|cron| cron.prompt)
-                .filter(|prompt| !prompt.trim().is_empty()),
-            _ => resolve_inbox_message(&self.db, thread, &self.inbound),
-        }
-    }
-}
-
-/// Find, consume, and return the text of the oldest unprocessed inbox `message`
-/// for `thread` (matched by `threadId`, falling back to `taskId` for an untargeted
-/// chat message). Consuming it (mark processed) prevents both a replay re-run and a
-/// re-resolve; an empty message yields `None` (which fails the thread) but is still
-/// consumed so it cannot loop.
-///
-/// For a runnable message this also stashes its inbound attachment descriptors into
-/// `inbound`: consuming the row hides it from the executor's later inbound query, so
-/// the descriptors are lifted off the same `MessageInData` here (empty/absent →
-/// nothing recorded). Stashed only when the prompt is non-empty, so a failed
-/// (unrunnable) thread — which never reaches materialization — leaves no orphan
-/// entry.
-fn resolve_inbox_message(
-    db: &Mutex<Db>,
-    thread: &ThreadRow,
-    inbound: &InboundAttachments,
-) -> Option<String> {
-    let guard = lock_db(db);
-    let rows = guard.list_inbox_by_type("message").ok()?;
-    let row = rows.into_iter().find(|row| {
-        row.thread_id.as_deref() == Some(thread.id.as_str())
-            || (row.thread_id.is_none() && row.task_id.as_deref() == Some(thread.task_id.as_str()))
-    })?;
-    if let Err(err) = guard.mark_inbox_processed(row.id) {
-        warn!(id = row.id, error = %err, "failed to consume inbox message");
-    }
-    let frame: InboundFrameV2 = serde_json::from_str(&row.payload).ok()?;
-    match frame {
-        InboundFrameV2::Message { data, .. } if !data.text.trim().is_empty() => {
-            if let Some(attachments) = data.attachments {
-                inbound.record(&thread.id, attachments);
-            }
-            Some(data.text)
-        }
-        _ => None,
-    }
-}
-
 /// Map the [`ExecutorConfig`] knobs onto the executor's watchdog thresholds. A
-/// zero `inactivity_timeout_secs` disables the in-run inactivity watchdog.
+/// zero `inactivity_timeout_secs` disables the in-run inactivity watchdog only —
+/// the total-time watchdog still bounds a silent engine on wall clock (P2-19),
+/// so the serial plane can never wedge indefinitely.
 fn watchdog_cfg(cfg: &ExecutorConfig) -> WatchdogCfg {
     WatchdogCfg {
         dispatched_timeout: TimeDelta::seconds(cfg.dispatched_timeout_secs),
         running_timeout: TimeDelta::seconds(cfg.running_timeout_secs),
         inactivity_timeout: (cfg.inactivity_timeout_secs > 0)
             .then(|| Duration::from_secs(cfg.inactivity_timeout_secs)),
+        ..WatchdogCfg::default()
     }
 }
 
@@ -399,16 +452,22 @@ async fn fetch_and_apply_config(
 /// `None` manager (absent host base / connect token) degrades both planes off. The
 /// returned provisioner is `None` in that same degraded case. The startup reconcile
 /// (repair → reconcile(global) → gc) is non-fatal — see [`reconcile_global_startup`].
+/// Also returns the live engine-settings seam (audit P2-19) the executor's engine
+/// snapshots at every spawn, so the `config_update` route can replace its contents.
 async fn build_execution_plane(
     config: &Config,
     http: &HttpClient,
     db: &Arc<Mutex<Db>>,
     engine_config_dir: &Path,
+    shutdown: &Arc<Cancel>,
+    flush: Arc<Notify>,
 ) -> (
     Arc<ThreadExecutor>,
-    InboundAttachments,
     Option<Arc<Provisioner>>,
+    SharedEngineSettings,
 ) {
+    let settings: SharedEngineSettings =
+        Arc::new(Mutex::new(engine_settings(config, engine_config_dir)));
     let manager = build_attachment_manager(config, http);
 
     // The shared content-addressed provisioner over the manager (`impl BlobFetcher
@@ -424,12 +483,14 @@ async fn build_execution_plane(
         ))
     });
 
-    let (executor, inbound) = build_executor(
+    let executor = build_executor(
         config,
         Arc::clone(db),
-        engine_config_dir,
+        &settings,
         manager,
         provisioner.clone(),
+        Arc::clone(shutdown),
+        flush,
     );
 
     if let Some(provisioner) = &provisioner {
@@ -442,35 +503,44 @@ async fn build_execution_plane(
         )
         .await;
     }
-    (executor, inbound, provisioner)
+    (executor, provisioner, settings)
 }
 
 /// Build the v2 [`ThreadExecutor`] and (when present) wire its out-of-band
-/// attachment plane (PLAN-005, Lane Z1) onto the shared `manager`. Returns the
-/// executor plus the shared [`InboundAttachments`] stash to hand the prompt
-/// drainer, so a resolved message's inbound descriptors reach the executor (the
-/// message is consumed before materialization — see [`crate::attachment_source`]).
-/// The plane is non-fatal: a `None` manager (absent host base / connect token)
-/// leaves attachments off and the executor behaves as before.
+/// attachment plane (PLAN-005, Lane Z1) onto the shared `manager`. The inbound
+/// descriptors reach the executor through a [`DbAttachmentSource`] over the
+/// durable `thread_attachments` snapshot the prompt drainer writes (the message
+/// is consumed before materialization, and retries/restarts must resolve the
+/// same set — P1-10b; see [`crate::attachment_source`]). The plane is non-fatal:
+/// a `None` manager (absent host base / connect token) leaves attachments off
+/// and the executor behaves as before.
 fn build_executor(
     config: &Config,
     db: Arc<Mutex<Db>>,
-    engine_config_dir: &Path,
+    settings: &SharedEngineSettings,
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
-) -> (Arc<ThreadExecutor>, InboundAttachments) {
-    let engine = build_engine(config, engine_config_dir);
+    shutdown: Arc<Cancel>,
+    flush: Arc<Notify>,
+) -> Arc<ThreadExecutor> {
+    let engine: Arc<dyn Engine> = Arc::new(ReloadableEngine {
+        settings: Arc::clone(settings),
+    });
+    // The daemon shutdown token (P1-6): a shutdown cancels the active run through
+    // the executor's converged cancel path and stops the pending drain. The
+    // transport flush signal (P2-16): the executor pokes it after each persisted
+    // frame so transcript events stream mid-run over the live socket.
     let mut executor = ThreadExecutor::new(
         engine,
-        db,
+        Arc::clone(&db),
         config.paths.workspace_dir.clone(),
         watchdog_cfg(&config.executor),
-    );
-    let inbound = InboundAttachments::default();
+    )
+    .with_shutdown(shutdown)
+    .with_flush(flush);
     if let Some(manager) = manager {
         info!("attachment plane active (host-proxy byte backend)");
-        let source: Arc<dyn AttachmentSource> =
-            Arc::new(InboxAttachmentSource::new(inbound.clone()));
+        let source: Arc<dyn AttachmentSource> = Arc::new(DbAttachmentSource::new(db));
         executor = executor.with_attachments(manager, source);
     } else {
         debug!("attachment plane disabled (no host base / connect token)");
@@ -484,15 +554,15 @@ fn build_executor(
     } else {
         debug!("task provisioning plane disabled (no host base / connect token)");
     }
-    (Arc::new(executor), inbound)
+    Arc::new(executor)
 }
 
-/// Build the Claude engine from the resolved config, exporting the workspace dir
-/// (`GINO_WORKSPACE_DIR`, read by the PreCompact `archive` hook subprocess) and
-/// pointing the engine at the provisioned global config dir (PLAN-007 §6) on top
-/// of the credential env. Returned as `Arc<dyn Engine>` so everything downstream
-/// stays engine-agnostic.
-fn build_engine(config: &Config, engine_config_dir: &Path) -> Arc<dyn Engine> {
+/// Resolve the Claude engine settings from the config, exporting the workspace
+/// dir (`GINO_WORKSPACE_DIR`, read by the PreCompact `archive` hook subprocess)
+/// and pointing the engine at the provisioned global config dir (PLAN-007 §6) on
+/// top of the credential env. Rebuilt on a live `config_update` (audit P2-19) so
+/// a rotated credential reaches the next engine run without a restart.
+fn engine_settings(config: &Config, engine_config_dir: &Path) -> ClaudeSettings {
     let mut settings = ClaudeSettings::from_config(config);
     settings.env.push((
         "GINO_WORKSPACE_DIR".to_owned(),
@@ -501,7 +571,42 @@ fn build_engine(config: &Config, engine_config_dir: &Path) -> Arc<dyn Engine> {
     // Launch the engine reading the global instruction file + skills the runner
     // materialized; `ClaudeSettings` exports `ENGINE_CONFIG_DIR`/`CLAUDE_CONFIG_DIR`.
     settings.config_dir = Some(engine_config_dir.to_path_buf());
-    Arc::new(ClaudeEngine::new(settings))
+    settings
+}
+
+/// The live engine-settings seam (audit P2-19): the executor's engine snapshots
+/// these settings at every spawn, and the `config_update` route replaces them
+/// after merging the overlay onto the live [`Config`] — so a rotated
+/// `anthropicApiKey` takes effect without a daemon restart.
+type SharedEngineSettings = Arc<Mutex<ClaudeSettings>>;
+
+/// An [`Engine`] over the [`SharedEngineSettings`] seam: each call snapshots the
+/// current settings and delegates to a [`ClaudeEngine`] built from that snapshot.
+/// Decision (protocol.md leaves `config_update` apply semantics open):
+/// APPLY-ON-NEXT-RUN — a session already spawned keeps the environment it was
+/// born with; only the next spawn reads the updated settings. A mid-flight run
+/// is never hot-swapped.
+#[derive(Debug)]
+struct ReloadableEngine {
+    settings: SharedEngineSettings,
+}
+
+#[async_trait]
+impl Engine for ReloadableEngine {
+    fn name(&self) -> &'static str {
+        "claude"
+    }
+
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        self.snapshot().start_session(cfg).await
+    }
+}
+
+impl ReloadableEngine {
+    /// A [`ClaudeEngine`] over the settings as they stand right now.
+    fn snapshot(&self) -> ClaudeEngine {
+        ClaudeEngine::new(lock(&self.settings).clone())
+    }
 }
 
 /// Build the shared content-addressed [`AttachmentManager`] (PLAN-005, agent-
@@ -638,30 +743,71 @@ struct ServeContext {
     /// The global scope root the provisioner materializes into (= the engine's
     /// `ENGINE_CONFIG_DIR`), re-reconciled live on `config_update`.
     engine_config_dir: PathBuf,
+    /// The merged live config. A WS `config_update` overlay lands here (the last
+    /// layer of the config.rs precedence chain) and drives the engine-settings
+    /// rebuild below.
+    config: Mutex<Config>,
+    /// The live engine-settings seam (audit P2-19): replaced on `config_update`,
+    /// snapshotted by [`ReloadableEngine`] at every engine spawn.
+    engine_settings: SharedEngineSettings,
 }
 
-/// Pump inbound v2 frames until Ctrl-C, a `close`, or the transport closes
-/// (reconnect exhausted). Outbound frames are produced straight into the durable
-/// outbox by the executor/scheduler and shipped by the transport (flush/replay), so
-/// the serve loop has no outbound branch.
+/// Resolve when a daemon shutdown signal arrives (P1-6): SIGINT (Ctrl-C) and —
+/// on unix — SIGTERM (what systemd `stop`/`restart` sends) are handled
+/// identically. A listener that cannot be installed is logged and disabled;
+/// the other signal and the internal cancel/`close` paths still shut down.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!(error = %err, "failed to listen for SIGINT; that signal cannot trigger shutdown");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    () = ctrl_c => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to listen for SIGTERM; that signal cannot trigger shutdown");
+                ctrl_c.await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+/// Pump inbound v2 frames until a shutdown signal or a `close`. Outbound frames
+/// are produced straight into the durable outbox by the executor/scheduler and
+/// shipped by the transport (flush/replay), so the serve loop has no outbound
+/// branch. Transport loss never ends the loop (P0-2): the manager reconnects
+/// forever, and even a dead manager task only stops the frame pump — the
+/// daemon (scheduler + executor) keeps serving local work until shutdown.
 async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cancel) {
     loop {
         tokio::select! {
             biased;
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(err) = signal {
-                    warn!(error = %err, "failed to listen for shutdown signal");
-                }
+            () = shutdown_signal() => {
                 info!("shutdown signal received");
                 break;
             }
             () = cancel.cancelled() => break,
             inbound = transport.recv() => {
                 let Some(inbound) = inbound else {
-                    warn!("transport closed (reconnect exhausted); shutting down");
+                    // Reconnect never exhausts, so a closed channel means the
+                    // manager task itself died. Local execution must outlive
+                    // the transport: keep running, wait for a real shutdown.
+                    warn!("transport channel closed; daemon keeps serving local work");
+                    wait_for_shutdown(cancel).await;
                     break;
                 };
-                if route(inbound, transport, context).await.is_break() {
+                if route(inbound, context).await.is_break() {
                     info!("close received; shutting down");
                     break;
                 }
@@ -670,24 +816,40 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
     }
 }
 
-/// Route one inbound v2 frame to the executor / scheduler / config, then mark its
-/// inbox row processed. Returns [`ControlFlow::Break`] for a `close`.
+/// Block until a shutdown signal or an internal cancel — the tail of [`serve`]
+/// once the transport channel has closed (P0-2: transport death must not shut
+/// the daemon down; the scheduler and executor keep running until a real
+/// shutdown).
+async fn wait_for_shutdown(cancel: &Cancel) {
+    tokio::select! {
+        () = shutdown_signal() => {
+            info!("shutdown signal received");
+        }
+        () = cancel.cancelled() => {}
+    }
+}
+
+/// Route one inbound v2 frame to the executor / scheduler / config, then settle
+/// its inbox row: a successfully applied frame is marked processed; a FAILED
+/// apply leaves the row unprocessed (it replays on reconnect) and bumps its
+/// processing-failure counter, so the poison policy counts real failures — never
+/// reconnects (P1-12/P2-19). Returns [`ControlFlow::Break`] for a `close`.
 ///
-/// A `message` is the one frame **not** marked processed here: its text is the chat
+/// A `message` is the one frame **not** settled here: its text is the chat
 /// thread's prompt, consumed (and marked) later by the [`InboxPromptSource`].
-async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) -> ControlFlow<()> {
+async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
     let Inbound { inbox_id, frame } = inbound;
     let defer_processing = matches!(frame, InboundFrameV2::Message { .. });
+    let mut applied = true;
     let flow = match frame {
         InboundFrameV2::Message {
             task_id, thread_id, ..
         } => {
-            ensure_chat_thread(
-                &context.db,
-                &task_id,
-                thread_id.as_deref(),
-                context.chat_max_attempts,
-            );
+            // Idempotent thread minting (P0-3): an absent `threadId` derives the
+            // thread id from the inbox row, so a reconnect replay of the same row
+            // finds the already-minted thread instead of racing a fresh one.
+            let tid = thread_id.unwrap_or_else(|| minted_thread_id(&task_id, inbox_id));
+            ensure_chat_thread(&context.db, &task_id, &tid, context.chat_max_attempts);
             context.drain.notify_one();
             ControlFlow::Continue(())
         }
@@ -696,11 +858,11 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskUpsert { task_id, data, .. } => {
-            apply_task_def(&context.db, &task_id, &data);
+            applied = apply_task_def(&context.db, &task_id, &data);
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskDelete { task_id, .. } => {
-            delete_task(&context.db, &task_id);
+            applied = delete_task(&context.db, &task_id);
             ControlFlow::Continue(())
         }
         InboundFrameV2::CronUpsert {
@@ -709,15 +871,11 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             data,
             ..
         } => {
-            apply_trigger(
-                || apply_cron_upsert(&context.db, &task_id, &cron_id, &data),
-                "cron_upsert",
-                &context.nudge,
-            );
+            applied = handle_cron_upsert(&context.db, &task_id, &cron_id, &data, &context.nudge);
             ControlFlow::Continue(())
         }
         InboundFrameV2::CronDelete { cron_id, .. } => {
-            apply_trigger(
+            applied = apply_trigger(
                 || apply_cron_delete(&context.db, &cron_id),
                 "cron_delete",
                 &context.nudge,
@@ -725,12 +883,12 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
             ControlFlow::Continue(())
         }
         InboundFrameV2::ConfigUpdate { data, .. } => {
-            // Engine-affecting config changes take effect on the next engine start;
-            // record the update so it is not silently dropped.
             debug!(keys = ?config_keys(&data), "config_update received");
-            // A `config_update` carrying the full re-pushed global provisioning set
-            // is reconciled live (PLAN-007 §6): add / repoint / remove converge the
-            // engine config dir without an engine restart.
+            // Applied on both planes (audit P2-19): the overlay merges onto the
+            // live config + engine settings (rotated credentials reach the next
+            // engine run), and a re-pushed global provisioning set is reconciled
+            // live (PLAN-007 §6). Always marked processed: the host re-pushes
+            // config on connect, so a replay is worthless.
             apply_config_update(context, &data).await;
             ControlFlow::Continue(())
         }
@@ -738,110 +896,70 @@ async fn route(inbound: Inbound, transport: &Transport, context: &ServeContext) 
         // The transport intercepts `ack`; an unknown frame is forward-compat noise.
         InboundFrameV2::Ack { .. } | InboundFrameV2::Unknown => ControlFlow::Continue(()),
     };
-    if !defer_processing && let Err(err) = transport.mark_inbox_processed(inbox_id) {
-        warn!(error = %err, "failed to mark inbox row processed");
+    if !defer_processing {
+        conclude_inbox_row(&context.db, inbox_id, applied);
     }
     flow
 }
 
-/// Ensure a chat thread exists and is runnable for a `message` (host-v2 §M4
-/// threading). A **present** `threadId` CONTINUES that thread: a resting
-/// (`active`/`succeeded`/`failed`/`cancelled`) thread is re-set `pending` for the new
-/// turn, KEEPING its `engine_session_id` so the engine conversation resumes; an
-/// in-flight thread is left as-is (the message waits in the inbox — concurrent
-/// same-thread messaging is a Lane I follow-up). An **absent** `threadId` STARTS A
-/// FRESH thread: a new unique id is minted with no carried `engine_session_id`, so the
-/// outbound `thread_result`/`thread_message` carry it back (the executor drives by
-/// `thread.id`) for the host to record as `current_thread_id`. There is no implicit
-/// per-task `"<task>@chat"` continue — every absent-`threadId` message is brand-new.
-fn ensure_chat_thread(db: &Mutex<Db>, task_id: &str, thread_id: Option<&str>, max_attempts: i64) {
-    // Absent threadId → a brand-new thread each call: mint a unique id keeping the
-    // `task_id@` prefix so `resolve_inbox_message` still correlates the untargeted inbox
-    // row by `task_id`. Threads drain in creation order, so sequential absent-threadId
-    // messages map FIFO to their freshly-minted threads — correct for the common case
-    // (concurrent same-thread messaging is a Lane I follow-up).
-    let tid = thread_id.map_or_else(
-        || format!("{task_id}@{}", uuid::Uuid::new_v4()),
-        str::to_owned,
-    );
+/// Settle a routed inbox row. Applied → processed. Failed → left unprocessed
+/// (replayed on reconnect) with its processing-failure counter bumped; once the
+/// counter reaches [`MAX_INBOX_RETRIES`] the row is discarded (marked processed)
+/// so a permanently failing frame cannot replay forever.
+fn conclude_inbox_row(db: &Mutex<Db>, inbox_id: i64, applied: bool) {
     let guard = lock_db(db);
-    match guard.get_thread(&tid) {
-        Ok(Some(existing)) => {
-            if matches!(
-                existing.status.as_str(),
-                "active" | "succeeded" | "failed" | "cancelled"
-            ) {
-                let mut turn = existing;
-                "pending".clone_into(&mut turn.status);
-                turn.attempt = 0;
-                turn.failure_reason = None;
-                turn.started_at = None;
-                turn.finished_at = None;
-                turn.duration_ms = None;
-                turn.result = None;
-                turn.error = None;
-                // A new turn snapshots its OWN message: clear the prior snapshot so
-                // the executor re-resolves this turn's `message.text` at attempt 0
-                // (D10). Retries within the turn then reuse the fresh snapshot.
-                turn.prompt = String::new();
-                if let Err(err) = guard.update_thread(&turn) {
-                    warn!(thread = %tid, error = %err, "failed to re-pend chat thread");
-                }
-            } else {
-                debug!(thread = %tid, status = %existing.status, "chat message for an in-flight thread; queued");
+    if applied {
+        if let Err(err) = guard.mark_inbox_processed(inbox_id) {
+            warn!(inbox = inbox_id, error = %err, "failed to mark inbox row processed");
+        }
+        return;
+    }
+    match guard.increment_inbox_retry(inbox_id) {
+        Ok(failures) if failures >= MAX_INBOX_RETRIES => {
+            warn!(
+                inbox = inbox_id,
+                failures, "inbox row failed too many times; discarding (poison)"
+            );
+            if let Err(err) = guard.mark_inbox_processed(inbox_id) {
+                warn!(inbox = inbox_id, error = %err, "failed to discard poison inbox row");
             }
         }
-        Ok(None) => {
-            // Satisfy the `threads.task_id → tasks(id)` FK: a chat message may arrive
-            // before its `task_upsert`, so seed a minimal task row if absent.
-            if guard.get_task_row(task_id).ok().flatten().is_none() {
-                let now_iso = to_iso(now());
-                let task = TaskRow {
-                    id: task_id.to_owned(),
-                    name: None,
-                    kind: None,
-                    status: "active".to_owned(),
-                    created_at: now_iso.clone(),
-                    updated_at: now_iso,
-                };
-                if let Err(err) = guard.insert_task_row(&task) {
-                    warn!(task = %task_id, error = %err, "failed to seed task for chat thread");
-                }
-            }
-            let row = ThreadRow {
-                id: tid.clone(),
-                task_id: task_id.to_owned(),
-                cron_id: None,
-                source: "chat".to_owned(),
-                // No snapshot yet: the executor resolves and snapshots this turn's
-                // inbox `message.text` into threads.prompt at attempt 0 (D10).
-                prompt: String::new(),
-                engine: DEFAULT_ENGINE.to_owned(),
-                engine_session_id: None,
-                status: "pending".to_owned(),
-                failure_reason: None,
-                attempt: 0,
-                max_attempts,
-                work_dir: None,
-                started_at: None,
-                finished_at: None,
-                duration_ms: None,
-                result: None,
-                error: None,
-                synced: false,
-                created_at: to_iso(now()),
-            };
-            if let Err(err) = guard.insert_thread(&row) {
-                warn!(thread = %tid, error = %err, "failed to create chat thread");
-            }
+        Ok(failures) => {
+            debug!(
+                inbox = inbox_id,
+                failures, "inbox row apply failed; left unprocessed for replay"
+            );
         }
-        Err(err) => warn!(thread = %tid, error = %err, "chat thread lookup failed"),
+        Err(err) => {
+            warn!(inbox = inbox_id, error = %err, "failed to record inbox processing failure");
+        }
     }
 }
 
+/// Apply a host `cron_upsert`, seeding a minimal task row first when the cron
+/// arrives before its `task_upsert` (P2-19: the ordering must not drop the cron —
+/// the later `task_upsert` patches the seeded row in place).
+fn handle_cron_upsert(
+    db: &Mutex<Db>,
+    task_id: &str,
+    cron_id: &str,
+    data: &CronUpsertData,
+    nudge: &Notify,
+) -> bool {
+    if !seed_task_if_missing(&lock_db(db), task_id) {
+        return false;
+    }
+    apply_trigger(
+        || apply_cron_upsert(db, task_id, cron_id, data),
+        "cron_upsert",
+        nudge,
+    )
+}
+
 /// Apply a host `task_upsert` to the v2 `tasks` entity: insert when new, patch the
-/// supplied fields in place when known.
-fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
+/// supplied fields in place when known. Returns `false` on a DB failure so the
+/// router leaves the inbox row unprocessed for replay.
+fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool {
     let guard = lock_db(db);
     let now_iso = to_iso(now());
     match guard.get_task_row(task_id) {
@@ -858,8 +976,9 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
             row.updated_at = now_iso;
             if let Err(err) = guard.update_task_row(&row) {
                 warn!(task = %task_id, error = %err, "failed to update task");
+                return false;
             }
-            persist_task_entries(&guard, task_id, data);
+            persist_task_entries(&guard, task_id, data)
         }
         Ok(None) => {
             let row = TaskRow {
@@ -872,10 +991,14 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
             };
             if let Err(err) = guard.insert_task_row(&row) {
                 warn!(task = %task_id, error = %err, "failed to insert task");
+                return false;
             }
-            persist_task_entries(&guard, task_id, data);
+            persist_task_entries(&guard, task_id, data)
         }
-        Err(err) => warn!(task = %task_id, error = %err, "task lookup failed"),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task lookup failed");
+            false
+        }
     }
 }
 
@@ -883,50 +1006,77 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) {
 /// §5). Present → serialized to the `entries` JSON column for the per-thread
 /// materialize ([`ThreadExecutor::with_provisioning`]); absent (`None`) → left
 /// untouched, so a `task_upsert` that omits `entries` never wipes a prior set.
-fn persist_task_entries(db: &Db, task_id: &str, data: &TaskUpsertData) {
+/// Returns `false` on a serialize/DB failure.
+fn persist_task_entries(db: &Db, task_id: &str, data: &TaskUpsertData) -> bool {
     let Some(entries) = &data.entries else {
-        return;
+        return true;
     };
     match serde_json::to_string(entries) {
-        Ok(json) => {
-            if let Err(err) = db.set_task_entries(task_id, Some(&json)) {
+        Ok(json) => match db.set_task_entries(task_id, Some(&json)) {
+            Ok(()) => true,
+            Err(err) => {
                 warn!(task = %task_id, error = %err, "failed to persist task entries");
+                false
             }
+        },
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "failed to serialize task entries");
+            false
         }
-        Err(err) => warn!(task = %task_id, error = %err, "failed to serialize task entries"),
     }
 }
 
 /// Apply a host `task_delete`: there is no hard delete, so the task is marked
-/// `cancelled` (its triggers stop being seeded by their own `cron_delete`).
-fn delete_task(db: &Mutex<Db>, task_id: &str) {
+/// `cancelled` (its triggers stop being seeded by their own `cron_delete`). An
+/// unknown task is a no-op success (nothing to replay); only a DB failure
+/// returns `false`.
+fn delete_task(db: &Mutex<Db>, task_id: &str) -> bool {
     let guard = lock_db(db);
     match guard.get_task_row(task_id) {
         Ok(Some(mut row)) => {
             "cancelled".clone_into(&mut row.status);
             row.updated_at = to_iso(now());
-            if let Err(err) = guard.update_task_row(&row) {
-                warn!(task = %task_id, error = %err, "failed to cancel task");
+            match guard.update_task_row(&row) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(task = %task_id, error = %err, "failed to cancel task");
+                    false
+                }
             }
         }
-        Ok(None) => debug!(task = %task_id, "task_delete for an unknown task; ignoring"),
-        Err(err) => warn!(task = %task_id, error = %err, "task lookup failed"),
+        Ok(None) => {
+            debug!(task = %task_id, "task_delete for an unknown task; ignoring");
+            true
+        }
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task lookup failed");
+            false
+        }
     }
 }
 
 /// Apply a trigger-definition mutation and nudge the scheduler when it changed.
+/// Returns `false` only when the apply FAILED (an unchanged trigger is a
+/// success), so the router can leave the inbox row unprocessed for replay.
 fn apply_trigger(
     op: impl FnOnce() -> Result<bool, crate::db::DbError>,
     label: &str,
     nudge: &Notify,
-) {
+) -> bool {
     match op() {
         Ok(true) => {
             debug!(op = label, "trigger updated; nudging scheduler");
             nudge.notify_one();
+            true
         }
-        Ok(false) => debug!(op = label, "trigger unchanged"),
-        Err(err) => warn!(op = label, error = %err, "failed to apply trigger"),
+        Ok(false) => {
+            debug!(op = label, "trigger unchanged");
+            true
+        }
+        Err(err) => {
+            warn!(op = label, error = %err, "failed to apply trigger");
+            false
+        }
     }
 }
 
@@ -938,9 +1088,51 @@ fn config_keys(data: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Apply a live `config_update` end-to-end (audit P2-19). The payload is parsed
+/// ONCE as a [`ConfigOverlay`], then applied on both planes:
+///
+/// 1. **engine/config** ([`apply_engine_config`]) — merge the overlay onto the
+///    live [`Config`] and rebuild the shared engine settings, so a rotated
+///    `anthropicApiKey` reaches the next engine run without a restart.
+/// 2. **provisioning** ([`apply_provisioning_update`]) — the version-gated global
+///    reconcile (PLAN-007 §6).
+///
+/// A payload that does not parse as an overlay is dropped, not retried: the
+/// failure is deterministic (a replay re-fails identically) and the host
+/// re-pushes config on connect, so dropping follows the same dead-letter policy
+/// the transport applies to malformed known-type frames. Non-fatal.
+async fn apply_config_update(context: &ServeContext, data: &serde_json::Value) {
+    let overlay: ConfigOverlay = match serde_json::from_value(data.clone()) {
+        Ok(overlay) => overlay,
+        Err(err) => {
+            warn!(error = %err, "config_update did not parse as a config overlay; dropping (dead-letter)");
+            return;
+        }
+    };
+    apply_engine_config(context, overlay.clone());
+    apply_provisioning_update(context, &overlay).await;
+}
+
+/// Merge a `config_update` overlay onto the live [`Config`] (the "WS update"
+/// layer — last in the config.rs precedence chain) and rebuild the shared
+/// [`ClaudeSettings`] from the merged result, so the NEXT engine spawn sees the
+/// updated credentials/model/tools (see [`ReloadableEngine`] for the
+/// apply-on-next-run decision). Fields the engine does not read at spawn time
+/// (heartbeat cadence, paths) are merged too but only take effect where they
+/// are re-read — the transport and DB keep their startup values until restart.
+fn apply_engine_config(context: &ServeContext, overlay: ConfigOverlay) {
+    let rebuilt = {
+        let mut config = lock(&context.config);
+        config.apply(overlay);
+        engine_settings(&config, &context.engine_config_dir)
+    };
+    *lock(&context.engine_settings) = rebuilt;
+    debug!("config_update merged onto live config; engine settings apply on the next run");
+}
+
 /// Apply the provisioning side of a live `config_update` (PLAN-007 §6) under the SAME
-/// version gate as the startup reconcile. Parse the payload as a [`ConfigOverlay`] and
-/// re-reconcile the global scope ONLY when it carries BOTH a `version` and an
+/// version gate as the startup reconcile. Re-reconcile the global scope ONLY when the
+/// overlay carries BOTH a `version` and an
 /// `entries` set AND that version advances past the persisted applied version. The
 /// host re-pushes the FULL desired set, so one [`Provisioner::reconcile`] converges
 /// add / repoint / remove (incl. the authoritative-empty case — a versioned empty set
@@ -950,16 +1142,9 @@ fn config_keys(data: &serde_json::Value) -> Vec<String> {
 /// applied version is persisted only after a successful reconcile. Unlike the startup
 /// path this does NOT gc — orphaned store versions are collected on the next restart's
 /// startup gc, matching the documented "no GC without a restart". Non-fatal.
-async fn apply_config_update(context: &ServeContext, data: &serde_json::Value) {
+async fn apply_provisioning_update(context: &ServeContext, overlay: &ConfigOverlay) {
     let Some(provisioner) = &context.provisioner else {
         return;
-    };
-    let overlay: ConfigOverlay = match serde_json::from_value(data.clone()) {
-        Ok(overlay) => overlay,
-        Err(err) => {
-            warn!(error = %err, "config_update did not parse as a config overlay; skipping reconcile");
-            return;
-        }
     };
     // The version gate keys on a (version, entries) pair: a versioned desired set.
     let (Some(fetched), Some(entries)) = (overlay.version(), overlay.entries()) else {
@@ -1004,277 +1189,14 @@ fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use crate::attachment_source::{InboundAttachments, InboxAttachmentSource};
-    use crate::attachments::AttachmentSource;
-    use crate::db::{Db, TaskRow, ThreadRow};
-    use crate::executor::v2::PromptSource;
-    use crate::protocol::v2::{
-        AttachmentDescriptor, EntryKind, InboundFrameV2, MessageInData, ProvisioningEntry,
-        TaskUpsertData,
-    };
-
-    use super::{InboxPromptSource, apply_task_def, ensure_chat_thread, lock_db};
-
-    fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
-        ThreadRow {
-            id: id.to_owned(),
-            task_id: task_id.to_owned(),
-            cron_id: None,
-            source: "chat".to_owned(),
-            prompt: String::new(),
-            engine: "claude".to_owned(),
-            engine_session_id: None,
-            status: "pending".to_owned(),
-            failure_reason: None,
-            attempt: 0,
-            max_attempts: 1,
-            work_dir: None,
-            started_at: None,
-            finished_at: None,
-            duration_ms: None,
-            result: None,
-            error: None,
-            synced: false,
-            created_at: "2026-06-22T00:00:00Z".to_owned(),
-        }
-    }
-
-    fn inbound_descriptor(name: &str) -> AttachmentDescriptor {
-        AttachmentDescriptor {
-            id: format!("in-{name}"),
-            name: name.to_owned(),
-            content_type: "text/plain".to_owned(),
-            size: 4,
-            sha256: "11".repeat(32),
-            reference: format!("/agent/attachments/in-{name}"),
-            direction: Some("inbound".to_owned()),
-        }
-    }
-
-    /// Record a `message` frame carrying `attachments` for the thread, then resolve
-    /// its prompt. The drainer consumes the inbox row (hiding it from a later inbox
-    /// query) yet the executor's source still surfaces the descriptors — proof the
-    /// consume-before-materialize ordering is handled via the shared stash.
-    #[test]
-    fn message_attachments_survive_prompt_consumption_for_inbound_for() {
-        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        let descriptors = vec![
-            inbound_descriptor("spec.txt"),
-            inbound_descriptor("data.json"),
-        ];
-        let frame = InboundFrameV2::Message {
-            task_id: "t-1".to_owned(),
-            thread_id: Some("th-1".to_owned()),
-            data: MessageInData {
-                text: "summarize the inputs".to_owned(),
-                attachments: Some(descriptors.clone()),
-            },
-            msg_id: Some(7),
-        };
-        lock_db(&db)
-            .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"))
-            .unwrap();
-
-        let inbound = InboundAttachments::default();
-        let prompts = InboxPromptSource {
-            db: Arc::clone(&db),
-            inbound: inbound.clone(),
-        };
-        let thread = chat_thread("th-1", "t-1");
-
-        // Resolving the prompt consumes the inbox message...
-        assert_eq!(
-            prompts.prompt_for(&thread).as_deref(),
-            Some("summarize the inputs")
-        );
-        assert!(
-            lock_db(&db)
-                .list_inbox_by_type("message")
-                .unwrap()
-                .is_empty(),
-            "message must be consumed (no replay/re-resolve)"
-        );
-
-        // ...but the executor's attachment source still resolves the descriptors.
-        let source = InboxAttachmentSource::new(inbound);
-        assert_eq!(source.inbound_for(&thread), descriptors);
-    }
-
-    /// A message with no attachments stashes nothing → `inbound_for` is empty (the
-    /// executor then materializes no inputs).
-    #[test]
-    fn message_without_attachments_yields_no_inbound() {
-        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        let frame = InboundFrameV2::Message {
-            task_id: "t-2".to_owned(),
-            thread_id: Some("th-2".to_owned()),
-            data: MessageInData {
-                text: "no files attached".to_owned(),
-                attachments: None,
-            },
-            msg_id: None,
-        };
-        lock_db(&db)
-            .record_inbound_correlated("message", &frame, Some("t-2"), Some("th-2"))
-            .unwrap();
-
-        let inbound = InboundAttachments::default();
-        let prompts = InboxPromptSource {
-            db: Arc::clone(&db),
-            inbound: inbound.clone(),
-        };
-        let thread = chat_thread("th-2", "t-2");
-        assert!(prompts.prompt_for(&thread).is_some());
-
-        let source = InboxAttachmentSource::new(inbound);
-        assert!(source.inbound_for(&thread).is_empty());
-    }
-
-    /// host-v2 §M4: a `message` with an ABSENT `threadId` starts a brand-new thread
-    /// every call — two such messages for the same task mint TWO DISTINCT thread rows,
-    /// each fresh (no inherited `engine_session_id`). The old `"<task>@chat"` implicit
-    /// continue is gone.
-    #[test]
-    fn absent_thread_id_mints_fresh_thread_each_call() {
-        let db = Mutex::new(Db::open_in_memory().unwrap());
-        ensure_chat_thread(&db, "t-1", None, 1);
-        ensure_chat_thread(&db, "t-1", None, 1);
-
-        let threads = lock_db(&db).list_pending_threads().unwrap();
-        assert_eq!(
-            threads.len(),
-            2,
-            "each absent-threadId message mints its own fresh thread"
-        );
-        assert_ne!(threads[0].id, threads[1].id, "minted ids are distinct");
-        assert!(threads.iter().all(|t| t.task_id == "t-1"));
-        assert!(
-            threads.iter().all(|t| t.engine_session_id.is_none()),
-            "fresh threads carry no engine session (nothing inherited to resume)"
-        );
-    }
-
-    /// host-v2 §M4: a `message` with a PRESENT `threadId` continues that same thread —
-    /// a resting thread is re-pended for the new turn while its `engine_session_id` is
-    /// PRESERVED (resumed, not minted anew).
-    #[test]
-    fn present_thread_id_continues_same_thread() {
-        let db = Mutex::new(Db::open_in_memory().unwrap());
-        {
-            let guard = lock_db(&db);
-            // Seed the task (FK target) and a resting thread holding a resume handle.
-            guard
-                .insert_task_row(&TaskRow {
-                    id: "t-1".to_owned(),
-                    name: None,
-                    kind: None,
-                    status: "active".to_owned(),
-                    created_at: "2026-06-22T00:00:00Z".to_owned(),
-                    updated_at: "2026-06-22T00:00:00Z".to_owned(),
-                })
-                .unwrap();
-            let mut existing = chat_thread("th-x", "t-1");
-            existing.engine_session_id = Some("sess-1".to_owned());
-            "succeeded".clone_into(&mut existing.status);
-            guard.insert_thread(&existing).unwrap();
-        }
-
-        ensure_chat_thread(&db, "t-1", Some("th-x"), 1);
-
-        let row = lock_db(&db)
-            .get_thread("th-x")
-            .unwrap()
-            .expect("the present thread is reused, not minted anew");
-        assert_eq!(row.id, "th-x", "same thread id reused");
-        assert_eq!(
-            row.status, "pending",
-            "resting thread re-pended for the new turn"
-        );
-        assert_eq!(
-            row.engine_session_id.as_deref(),
-            Some("sess-1"),
-            "engine session preserved → conversation resumes"
-        );
-        assert_eq!(
-            lock_db(&db).list_pending_threads().unwrap().len(),
-            1,
-            "no extra thread minted on a present threadId"
-        );
-    }
-
-    /// A `task_upsert` carrying `entries` persists them as the `tasks.entries` JSON
-    /// (insert-new and patch-existing); a later `task_upsert` that OMITS `entries`
-    /// must leave the prior set intact, while an explicit (empty) set replaces it
-    /// (PLAN-007 §5).
-    #[test]
-    fn task_upsert_persists_entries_and_omission_preserves_them() {
-        let db = Mutex::new(Db::open_in_memory().unwrap());
-        let entry = ProvisioningEntry {
-            id: "claude-md".to_owned(),
-            sha256: "ab".repeat(32),
-            target: "CLAUDE.md".to_owned(),
-            kind: EntryKind::File,
-        };
-
-        // Insert-new WITH entries → persisted as the JSON array.
-        apply_task_def(
-            &db,
-            "t-1",
-            &TaskUpsertData {
-                name: Some("build".to_owned()),
-                kind: None,
-                status: None,
-                entries: Some(vec![entry.clone()]),
-            },
-        );
-        let json = lock_db(&db)
-            .get_task_entries("t-1")
-            .unwrap()
-            .expect("entries persisted on insert");
-        assert_eq!(
-            serde_json::from_str::<Vec<ProvisioningEntry>>(&json).unwrap(),
-            vec![entry],
-        );
-
-        // Patch-existing WITHOUT entries → the prior set is untouched.
-        apply_task_def(
-            &db,
-            "t-1",
-            &TaskUpsertData {
-                name: Some("build-2".to_owned()),
-                kind: None,
-                status: None,
-                entries: None,
-            },
-        );
-        assert_eq!(
-            lock_db(&db).get_task_entries("t-1").unwrap().as_deref(),
-            Some(json.as_str()),
-            "a task_upsert without entries must not wipe them"
-        );
-
-        // Patch-existing WITH an explicit empty set → replaced.
-        apply_task_def(
-            &db,
-            "t-1",
-            &TaskUpsertData {
-                name: None,
-                kind: None,
-                status: None,
-                entries: Some(Vec::new()),
-            },
-        );
-        assert_eq!(
-            lock_db(&db).get_task_entries("t-1").unwrap().as_deref(),
-            Some("[]"),
-            "an explicit empty entries set replaces the prior one"
-        );
-    }
+/// Poison-tolerant lock for the live config / engine-settings seams — same
+/// policy as [`lock_db`]: short critical sections, never across an `.await`.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Focused coverage of the PLAN-007-5a global-provisioning startup wiring
 /// (`reconcile_global_startup`) against a fake byte fetcher — the full host-driven

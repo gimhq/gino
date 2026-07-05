@@ -16,26 +16,24 @@
 //! the next one; [`ClaudeSession::interrupt`] cancels a turn gracefully without
 //! killing it. The child is configured `kill_on_drop`, so dropping the session
 //! tears the process down.
-//!
-//! [`ClaudeEngine::run_once`] is the isolated path: a fresh session, one user
-//! turn, drain the stream to the single `result`, then drop (exit).
 
 mod control;
 mod events;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use futures_util::stream::{BoxStream, Stream};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
@@ -43,9 +41,7 @@ use uuid::Uuid;
 
 use self::control::ControlAsk;
 use crate::config::Config;
-use crate::engine::{
-    Engine, EngineError, EngineEvent, Input, Payload, RunOutcome, Session, SessionCfg,
-};
+use crate::engine::{Engine, EngineError, EngineEvent, LogLevel, Session, SessionCfg};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
 /// environment (PLAN-001 §"claude invocation"). Built from the global [`Config`]
@@ -171,14 +167,6 @@ impl SessionArgs {
             session,
         }
     }
-
-    /// Derive the args for an isolated one-shot: always a fresh session.
-    fn fresh(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            session: SessionId::New(Uuid::new_v4().to_string()),
-        }
-    }
 }
 
 /// Build the `claude` argv from [`ClaudeSettings`] and the per-run [`SessionArgs`]
@@ -293,11 +281,6 @@ impl ClaudeEngine {
     pub(crate) fn new(settings: ClaudeSettings) -> Self {
         Self { settings }
     }
-
-    /// Construct an engine from the global [`Config`].
-    pub(crate) fn from_config(config: &Config) -> Self {
-        Self::new(ClaudeSettings::from_config(config))
-    }
 }
 
 #[async_trait]
@@ -317,12 +300,53 @@ impl Engine for ClaudeEngine {
         )?;
         Ok(Box::new(session))
     }
+}
 
-    async fn run_once(&self, payload: Payload) -> Result<RunOutcome, EngineError> {
-        let Payload { prompt, cwd } = payload;
-        let session_args = SessionArgs::fresh(cwd);
-        let session = spawn_session(&self.settings, &session_args, Some(&prompt), None, None)?;
-        Ok(drain_to_result(session).await)
+/// Bounds on the captured stderr tail: enough for a startup/auth error banner,
+/// small enough to embed in a failure message.
+const STDERR_TAIL_MAX_LINES: usize = 32;
+const STDERR_TAIL_MAX_BYTES: usize = 4096;
+/// How long the reader waits for the stderr drain to settle after stdout EOF
+/// (both pipes close on child exit, so this is only a scheduling grace).
+const STDERR_DRAIN_WINDOW: Duration = Duration::from_millis(500);
+
+/// A bounded tail of the child's stderr (audit P3): startup/auth failures die
+/// before any stream-json `result`, so their stderr is the only diagnostic.
+/// Shared between the drain task (writer) and the failure paths (readers).
+#[derive(Clone, Debug, Default)]
+struct StderrTail {
+    lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl StderrTail {
+    /// Append a line, dropping oldest lines beyond the line/byte bounds.
+    fn push(&self, line: String) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push_back(line);
+            while lines.len() > STDERR_TAIL_MAX_LINES
+                || lines.iter().map(String::len).sum::<usize>() > STDERR_TAIL_MAX_BYTES
+            {
+                if lines.pop_front().is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The captured tail joined into one block; `None` when nothing arrived.
+    fn snapshot(&self) -> Option<String> {
+        let lines = self.lines.lock().ok()?;
+        if lines.is_empty() {
+            None
+        } else {
+            Some(
+                lines
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
     }
 }
 
@@ -347,7 +371,11 @@ fn spawn_session(
         .args(&argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        // Captured (audit P3): a child that dies at startup (bad binary args,
+        // auth failure) writes its reason to stderr only — the bounded tail is
+        // folded into the failure diagnostics instead of vanishing into the
+        // daemon's inherited stderr.
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     if !session_args.cwd.as_os_str().is_empty() {
         command.current_dir(&session_args.cwd);
@@ -380,12 +408,24 @@ fn spawn_session(
         .stdout
         .take()
         .ok_or(EngineError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(EngineError::MissingPipe("stderr"))?;
 
     let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
     let (events_tx, events_rx) = mpsc::unbounded_channel::<EngineEvent>();
 
+    let stderr_tail = StderrTail::default();
+    let stderr_handle = tokio::spawn(stderr_task(stderr, stderr_tail.clone()));
     let writer_handle = tokio::spawn(writer_task(stdin, writer_rx));
-    let reader_handle = tokio::spawn(reader_task(stdout, events_tx, writer_tx.clone()));
+    let reader_handle = tokio::spawn(reader_task(
+        stdout,
+        events_tx,
+        writer_tx.clone(),
+        stderr_handle,
+        stderr_tail,
+    ));
 
     // Handshake: initialize → bypass mode → optional first user turn. These are
     // queued on the single writer channel so the child receives them in order.
@@ -407,6 +447,16 @@ fn spawn_session(
         child: Mutex::new(Some(child)),
         tasks: vec![writer_handle, reader_handle],
     })
+}
+
+/// Drain the child's stderr into the bounded tail. Ends on EOF (child exited)
+/// or a read error; each line is also traced for live debugging.
+async fn stderr_task(stderr: ChildStderr, tail: StderrTail) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        debug!(line = %line, "engine stderr");
+        tail.push(line);
+    }
 }
 
 /// Drive the child's stdin: write each queued line, newline-framed and flushed.
@@ -432,11 +482,15 @@ async fn write_line(stdin: &mut ChildStdin, line: &str) -> std::io::Result<()> {
 
 /// Parse the child's stdout line by line: answer control requests through
 /// `writer`, forward mapped events on `events`. Ends on EOF (child exited),
-/// dropping both senders to wind the session down.
+/// dropping both senders to wind the session down. On EOF the captured stderr
+/// tail is surfaced as a final error log event (audit P3): a child that died
+/// before its `result` (startup/auth failure) has stderr as its only diagnostic.
 async fn reader_task(
     stdout: ChildStdout,
     events: mpsc::UnboundedSender<EngineEvent>,
     writer: mpsc::UnboundedSender<String>,
+    stderr_drain: JoinHandle<()>,
+    stderr_tail: StderrTail,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -447,7 +501,18 @@ async fn reader_task(
                 }
                 handle_line(&line, &events, &writer);
             }
-            Ok(None) => return,
+            Ok(None) => {
+                // Child exited: stderr hits EOF too — give its drain a grace
+                // window so the tail is complete before it is surfaced.
+                let _ = tokio::time::timeout(STDERR_DRAIN_WINDOW, stderr_drain).await;
+                if let Some(tail) = stderr_tail.snapshot() {
+                    let _ = events.send(EngineEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!("engine stderr tail:\n{tail}"),
+                    });
+                }
+                return;
+            }
             Err(err) => {
                 warn!(error = %err, "engine stdout read failed; stopping reader");
                 return;
@@ -510,35 +575,6 @@ fn answer_control(value: &Value, writer: &mpsc::UnboundedSender<String>) {
     }
 }
 
-/// Consume an isolated session's event stream to its single `result`, folding in
-/// the session id from `init`, then return the outcome (the session drops on
-/// return, killing the child).
-async fn drain_to_result(session: ClaudeSession) -> RunOutcome {
-    let mut session_id = None;
-    let mut outcome = None;
-    {
-        let mut stream = session.events();
-        while let Some(event) = stream.next().await {
-            match event {
-                EngineEvent::SessionStarted { session_id: id } => session_id = Some(id),
-                EngineEvent::Result(mut completed) => {
-                    if completed.session_id.is_none() {
-                        completed.session_id.clone_from(&session_id);
-                    }
-                    outcome = Some(completed);
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
-    outcome.unwrap_or_else(|| {
-        let mut errored = RunOutcome::errored("engine exited before producing a result");
-        errored.session_id = session_id;
-        errored
-    })
-}
-
 /// A live Claude conversation. Holds the writer channel, the (one-shot) event
 /// receiver, the child handle (`kill_on_drop`), and the reader/writer task
 /// handles (aborted on drop).
@@ -552,11 +588,6 @@ pub(crate) struct ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
-    async fn send(&self, input: Input) -> Result<(), EngineError> {
-        let line = control::user_message_line(&input.text)?;
-        self.writer.send(line).map_err(|_| EngineError::Closed)
-    }
-
     async fn interrupt(&self) -> Result<(), EngineError> {
         let line = control::interrupt_line()?;
         self.writer.send(line).map_err(|_| EngineError::Closed)
@@ -784,8 +815,10 @@ mod smoke {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use futures_util::StreamExt;
+
     use super::{ClaudeEngine, ClaudeSettings};
-    use crate::engine::{Engine, Payload, RunStatus};
+    use crate::engine::{Engine, EngineError, EngineEvent, LogLevel, RunStatus, SessionCfg};
 
     /// Write an executable bash stub that speaks just enough control protocol to
     /// require — and prove — the host's auto-allow.
@@ -821,7 +854,7 @@ fi
     }
 
     #[tokio::test]
-    async fn run_once_auto_allows_tool_and_captures_result() {
+    async fn session_auto_allows_tool_and_captures_result() {
         let dir = tempfile::tempdir().expect("temp dir");
         let fake = write_fake_claude(dir.path());
         let engine = ClaudeEngine::new(ClaudeSettings {
@@ -829,21 +862,122 @@ fi
             ..ClaudeSettings::default()
         });
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            engine.run_once(Payload {
-                prompt: "hi".to_owned(),
-                cwd: dir.path().to_path_buf(),
-            }),
-        )
-        .await
-        .expect("run_once timed out")
-        .expect("run_once errored");
+        // ETXTBSY retry: a concurrently-spawning test child can briefly hold
+        // the just-written script's fd, failing exec with "text file busy".
+        let session = loop {
+            match engine
+                .start_session(SessionCfg {
+                    cwd: dir.path().to_path_buf(),
+                    initial_prompt: Some("hi".to_owned()),
+                    ..SessionCfg::default()
+                })
+                .await
+            {
+                Ok(session) => break session,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        };
 
-        // The result only arrives if the stub saw our auto-allow.
+        // Drain the stream to the single `result` — it only arrives if the stub
+        // saw our auto-allow.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = session.events();
+            let mut session_started = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    EngineEvent::SessionStarted { session_id } => {
+                        session_started = Some(session_id);
+                    }
+                    EngineEvent::Result(outcome) => return Some((session_started, outcome)),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await
+        .expect("session timed out")
+        .expect("stream ended without a result");
+
+        let (session_started, outcome) = outcome;
+        assert_eq!(session_started.as_deref(), Some("sess-smoke"));
         assert_eq!(outcome.status, RunStatus::Success);
         assert_eq!(outcome.result.as_deref(), Some("all good"));
         assert_eq!(outcome.session_id.as_deref(), Some("sess-smoke"));
         assert!(outcome.error.is_none());
+    }
+
+    /// Audit P3: a child that dies at startup (e.g. an auth failure) writes its
+    /// reason to stderr only — the reader must surface that tail as an error log
+    /// event before the stream ends, instead of letting it vanish.
+    #[tokio::test]
+    async fn startup_failure_diagnostics_carry_the_stderr_tail() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("dying-claude.sh");
+        let script = "#!/usr/bin/env bash\n\
+                      echo 'Invalid API key: please run /login' >&2\n\
+                      exit 1\n";
+        {
+            let mut file = std::fs::File::create(&path).expect("create stub");
+            file.write_all(script.as_bytes()).expect("write stub");
+            let mut perms = file.metadata().expect("stub metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod stub");
+        }
+        let engine = ClaudeEngine::new(ClaudeSettings {
+            binary: path,
+            ..ClaudeSettings::default()
+        });
+
+        // ETXTBSY retry: a concurrently-spawning test child can briefly hold
+        // the just-written script's fd, failing exec with "text file busy".
+        let session = loop {
+            match engine
+                .start_session(SessionCfg {
+                    cwd: dir.path().to_path_buf(),
+                    initial_prompt: Some("hi".to_owned()),
+                    ..SessionCfg::default()
+                })
+                .await
+            {
+                Ok(session) => break session,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        };
+
+        // No `result` ever arrives; the stderr tail must reach the stream as an
+        // error-level log event before EOF ends it.
+        let tail_log = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = session.events();
+            let mut tail_log = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    EngineEvent::Result(_) => panic!("a dead child must not produce a result"),
+                    EngineEvent::Log {
+                        level: LogLevel::Error,
+                        message,
+                    } => tail_log = Some(message),
+                    _ => {}
+                }
+            }
+            tail_log
+        })
+        .await
+        .expect("session timed out")
+        .expect("stream ended without surfacing the stderr tail");
+
+        assert!(
+            tail_log.contains("Invalid API key: please run /login"),
+            "the stderr tail must reach the diagnostics, got: {tail_log}"
+        );
     }
 }

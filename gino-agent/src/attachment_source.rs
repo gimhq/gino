@@ -1,12 +1,12 @@
-//! The runner's [`AttachmentSource`] (PLAN-005, agent-architecture §9; Lane Z1
-//! wiring).
+//! The runner's [`AttachmentSource`] (PLAN-005, agent-architecture §9; audit
+//! P1-10b).
 //!
 //! Inbound attachment **descriptors** ride the inbox `message` frame
 //! ([`MessageInData::attachments`](crate::protocol::v2::MessageInData)), not the
 //! `threads` row, so the executor materializes them through a resolver
-//! ([`AttachmentSource`]) that Lane G/Z1 supplies.
+//! ([`AttachmentSource`]) that the runner supplies.
 //!
-//! ## Why a stash and not a fresh inbox query
+//! ## Why a durable snapshot and not a fresh inbox query
 //!
 //! The pending-thread drainer resolves a thread's prompt
 //! ([`InboxPromptSource`](crate::runner)) and **consumes** its inbox `message`
@@ -14,83 +14,98 @@
 //! executor materializes inputs ([`ThreadExecutor::run_thread`] calls
 //! `inbound_for` only after the prompt is resolved). A fresh
 //! `list_inbox_by_type("message")` here would therefore miss it — the only inbox
-//! query returns *unprocessed* rows. So the drainer stashes the descriptors from
-//! the very `MessageInData` it already parsed (keyed by thread id) into a shared
-//! [`InboundAttachments`]; [`InboxAttachmentSource::inbound_for`] pops them. This
-//! leaves the consume-once semantics untouched and keeps the byte plane fed.
+//! query returns *unprocessed* rows. The drainer therefore snapshots the
+//! descriptors from the very `MessageInData` it already parsed into the
+//! `thread_attachments` table (keyed by thread id, written BEFORE the message is
+//! consumed), and [`DbAttachmentSource::inbound_for`] reads them back — without
+//! popping, so a retried, re-pended or crash-recovered thread resolves the
+//! identical set on every attempt. The previous in-memory one-shot stash lost
+//! the descriptors on retry and on restart, silently running the thread with
+//! zero attachments (P1-10b).
 //!
-//! [`ThreadExecutor::run_thread`]: crate::executor::v2::ThreadExecutor
+//! [`ThreadExecutor::run_thread`]: crate::executor::ThreadExecutor
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tracing::warn;
+
 use crate::attachments::AttachmentSource;
-use crate::db::ThreadRow;
+use crate::db::{Db, ThreadRow};
 use crate::protocol::v2::AttachmentDescriptor;
 
-/// A thread-id → inbound-descriptors stash bridging the prompt drainer (writer)
-/// and the executor's attachment plane (reader). Cheap to clone — a shared `Arc`
-/// around the map, so the daemon hands one handle to each side.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct InboundAttachments {
-    by_thread: Arc<Mutex<HashMap<String, Vec<AttachmentDescriptor>>>>,
-}
-
-impl InboundAttachments {
-    /// Record the inbound descriptors a thread's inbox `message` carried, so the
-    /// executor can materialize them once the run starts. Empty lists are dropped
-    /// (the common case: no attachments → nothing to track, map stays small).
-    pub(crate) fn record(&self, thread_id: &str, descriptors: Vec<AttachmentDescriptor>) {
-        if descriptors.is_empty() {
-            return;
-        }
-        self.lock().insert(thread_id.to_owned(), descriptors);
-    }
-
-    /// Take (and clear) the descriptors stashed for `thread_id`. Empty when none
-    /// were recorded — the executor then materializes nothing (a no-op).
-    fn take(&self, thread_id: &str) -> Vec<AttachmentDescriptor> {
-        self.lock().remove(thread_id).unwrap_or_default()
-    }
-
-    /// Poison-tolerant lock (Lock 6): the critical sections are tiny map ops that
-    /// never span an `.await`, so recovering the guard cannot observe a torn map.
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<AttachmentDescriptor>>> {
-        self.by_thread
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// The runner's [`AttachmentSource`]: returns (and clears) the inbound descriptors
-/// the prompt drainer stashed for a thread. Engine-agnostic and non-fatal — a
-/// thread with no inbox attachments (cron threads, attachment-free messages)
-/// resolves to an empty list, and the executor materializes nothing.
+/// The runner's [`AttachmentSource`]: reads the inbound descriptors the prompt
+/// drainer snapshotted into `thread_attachments` for a thread. Engine-agnostic
+/// and non-fatal for the common case — a thread that never carried attachments
+/// (cron threads, attachment-free messages) resolves to an empty list, and the
+/// executor materializes nothing.
 #[derive(Clone, Debug)]
-pub(crate) struct InboxAttachmentSource {
-    inbound: InboundAttachments,
+pub(crate) struct DbAttachmentSource {
+    db: Arc<Mutex<Db>>,
 }
 
-impl InboxAttachmentSource {
-    /// Build a source reading from the shared [`InboundAttachments`] the prompt
-    /// drainer writes to.
-    pub(crate) fn new(inbound: InboundAttachments) -> Self {
-        Self { inbound }
+impl DbAttachmentSource {
+    /// Build a source reading the `thread_attachments` snapshots the prompt
+    /// drainer writes.
+    pub(crate) fn new(db: Arc<Mutex<Db>>) -> Self {
+        Self { db }
+    }
+
+    /// Poison-tolerant DB lock (Lock 6): the critical section is one SELECT that
+    /// never spans an `.await`, so recovering the guard cannot observe torn state.
+    fn lock(&self) -> MutexGuard<'_, Db> {
+        self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-impl AttachmentSource for InboxAttachmentSource {
+impl AttachmentSource for DbAttachmentSource {
     fn inbound_for(&self, thread: &ThreadRow) -> Vec<AttachmentDescriptor> {
-        self.inbound.take(&thread.id)
+        let json = match self.lock().get_thread_attachments(&thread.id) {
+            Ok(None) => return Vec::new(),
+            Ok(Some(json)) => json,
+            Err(err) => {
+                warn!(thread = %thread.id, error = %err, "failed to read the thread's attachment snapshot");
+                return unreadable_sentinel();
+            }
+        };
+        match serde_json::from_str(&json) {
+            Ok(descriptors) => descriptors,
+            Err(err) => {
+                warn!(thread = %thread.id, error = %err, "thread attachment snapshot did not parse");
+                unreadable_sentinel()
+            }
+        }
     }
+}
+
+/// DECISION (P1-10b): the executor seam ([`AttachmentSource::inbound_for`])
+/// returns a bare `Vec`, so a snapshot-read failure cannot surface as an error
+/// through it. Returning empty would run the thread WITHOUT its inputs and
+/// report success — the exact silent drop this module exists to close. Instead
+/// return one descriptor with a negative declared size: materialization rejects
+/// it up front ([`InvalidDeclaredSize`]) with zero byte transfer, failing the
+/// run loudly.
+///
+/// [`InvalidDeclaredSize`]: crate::attachments::AttachmentError::InvalidDeclaredSize
+fn unreadable_sentinel() -> Vec<AttachmentDescriptor> {
+    vec![AttachmentDescriptor {
+        id: String::new(),
+        name: "thread-attachments-unreadable".to_owned(),
+        content_type: String::new(),
+        size: -1,
+        sha256: String::new(),
+        reference: String::new(),
+        direction: None,
+    }]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InboundAttachments, InboxAttachmentSource};
+    use std::sync::{Arc, Mutex};
+
+    use super::DbAttachmentSource;
     use crate::attachments::AttachmentSource;
-    use crate::db::ThreadRow;
-    use crate::protocol::v2::{AttachmentDescriptor, MessageInData};
+    use crate::db::{Db, TaskRow, ThreadRow};
+    use crate::protocol::v2::AttachmentDescriptor;
 
     /// A bare `pending` thread row carrying just the id `inbound_for` keys on.
     fn thread(id: &str) -> ThreadRow {
@@ -129,49 +144,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inbound_for_returns_recorded_descriptors_from_a_message() {
-        // The descriptors the drainer would lift off the inbox `message` frame.
-        let message = MessageInData {
-            text: "do the thing".to_owned(),
-            attachments: Some(vec![descriptor("a.txt"), descriptor("b.json")]),
-        };
-
-        let inbound = InboundAttachments::default();
-        inbound.record("th-1", message.attachments.clone().unwrap());
-        let source = InboxAttachmentSource::new(inbound);
-
-        let got = source.inbound_for(&thread("th-1"));
-        assert_eq!(got, message.attachments.unwrap());
+    fn db_with_thread(id: &str) -> Arc<Mutex<Db>> {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_task_row(&TaskRow {
+            id: "t-1".to_owned(),
+            name: None,
+            kind: None,
+            status: "active".to_owned(),
+            created_at: "2026-06-22T00:00:00Z".to_owned(),
+            updated_at: "2026-06-22T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        db.insert_thread(&thread(id)).unwrap();
+        Arc::new(Mutex::new(db))
     }
 
     #[test]
-    fn inbound_for_is_empty_without_a_recorded_message() {
-        let source = InboxAttachmentSource::new(InboundAttachments::default());
+    fn inbound_for_reads_the_persisted_snapshot() {
+        let db = db_with_thread("th-1");
+        let descriptors = vec![descriptor("a.txt"), descriptor("b.json")];
+        db.lock()
+            .unwrap()
+            .set_thread_attachments("th-1", &descriptors)
+            .unwrap();
+
+        let source = DbAttachmentSource::new(db);
+        assert_eq!(source.inbound_for(&thread("th-1")), descriptors);
+    }
+
+    #[test]
+    fn inbound_for_is_empty_without_a_snapshot() {
+        let source = DbAttachmentSource::new(db_with_thread("th-unknown"));
         assert!(source.inbound_for(&thread("th-unknown")).is_empty());
     }
 
+    /// P1-10b regression: a retried run (second `inbound_for` on the same source)
+    /// and a restarted daemon (a FRESH source over the same db) both resolve the
+    /// identical descriptor set — the snapshot is read, never popped.
     #[test]
-    fn record_of_no_attachments_yields_empty() {
-        // A message with no `attachments` records nothing → no-op materialization.
-        let message = MessageInData {
-            text: "no files".to_owned(),
-            attachments: None,
-        };
-        let inbound = InboundAttachments::default();
-        inbound.record("th-2", message.attachments.unwrap_or_default());
-        let source = InboxAttachmentSource::new(inbound);
-        assert!(source.inbound_for(&thread("th-2")).is_empty());
+    fn snapshot_survives_retry_and_a_fresh_source_over_the_same_db() {
+        let db = db_with_thread("th-3");
+        let descriptors = vec![descriptor("once.txt")];
+        db.lock()
+            .unwrap()
+            .set_thread_attachments("th-3", &descriptors)
+            .unwrap();
+
+        let source = DbAttachmentSource::new(Arc::clone(&db));
+        assert_eq!(source.inbound_for(&thread("th-3")), descriptors);
+        // A retry on the same source sees the same set (the old stash was
+        // one-shot and returned empty here).
+        assert_eq!(source.inbound_for(&thread("th-3")), descriptors);
+
+        // A daemon restart = a fresh source instance over the same db.
+        let restarted = DbAttachmentSource::new(db);
+        assert_eq!(restarted.inbound_for(&thread("th-3")), descriptors);
     }
 
+    /// A snapshot that exists but cannot be decoded must NOT resolve to "no
+    /// attachments" (that would run — and succeed — without the inputs). The
+    /// sentinel's negative declared size fails materialization up front.
     #[test]
-    fn inbound_for_clears_the_stash_so_a_retry_does_not_re_materialize() {
-        let inbound = InboundAttachments::default();
-        inbound.record("th-3", vec![descriptor("once.txt")]);
-        let source = InboxAttachmentSource::new(inbound);
+    fn unreadable_snapshot_yields_a_run_failing_sentinel_not_empty() {
+        let db = db_with_thread("th-4");
+        db.lock()
+            .unwrap()
+            .set_thread_attachments("th-4", &"not-an-array")
+            .unwrap();
 
-        assert_eq!(source.inbound_for(&thread("th-3")).len(), 1);
-        // One-shot: a second call (e.g. a retried run) sees nothing.
-        assert!(source.inbound_for(&thread("th-3")).is_empty());
+        let source = DbAttachmentSource::new(db);
+        let got = source.inbound_for(&thread("th-4"));
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].size < 0,
+            "the sentinel must carry a negative declared size so materialization rejects it"
+        );
     }
 }

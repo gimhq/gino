@@ -74,6 +74,12 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('gino-agent/Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      # Prebuilt binaries, pinned versions — reproducible and fast (no compile).
+      - name: Install cargo-deny + cargo-shear
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19.8,cargo-shear@1.13.1
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -82,6 +88,12 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked
+
+      - name: Deny (supply-chain policy)
+        run: cargo deny check
+
+      - name: Shear (unused dependencies)
+        run: cargo shear
 
   security:
     name: security scans

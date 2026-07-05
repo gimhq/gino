@@ -34,8 +34,6 @@ use thiserror::Error;
 
 use crate::protocol::v2::ProvisioningEntry;
 
-/// Default tracing filter directive when neither `RUST_LOG` nor `-v` is set.
-const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default workspace directory (configurable; never a hardcoded Docker mount).
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
 /// Default SQLite filename within the workspace directory.
@@ -48,6 +46,10 @@ const DEFAULT_ATTACHMENT_MAX_SINGLE_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_MAX_EXECUTION_BYTES: u64 = 500 * 1024 * 1024;
 /// Default content-addressed attachment cache cap before LRU GC (A4: 1 GiB).
 const DEFAULT_ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default days a terminal queue row (acked outbox / processed inbox / cron_logs
+/// ledger line / terminal-thread attachment snapshot) is retained before the
+/// periodic GC sweep deletes it (audit P1-9).
+const DEFAULT_RETENTION_DAYS: u32 = 30;
 
 /// Errors raised while validating a resolved [`Config`].
 #[derive(Debug, Error)]
@@ -78,12 +80,12 @@ pub(crate) struct Config {
     pub(crate) connect_token: Option<SecretString>,
     /// Engine environment and defaults handed to the execution backend.
     pub(crate) engine: EngineConfig,
-    /// Local scheduler limits.
-    pub(crate) scheduler: SchedulerConfig,
     /// Thread-executor limits (watchdog thresholds, retry budget).
     pub(crate) executor: ExecutorConfig,
     /// Out-of-band attachment channel limits + backend selection (PLAN-005).
     pub(crate) attachments: AttachmentsConfig,
+    /// Queue/ledger GC retention window (audit P1-9).
+    pub(crate) retention: RetentionConfig,
     /// Global-scope provisioning entries — the desired set of instruction files +
     /// skills materialized into `$ENGINE_CONFIG_DIR/` (PLAN-007 §5). The host
     /// re-pushes the full desired global set each refresh; an overlay carrying
@@ -106,8 +108,10 @@ pub(crate) struct Config {
     pub(crate) heartbeat_interval_ms: u64,
     /// Filesystem layout (workspace + DB path).
     pub(crate) paths: Paths,
-    /// Tracing filter directive (e.g. `info`, `gino_agent=debug`).
-    pub(crate) log_level: String,
+    // No `log_level` here: the tracing filter is fixed at process start from
+    // `RUST_LOG`/`-v` (see `init_tracing`), before any host config layer exists;
+    // a host-sent `logLevel` was never consulted and is now just an ignored
+    // unknown field.
 }
 
 impl Default for Config {
@@ -119,14 +123,13 @@ impl Default for Config {
             register_token: None,
             connect_token: None,
             engine: EngineConfig::default(),
-            scheduler: SchedulerConfig::default(),
             executor: ExecutorConfig::default(),
             attachments: AttachmentsConfig::default(),
+            retention: RetentionConfig::default(),
             entries: Vec::new(),
             config_version: None,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             paths: Paths::default(),
-            log_level: DEFAULT_LOG_LEVEL.to_owned(),
         }
     }
 }
@@ -149,24 +152,6 @@ pub(crate) struct EngineConfig {
     pub(crate) allowed_tools: Vec<String>,
 }
 
-/// Local scheduler limits.
-#[derive(Clone, Debug)]
-pub(crate) struct SchedulerConfig {
-    /// Maximum number of executors running concurrently.
-    pub(crate) max_concurrent_tasks: u32,
-    /// Maximum number of tasks held in the local queue.
-    pub(crate) max_queued_tasks: u32,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self {
-            max_concurrent_tasks: 4,
-            max_queued_tasks: 128,
-        }
-    }
-}
-
 /// Thread-executor limits (agent-architecture §5/§6). These promote the executor's
 /// in-file `WatchdogCfg`/retry defaults to host-overridable config so a deployment
 /// can tune the reap thresholds and retry budget; the runner maps them onto the
@@ -187,28 +172,30 @@ pub(crate) struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         // Mirrors the executor's `WatchdogCfg::default` (Td 60s, Tr 30m, inactivity
-        // 5m) and the schema's `max_attempts` default of 1.
+        // 5m). The retry budget defaults to 3 so retryable (`runner.*`) failures
+        // actually retry under the shipped config — the gate is
+        // `attempt < max_attempts`, so 1 would make every failure terminal.
         Self {
             dispatched_timeout_secs: 60,
             running_timeout_secs: 1_800,
             inactivity_timeout_secs: 300,
-            max_attempts: 1,
+            max_attempts: 3,
         }
     }
 }
 
 /// Byte backend for the out-of-band attachment channel (agent-architecture §9,
 /// decision A2). **Host-proxy is the always-available default** (`GET`/`POST
-/// /agent/attachments`, connect-token auth); `Presigned` (URL/CDN) is selected
-/// only when object storage is configured and is **not implemented this
-/// campaign** — the runner returns an `unsupported` error for it.
+/// /agent/attachments`, connect-token auth). The spec's presigned-URL/CDN
+/// backend was never implemented — its selectable-but-unusable variant is
+/// deleted; re-add it here together with a real backend impl if object storage
+/// lands. An unrecognized `backend` string (including `"presigned"`) leaves the
+/// host-proxy selection untouched.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AttachmentBackendKind {
     /// Host streams the bytes through `GET`/`POST /agent/attachments`.
     #[default]
     HostProxy,
-    /// Presigned URL / CDN (object storage). Not yet implemented.
-    Presigned,
 }
 
 /// Out-of-band attachment channel limits + backend selection (agent-architecture
@@ -236,6 +223,25 @@ impl Default for AttachmentsConfig {
             max_execution_bytes: DEFAULT_ATTACHMENT_MAX_EXECUTION_BYTES,
             content_type_allowlist: Vec::new(),
             cache_max_bytes: DEFAULT_ATTACHMENT_CACHE_MAX_BYTES,
+        }
+    }
+}
+
+/// Queue/ledger GC retention window (audit P1-9). The periodic sweep deletes
+/// **terminal** rows — acked outbox, processed inbox, cron_logs ledger lines,
+/// and attachment snapshots of terminal threads — older than this window.
+/// Un-acked/un-processed rows are never deleted regardless of age (the
+/// at-least-once contract).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetentionConfig {
+    /// Days a terminal row survives before the GC sweep deletes it.
+    pub(crate) days: u32,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            days: DEFAULT_RETENTION_DAYS,
         }
     }
 }
@@ -272,14 +278,13 @@ impl Config {
             register_token,
             connect_token,
             engine,
-            scheduler,
             executor,
             attachments,
+            retention,
             entries,
             version,
             heartbeat_interval_ms,
             paths,
-            log_level,
         } = overlay;
 
         overlay_field(&mut self.host_url, host_url);
@@ -287,9 +292,6 @@ impl Config {
         overlay_field(&mut self.agent_id, agent_id);
         overlay_secret(&mut self.register_token, register_token);
         overlay_secret(&mut self.connect_token, connect_token);
-        if let Some(level) = log_level {
-            self.log_level = level;
-        }
         if let Some(ms) = heartbeat_interval_ms {
             self.heartbeat_interval_ms = ms;
         }
@@ -312,17 +314,6 @@ impl Config {
             self.engine.allowed_tools = tools;
         }
 
-        let SchedulerOverlay {
-            max_concurrent_tasks,
-            max_queued_tasks,
-        } = scheduler;
-        if let Some(value) = max_concurrent_tasks {
-            self.scheduler.max_concurrent_tasks = value;
-        }
-        if let Some(value) = max_queued_tasks {
-            self.scheduler.max_queued_tasks = value;
-        }
-
         let ExecutorOverlay {
             dispatched_timeout_secs,
             running_timeout_secs,
@@ -343,6 +334,11 @@ impl Config {
         }
 
         self.apply_attachments(attachments);
+
+        let RetentionOverlay { days } = retention;
+        if let Some(value) = days {
+            self.retention.days = value;
+        }
 
         // Provisioning entries are a replace-when-Some list (cf. `allowed_tools` /
         // `content_type_allowlist`): the host re-pushes the full desired global set
@@ -379,14 +375,10 @@ impl Config {
             content_type_allowlist,
             cache_max_bytes,
         } = overlay;
-        if let Some(kind) = backend {
-            match kind.as_str() {
-                "host_proxy" | "hostProxy" => {
-                    self.attachments.backend = AttachmentBackendKind::HostProxy;
-                }
-                "presigned" => self.attachments.backend = AttachmentBackendKind::Presigned,
-                _ => {}
-            }
+        if let Some(kind) = backend
+            && matches!(kind.as_str(), "host_proxy" | "hostProxy")
+        {
+            self.attachments.backend = AttachmentBackendKind::HostProxy;
         }
         if let Some(value) = max_single_bytes {
             self.attachments.max_single_bytes = value;
@@ -412,10 +404,7 @@ impl Config {
     }
 }
 
-/// Orchestrator URL derivation. These are part of the resolved config surface
-/// consumed by the register/transport modules added in later changes; they are
-/// already validated by unit tests here but not yet called from `main`.
-#[allow(dead_code)]
+/// Orchestrator URL derivation, consumed by the register/runner wiring.
 impl Config {
     /// The orchestrator HTTP base URL with any trailing slash trimmed.
     pub(crate) fn http_base(&self) -> Result<&str, ConfigError> {
@@ -468,9 +457,9 @@ pub(crate) struct ConfigOverlay {
     register_token: Option<String>,
     connect_token: Option<String>,
     engine: EngineOverlay,
-    scheduler: SchedulerOverlay,
     executor: ExecutorOverlay,
     attachments: AttachmentsOverlay,
+    retention: RetentionOverlay,
     /// Full desired global provisioning set (PLAN-007 §5). Unlike `register_token`
     /// this is host-sent, so it is **not** `#[serde(skip)]`; when present it
     /// replaces `Config::entries` wholesale.
@@ -481,7 +470,6 @@ pub(crate) struct ConfigOverlay {
     version: Option<i64>,
     heartbeat_interval_ms: Option<u64>,
     paths: PathsOverlay,
-    log_level: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -492,13 +480,6 @@ struct EngineOverlay {
     anthropic_base_url: Option<String>,
     model: Option<String>,
     allowed_tools: Option<Vec<String>>,
-}
-
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct SchedulerOverlay {
-    max_concurrent_tasks: Option<u32>,
-    max_queued_tasks: Option<u32>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -522,8 +503,19 @@ struct AttachmentsOverlay {
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+struct RetentionOverlay {
+    days: Option<u32>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct PathsOverlay {
     workspace_dir: Option<PathBuf>,
+    /// Settable only by the env/CLI bootstrap layer ([`ConfigOverlay::paths_bootstrap`]).
+    /// `#[serde(skip)]`: the DB is opened before any host layer applies, so a
+    /// host-sent `paths.dbPath` could never take effect — it is ignored instead
+    /// of silently accepted-and-dead.
+    #[serde(skip)]
     db_path: Option<PathBuf>,
 }
 
@@ -572,13 +564,13 @@ impl ConfigOverlay {
         }
     }
 
-    /// Parse a host-assigned config payload (register response / HTTP refresh /
-    /// WS `config_update`) into an overlay. Unknown fields are rejected so a
-    /// typo in a host payload surfaces loudly instead of being silently dropped.
-    ///
-    /// Consumed by the register/transport modules added in later changes; here
-    /// it is exercised only by unit tests.
-    #[allow(dead_code)]
+    /// Parse a host-assigned config payload into an overlay. Production callers
+    /// deserialize from an already-parsed `Value` (`serde_json::from_value`);
+    /// this string-input wrapper is test-only convenience.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "test-only convenience over serde_json::from_str")
+    )]
     pub(crate) fn from_json(raw: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(raw)
     }
@@ -627,9 +619,10 @@ mod tests {
     #[test]
     fn defaults_have_expected_values() {
         let config = Config::default();
-        assert_eq!(config.log_level, "info");
-        assert_eq!(config.scheduler.max_concurrent_tasks, 4);
-        assert_eq!(config.scheduler.max_queued_tasks, 128);
+        assert_eq!(
+            config.executor.max_attempts, 3,
+            "shipped default must let retryable failures actually retry"
+        );
         assert_eq!(
             config.paths.workspace_dir,
             std::path::PathBuf::from("/var/lib/gino-agent")
@@ -641,6 +634,18 @@ mod tests {
         assert!(config.host_url.is_none());
         assert!(config.register_token.is_none());
         assert!(config.engine.allowed_tools.is_empty());
+        assert_eq!(config.retention.days, 30);
+    }
+
+    #[test]
+    fn from_json_overlays_retention_window() {
+        let mut config = Config::default();
+        config.apply(ConfigOverlay::from_json(r#"{ "retention": { "days": 7 } }"#).unwrap());
+        assert_eq!(config.retention.days, 7);
+
+        // An overlay without `retention` leaves the prior value untouched.
+        config.apply(ConfigOverlay::from_json(r#"{ "logLevel": "debug" }"#).unwrap());
+        assert_eq!(config.retention.days, 7);
     }
 
     #[test]
@@ -689,13 +694,13 @@ mod tests {
             ConfigOverlay::from_json(r#"{ "engine": { "model": "claude-sonnet-4-6" } }"#).unwrap(),
         );
 
-        // Layer 4 — live WS update: overrides only the log level.
-        config.apply(ConfigOverlay::from_json(r#"{ "logLevel": "debug" }"#).unwrap());
+        // Layer 4 — live WS update: overrides only the heartbeat cadence.
+        config.apply(ConfigOverlay::from_json(r#"{ "heartbeatIntervalMs": 5000 }"#).unwrap());
 
         // Latest writer wins for each field…
         assert_eq!(config.host_url.as_deref(), Some("https://new.example.com"));
         assert_eq!(config.engine.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.heartbeat_interval_ms, 5000);
         // …and fields a later layer left unset are preserved.
         assert_eq!(config.agent_name.as_deref(), Some("worker-1"));
         assert_eq!(config.agent_id.as_deref(), Some("agent-123"));
@@ -733,7 +738,7 @@ mod tests {
                         "anthropicBaseUrl": "https://proxy.example.com",
                         "allowedTools": ["Bash", "Read", "Write"]
                     },
-                    "scheduler": { "maxConcurrentTasks": 8 },
+                    "executor": { "maxAttempts": 5 },
                     "paths": { "workspaceDir": "/data/ws" }
                 }"#,
             )
@@ -749,9 +754,9 @@ mod tests {
             Some("https://proxy.example.com")
         );
         assert_eq!(config.engine.allowed_tools, ["Bash", "Read", "Write"]);
-        assert_eq!(config.scheduler.max_concurrent_tasks, 8);
+        assert_eq!(config.executor.max_attempts, 5);
         // A field the payload omitted keeps its default.
-        assert_eq!(config.scheduler.max_queued_tasks, 128);
+        assert_eq!(config.executor.dispatched_timeout_secs, 60);
         assert_eq!(
             config.paths.workspace_dir,
             std::path::PathBuf::from("/data/ws")
@@ -764,8 +769,10 @@ mod tests {
         // unknown fields are accepted (ignored), never rejected. The host's
         // register config legitimately carries `wsUrl`/`configUrl`/`outputUrl`/
         // `protocolVersion` (docs/protocol.md §3) that this overlay does not model.
+        // The retired `scheduler` block (`maxConcurrentTasks`/`maxQueuedTasks` —
+        // execution is strictly serial) is likewise just an unknown field now.
         let overlay = ConfigOverlay::from_json(
-            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 2, "bogusField": 1, "engine": { "model": "m" } }"#,
+            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 2, "bogusField": 1, "scheduler": { "maxConcurrentTasks": 8, "maxQueuedTasks": 16 }, "engine": { "model": "m" } }"#,
         )
         .expect("unknown host config fields must be ignored, not rejected");
         assert_eq!(overlay.engine.model.as_deref(), Some("m"));
@@ -801,9 +808,12 @@ mod tests {
             )
             .unwrap(),
         );
+        // "presigned" was deleted with its unimplemented backend: it now parses
+        // as an unrecognized selection and host-proxy stays in effect, while the
+        // limits from the same overlay still apply.
         assert_eq!(
             config.attachments.backend,
-            super::AttachmentBackendKind::Presigned
+            super::AttachmentBackendKind::HostProxy
         );
         assert_eq!(config.attachments.max_single_bytes, 1_048_576);
         assert_eq!(config.attachments.max_execution_bytes, 4_194_304);

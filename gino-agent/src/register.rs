@@ -36,7 +36,9 @@ const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
 #[derive(Debug, Error)]
 pub(crate) enum RegisterError {
     /// No register token was supplied, and no identity is persisted to reuse.
-    #[error("a register token is required to enroll (set --register-token or GINO_REGISTER_TOKEN)")]
+    #[error(
+        "a register token is required to enroll (set GINO_REGISTER_TOKEN, GINO_REGISTER_TOKEN_FILE, or the deprecated --register-token flag)"
+    )]
     MissingRegisterToken,
     /// The host returned a `register_error {reason}` envelope.
     #[error("host rejected registration: {0}")]
@@ -79,6 +81,12 @@ pub(crate) async fn load_or_register(
     db: &Db,
     http: &HttpClient,
 ) -> Result<ResolvedIdentity, RegisterError> {
+    // Loud startup warning, not a hard reject: loopback/dev deployments may
+    // legitimately run over plain HTTP, but on any real network both the
+    // register token and the connect token would travel in cleartext.
+    if let Some(message) = insecure_host_warning(config.host_url.as_deref()) {
+        warn!("{message}");
+    }
     if let Some(identity) = db.get_identity()? {
         config.agent_id = Some(identity.agent_id.clone());
         config.connect_token = Some(identity.connect_token.clone());
@@ -133,7 +141,19 @@ async fn register(
     // Belt-and-suspenders to the host gate: the success response echoes the
     // version the host will speak (docs/protocol.md §1/§3). Pull it off the config
     // overlay — which is parsed strictly — and refuse a version we cannot speak.
-    if let Some(host_version) = take_host_protocol_version(&mut ok.config)
+    // A declared-but-non-integer version fails CLOSED: it is a host we cannot
+    // reason about, so the agent refuses to connect rather than assuming a match.
+    let host_version = take_host_protocol_version(&mut ok.config).map_err(|raw| {
+        warn!(
+            agent_protocol_version = PROTOCOL_VERSION,
+            host_protocol_version = %raw,
+            "host declared a non-integer protocolVersion — exiting"
+        );
+        RegisterError::UnsupportedProtocol(format!(
+            "the host declared a non-integer protocolVersion ({raw})"
+        ))
+    })?;
+    if let Some(host_version) = host_version
         && host_version != u64::from(PROTOCOL_VERSION)
     {
         warn!(
@@ -176,14 +196,89 @@ fn apply_config_overlay(config: &mut Config, value: &Value) -> Result<(), Regist
 /// Remove and return the host's declared `protocolVersion` from a register
 /// response `config` overlay. Stripping it keeps the strict (`deny_unknown_fields`)
 /// [`ConfigOverlay`] parse happy — the version is consumed by the gate, not config.
-/// Absent / non-integer ⇒ `None` (the host gate via `register_error` still applies).
-fn take_host_protocol_version(config: &mut Value) -> Option<u64> {
-    config.as_object_mut()?.remove("protocolVersion")?.as_u64()
+/// Absent ⇒ `Ok(None)` (the host gate via `register_error` still applies).
+/// Declared but non-integer ⇒ `Err` with the raw value rendered — the caller
+/// fails CLOSED on it rather than connecting to a host it cannot reason about.
+fn take_host_protocol_version(config: &mut Value) -> Result<Option<u64>, String> {
+    let Some(object) = config.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(raw) = object.remove("protocolVersion") else {
+        return Ok(None);
+    };
+    raw.as_u64().map(Some).ok_or_else(|| raw.to_string())
 }
 
 /// A short `arch-os` platform label for the agent registry (e.g. `x86_64-linux`).
 fn platform_string() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+}
+
+/// The warning to log when the host URL is not TLS (`http://`): both bootstrap
+/// tokens would cross the network in cleartext. `None` for `https://` (or an
+/// absent host, which fails validation elsewhere). Split from the `warn!` call
+/// site so the decision is unit-testable.
+fn insecure_host_warning(host_url: Option<&str>) -> Option<String> {
+    let host = host_url?;
+    host.starts_with("http://").then(|| {
+        format!(
+            "host URL {host} is not TLS — the register and connect tokens travel in CLEARTEXT; \
+             use https:// for anything beyond a loopback deployment"
+        )
+    })
+}
+
+/// Env var carrying the register token directly.
+const REGISTER_TOKEN_ENV: &str = "GINO_REGISTER_TOKEN";
+/// Env var naming a file whose trimmed contents are the register token.
+const REGISTER_TOKEN_FILE_ENV: &str = "GINO_REGISTER_TOKEN_FILE";
+
+/// Resolve the bootstrap register token from, in order of preference,
+/// `GINO_REGISTER_TOKEN`, a file named by `GINO_REGISTER_TOKEN_FILE`, and — kept
+/// only for compatibility — the `--register-token` CLI flag. The flag is
+/// deprecated because argv is world-readable via `/proc/*/cmdline`; env and file
+/// deliberately win over it.
+pub(crate) fn resolve_register_token(cli_flag: Option<String>) -> Option<String> {
+    resolve_register_token_from(
+        std::env::var(REGISTER_TOKEN_ENV).ok(),
+        std::env::var_os(REGISTER_TOKEN_FILE_ENV)
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        cli_flag,
+    )
+}
+
+/// Testable core of [`resolve_register_token`]: env value > token file > CLI flag.
+fn resolve_register_token_from(
+    env_token: Option<String>,
+    token_file: Option<&std::path::Path>,
+    cli_flag: Option<String>,
+) -> Option<String> {
+    if let Some(token) = env_token.filter(|token| !token.is_empty()) {
+        return Some(token);
+    }
+    if let Some(path) = token_file {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let token = contents.trim();
+                if token.is_empty() {
+                    warn!(path = %path.display(), "register token file is empty — ignoring it");
+                } else {
+                    return Some(token.to_owned());
+                }
+            }
+            Err(err) => {
+                warn!(path = %path.display(), %err, "could not read the register token file — ignoring it");
+            }
+        }
+    }
+    if cli_flag.is_some() {
+        warn!(
+            "--register-token on the command line is DEPRECATED: argv is world-readable via \
+             /proc/*/cmdline; set {REGISTER_TOKEN_ENV} or {REGISTER_TOKEN_FILE_ENV} instead"
+        );
+    }
+    cli_flag
 }
 
 #[cfg(test)]
@@ -382,6 +477,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_integer_host_protocol_version_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            // Success envelope, but the declared version is a STRING. The check
+            // must fail closed (refuse), not fall through as "no version".
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agentId": "agent-9",
+                "connectToken": "connect-xyz",
+                "config": { "protocolVersion": "2" },
+            })))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().unwrap();
+        let http = HttpClient::new().unwrap();
+        let mut config = bootstrap_config(&server.uri(), Some("reg-tok"));
+
+        let err = load_or_register(&mut config, &db, &http).await.unwrap_err();
+        assert!(
+            matches!(&err, RegisterError::UnsupportedProtocol(_)),
+            "unexpected error: {err:?}"
+        );
+        // Refused before persistence: nothing stored, nothing pinned.
+        assert!(db.get_identity().unwrap().is_none());
+        assert!(config.connect_token.is_none());
+    }
+
+    #[tokio::test]
     async fn matching_host_protocol_version_is_stripped_and_config_applies() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -406,5 +530,63 @@ mod tests {
         // protocolVersion stripped ⇒ the overlay parsed and applied.
         assert_eq!(config.engine.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(config.agent_id.as_deref(), Some("agent-9"));
+    }
+
+    #[test]
+    fn insecure_host_warns_and_tls_host_does_not() {
+        // http:// ⇒ a loud cleartext warning naming the host; https:// / absent ⇒ silence.
+        let message = super::insecure_host_warning(Some("http://gino.example.com")).unwrap();
+        assert!(message.contains("http://gino.example.com"));
+        assert!(message.contains("CLEARTEXT"));
+        assert!(super::insecure_host_warning(Some("https://gino.example.com")).is_none());
+        assert!(super::insecure_host_warning(None).is_none());
+    }
+
+    #[test]
+    fn register_token_env_wins_over_file_and_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "file-tok\n").unwrap();
+        let token = super::resolve_register_token_from(
+            Some("env-tok".to_owned()),
+            Some(&file),
+            Some("flag-tok".to_owned()),
+        );
+        assert_eq!(token.as_deref(), Some("env-tok"));
+    }
+
+    #[test]
+    fn register_token_file_is_read_trimmed_and_beats_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "  file-tok\n").unwrap();
+        // An EMPTY env value must not shadow the file.
+        let token = super::resolve_register_token_from(
+            Some(String::new()),
+            Some(&file),
+            Some("flag-tok".to_owned()),
+        );
+        assert_eq!(token.as_deref(), Some("file-tok"));
+    }
+
+    #[test]
+    fn register_token_flag_is_the_deprecated_fallback() {
+        // No env, an unreadable file path, an empty file: the flag still works
+        // (compat), it is just deprecated.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            super::resolve_register_token_from(None, Some(&missing), Some("flag-tok".to_owned()))
+                .as_deref(),
+            Some("flag-tok")
+        );
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert_eq!(
+            super::resolve_register_token_from(None, Some(&empty), Some("flag-tok".to_owned()))
+                .as_deref(),
+            Some("flag-tok")
+        );
+        assert_eq!(super::resolve_register_token_from(None, None, None), None);
     }
 }

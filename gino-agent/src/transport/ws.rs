@@ -1,9 +1,11 @@
 //! Reconnecting WebSocket client (PLAN-003 §2, PLAN-001 `ws.rs`).
 //!
-//! A faithful Rust port of the TypeScript runner's [`ws.ts`](../../../container/gino-agent/src/ws.ts):
-//! outbox-backed at-least-once delivery, inbox dedup/replay, bounded-backoff
-//! reconnect, and (new here) a periodic heartbeat. The connection is **outbound
-//! only** — the runner always dials the orchestrator, never the reverse.
+//! A Rust port of the TypeScript runner's [`ws.ts`](../../../container/gino-agent/src/ws.ts):
+//! outbox-backed at-least-once delivery, inbox dedup/replay, capped-backoff
+//! reconnect (the delay is bounded, the attempts never are — P0-2), and (new
+//! here) a periodic heartbeat plus read-liveness detection of half-open sockets
+//! (P2-16). The connection is **outbound only** — the runner always dials the
+//! orchestrator, never the reverse.
 //!
 //! ## Authentication
 //!
@@ -14,19 +16,27 @@
 //! ## Delivery model (protocol v2)
 //!
 //! * **Outbound** — every data frame is persisted to the `outbox` before it is
-//!   sent (by [`super::Transport::send`]), storing the frame's `data` plus its
-//!   correlation ids in the indexed columns. The driver transmits the freshly
-//!   queued envelope immediately and, on every (re)connect, replays *all* unacked
-//!   rows oldest-first — rebuilding each `{type, …ids, data, outboxId}` envelope
-//!   from the columns via [`build_envelope`], byte-identical to the live send. The
-//!   host's `ack {id}` marks a row acked. Stale immediate sends queued while
-//!   disconnected are discarded on reconnect so replay does not double-transmit.
+//!   sent (producers enqueue via [`crate::db::Db::enqueue_outbox_correlated`] and
+//!   poke the flush handle), storing the frame's `data` plus its
+//!   correlation ids in the indexed columns. On every (re)connect the driver
+//!   replays *all* unacked rows oldest-first — rebuilding each `{type, …ids,
+//!   data, outboxId}` envelope from the columns via [`build_envelope`],
+//!   byte-identical to the live send. Between reconnects a flush poke transmits
+//!   only the rows **not yet sent on this connection** (a per-connection
+//!   watermark — P2-16: flushing under ack lag must not retransmit the whole
+//!   backlog every time); rows whose acks stall for a full ack window are
+//!   retransmitted in bulk. The host's `ack {id}` marks a row acked.
 //! * **Inbound** — every frame (bar `ack`, and unknown forward-compat frames) is
 //!   recorded to the `inbox` *verbatim* (the full received frame is the payload;
 //!   the `type` column classifies it and the correlation ids index it), a
 //!   `msg_ack` is returned so the host can advance its cursor, and the typed frame
-//!   is forwarded to the consumer. Rows stay unprocessed until the consumer calls
-//!   [`super::Transport::mark_inbox_processed`]; `close` is marked processed
+//!   is forwarded to the consumer. The `msg_id` UNIQUE column closes the
+//!   at-least-once loop (protocol.md §6): a redelivery of an already-stored
+//!   `msg_id` inserts nothing and is only re-acked, so a lost `msg_ack` can never
+//!   run the same frame twice. A known-type frame with a malformed body is
+//!   dead-lettered (acked and dropped) rather than left to head-of-line-block the
+//!   stream. Rows stay unprocessed until the consumer marks them processed
+//!   ([`crate::db::Db::mark_inbox_processed`]); `close` is marked processed
 //!   *before* delivery to avoid a spurious re-shutdown on crash recovery.
 
 use std::sync::{Arc, Mutex};
@@ -39,9 +49,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, warn};
 
@@ -51,8 +61,26 @@ use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
 
 /// The auth header carrying the connect token (host WS handler reads this name).
 const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
-/// Inbox replay poison-pill guard (TS parity): drop a row after this many retries.
-const MAX_INBOX_RETRIES: i64 = 10;
+/// Inbox poison-pill guard: discard a row after this many PROCESSING failures
+/// (`retry_count` is bumped by the consumer when applying the frame fails, never
+/// by a reconnect replay — network flaps must not discard a legitimately queued
+/// message).
+pub(crate) const MAX_INBOX_RETRIES: i64 = 10;
+/// Outbox poison-pill guard (audit P3), mirroring [`MAX_INBOX_RETRIES`]: a row
+/// whose payload no longer parses can never be rebuilt into an envelope, so
+/// after this many replay attempts it is dead-lettered
+/// ([`crate::db::Db::mark_outbox_dead`]) instead of replayed forever. Healthy
+/// rows never reach the guard — only the malformed-payload branch counts, so
+/// ack lag can never kill a deliverable frame.
+pub(crate) const MAX_OUTBOX_RETRIES: i64 = 10;
+/// Host-supplied heartbeat cadence clamp: `heartbeatIntervalMs: 0` would panic
+/// `tokio::time::interval`, and an absurdly large value would silence liveness.
+const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
+const MAX_HEARTBEAT: Duration = Duration::from_hours(1);
+/// Per-attempt dial bound (P2-16): a black-holed TCP connect (or a peer that
+/// accepts but never completes the WS handshake) must not stall a reconnect
+/// attempt indefinitely — the backoff loop moves on to the next attempt.
+pub(super) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pre-serialized liveness ping; equal to the v2 `OutboundFrameV2::Heartbeat`
 /// with no `activeThreads` summary (asserted by a unit test) so the constant
 /// never drifts from the type. The runner-driven periodic heartbeat carries no
@@ -82,16 +110,28 @@ pub(crate) enum WsError {
     /// The handshake/TLS/TCP dial failed.
     #[error("dial: {0}")]
     Dial(TungsteniteError),
+    /// The dial did not complete within the per-attempt bound.
+    #[error("dial timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 /// Dial `ws_url`, authenticating with `connect_token` in the `x-internal-token`
-/// header. Used for both the initial connection and every reconnect.
-pub(super) async fn dial(ws_url: &str, connect_token: &SecretString) -> Result<WsStream, WsError> {
+/// header, bounded by `timeout` per attempt (P2-16: a black-holed connect must
+/// not stall the reconnect loop). Used for both the initial connection and
+/// every reconnect, with [`DIAL_TIMEOUT`].
+pub(super) async fn dial(
+    ws_url: &str,
+    connect_token: &SecretString,
+    timeout: Duration,
+) -> Result<WsStream, WsError> {
     let mut request = ws_url.into_client_request().map_err(WsError::Request)?;
     let value =
         HeaderValue::from_str(connect_token.expose_secret()).map_err(|_| WsError::Header)?;
     request.headers_mut().insert(INTERNAL_TOKEN_HEADER, value);
-    let (stream, _response) = connect_async(request).await.map_err(WsError::Dial)?;
+    let (stream, _response) = tokio::time::timeout(timeout, connect_async(request))
+        .await
+        .map_err(|_elapsed| WsError::Timeout(timeout))?
+        .map_err(WsError::Dial)?;
     Ok(stream)
 }
 
@@ -100,29 +140,28 @@ pub(super) async fn dial(ws_url: &str, connect_token: &SecretString) -> Result<W
 // ---------------------------------------------------------------------------
 
 /// Owns the connection lifecycle. Built by [`super::Transport::open`] and run on
-/// a spawned task; it never returns until cancelled or reconnect is exhausted.
+/// a spawned task; it never returns until cancelled — reconnect never gives up
+/// (P0-2).
 #[derive(Debug)]
 pub(super) struct WsDriver {
     pub(super) ws_url: String,
     pub(super) connect_token: SecretString,
     pub(super) db: Arc<Mutex<Db>>,
     pub(super) inbound_tx: mpsc::UnboundedSender<Inbound>,
-    pub(super) immediate_rx: mpsc::UnboundedReceiver<String>,
     pub(super) cancel: Arc<Cancel>,
     pub(super) flush: Arc<Notify>,
     pub(super) heartbeat: Duration,
+    pub(super) read_timeout: Duration,
+    pub(super) ack_timeout: Duration,
     pub(super) backoff: Backoff,
 }
 
 impl WsDriver {
-    /// Drive `initial` until it drops, then reconnect-with-backoff in a loop until
-    /// cancelled or the backoff is exhausted.
+    /// Drive `initial` until it drops, then reconnect-with-backoff in a loop
+    /// until cancelled.
     pub(super) async fn run(mut self, initial: WsStream) {
         let mut current = initial;
         loop {
-            // Discard immediate-send envelopes that piled up while disconnected;
-            // `serve` replays the outbox, which is the durable source of truth.
-            while self.immediate_rx.try_recv().is_ok() {}
             self.serve(current).await;
             if self.cancel.is_cancelled() {
                 break;
@@ -139,20 +178,41 @@ impl WsDriver {
     }
 
     /// Serve a single live connection: replay outbox + inbox on connect, then
-    /// multiplex inbound reads, queued outbound sends, and the heartbeat until the
-    /// socket drops or shutdown is requested.
+    /// multiplex inbound reads, queued outbound sends, the heartbeat, the
+    /// ack-progress check, and the read-liveness deadline until the socket drops
+    /// or shutdown is requested.
     async fn serve(&mut self, stream: WsStream) {
         let (mut sink, mut read) = stream.split();
 
-        if let Err(err) = replay_outbox(&mut sink, &self.db).await {
-            warn!(error = %err, "outbox replay failed on connect; reconnecting");
-            return;
-        }
+        // Full replay on (re)connect — the one moment every unacked row is
+        // retransmitted. The returned watermark makes later flushes incremental.
+        let mut sent_watermark = match replay_outbox(&mut sink, &self.db, 0).await {
+            Ok(watermark) => watermark,
+            Err(err) => {
+                warn!(error = %err, "outbox replay failed on connect; reconnecting");
+                return;
+            }
+        };
         replay_inbox(&self.db, &self.inbound_tx);
 
-        let mut heartbeat = tokio::time::interval(self.heartbeat);
+        let heartbeat_period = clamp_period(self.heartbeat);
+        let mut heartbeat = tokio::time::interval(heartbeat_period);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await; // consume the immediate first tick
+
+        // Ack-progress check (P2-16): if the oldest transmitted-but-unacked row
+        // is unchanged across two consecutive ticks, retransmit the backlog.
+        let mut ack_check = tokio::time::interval(clamp_period(self.ack_timeout));
+        ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ack_check.tick().await;
+        let mut stalled_oldest: Option<i64> = None;
+
+        // Read-liveness (P2-16): every heartbeat also sends a WS ping, so a live
+        // peer produces at least pong traffic; a window with nothing received at
+        // all means a half-open socket — tear down instead of waiting for the
+        // ~15-minute TCP retransmit timeout.
+        let read_window = read_window(self.read_timeout, heartbeat_period);
+        let mut last_rx = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -161,6 +221,7 @@ impl WsDriver {
                     return;
                 }
                 message = read.next() => {
+                    last_rx = tokio::time::Instant::now();
                     match message {
                         Some(Ok(message)) => {
                             if !self.on_message(message, &mut sink).await {
@@ -177,24 +238,43 @@ impl WsDriver {
                         }
                     }
                 }
-                Some(raw) = self.immediate_rx.recv() => {
-                    if sink.send(Message::text(raw)).await.is_err() {
-                        return;
-                    }
-                }
                 () = self.flush.notified() => {
-                    // A producer enqueued frames straight to the outbox; replay the
-                    // unacked rows over the live socket so they ship now (the host
-                    // dedups, exactly as on a reconnect replay).
-                    if let Err(err) = replay_outbox(&mut sink, &self.db).await {
-                        warn!(error = %err, "outbox flush failed; reconnecting");
-                        return;
+                    // A producer enqueued frames straight to the outbox; ship the
+                    // rows not yet sent on this connection (incremental — already
+                    // transmitted rows wait for an ack, a stall, or a reconnect).
+                    match replay_outbox(&mut sink, &self.db, sent_watermark).await {
+                        Ok(watermark) => sent_watermark = watermark,
+                        Err(err) => {
+                            warn!(error = %err, "outbox flush failed; reconnecting");
+                            return;
+                        }
                     }
                 }
                 _ = heartbeat.tick() => {
                     if sink.send(Message::text(HEARTBEAT_FRAME.to_owned())).await.is_err() {
                         return;
                     }
+                    // Solicit a pong so read-liveness sees traffic from a peer
+                    // that has nothing else to send.
+                    if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                        return;
+                    }
+                }
+                _ = ack_check.tick() => {
+                    if ack_stalled(&self.db, sent_watermark, &mut stalled_oldest) {
+                        debug!("no ack progress within the ack window; retransmitting unacked outbox");
+                        match replay_outbox(&mut sink, &self.db, 0).await {
+                            Ok(watermark) => sent_watermark = watermark,
+                            Err(err) => {
+                                warn!(error = %err, "outbox retransmit failed; reconnecting");
+                                return;
+                            }
+                        }
+                    }
+                }
+                () = tokio::time::sleep_until(last_rx + read_window) => {
+                    warn!("nothing received within the read-liveness window; treating the connection as dead");
+                    return;
                 }
             }
         }
@@ -222,8 +302,8 @@ impl WsDriver {
         }
     }
 
-    /// Reconnect with bounded backoff. Returns the new stream, or `None` if
-    /// cancelled or the backoff is exhausted.
+    /// Reconnect with capped backoff (the delay is bounded, the attempts are
+    /// not). Returns the new stream, or `None` once cancelled.
     async fn reconnect(&mut self) -> Option<WsStream> {
         loop {
             let delay = self.backoff.next_delay()?;
@@ -234,7 +314,7 @@ impl WsDriver {
             if self.cancel.is_cancelled() {
                 return None;
             }
-            match dial(&self.ws_url, &self.connect_token).await {
+            match dial(&self.ws_url, &self.connect_token, DIAL_TIMEOUT).await {
                 Ok(stream) => {
                     debug!("reconnected; replaying unacked state");
                     return Some(stream);
@@ -249,22 +329,64 @@ impl WsDriver {
 // Outbox / inbox replay
 // ---------------------------------------------------------------------------
 
-/// Transmit every unacked outbox row, oldest-first, bumping each row's retry
-/// counter. DB read/write errors are logged and skipped; only a socket send
-/// failure propagates (the caller reconnects).
-async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), TungsteniteError> {
+/// Transmit the unacked outbox rows with id above `after_id`, oldest-first,
+/// bumping each transmitted row's retry counter. `after_id = 0` is the full
+/// replay (reconnect / ack-stall retransmit); a flush passes the connection's
+/// send watermark so only fresh rows ship (P2-16). Returns the new watermark —
+/// the highest row id considered. DB read/write errors are logged and skipped;
+/// only a socket send failure propagates (the caller reconnects).
+async fn replay_outbox(
+    sink: &mut WsSink,
+    db: &Arc<Mutex<Db>>,
+    after_id: i64,
+) -> Result<i64, TungsteniteError> {
+    let (envelopes, watermark) = collect_outbox_replay(db, after_id);
+    let count = envelopes.len();
+    for envelope in envelopes {
+        sink.send(Message::text(envelope)).await?;
+    }
+    if count > 0 {
+        debug!(count, after_id, "transmitted unacked outbox rows");
+    }
+    Ok(watermark)
+}
+
+/// Build the envelope for every replayable unacked outbox row with id above
+/// `after_id`, oldest-first, bumping each row's retry counter. A row whose
+/// payload fails to parse is skipped, and — since that failure is deterministic
+/// and will recur on every replay — dead-lettered once its replay count reaches
+/// [`MAX_OUTBOX_RETRIES`] (the outbound poison policy, audit P3). Returns the
+/// envelopes plus the new send watermark (the highest row id considered, or
+/// `after_id` when none qualified). Split from [`replay_outbox`] so the per-row
+/// policy is unit-testable without a live socket.
+fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i64) {
     let rows = match lock_db(db).list_unacked_outbox() {
         Ok(rows) => rows,
         Err(err) => {
             warn!(error = %err, "failed to list outbox for replay");
-            return Ok(());
+            return (Vec::new(), after_id);
         }
     };
-    let count = rows.len();
+    let mut watermark = after_id;
+    let mut envelopes = Vec::with_capacity(rows.len());
     for row in rows {
+        if row.id <= after_id {
+            continue;
+        }
+        watermark = watermark.max(row.id);
         let _ = lock_db(db).increment_outbox_retry(row.id);
+        let attempts = row.retry_count + 1;
         let Ok(data) = serde_json::from_str::<Value>(&row.payload) else {
-            warn!(id = row.id, "skipping outbox row with malformed payload");
+            if attempts >= MAX_OUTBOX_RETRIES {
+                warn!(
+                    id = row.id,
+                    attempts,
+                    "outbox row payload malformed after repeated replays; dead-lettering (poison)"
+                );
+                let _ = lock_db(db).mark_outbox_dead(row.id);
+            } else {
+                warn!(id = row.id, "skipping outbox row with malformed payload");
+            }
             continue;
         };
         // Rebuild the v2 envelope from the correlation columns + `data`. The
@@ -277,16 +399,38 @@ async fn replay_outbox(sink: &mut WsSink, db: &Arc<Mutex<Db>>) -> Result<(), Tun
             row.thread_id.as_deref(),
             row.id,
         );
-        sink.send(Message::text(envelope.to_string())).await?;
+        envelopes.push(envelope.to_string());
     }
-    if count > 0 {
-        debug!(count, "replayed unacked outbox rows");
+    (envelopes, watermark)
+}
+
+/// Whether ack progress has stalled (P2-16): `stalled` carries the oldest
+/// transmitted-but-unacked row id observed on the previous check; seeing the
+/// SAME id again means the host acked nothing for a full ack window, so the
+/// caller retransmits the backlog. Any progress (a different oldest, or no
+/// outstanding rows at all) just records the new observation.
+fn ack_stalled(db: &Arc<Mutex<Db>>, watermark: i64, stalled: &mut Option<i64>) -> bool {
+    let oldest = match lock_db(db).list_unacked_outbox() {
+        // Rows are ordered by id, so the first at-or-below the watermark is the
+        // oldest row already transmitted on this connection.
+        Ok(rows) => rows.iter().map(|row| row.id).find(|id| *id <= watermark),
+        Err(err) => {
+            warn!(error = %err, "failed to inspect outbox for ack progress");
+            None
+        }
+    };
+    if oldest.is_some() && *stalled == oldest {
+        *stalled = None;
+        return true;
     }
-    Ok(())
+    *stalled = oldest;
+    false
 }
 
 /// Re-deliver every unprocessed inbox row to the consumer (dedup: rows are not
-/// re-recorded). Mirrors the TS `replayInbound`: drop poison rows, skip
+/// re-recorded). Mirrors the TS `replayInbound`: drop poison rows (rows whose
+/// PROCESSING failed [`MAX_INBOX_RETRIES`] times — a replay itself never bumps
+/// the counter, so reconnect flaps cannot poison a queued message), skip
 /// `system_config` (the host re-pushes config), mark `system_close` processed
 /// before delivery, and defer the rest until the consumer acknowledges them.
 fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>) {
@@ -302,12 +446,11 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
         if row.retry_count >= MAX_INBOX_RETRIES {
             warn!(
                 id = row.id,
-                "inbox row exceeded retry limit; marking processed"
+                "inbox row exceeded the processing-failure limit; marking processed"
             );
             let _ = lock_db(db).mark_inbox_processed(row.id);
             continue;
         }
-        let _ = lock_db(db).increment_inbox_retry(row.id);
 
         let Ok(frame) = serde_json::from_str::<InboundFrameV2>(&row.payload) else {
             warn!(
@@ -349,37 +492,79 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
 // Inbound handling
 // ---------------------------------------------------------------------------
 
+/// The socket-free decision for one received text frame, made by
+/// [`classify_inbound`] and acted on by [`handle_inbound`] (which owns the sink).
+#[derive(Debug)]
+enum InboundDisposition {
+    /// Nothing to send or deliver: an outbox `ack` (already applied), a
+    /// forward-compat unknown frame, or junk with no ackable `msgId`.
+    Done,
+    /// Send a `msg_ack` but deliver nothing: a duplicate redelivery of an
+    /// already-stored `msg_id`, or a dead-lettered malformed known-type frame.
+    AckOnly { msg_id: i64 },
+    /// Freshly persisted: ack durable receipt (when the frame carries a
+    /// `msg_id`) and forward to the consumer. The frame is boxed to keep the
+    /// enum's ack-only variants small.
+    Deliver {
+        frame: Box<InboundFrameV2>,
+        inbox_id: i64,
+        msg_id: Option<i64>,
+    },
+}
+
 /// Route a freshly received text frame: ack our outbox, drop a forward-compat
 /// unknown frame, or persist + msg_ack + forward an inbound frame. The full frame
 /// is stored to the inbox verbatim (the host's wire bytes, parsed once as a
-/// [`Value`] for storage and once as the typed frame for routing). Parse failures
-/// are logged and swallowed (the socket stays up); only a `msg_ack` send failure
-/// propagates.
+/// [`Value`] for storage and once as the typed frame for routing); the `msg_id`
+/// UNIQUE column dedups an at-least-once redelivery, which is re-acked without a
+/// second row. Parse failures are dead-lettered (acked away when a `msgId` is
+/// extractable, so a permanently malformed frame cannot head-of-line-block the
+/// stream) or logged and swallowed; only a `msg_ack` send failure propagates.
 async fn handle_inbound(
     text: &str,
     sink: &mut WsSink,
     db: &Arc<Mutex<Db>>,
     inbound_tx: &mpsc::UnboundedSender<Inbound>,
 ) -> Result<(), TungsteniteError> {
+    match classify_inbound(text, db) {
+        InboundDisposition::Done => Ok(()),
+        InboundDisposition::AckOnly { msg_id } => send_msg_ack(sink, msg_id).await,
+        InboundDisposition::Deliver {
+            frame,
+            inbox_id,
+            msg_id,
+        } => {
+            // Confirm durable receipt so the host can advance its cursor.
+            if let Some(msg_id) = msg_id {
+                send_msg_ack(sink, msg_id).await?;
+            }
+            deliver(*frame, inbox_id, db, inbound_tx);
+            Ok(())
+        }
+    }
+}
+
+/// Parse, dedup, and persist one received text frame (everything except the
+/// socket IO, so the at-least-once decisions are unit-testable).
+fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
     let frame = match serde_json::from_str::<InboundFrameV2>(text) {
         Ok(frame) => frame,
-        Err(err) => {
-            warn!(error = %err, "ignoring unparsable inbound frame");
-            return Ok(());
-        }
+        // An unknown `type` parses into `Unknown`, so a typed-parse failure is a
+        // KNOWN type with a malformed body (or unusable JSON): dead-letter it.
+        Err(err) => return dead_letter(text, &err),
     };
 
     // The host's `ack {id}` confirms one of our outbox rows.
     if let InboundFrameV2::Ack { id } = frame {
         let _ = lock_db(db).mark_outbox_acked(id);
-        return Ok(());
+        return InboundDisposition::Done;
     }
 
     // A frame `type` this runner does not model (additive-within-major): ignore it
     // rather than persist/ack/deliver a frame we cannot act on.
     if matches!(frame, InboundFrameV2::Unknown) {
         debug!("ignoring unknown inbound v2 frame");
-        return Ok(());
+        return InboundDisposition::Done;
     }
 
     // Persist the FULL received frame (verbatim) for at-least-once before doing
@@ -390,30 +575,73 @@ async fn handle_inbound(
             // Unreachable in practice — the typed parse above already succeeded —
             // but never persist a payload we cannot re-deliver verbatim.
             warn!(error = %err, "inbound frame is not storable json; dropping");
-            return Ok(());
+            return InboundDisposition::Done;
         }
     };
     let inbox_type = inbox_type(&frame);
     let (task_id, secondary_id) = correlation_of(&frame);
-    let inbox_id =
-        match lock_db(db).record_inbound_correlated(inbox_type, &raw, task_id, secondary_id) {
-            Ok(id) => id,
-            Err(err) => {
-                warn!(error = %err, "failed to persist inbound frame; dropping");
-                return Ok(());
+    let msg_id = msg_id_of(&frame);
+    match lock_db(db).record_inbound_correlated(inbox_type, &raw, task_id, secondary_id, msg_id) {
+        Ok(Some(inbox_id)) => InboundDisposition::Deliver {
+            frame: Box::new(frame),
+            inbox_id,
+            msg_id,
+        },
+        // `msg_id` already stored: a redelivery after a lost `msg_ack`. Re-ack so
+        // the host advances; the original row already drives (or drove) delivery.
+        Ok(None) => match msg_id {
+            Some(msg_id) => {
+                debug!(msg_id, "duplicate inbound delivery; re-acking");
+                InboundDisposition::AckOnly { msg_id }
             }
-        };
-
-    // Confirm durable receipt so the host can advance its cursor.
-    if let Some(msg_id) = msg_id_of(&frame) {
-        let ack = serde_json::to_string(&OutboundFrameV2::MsgAck { msg_id });
-        if let Ok(ack) = ack {
-            sink.send(Message::text(ack)).await?;
+            // Unreachable: only a `msg_id` collision can conflict.
+            None => InboundDisposition::Done,
+        },
+        Err(err) => {
+            warn!(error = %err, "failed to persist inbound frame; dropping");
+            InboundDisposition::Done
         }
     }
+}
 
-    deliver(frame, inbox_id, db, inbound_tx);
+/// Dead-letter a frame that failed the typed parse: extract the top-level
+/// `msgId` so the row can be acked away (the host must not resend it forever);
+/// with no extractable `msgId` there is nothing to ack — drop it.
+fn dead_letter(text: &str, err: &serde_json::Error) -> InboundDisposition {
+    let msg_id = serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|raw| raw.get("msgId")?.as_i64());
+    if let Some(msg_id) = msg_id {
+        warn!(error = %err, msg_id, "dead-lettering malformed inbound frame (acked, dropped)");
+        InboundDisposition::AckOnly { msg_id }
+    } else {
+        warn!(error = %err, "ignoring unparsable inbound frame");
+        InboundDisposition::Done
+    }
+}
+
+/// Send a `msg_ack {msgId}` over the live sink.
+async fn send_msg_ack(sink: &mut WsSink, msg_id: i64) -> Result<(), TungsteniteError> {
+    if let Ok(ack) = serde_json::to_string(&OutboundFrameV2::MsgAck { msg_id }) {
+        sink.send(Message::text(ack)).await?;
+    }
     Ok(())
+}
+
+/// The effective cadence for a periodic driver timer (heartbeat / ack check):
+/// the supplied interval clamped into [`MIN_HEARTBEAT`, `MAX_HEARTBEAT`] so
+/// `heartbeatIntervalMs: 0` (which would panic `tokio::time::interval`) or an
+/// absurd value cannot break the transport.
+fn clamp_period(requested: Duration) -> Duration {
+    requested.clamp(MIN_HEARTBEAT, MAX_HEARTBEAT)
+}
+
+/// The effective read-liveness window: the (clamped) configured window, but
+/// never below two heartbeat periods — the pongs the heartbeat solicits are the
+/// guaranteed inbound traffic, so a window shorter than their cadence would
+/// declare every healthy-but-quiet connection dead.
+fn read_window(requested: Duration, heartbeat: Duration) -> Duration {
+    clamp_period(requested).max(heartbeat.saturating_mul(2))
 }
 
 /// Forward a frame to the consumer. `close` is marked processed *before* delivery
@@ -495,12 +723,18 @@ fn msg_id_of(frame: &InboundFrameV2) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::{
-        HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, correlation_of, inbox_type,
-        msg_id_of,
+        HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, InboundDisposition,
+        MAX_HEARTBEAT, MAX_OUTBOX_RETRIES, MIN_HEARTBEAT, ack_stalled, clamp_period,
+        classify_inbound, collect_outbox_replay, correlation_of, inbox_type, msg_id_of,
+        read_window,
     };
+    use crate::db::Db;
     use crate::protocol::v2::{InboundFrameV2, MessageInData};
 
     fn message(thread_id: Option<&str>) -> InboundFrameV2 {
@@ -513,6 +747,117 @@ mod tests {
             },
             msg_id: Some(3),
         }
+    }
+
+    /// Outbox poison policy (audit P3): a row whose payload cannot be parsed is
+    /// skipped on each replay and dead-lettered at [`MAX_OUTBOX_RETRIES`]
+    /// attempts, while healthy rows keep replaying before and after.
+    #[test]
+    fn malformed_outbox_row_dead_letters_after_repeated_replays() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let healthy = {
+            let guard = db.lock().unwrap();
+            let id = guard.enqueue_outbox("heartbeat", &json!({})).unwrap();
+            // A malformed payload can only enter via raw SQL — the enqueue API
+            // always serializes valid JSON.
+            guard
+                .exec_raw("INSERT INTO outbox (type, payload) VALUES ('thread_result', 'not-json')")
+                .unwrap();
+            id
+        };
+
+        // Below the limit: the malformed row is skipped (never an envelope) but
+        // stays queued; the healthy row replays on every full replay.
+        for _ in 0..MAX_OUTBOX_RETRIES - 1 {
+            let (envelopes, _) = collect_outbox_replay(&db, 0);
+            assert_eq!(envelopes.len(), 1);
+            assert!(envelopes[0].contains("heartbeat"));
+            assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 2);
+        }
+
+        // The attempt that reaches the limit dead-letters the poison row…
+        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
+        let unacked = db.lock().unwrap().list_unacked_outbox().unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].id, healthy);
+
+        // …and the healthy row continues to replay afterwards.
+        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
+    }
+
+    /// P2-16 regression: `after_id` makes replay incremental — rows at or below
+    /// the send watermark are not rebuilt (so a flush cannot retransmit them),
+    /// and the returned watermark advances to the highest row considered.
+    #[test]
+    fn collect_outbox_replay_skips_rows_at_or_below_the_watermark() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        {
+            let guard = db.lock().unwrap();
+            guard
+                .enqueue_outbox("thread_message", &json!({"seq": 1}))
+                .unwrap();
+            guard
+                .enqueue_outbox("thread_message", &json!({"seq": 2}))
+                .unwrap();
+        }
+
+        // Full replay sends both and reports watermark 2.
+        let (all, watermark) = collect_outbox_replay(&db, 0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(watermark, 2);
+
+        // A flush at that watermark has nothing new to send…
+        let (incremental, watermark) = collect_outbox_replay(&db, watermark);
+        assert!(incremental.is_empty());
+        assert_eq!(watermark, 2);
+
+        // …and a freshly enqueued row is the only thing the next flush sends.
+        db.lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 3}))
+            .unwrap();
+        let (fresh, watermark) = collect_outbox_replay(&db, watermark);
+        assert_eq!(fresh.len(), 1);
+        assert!(fresh[0].contains("\"seq\":3"));
+        assert_eq!(watermark, 3);
+    }
+
+    /// P2-16: the ack-progress check trips only when the SAME oldest
+    /// transmitted-but-unacked row survives two consecutive checks; acked
+    /// progress or untransmitted rows never trip it.
+    #[test]
+    fn ack_stall_requires_the_same_oldest_row_across_two_checks() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let first = db
+            .lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 1}))
+            .unwrap();
+        let second = db
+            .lock()
+            .unwrap()
+            .enqueue_outbox("thread_message", &json!({"seq": 2}))
+            .unwrap();
+
+        // Rows beyond the watermark (never transmitted) are not "stalled".
+        let mut stalled = None;
+        assert!(!ack_stalled(&db, 0, &mut stalled));
+        assert!(!ack_stalled(&db, 0, &mut stalled));
+
+        // First check under the watermark only records the observation…
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        // …the second check with zero ack progress trips the retransmit.
+        assert!(ack_stalled(&db, second, &mut stalled));
+
+        // Ack progress between checks (oldest changes) does not trip.
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        db.lock().unwrap().mark_outbox_acked(first).unwrap();
+        assert!(!ack_stalled(&db, second, &mut stalled));
+
+        // Everything acked: nothing outstanding, never trips.
+        db.lock().unwrap().mark_outbox_acked(second).unwrap();
+        assert!(!ack_stalled(&db, second, &mut stalled));
+        assert!(!ack_stalled(&db, second, &mut stalled));
     }
 
     #[test]
@@ -609,5 +954,235 @@ mod tests {
     fn heartbeat_frame_carries_empty_data_object() {
         // The constant is the v2 liveness ping with no `activeThreads` summary.
         assert_eq!(HEARTBEAT_FRAME, r#"{"type":"heartbeat","data":{}}"#);
+    }
+
+    /// P1-12 regression: a host-supplied `heartbeatIntervalMs: 0` (or an absurd
+    /// value) is clamped, never handed to `tokio::time::interval` (which panics
+    /// on zero).
+    #[test]
+    fn clamp_period_clamps_zero_and_absurd_values() {
+        assert_eq!(clamp_period(Duration::ZERO), MIN_HEARTBEAT);
+        assert_eq!(clamp_period(Duration::from_hours(24 * 365)), MAX_HEARTBEAT);
+        // A sane value passes through unchanged.
+        assert_eq!(
+            clamp_period(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    /// P2-16: the read-liveness window is clamped and never drops below two
+    /// heartbeat periods (the guaranteed pong cadence).
+    #[test]
+    fn read_window_never_undercuts_the_pong_cadence() {
+        // Wider than two heartbeats: passes through (clamped only).
+        assert_eq!(
+            read_window(Duration::from_secs(90), Duration::from_secs(30)),
+            Duration::from_secs(90)
+        );
+        // Narrower than two heartbeats: floored at 2× so pongs can arrive.
+        assert_eq!(
+            read_window(Duration::from_secs(90), Duration::from_hours(1)),
+            Duration::from_hours(2)
+        );
+        // Zero is clamped before the floor applies.
+        assert_eq!(
+            read_window(Duration::ZERO, Duration::from_millis(100)),
+            MIN_HEARTBEAT
+        );
+    }
+
+    fn test_db() -> Arc<Mutex<Db>> {
+        Arc::new(Mutex::new(Db::open_in_memory().unwrap()))
+    }
+
+    const MESSAGE_FRAME: &str =
+        r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hi"},"msgId":7}"#;
+
+    /// P0-3 regression: delivering the same `msgId` twice stores exactly ONE
+    /// inbox row and delivers ONE frame; the duplicate is only re-acked (so a
+    /// lost `msg_ack` cannot run the same prompt twice).
+    #[test]
+    fn duplicate_msg_id_is_reacked_not_restored() {
+        let db = test_db();
+
+        let first = classify_inbound(MESSAGE_FRAME, &db);
+        assert!(
+            matches!(
+                first,
+                InboundDisposition::Deliver {
+                    msg_id: Some(7),
+                    ..
+                }
+            ),
+            "first delivery persists and delivers: {first:?}"
+        );
+
+        let dup = classify_inbound(MESSAGE_FRAME, &db);
+        assert!(
+            matches!(dup, InboundDisposition::AckOnly { msg_id: 7 }),
+            "redelivery is re-acked without delivery: {dup:?}"
+        );
+        assert_eq!(
+            db.lock().unwrap().list_unprocessed_inbox().unwrap().len(),
+            1,
+            "exactly one inbox row for the deduped delivery"
+        );
+    }
+
+    const CONFIG_UPDATE_FRAME: &str =
+        r#"{"type":"config_update","data":{"engine":{"anthropicApiKey":"sk-new"}},"msgId":11}"#;
+
+    /// P2-19 regression: a `config_update` flows through the SAME at-least-once
+    /// pipeline as every other inbound frame — persisted verbatim under its wire
+    /// type, acked, and deduped by `msg_id` (a redelivery is re-acked without a
+    /// second row) — instead of being silently dropped at the WS layer.
+    #[test]
+    fn config_update_is_persisted_acked_and_deduped_like_other_frames() {
+        let db = test_db();
+
+        let first = classify_inbound(CONFIG_UPDATE_FRAME, &db);
+        assert!(
+            matches!(
+                first,
+                InboundDisposition::Deliver {
+                    msg_id: Some(11),
+                    ..
+                }
+            ),
+            "first delivery persists, acks and delivers: {first:?}"
+        );
+        let rows = db.lock().unwrap().list_unprocessed_inbox().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].msg_type, INBOX_TYPE_CONFIG_UPDATE);
+
+        let dup = classify_inbound(CONFIG_UPDATE_FRAME, &db);
+        assert!(
+            matches!(dup, InboundDisposition::AckOnly { msg_id: 11 }),
+            "redelivery is re-acked without a second row: {dup:?}"
+        );
+        assert_eq!(
+            db.lock().unwrap().list_unprocessed_inbox().unwrap().len(),
+            1
+        );
+    }
+
+    /// P2-19: a malformed `config_update` (missing its required `data`) follows
+    /// the established dead-letter policy — acked away, never queued — so it
+    /// cannot head-of-line-block the stream.
+    #[test]
+    fn malformed_config_update_is_dead_lettered_with_ack() {
+        let db = test_db();
+        let disposition = classify_inbound(r#"{"type":"config_update","msgId":12}"#, &db);
+        assert!(
+            matches!(disposition, InboundDisposition::AckOnly { msg_id: 12 }),
+            "malformed config_update is acked per the dead-letter policy: {disposition:?}"
+        );
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty(),
+            "a dead-lettered frame is not queued for processing"
+        );
+
+        // A well-formed frame right after flows normally — no blocking.
+        assert!(matches!(
+            classify_inbound(CONFIG_UPDATE_FRAME, &db),
+            InboundDisposition::Deliver { .. }
+        ));
+    }
+
+    /// P1-12 regression: a KNOWN-type frame with a malformed body is acked away
+    /// (dead-lettered) rather than left unpersisted+unacked, where the host
+    /// would resend it forever and head-of-line-block the stream.
+    #[test]
+    fn malformed_known_type_frame_is_dead_lettered_with_ack() {
+        let db = test_db();
+        // `data.text` must be a string; a number fails the typed parse.
+        let malformed = r#"{"type":"message","taskId":"t-1","data":{"text":12345},"msgId":9}"#;
+        let disposition = classify_inbound(malformed, &db);
+        assert!(
+            matches!(disposition, InboundDisposition::AckOnly { msg_id: 9 }),
+            "malformed known-type frame is acked per the dead-letter policy: {disposition:?}"
+        );
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty(),
+            "a dead-lettered frame is not queued for processing"
+        );
+
+        // A well-formed frame right after flows normally — the stream is not blocked.
+        assert!(matches!(
+            classify_inbound(MESSAGE_FRAME, &db),
+            InboundDisposition::Deliver { .. }
+        ));
+    }
+
+    /// P2-16: a peer that accepts TCP but never completes the WS handshake must
+    /// not stall a dial attempt past the per-attempt bound.
+    #[tokio::test]
+    async fn dial_times_out_when_the_handshake_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            // Accept and hold the raw TCP connection, never answering the
+            // upgrade request, so the dial can only end via its timeout.
+            let _tcp = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let err = super::dial(
+            &format!("ws://{addr}/agent/ws/stall"),
+            &secrecy::SecretString::from("tok"),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, super::WsError::Timeout(_)),
+            "expected a dial timeout, got {err:?}"
+        );
+        hold.abort();
+    }
+
+    /// Junk with no extractable `msgId` (or non-JSON) has nothing to ack: dropped.
+    #[test]
+    fn unusable_junk_is_dropped_without_ack() {
+        let db = test_db();
+        assert!(matches!(
+            classify_inbound("not json at all", &db),
+            InboundDisposition::Done
+        ));
+        assert!(matches!(
+            classify_inbound(r#"{"type":"message","data":{"text":1}}"#, &db),
+            InboundDisposition::Done
+        ));
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A forward-compat unknown `type` is ignored (not persisted, not acked).
+    #[test]
+    fn unknown_type_is_ignored() {
+        let db = test_db();
+        let disposition =
+            classify_inbound(r#"{"type":"brand_new_frame","data":{},"msgId":3}"#, &db);
+        assert!(matches!(disposition, InboundDisposition::Done));
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
