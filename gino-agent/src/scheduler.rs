@@ -510,8 +510,9 @@ fn new_pending_thread(
         cron_id: Some(cron.id.clone()),
         source: "cron".to_owned(),
         // Snapshot the cron's recurring instruction at attempt 0 (D10). A shared
-        // thread snapshots on its first fire and keeps it across later turns;
-        // retries reuse it rather than re-resolving (agent-architecture §3/§8).
+        // thread re-snapshots the current cron prompt on each re-pend; within-turn
+        // retries reuse the thread snapshot rather than re-resolving
+        // (agent-architecture §3/§8).
         prompt: cron.prompt.clone(),
         engine: DEFAULT_ENGINE.to_owned(),
         engine_session_id: None,
@@ -855,7 +856,7 @@ impl Scheduler {
             isolated: false,
         } = &action
         {
-            self.repend_shared_thread(db, thread_id)?;
+            self.repend_shared_thread(db, cron, thread_id)?;
         }
 
         // Tally + summary (process-local skip/last-status; round_count is the truth).
@@ -894,13 +895,20 @@ impl Scheduler {
     }
 
     /// Re-set a resting shared thread `pending` so a fresh fire actually runs a
-    /// new turn (P0-1): the `engine_session_id` (continuity) and the prompt
-    /// snapshot are KEPT, the per-turn fields (attempt counter, failure fields,
+    /// new turn (P0-1): the `engine_session_id` (continuity) is KEPT, the
+    /// prompt is RE-SNAPSHOTTED from the current cron row so a `cron_upsert`
+    /// prompt edit reaches the next turn (within-turn retries still reuse the
+    /// thread snapshot), the per-turn fields (attempt counter, failure fields,
     /// timestamps, result) are cleared, and the retry budget is refreshed from
     /// config. An in-flight (`pending`/`dispatched`/`running`) thread is left
     /// as-is — [`decide_fire`] skips those fires, so that arm only guards a
     /// replay race. Called only after the fire passed the ledger dedup.
-    fn repend_shared_thread(&self, db: &Db, thread_id: &str) -> Result<(), DbError> {
+    fn repend_shared_thread(
+        &self,
+        db: &Db,
+        cron: &CronRow,
+        thread_id: &str,
+    ) -> Result<(), DbError> {
         let Some(existing) = db.get_thread(thread_id)? else {
             warn!(thread = %thread_id, "shared thread missing at re-pend");
             return Ok(());
@@ -914,6 +922,7 @@ impl Scheduler {
         }
         let mut turn = existing;
         "pending".clone_into(&mut turn.status);
+        turn.prompt.clone_from(&cron.prompt);
         turn.attempt = 0;
         turn.max_attempts = self.max_attempts;
         turn.failure_reason = None;
@@ -1708,7 +1717,7 @@ mod tests {
         );
         assert_eq!(
             turn.prompt, "run the recurring job",
-            "the prompt snapshot survives across turns"
+            "the prompt is re-snapshotted from the (unchanged) cron on re-pend"
         );
         assert_eq!(turn.attempt, 0, "attempt counter reset for the new turn");
         assert_eq!(
@@ -1762,11 +1771,12 @@ mod tests {
 
     // ===== scheduler + executor integration (P0-1 / P1-5 regressions) =====
 
-    /// Records the `resume` handle of every session the engine is asked to
-    /// start, then replays a successful turn on `session_id`.
+    /// Records the `resume` handle and `initial_prompt` of every session the
+    /// engine is asked to start, then replays a successful turn on `session_id`.
     struct RecordingEngine {
         session_id: &'static str,
         resumes: Mutex<Vec<Option<String>>>,
+        prompts: Mutex<Vec<Option<String>>>,
     }
 
     /// A scripted session (mirrors the executor tests' mock).
@@ -1789,6 +1799,7 @@ mod tests {
         }
         async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
             self.resumes.lock().unwrap().push(cfg.resume);
+            self.prompts.lock().unwrap().push(cfg.initial_prompt);
             Ok(Box::new(ScriptSession(vec![
                 EngineEvent::SessionStarted {
                     session_id: self.session_id.to_owned(),
@@ -1840,6 +1851,7 @@ mod tests {
         let engine = Arc::new(RecordingEngine {
             session_id: "sess-shared",
             resumes: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
         });
         let exec = executor_over(&db, Arc::clone(&engine) as Arc<dyn Engine>);
         let sched = make_scheduler(Arc::clone(&db));
@@ -1875,6 +1887,61 @@ mod tests {
             "engine_session_id continuity kept across turns"
         );
         assert_eq!(lock_db(&db).max_round_seq("c-sh").unwrap(), Some(2));
+    }
+
+    /// A `cron_upsert` prompt edit must reach the NEXT turn of a shared
+    /// thread: the re-pend re-snapshots `crons.prompt`, so the second engine
+    /// run receives the edited prompt while still resuming the same session.
+    #[tokio::test]
+    async fn shared_cron_prompt_edit_reaches_the_next_engine_run() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let slot1 = "2026-06-22T12:00:00.000Z";
+        let mut data = cron_upsert_data("schedule", Some("interval"), Some("60000"), "shared");
+        "old prompt".clone_into(&mut data.prompt);
+        data.next_run = Some(slot1.to_owned());
+        assert!(apply_cron_upsert(&db, "task-1", "c-sh", &data).unwrap());
+
+        let engine = Arc::new(RecordingEngine {
+            session_id: "sess-shared",
+            resumes: Mutex::new(Vec::new()),
+            prompts: Mutex::new(Vec::new()),
+        });
+        let exec = executor_over(&db, Arc::clone(&engine) as Arc<dyn Engine>);
+        let sched = make_scheduler(Arc::clone(&db));
+        let mut tally = HashMap::new();
+
+        // Fire 1 + drain: turn 1 receives the original prompt and parks `active`.
+        sched.tick(at("2026-06-22T12:00:01Z"), &mut tally);
+        exec.drain_pending(&NoPrompt).await;
+        assert_eq!(
+            *engine.prompts.lock().unwrap(),
+            vec![Some("old prompt".to_owned())]
+        );
+
+        // Edit the prompt via the same cron_upsert path, preserving the
+        // schedule fields so next_run stays valid.
+        let advanced = lock_db(&db).get_cron("c-sh").unwrap().unwrap();
+        let mut edited = cron_upsert_data("schedule", Some("interval"), Some("60000"), "shared");
+        "new prompt".clone_into(&mut edited.prompt);
+        edited.next_run = advanced.next_run.clone();
+        assert!(apply_cron_upsert(&db, "task-1", "c-sh", &edited).unwrap());
+
+        // Fire 2 + drain: the second engine run receives the EDITED prompt.
+        let slot2 = parse_iso(advanced.next_run.as_deref().unwrap()).unwrap();
+        sched.tick(slot2 + TimeDelta::seconds(1), &mut tally);
+        exec.drain_pending(&NoPrompt).await;
+
+        assert_eq!(
+            *engine.prompts.lock().unwrap(),
+            vec![Some("old prompt".to_owned()), Some("new prompt".to_owned())],
+            "the re-pend re-snapshots the edited cron prompt into turn 2"
+        );
+        assert_eq!(
+            *engine.resumes.lock().unwrap(),
+            vec![None, Some("sess-shared".to_owned())],
+            "prompt re-snapshot must not break session continuity"
+        );
     }
 
     /// A session-counting engine whose first run fails retryably
