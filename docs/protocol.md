@@ -84,9 +84,9 @@ level; `data` carries the type-specific business payload only.**
   so it lives **inside `data`** on `thread_result` (stored, not routed-by).
 - The host routes and correlates by the **envelope** ids *without parsing `data`*,
   mirroring the runner's `inbox`/`outbox` correlation columns and the host read-model keys.
-- Which ids are present depends on the frame (see §5). Pure control frames (`interrupt`,
-  `close`) and the acks carry no correlation ids; deletes carry only their identity ids and
-  no `data`.
+- Which ids are present depends on the frame (see §5). `interrupt` MAY carry `taskId` to
+  scope the cancel to one task; `close` and the acks carry no correlation ids; deletes
+  carry only their identity ids and no `data`.
 
 ### 4.2 Delivery — at-least-once both ways
 
@@ -125,8 +125,8 @@ agent-architecture); bytes never travel in frames.
 | `cron_upsert` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity, next_run?, status?}` | seed/modify a trigger under a task |
 | `cron_delete` | `taskId`, `cronId` | — | remove a trigger |
 | `message` | `taskId`, `threadId?` | `{text, attachments?}` | user/system input for a task (optionally a live thread) |
-| `interrupt` | — | — | graceful cancel of the current turn (engine stays alive) |
-| `close` | — | — | wind down and exit |
+| `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn |
+| `close` | — | — | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
 | `config_update` | — | `{<config fields>}` | live config change (opaque overlay) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
 
@@ -788,6 +788,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "type": {
               "type": "string",
               "const": "interrupt"
+            },
+            "taskId": {
+              "type": "string"
             },
             "outboxId": {
               "type": "integer",
@@ -1455,6 +1458,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "type": {
               "type": "string",
               "const": "interrupt"
+            },
+            "taskId": {
+              "type": "string"
             },
             "outboxId": {
               "type": "integer",
