@@ -853,8 +853,21 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             context.drain.notify_one();
             ControlFlow::Continue(())
         }
-        InboundFrameV2::Interrupt { .. } => {
-            context.executor.interrupt().await;
+        InboundFrameV2::Interrupt { task_id, .. } => {
+            // No `taskId` → legacy global interrupt: cancel whatever is in
+            // flight. Scoped → interrupt only when the task owns the active
+            // run. Always marked processed (even on a scope-check DB error):
+            // replaying an interrupt is worthless.
+            match task_id {
+                None => context.executor.interrupt().await,
+                Some(tid) => {
+                    if task_owns_active_run(&context.db, &tid) {
+                        context.executor.interrupt().await;
+                    } else {
+                        debug!(task = %tid, "scoped interrupt: task has no in-flight run; ignoring");
+                    }
+                }
+            }
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskUpsert { task_id, data, .. } => {
@@ -900,6 +913,24 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
         conclude_inbox_row(&context.db, inbox_id, applied);
     }
     flow
+}
+
+/// Whether `task_id` owns the in-flight run: any of its threads is
+/// `dispatched` or `running`. The executor drains threads serially (single
+/// active run), so such a thread can only be the active one. The check and
+/// the interrupt are not atomic — the run may finish in between — but that
+/// race is benign: interrupting an idle executor is a no-op. On a DB read
+/// error, answer `false`: never cancel another task's turn on uncertain data.
+fn task_owns_active_run(db: &Mutex<Db>, task_id: &str) -> bool {
+    match lock_db(db).list_threads_by_task(task_id) {
+        Ok(threads) => threads
+            .iter()
+            .any(|t| t.status == "dispatched" || t.status == "running"),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "scoped interrupt: thread lookup failed; not interrupting");
+            false
+        }
+    }
 }
 
 /// Settle a routed inbox row. Applied → processed. Failed → left unprocessed
