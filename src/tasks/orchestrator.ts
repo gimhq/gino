@@ -199,7 +199,11 @@ export function emitInterrupt(db: AppDatabase, sender: FrameSender, task: Task):
   return enqueue(db, sender, { agentId, type: "interrupt", taskId: task.id });
 }
 
-/** Emit a `close` — wind down the task's work on the agent. */
+/**
+ * Emit a `close` — RUNNER-LEVEL wind-down: the agent runner exits on it. NOT
+ * used for per-task close (that is a task-scoped `interrupt` +
+ * `task_upsert{status:"closed"}`); reserve this for genuine runner shutdown.
+ */
 export function emitClose(db: AppDatabase, sender: FrameSender, task: Task): Outbox {
   const agentId = requirePlacement(task);
   return enqueue(db, sender, { agentId, type: "close", taskId: task.id });
