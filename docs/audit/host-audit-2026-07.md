@@ -1501,3 +1501,424 @@ for the global scope (HOST-M8-01 below) and orphaned-entry lifecycle gaps (HOST-
 *Chapter summary: P0=1 P1=2 P2=7 P3=4 (14 findings).*
 
 ---
+
+## Chapter M9 — Platform, DB, Shared, Config, Bootstrap
+
+Scope: `src/platform/**`, `src/db/**`, `src/shared/lib/**`, `src/shared/middleware/**`,
+`src/config.ts`, `src/config/schema.ts`, `src/dirs.ts`, `src/build-info.ts`, `src/app.ts`,
+`src/cli.ts`, `src/index.ts` (26 files, every line read). Ground truth:
+`docs/host-architecture.md` (module map + §8 invariants), `docs/protocol.md` §3–§6.
+Cross-side patterns re-checked from `docs/audit/agent-audit-2026-07.md` (offline handling,
+queue GC, token storage, shutdown chain, double-start).
+
+Verified clean (explicitly checked, no finding):
+
+- **UTC mandate (module focus 2)**: every datetime column is an integer epoch-milliseconds
+  value defaulted via `$defaultFn(() => Date.now())` (`src/db/schema.ts`); no
+  `CURRENT_TIMESTAMP`, no `datetime('now','localtime')`, no Date-object serialization
+  anywhere in the schema or migration SQL. Epoch-ms is timezone-unambiguous.
+- **Crypto (module focus 1)**: a timing-safe compare helper exists and is correct —
+  `safeEqual` (`src/platform/crypto.ts:15`) SHA-256-digests both inputs to fixed length
+  before `timingSafeEqual`, hiding length differences. `hashToken`/`verifyToken` store only
+  SHA-256 digests (appropriate for the 256-bit random tokens minted via
+  `randomBytes(32)` — CSPRNG, verified in `src/agents/registry.ts:45`). The three-token
+  auth middleware (`src/shared/middleware/auth.ts`) uses `safeEqual` for every secret
+  comparison and fails closed on an empty configured secret.
+- **Migrations (module focus 3)**: a single initial migration
+  (`drizzle/0000_smiling_prism.sql`) containing only `CREATE TABLE`/`CREATE INDEX` — no
+  destructive statements. The embedded-migration fallback fail-fasts on an empty map and on
+  a missing `meta/_journal.json` sentinel (truncated-bundle guard). The pre-migration
+  snapshot / migrate / record-version ordering in `src/db/index.ts:59-61` is correct (the
+  version marker is written only after `runMigrations` returns).
+- **DB PRAGMAs**: `foreign_keys = ON`, WAL, `busy_timeout` are set
+  (`src/db/index.ts:32-34`) — the agent-side "FKs never enabled" gap (agent audit P2-19)
+  does not recur on the host.
+- **Error handler leakage (module focus 4)**: `error-handler.ts` returns generic messages
+  for 409/500; internal error details reach only the log, and `NotFoundError` surfaces only
+  opaque ids. Validation 422 details are Zod messages, not values.
+- **Signals (module focus 6)**: SIGINT, SIGTERM and SIGHUP (log reopen) are all handled
+  (`src/index.ts:110-120`) — the agent-side SIGTERM gap (agent audit P1-6) does not recur.
+  DB close ordered after server stop; WAL checkpointed on the lode prepare handshake.
+- **Auth middleware**: connect-token lookup resolves identity from the token hash (never a
+  client-supplied id), excludes `removed` agents, and 403s cross-agent access to
+  `:agentId`-scoped routes.
+
+### HOST-M9-01 · [P1] Graceful shutdown is inverted: `server.stop(true)` runs first, killing all in-flight work immediately
+
+- Location: src/index.ts:57-67
+- Description: The non-fatal shutdown path races `server.stop(true)` against a 25 s timer,
+  then calls `server.stop(false)`. In Bun, `stop(true)` immediately terminates every active
+  connection — in-flight HTTP requests and all agent WebSocket sessions — so the "bounded
+  drain" resolves almost instantly having drained nothing, and the follow-up `stop(false)`
+  is a no-op on an already-stopped server. The intended order (stop accepting → drain →
+  force-close) is reversed.
+- Failure scenario: Every ordinary SIGTERM (systemd stop, deploy, lode cut-over): an admin
+  POST mid-write is aborted mid-response; every connected agent's WS is dropped without a
+  close handshake and must rely on reconnect+outbox replay. The 25 s drain window the code
+  documents never occurs, on every single restart.
+- Suggested fix direction: Swap the arguments: race `server.stop(false)` (graceful drain)
+  against the 25 s timer, then call `server.stop(true)` as the force-close fallback.
+
+### HOST-M9-02 · [P2] Rate-limit middleware is dead code — no route in the host is rate-limited
+
+- Location: src/shared/middleware/rate-limit.ts:94 (definition; zero call sites in `src/**`)
+- Description: `rateLimit()` is fully implemented (per-IP buckets, GC timer, eviction cap)
+  but never mounted on any router. `docs/host-architecture.md` §M1 states the edge "Owns
+  transport, auth, rate-limit, SSRF guard", and `docs/protocol.md` §3 defines the
+  `register_error` reason `rate_limited` — which the host can never produce. The
+  unauthenticated `POST /agent/register` (shared long-lived bootstrap secret) and the
+  channel-token surfaces have no brute-force throttle at all.
+- Failure scenario: An attacker with network reach makes unlimited high-rate guesses
+  against the shared register token (and the admin bearer); nothing throttles, delays, or
+  surfaces the attempts as `rate_limited`. A weak operator-chosen `GINO_REGISTER_TOKEN`
+  becomes enrollable-by-brute-force.
+- Suggested fix direction: Mount `rateLimit(...)` on the unauthenticated/secret-bearing
+  edges (`/agent/register` at minimum, ideally `/admin/*` and `/messages/*` auth failures),
+  and wire the register handler to return `register_error{rate_limited}` per protocol §3.
+- Related: HOST-M1M2-10 flags the same middleware from the edge chapter; cross-cutting Lens B dedupes here.
+
+### HOST-M9-03 · [P2] Logger redaction misses the host's own secret field names (exact-match key set)
+
+- Location: src/shared/lib/logger.ts:60-78
+- Description: `REDACT_KEYS` is matched by exact lowercase key equality, and the set does
+  not contain the names this codebase actually uses for secrets: `registerToken` /
+  `connectToken` (the protocol §3/§4 wire field names), `x-internal-token` (the connect
+  header), `apiKey` / `api_key`, or any `PROXY_*_API_KEY` / `PROXY_*_OAUTH_TOKEN` /
+  `PROXY_CODEX_REFRESH_TOKEN` / `PROXY_STATIC_KEY` config keys. Only bare `token`,
+  `secret`, `authorization`, etc. are redacted. `host-architecture.md` §M9 names
+  "logger(redaction)" as a platform guarantee; the guarantee holds for generic names but
+  not the system's own vocabulary. (No current call site logs such an object — verified —
+  so this is latent, but redaction exists precisely to protect against future/error-path
+  callers.)
+- Failure scenario: Any log statement that includes a register request body
+  (`{ registerToken: ... }`), a register response (`{ connectToken: ... }`), request
+  headers, or the resolved `Config` object writes the secret in cleartext to
+  `data/logs/gino.log`, where it survives rotation into archived logs.
+- Suggested fix direction: Add the concrete key names used by this codebase
+  (`registertoken`, `connecttoken`, `x-internal-token`, `apikey`, `api_key`, and the
+  `proxy_*` credential keys), or switch to substring/suffix matching on `token`/`key`/
+  `secret` — the file's own comment already prefers false positives over false negatives.
+
+### HOST-M9-04 · [P2] Metrics registry grows without bound from unauthenticated request paths
+
+- Location: src/shared/middleware/logging.ts:22-27 (coarsenPath) + src/shared/lib/metrics.ts:33 (registry)
+- Description: `loggingMiddleware` records `http_requests_total` and a duration histogram
+  labeled by the coarsened request path for every request, including 404s. `coarsenPath`
+  only collapses id-shaped segments (32+ hex, 8+ mixed alnum, 4+ digits); alpha-only or
+  short segments pass through verbatim. The metrics registry (`Map`) has no eviction, so
+  each distinct surviving path creates permanent counter + histogram entries.
+- Failure scenario: An unauthenticated client sprays `GET /api/aaa`, `/api/aab`,
+  `/api/abc-def`, ... — each unique alpha-only path adds a registry entry (counter +
+  11-bucket histogram) that is never reclaimed. Sustained spraying grows host memory
+  without limit; no auth is required because 404s are still metered. Aggravated by the
+  endpoint never being readable (HOST-M9-09): the memory is spent on data no one can scrape.
+- Suggested fix direction: Only record metrics for matched routes (e.g. use Hono's matched
+  route pattern instead of the raw path, or label 404s with a fixed `unmatched` route), and
+  cap registry size defensively.
+
+### HOST-M9-05 · [P2] Proxy allow-list gate fails open when the peer IP is unavailable
+
+- Location: src/shared/lib/client-ip.ts:43
+- Description: With `TRUST_PROXY=true` and `TRUSTED_PROXY_IPS` configured, the gate is
+  `if (proxyAllowList.length > 0 && peerIp && !isAllowedPeer(...)) return peerIp`. When
+  `peerIp` is `undefined` (Bun's `server.requestIP()` can return null, and `c.env.IP` is
+  absent for any request not threaded through `index.ts`'s fetch wrapper), the condition
+  short-circuits and execution falls through to trusting `X-Forwarded-For` from an
+  unverified peer — the opposite of the allow-list's purpose.
+- Failure scenario: Operator configures `TRUSTED_PROXY_IPS=10.0.0.5` expecting only the
+  LB to set XFF. A request path where the runtime cannot resolve the peer address (or a
+  future caller that doesn't thread `IP` into the fetch env) lets any direct client forge
+  `X-Forwarded-For` and evade every IP-keyed control.
+- Suggested fix direction: When an allow-list is configured and the peer IP cannot be
+  determined, fail closed: ignore forwarding headers and return `"unknown"`.
+
+### HOST-M9-06 · [P2] Embedded-migration temp directory is predictable and pre-creatable (local TOCTOU → SQL execution)
+
+- Location: src/db/index.ts:160-172
+- Description: The compiled-binary migration path writes migration SQL to
+  `/tmp/gino-migrations-<pid>` — a predictable name in a world-writable directory —
+  using `mkdirSync(..., { recursive: true })`, which succeeds silently when the directory
+  already exists and is attacker-owned. Between `writeFileSync` and `migrate()`, a local
+  user who owns the directory can swap file contents (or pre-place a symlinked `meta/`);
+  the daemon then executes attacker SQL against the host database.
+- Failure scenario: Unprivileged local user watches for the gino process, pre-creates
+  `/tmp/gino-migrations-<pid>` for likely pids (or races the window), and replaces a
+  written `.sql` file before `migrate()` reads it — arbitrary DDL/DML runs with the
+  daemon's authority (e.g. rewrite `agents.connect_token_hash`).
+- Suggested fix direction: Use `mkdtempSync(join(tmpdir(), "gino-migrations-"))` (random,
+  owner-only 0700 directory), or better, run migrations from the in-memory map without
+  touching the filesystem.
+
+### HOST-M9-07 · [P2] Outbox has no GC and no index for the replay scan
+
+- Location: src/db/schema.ts:146-157 (table definition; grep-verified zero `DELETE`
+  statements against `outbox` anywhere in `src/**`)
+- Description: Every host→agent frame is persisted to `outbox` (at-least-once, per
+  invariant §8) and rows are only ever marked `acked_at` — never deleted. The table has no
+  index on `(agent_id, acked_at)`, so the reconnect replay query
+  (`WHERE agent_id = ? AND acked_at IS NULL`, src/protocol/outbox.ts:100) full-scans a
+  monotonically growing table. This is the host-side twin of agent audit P1-9 ("zero GC on
+  inbox/outbox/cron_logs"), which that audit flagged as a pattern to re-check here.
+- Failure scenario: A long-lived deployment with active tasks accumulates outbox rows
+  indefinitely (every `message`, `task_upsert`, `cron_upsert`, `config_update` forever);
+  each agent reconnect scans the whole table under SQLite's writer lock — replay latency
+  and DB size degrade linearly with host age until operators intervene manually.
+- Suggested fix direction: Add a retention sweep (DELETE acked rows older than a window,
+  e.g. alongside the liveness sweep) and a partial index on
+  `(agent_id) WHERE acked_at IS NULL` — mirroring the agent-side remediation plan.
+- Related: HOST-M1M2-08 and HOST-M4-08 report the same gap; cross-cutting Lens C dedupes here.
+
+### HOST-M9-08 · [P3] `isSpoofableProxyConfig` warning is never wired
+
+- Location: src/shared/lib/client-ip.ts:80 (zero call sites in `src/**`)
+- Description: The helper exists specifically so the app logs a startup warning when
+  `TRUST_PROXY=true` with no `TRUSTED_PROXY_IPS` (the spoofable configuration its own
+  doc-comment describes), but nothing calls it — the warning never fires.
+- Failure scenario: An operator enables `TRUST_PROXY` on an internet-exposed host without
+  an allow-list; every IP-keyed control is silently forgeable and no boot-time signal
+  points it out.
+- Suggested fix direction: Call it from `bootstrap()` and log a prominent warning when true.
+- Related: cross-cutting Lens B re-reports this; this module entry is canonical.
+
+### HOST-M9-09 · [P3] Metrics pipeline is write-only: `renderPrometheus` has no endpoint
+
+- Location: src/shared/lib/metrics.ts:125 (no caller outside the module); src/shared/middleware/logging.ts:10 (`SKIP_METRICS_RE` guards a `/metrics` path that does not exist)
+- Description: Metrics are collected on every request, but `renderPrometheus()` is never
+  mounted on any route — no `/metrics` endpoint exists in `src/routes/**` or
+  `src/modules/**`. The collection cost (and the HOST-M9-04 cardinality exposure) is paid
+  for data no one can scrape; the skip-regex in the logging middleware references the
+  nonexistent endpoint.
+- Failure scenario: Operator points Prometheus at the documented-looking `/metrics` path
+  and gets 404; meanwhile the in-process registry consumes memory for nothing.
+- Suggested fix direction: Mount a (channel-token-guarded or bind-restricted) `/metrics`
+  route in the system module, or remove the collection until it is served.
+
+### HOST-M9-10 · [P3] `gino migrate --check` reports every migration as pending
+
+- Location: src/cli.ts:108-128
+- Description: `listFsPendingMigrations` maps journal entries to tags and keeps those that
+  HAVE a matching `.sql` file on disk — i.e. the full set of available migrations. It never
+  consults the database (documented), so nothing is subtracted for already-applied
+  migrations: on a healthy, fully-migrated install it prints "N pending migration(s)"
+  forever.
+- Failure scenario: An operator gating a deploy on `migrate --check` output always sees
+  pending migrations and either blocks the rollout or learns to ignore the tool — both
+  outcomes defeat its purpose.
+- Suggested fix direction: Either read `__drizzle_migrations` from the target DB to
+  subtract applied tags, or rename/re-document the command as "list available migrations".
+
+### HOST-M9-11 · [P3] `generateId` (8-char nanoid, ~41 bits) is collision-prone for high-volume ids
+
+- Location: src/platform/ids.ts:13 + src/shared/lib/id.ts:11
+- Description: `generateId(prefix)` appends an 8-character nanoid over a 36-char alphabet
+  (~41.4 bits). Birthday collisions reach ~50 % around 1.7 M ids. It is used for
+  attachment primary keys (`generateId("att")`, src/edge/agent.ts:413) — a per-message
+  volume table.
+- Failure scenario: A long-lived deployment with millions of attachments hits a duplicate
+  `attachments.id`; the insert fails with a UNIQUE constraint error surfaced to the agent
+  as an opaque 409 on an otherwise-valid upload.
+- Suggested fix direction: Lengthen the nanoid (12–16 chars) or use `ulid()` for
+  row-volume ids; reserve the short form for human-facing, low-volume resources.
+
+### HOST-M9-12 · [P3] Error handler classifies by message text and mislabels non-uniqueness constraints
+
+- Location: src/shared/middleware/error-handler.ts:24-32
+- Description: Any error whose `message` matches
+  `/(UNIQUE|CHECK|FOREIGN KEY|NOT NULL) constraint failed/i` — including a non-database
+  error that merely quotes such text — is returned as 409 "Resource already exists or
+  violates a constraint". FK and NOT NULL violations (data bugs, not duplicates) get the
+  same misleading "already exists" framing and skip the 500 log line.
+- Failure scenario: A FOREIGN KEY failure caused by a genuine host bug (e.g. a mirror
+  write for an unknown task) is answered 409 to the caller and never logged as an error,
+  hiding the defect.
+- Suggested fix direction: Match only on the structured `err.code` prefix
+  (`SQLITE_CONSTRAINT*`), branch UNIQUE → 409 from the specific code
+  (`SQLITE_CONSTRAINT_UNIQUE`/`_PRIMARYKEY`), and let FK/NOT NULL fall through to the
+  logged 500.
+
+### HOST-M9-13 · [P3] Compiled binary prefers an on-disk `drizzle/` folder from its cwd
+
+- Location: src/dirs.ts:23-28 (`ROOT_DIR = process.cwd()` under `/$bunfs`) + src/db/index.ts:128-131
+- Description: In the compiled binary, `ROOT_DIR` is the process working directory, and
+  `runMigrations` prefers `<ROOT_DIR>/drizzle` over the embedded map whenever
+  `drizzle/meta/_journal.json` exists there. Launching the binary from any directory that
+  happens to contain a (stale, foreign, or attacker-planted) `drizzle/` tree silently
+  applies that SQL to the production database instead of the vetted embedded set.
+- Failure scenario: Operator runs the packaged binary from a checkout of a different
+  branch/version; its `drizzle/` journal differs from the binary's embedded one and the DB
+  is migrated with mismatched SQL.
+- Suggested fix direction: In the compiled binary (`/$bunfs` detected), use the embedded
+  map exclusively (or require an explicit env opt-in to load filesystem migrations).
+
+### HOST-M9-14 · [P3] No cross-process double-start guard before migrations run
+
+- Location: src/app.ts:158-181 (`bootstrap()` migrates) + src/index.ts:18 (port bind afterwards)
+- Description: Port-bind failure (EADDRINUSE) is the only double-start protection, and it
+  happens after `createDb` has already opened the DB, snapshotted, and run migrations.
+  Two instances started concurrently both execute the migration path against the same
+  file before one loses the bind; there is no pidfile/flock (the same gap the agent audit
+  logged as P2-18). With today's single idempotent-under-journal migration the window is
+  benign, but any future multi-statement migration can interleave.
+- Failure scenario: A supervisor restart races a manual start during an upgrade; both
+  processes enter `runMigrations` on a version boundary — the second applies a
+  half-visible journal state or fails mid-DDL, and the pre-migration snapshot may be taken
+  from an already-half-migrated file.
+- Suggested fix direction: Take an exclusive advisory lock (flock on a lockfile beside the
+  DB, or `PRAGMA locking_mode`/`BEGIN IMMEDIATE` around the migrate step) before
+  snapshot+migrate.
+
+*Chapter summary: P0=0 P1=1 P2=6 P3=7 (14 findings).*
+
+---
+
+## Chapter XC-A — Cross-Cutting Lens A: UTC Discipline
+
+Scope: all of `src/**` (~90 files) read against `docs/protocol.md` §4–6 and
+`docs/host-architecture.md` §8. Requirement: all times UTC end to end; the API layer only
+*declares* times as UTC; no timezone-conversion logic anywhere in `src/**`.
+
+Greps run and their result (every hit inspected):
+
+- `toLocale` (toLocaleString/DateString/TimeString) — **clean, 0 hits.**
+- `getTimezoneOffset` — **clean, 0 hits.**
+- `DateTimeFormat` / `Intl.` — **clean, 0 hits.**
+- `localtime` / `strftime` / `datetime(` / `CURRENT_TIMESTAMP` / `unixepoch` /
+  `julianday` (SQL defaults, `src/**` + `drizzle/0000_smiling_prism.sql`) —
+  **clean.** The only SQL column defaults are `integer DEFAULT 0`; every
+  timestamp column is `integer(...).$defaultFn(() => Date.now())` (epoch-ms UTC).
+- `getHours` / `getMinutes` / `getDate(` / `getMonth` / `getFullYear` / `setHours`
+  — **clean, 0 hits.**
+- `timezone` / `timeZone` / `tzOffset` / `offset` (date-related) — **clean.** The
+  `offset` hits are cursor/byte offsets, not time.
+- `new Date(` — one hit, `src/build-info.ts:10`, `new Date().toISOString()` (UTC,
+  compliant).
+- `.toString()` — three hits (`proxy/credentials.ts:110` URLSearchParams body,
+  `channels/webhooks.ts:170,195` URL) — none are `Date` renders.
+- `Date.now` / `toISOString` — all epoch-ms integer writes or the one `toISOString`
+  above; no raw `Date` serialized into an API response (`serializeTask` /
+  `serializeAgent` / `serializeCron` emit the integer columns directly).
+
+**Violation list (exhaustive): 1 finding.**
+
+### HOST-XC-01 · [P2] `next_run` parsed with `Date.parse`, so a timezone-less ISO string is read as LOCAL time
+
+- Location: `src/msgstore/crons.ts:34`
+- Description: `toEpochMs` coerces the wire `next_run` string to epoch-ms. A pure
+  digit string is handled explicitly, but any non-numeric value falls to
+  `Date.parse(value)`. Per ECMAScript, an ISO-8601 date-time **without** a timezone
+  designator (e.g. `2026-07-10T09:00:00`) is interpreted in the host's **local**
+  time zone, not UTC. This is exactly the implicit local-time conversion the lens
+  forbids: the stored mirror value is shifted by the host machine's UTC offset.
+- Failure scenario: agent (or admin round-trip) sends `cron_state.next_run =
+  "2026-07-10T09:00:00"`; host runs in `TZ=America/New_York`; the mirror stores an
+  epoch-ms value 4–5 hours off. Any operator view of "next run" is wrong, and the
+  value silently changes meaning if the host's `TZ` changes.
+- Suggested fix direction: require an explicit-UTC form on the wire (epoch-ms or a
+  `Z`/offset-qualified ISO string) and reject/normalize a bare local datetime;
+  treat a TZ-less string as UTC by appending `Z` before parsing, rather than
+  deferring to the platform local zone.
+
+*Chapter summary: P0=0 P1=0 P2=1 P3=0 (1 unique finding).*
+
+---
+
+## Chapter XC-B — Cross-Cutting Lens B: Auth Surface Inventory
+
+| route prefix | auth mechanism | timing-safe compare? | token stored hashed? | revocable? | rate-limited? |
+|---|---|---|---|---|---|
+| `POST /agent/register` | shared register token (body `registerToken`, or Bearer) via `requireSecret`→`safeEqual` | yes (`safeEqual`) | n/a (shared secret, compared to config plaintext) | rotate config only | **no** (see HOST-XC dedupe below) |
+| `GET /agent/ws/:agentId` | per-agent connect token `x-internal-token` → `verifyConnectToken` (hash match) + path-id must equal token's agent | yes (`verifyToken`/`safeEqual`) | yes (`connect_token_hash`) | yes (revoked on remove) | no (WS) |
+| `GET /agent/config/:agentId`, `POST /agent/output/:agentId` | connect token, `verifyConnectToken` | yes | yes | yes | no |
+| `GET/POST /agent/attachments[/:id]` | connect token via `connectTokenAuth` → `agentId` = token subject; authz by task placement / desired-set | yes | yes | yes | no |
+| `/admin/*` (agents, tasks, crons, channels, config) | channel token (Bearer) via `channelTokenAuth`→`safeEqual` | yes | no (compared to config plaintext) | rotate config only | no |
+| `/messages/:channel/{send,webhook,poll}` | **same channel token** as `/admin/*` | yes | no | rotate config only | no |
+| `POST /system/lode/{restart,update,rollback,hold}` | channel token (per-route) | yes | no | rotate config only | no |
+| `GET /health`, `/health/ready`, `/system/version`, `/api/docs`, `/openapi.json` | none (public, by design) | n/a | n/a | n/a | no |
+| `/llm/*` (proxy) | proxy credential: real `sk-ant-*` key **passthrough**, or static key (`safeEqual`), or per-agent connect token (hash match) | mixed (see HOST-M7-01) | connect-token path hashed; static-key path `safeEqual` | connect-token path revocable | no |
+
+Findings:
+
+### HOST-XC-02 · [P2] No privilege separation: the channel token grants both user message I/O and full admin/lode control
+
+- Location: `src/shared/middleware/auth.ts:85` (`channelTokenAuth`), applied to
+  `/admin/*` (`src/edge/admin/index.ts:20`), `/messages/*`
+  (`src/edge/messages.ts:84`), and `/system/lode/*` (`src/modules/system/system.routes.ts`).
+- Description: the single `HTTP_CHANNEL_TOKEN` authorizes both the user-facing
+  channel I/O surface (`/messages/:channel/send|webhook|poll`) and the full control
+  plane (agent stop/restart/**remove**, task create/assign, cron commands, lode
+  update/rollback/restart/hold). Any integration handed a channel token to push
+  messages therefore also holds destructive admin authority.
+- Failure scenario: an external chat/webhook integration is provisioned with the
+  channel token to call `/messages/*`; that same credential can `POST
+  /admin/agents/:id/remove` (revoking connect tokens, orphaning tasks) or
+  `POST /system/lode/update` to switch host versions.
+- Suggested fix direction: split the control-plane bearer from the channel/user I/O
+  bearer (distinct secrets, distinct middleware), so a channel credential cannot
+  reach `/admin/*` or `/system/lode/*`.
+
+**Dedupes — cross-cutting entries that duplicate a module chapter (not counted again):**
+
+- **`/llm/*` proxy auth bypass by any `sk-ant-` prefix** (`src/proxy/auth.ts:31`, `src/proxy/provider.ts:79`) → **canonical: HOST-M7-01 (P0)**. The auth-surface table's `/llm/*` row reflects this; see the M7 chapter for full detail.
+- **`POST /agent/register` has no rate limiting; the rate-limit middleware is dead code** (`src/edge/agent.ts:184`, `src/shared/middleware/rate-limit.ts`) → **canonical: HOST-M9-02 (P2)** (also HOST-M1M2-10).
+- **`register_error` reason taxonomy never emitted (only `unsupported_protocol`)** (`src/edge/agent.ts:196`) → **canonical: HOST-M1M2-14 (P3)**.
+- **`isSpoofableProxyConfig` defined but never called, startup warning never fires** (`src/shared/lib/client-ip.ts:80`) → **canonical: HOST-M9-08 (P3)**.
+
+*Chapter summary: P0=0 P1=0 P2=1 P3=0 (1 unique finding: HOST-XC-02). Four further entries dedupe to HOST-M7-01, HOST-M9-02, HOST-M1M2-14, HOST-M9-08.*
+
+---
+
+## Chapter XC-C — Cross-Cutting Lens C: At-Least-Once / Idempotency End-to-End Trace
+
+Trace M4 orchestrator → M2 outbox → WS → agent → inbound frames → M5 store →
+M6 egress. Per-invariant implementation map (protocol §4–6, host §8):
+
+| invariant (protocol §) | implementing code | verdict |
+|---|---|---|
+| persist-before-send (host→agent) | `src/protocol/outbox.ts:46` `enqueue` inserts row then sends | OK |
+| unacked replay on reconnect | `src/protocol/outbox.ts:96` `replayUnacked` (on WS `onOpen`, `edge/agent.ts:254`) | OK |
+| `ack{id}` stops replay | `src/protocol/outbox.ts:74` `ackOutbox`; `inbound.ts:162` | OK |
+| `message` uses `msgId` + `msg_ack` | `outbox.ts:62` sets `msgId`; `inbound.ts:155` `ackMessage` | partial — see dedupe to HOST-M4-07 |
+| demux by `threadId`, order by `seq` (transcript) | `msgstore/messages.ts:45` `ORDER BY seq` | OK (transcript); egress differs — see dedupe to HOST-M5M6-10 |
+| idempotent write on `(threadId, seq)` | `msgstore/messages.ts:40` `onConflictDoNothing([threadId,seq])` | OK |
+| `thread_result` idempotent (per thread) | `msgstore/thread-runs.ts:55` UPSERT on `threadId` | OK |
+| `cron_state` idempotent mirror | `msgstore/crons.ts:69` UPSERT on `id` | OK |
+| completeness via `final_seq` (received `1..=final_seq`) | stored at `thread-runs.ts:52`; **no verifier** | MISSING — see dedupe to HOST-M1M2-13 |
+| cross-agent/cross-task write guard | `protocol/inbound.ts:67` `authorizeWrite` (WS + HTTP fallback) | OK |
+
+All findings this lens surfaces are already owned by module chapters; they are recorded here
+as dedupes so the trace is complete without double-counting:
+
+**Dedupes — cross-cutting entries that duplicate a module chapter (not counted again):**
+
+- **`final_seq` completeness is never verified — a permanently missing middle `seq` goes undetected** (`src/msgstore/thread-runs.ts:52`; no consumer) → **canonical: HOST-M1M2-13 (P3)**. Protocol §6 says the host verifies it received `1..=final_seq`; the value is stored but never compared, so a transcript with a permanent hole is silently accepted as complete.
+- **Egress orders a thread by store `rowid`, not `seq`, so a late/replayed frame is delivered out of order** (`src/channels/egress.ts:122-126`) → **canonical: HOST-M5M6-10 (P3)**. At-least-once means a lower-`seq` frame can be inserted later (higher rowid); egress then delivers it out of `seq` order for the distributed stream.
+- **Host outbox has no GC and no index on the replay predicate — unbounded growth + full-scan on every reconnect** (`src/protocol/outbox.ts:96`; `outbox` table) → **canonical: HOST-M9-07 (P2)** (also HOST-M1M2-08, HOST-M4-08).
+- **`msg_ack` marks the row delivered but the M4 delivery-cursor advance is unimplemented (TODO)** (`src/protocol/outbox.ts:83` `ackMessage`, `TODO(M4/B3)`) → **canonical: HOST-M4-07 (P2)**. At-least-once still holds (unacked → replay, agent dedupes); this is a completeness/observability gap, the documented per-task cursor is absent.
+- **A crash between the `message` insert and the `msgId` back-fill yields an undeliverable, infinitely-replayed frame** (`src/protocol/outbox.ts:62-65`, then a separate UPDATE sets `msgId=id`; encode at `envelope.ts:89-92`) → **canonical: HOST-M4-07 / HOST-M1M2-07 (P2)**. `encodeOutbox` emits `msgId` only for a message (no `outboxId` fallback), so a crash in the sub-millisecond window leaves a row the agent can neither `msg_ack` nor dedupe — it replays forever.
+
+*Chapter summary: P0=0 P1=0 P2=0 P3=0 unique (all five entries dedupe to HOST-M1M2-13, HOST-M5M6-10, HOST-M9-07, HOST-M4-07, and HOST-M4-07/HOST-M1M2-07).*
+
+---
+
+## Appendix — Cross-cutting dedupe map
+
+The three cross-cutting lenses re-report nine issues already owned by module chapters. Each
+is listed once as a cross-reference and is **not** counted in the totals; the canonical module
+entry is authoritative.
+
+| cross-cutting observation | canonical id(s) |
+|---|---|
+| `/llm/*` proxy auth bypass (`sk-ant-` prefix) | HOST-M7-01 |
+| `/agent/register` unthrottled; rate-limit middleware dead | HOST-M9-02 (also HOST-M1M2-10) |
+| `register_error` taxonomy never emitted | HOST-M1M2-14 |
+| `isSpoofableProxyConfig` never wired | HOST-M9-08 |
+| `final_seq` completeness never verified | HOST-M1M2-13 |
+| egress orders by `rowid`, not `seq` | HOST-M5M6-10 |
+| host outbox no GC / no replay index | HOST-M9-07 (also HOST-M1M2-08, HOST-M4-08) |
+| `msg_ack` M4 delivery cursor unimplemented (TODO) | HOST-M4-07 |
+| crash between `message` insert and `msgId` back-fill | HOST-M4-07 / HOST-M1M2-07 |
+
+Unique cross-cutting findings counted in the totals: **HOST-XC-01** (UTC — `next_run`
+local-time parse) and **HOST-XC-02** (auth — no channel/admin privilege separation), both P2.
+
+*End of report.*
