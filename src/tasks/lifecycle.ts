@@ -43,7 +43,7 @@ export function transitionTaskStatus(db: AppDatabase, taskId: string, status: st
   return setStatus(db, taskId, status);
 }
 
-/** Mark a task `closed` (user/admin `/close`); pairs with an orchestrator `close` command. */
+/** Mark a task `closed` (user/admin `/close`); pairs with a task-scoped `interrupt` + `task_upsert{status:"closed"}`. */
 export function closeTask(db: AppDatabase, taskId: string): Task {
   return setStatus(db, taskId, TASK_STATUS.closed);
 }
