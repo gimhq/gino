@@ -19,7 +19,7 @@ it doubles as a wire-compatibility check.
 Two modes:
 
 - **Hermetic (default, `run.sh`)** — fake engine + mock LLM upstream; deterministic,
-  credential-free, 50/50 checks. This file + `TEST-COVERAGE.md`.
+  credential-free, 51/51 checks. This file + `TEST-COVERAGE.md`.
 - **Real flow (`run-real.sh`)** — the **real Claude CLI** drives a **real model**
   through the host `/llm` proxy to **real Anthropic**. Needs a credential you supply
   (`GINO_PROXY_ANTHROPIC_API_KEY` or `_OAUTH_TOKEN`). See `REAL-FLOW-REPORT.md`.
@@ -60,7 +60,7 @@ self-registers (`POST /agent/register`), opens its WebSocket, and runs tasks via
 the fake `claude` engine. The host writes its db/store to a tmpfs (the repo is
 bind-mounted read-only), so a run never touches the working tree.
 
-## Coverage (50 checks)
+## Coverage (51 checks)
 
 See [`TEST-COVERAGE.md`](TEST-COVERAGE.md) for the full check-by-check matrix
 (every request, what it asserts, and the path it proves). Summary:
@@ -95,13 +95,12 @@ This e2e found three host-v2 ↔ runner-v2 interop bugs on first integration.
    `gino-agent/src/config.rs` by dropping `deny_unknown_fields` on the host-config
    overlays (and inverting the corresponding unit test).
 
-2. **[OPEN] Per-task close shuts the whole runner down.** `POST /tasks/:id/close`
-   emits a protocol `close` frame, but protocol.md §4 defines `close` as
-   runner-level *wind-down and exit* (no `taskId`). The runner obeys
-   (`close received; shutting down` → `gino-agent stopped`), so closing one task
-   kills a multi-task agent. Suggested fix: the host should mark the task closed
-   (and `interrupt` any in-flight turn) without emitting the global `close` — or the
-   protocol + runner gain a real per-task close frame.
+2. **[FIXED] Per-task close shut the whole runner down.** `POST /tasks/:id/close`
+   emitted a protocol `close` frame, which protocol.md §4 defines as runner-level
+   *wind-down and exit* (no `taskId`) — the runner obeyed and the whole agent
+   exited, so closing one task killed a multi-task agent. Fixed: the host no
+   longer emits the runner-level `close` for a single task, and the suite now
+   **hard-asserts** the agent keeps serving other tasks after a per-task close.
 
 3. **[OPEN] Scheduling a cron before the first message silently fails.** The agent's
    `crons` table FK-references its local `tasks` row, which only exists after a
@@ -112,6 +111,6 @@ This e2e found three host-v2 ↔ runner-v2 interop bugs on first integration.
    fix: the host should seed `task_upsert` on the first cron too (as it does on the
    first message).
 
-Issues 2 and 3 are reported as **KNOWN ISSUES** in the run output and do not fail
-the suite; they are design-level decisions left for the maintainer rather than
+Issue 3 is reported as a **KNOWN ISSUE** in the run output and does not fail
+the suite; it is a design-level decision left for the maintainer rather than
 changed unilaterally.
