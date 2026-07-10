@@ -1,7 +1,7 @@
 # E2E test coverage
 
 What the docker-compose e2e (`./e2e/run.sh`) actually exercises, check by check.
-Latest run: **50/50 functional checks passed**, 2 known issues reported (see end).
+Latest run: **51/51 functional checks passed**, 1 known issue reported (see end).
 
 The suite is a **black-box integration test**: it drives only the host's public
 HTTP API and observes effects through it, while a **real gino-agent** does the
@@ -29,7 +29,7 @@ the real code path.
 - Liveness is probed by **work** (does a fresh task actually run?), not the `online`
   flag — a dead agent still reads online for the offline-grace window (~3×heartbeat).
 
-## Coverage matrix (50 checks across 11 groups)
+## Coverage matrix (51 checks across 11 groups)
 
 ### 1. Health & version — 3 checks
 | Check | Request | Asserts |
@@ -88,7 +88,7 @@ Proves the inbound message → task routing → real run → outbound transcript
 | mirror carries scheduling fields | same | `scheduleType=interval` round-tripped |
 | mirror shows it fired (roundCount ≥ 1) | same | a real fire happened on the agent (the mirror is fire-driven) |
 | 200 | `DELETE /admin/tasks/:id/crons/:cronId` | `cron_delete` command emitted |
-| host accepts the cron (201) | probe: cron on an un-messaged task | host returns 201 (→ see known issue #2) |
+| host accepts the cron (201) | probe: cron on an un-messaged task | host returns 201 (→ see known issue #1) |
 
 Proves the OD14 cron model end to end: emit → apply → fire → `cron_state` → mirror.
 
@@ -126,39 +126,31 @@ Authenticated by the per-agent connect token; authorized by task placement.
 | 200 (remove) | `POST /admin/agents/:id/remove` | agent removal |
 | 200 granted=false (revoke) | `POST /admin/agents/:id/revoke {owner}` | access revoked |
 
-### 11. Task lifecycle: interrupt / close — 4 checks (+1 known issue)
+### 11. Task lifecycle: interrupt / close — 5 checks
 | Check | Request | Asserts |
 |-------|---------|---------|
 | granted | grant owner-life → real agent | deterministic placement |
 | interrupt 200 | `POST /admin/tasks/:id/interrupt` | host emits `interrupt` |
 | agent still runs a new task after interrupt | run a fresh task (≤15s) | interrupt is **non-destructive** — agent keeps executing |
 | close 200 | `POST /admin/tasks/:id/close` | host side succeeds |
-| (per-task close non-destructive) | run a fresh task (≤12s) | **fails today** → reported as known issue #1 |
+| agent still runs a new task after a per-task close | run a fresh task (≤12s) | per-task close is **non-destructive** — the runner keeps serving other tasks (hard assertion) |
 
 ## Known issues (reported, do not fail the suite)
 
 These are pre-existing host↔runner design gaps the suite surfaces and reports
 without changing wire semantics unilaterally.
 
-1. **Per-task close shuts the whole runner down.** `POST /admin/tasks/:id/close`
-   emits a protocol `close` frame, which `docs/protocol.md §4` defines as
-   runner-level *wind-down and exit* (no `taskId`). The runner obeys
-   (`close received; shutting down` → `gino-agent stopped`), so closing one task
-   kills a multi-task agent. Detected here because a task placed on the agent after
-   the close never runs. Suggested fix: the host marks the task closed (and
-   `interrupt`s any in-flight turn) without emitting the global `close` — or the
-   protocol + runner gain a real per-task close.
-
-2. **Cron before the first message fails on the agent.** The agent's `crons` table
+1. **Cron before the first message fails on the agent.** The agent's `crons` table
    FK-references its local `tasks` row, created only by a `task_upsert` frame — which
    the host seeds lazily on the first *message*, not the first cron. So
    `POST /admin/tasks/:id/crons` on a never-messaged task returns 201 host-side, but
    the agent rejects `cron_upsert` with `FOREIGN KEY constraint failed` and the cron
    never applies/fires. Suggested fix: seed `task_upsert` on the first cron too.
 
-> A third bug — the runner rejecting the host's register config via
-> `deny_unknown_fields` — was **fixed** (`gino-agent/src/config.rs`); without it
-> registration failed outright and nothing below it could run.
+> Two earlier bugs are **fixed** and now hard-asserted: the runner rejecting the
+> host's register config via `deny_unknown_fields` (`gino-agent/src/config.rs`),
+> and a per-task close shutting the whole runner down (the host no longer emits
+> the runner-level `close` frame for a single task — see lifecycle check above).
 
 ## Not covered (out of scope for this harness)
 
