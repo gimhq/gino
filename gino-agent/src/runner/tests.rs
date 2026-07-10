@@ -7,7 +7,7 @@ use crate::transport::Inbound;
 
 use super::{
     ServeContext, acquire_daemon_lock, apply_task_def, conclude_inbox_row, handle_cron_upsert,
-    lock, lock_db, route,
+    lock, lock_db, route, task_owns_active_run,
 };
 
 fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
@@ -32,6 +32,46 @@ fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
         synced: false,
         created_at: "2026-06-22T00:00:00Z".to_owned(),
     }
+}
+
+/// Task-scoped interrupt: the scope check says a task owns the active run
+/// only when one of its threads is `dispatched` or `running` — a `pending`
+/// thread hasn't started and an `active`/settled one isn't in flight, so a
+/// scoped interrupt for those tasks must be a no-op.
+#[test]
+fn task_owns_active_run_matches_only_in_flight_threads() {
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+    {
+        let guard = lock_db(&db);
+        for task in ["t-running", "t-dispatched", "t-idle", "t-resting"] {
+            guard
+                .insert_task_row(&TaskRow {
+                    id: task.to_owned(),
+                    name: None,
+                    kind: None,
+                    status: "active".to_owned(),
+                    created_at: "2026-06-22T09:00:00.000Z".to_owned(),
+                    updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
+                })
+                .unwrap();
+        }
+        for (id, task, status) in [
+            ("th-run", "t-running", "running"),
+            ("th-disp", "t-dispatched", "dispatched"),
+            ("th-pend", "t-idle", "pending"),
+            ("th-done", "t-idle", "succeeded"),
+            ("th-rest", "t-resting", "active"),
+        ] {
+            let mut row = chat_thread(id, task);
+            row.status = status.to_owned();
+            guard.insert_thread(&row).unwrap();
+        }
+    }
+    assert!(task_owns_active_run(&db, "t-running"));
+    assert!(task_owns_active_run(&db, "t-dispatched"));
+    assert!(!task_owns_active_run(&db, "t-idle"));
+    assert!(!task_owns_active_run(&db, "t-resting"));
+    assert!(!task_owns_active_run(&db, "t-unknown"));
 }
 
 /// P2-18 regression: the daemon's single-instance lock is exclusive and

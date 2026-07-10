@@ -714,7 +714,7 @@ fn msg_id_of(frame: &InboundFrameV2) -> Option<i64> {
         | InboundFrameV2::CronUpsert { msg_id, .. }
         | InboundFrameV2::CronDelete { msg_id, .. }
         | InboundFrameV2::Message { msg_id, .. }
-        | InboundFrameV2::Interrupt { msg_id }
+        | InboundFrameV2::Interrupt { msg_id, .. }
         | InboundFrameV2::Close { msg_id }
         | InboundFrameV2::ConfigUpdate { msg_id, .. } => *msg_id,
         InboundFrameV2::Ack { .. } | InboundFrameV2::Unknown => None,
@@ -903,7 +903,10 @@ mod tests {
             "cron_delete"
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::Interrupt { msg_id: Some(1) }),
+            inbox_type(&InboundFrameV2::Interrupt {
+                task_id: None,
+                msg_id: Some(1)
+            }),
             "interrupt"
         );
     }

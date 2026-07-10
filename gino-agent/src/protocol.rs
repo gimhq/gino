@@ -525,8 +525,12 @@ pub(crate) mod v2 {
             #[serde(skip_serializing_if = "Option::is_none")]
             msg_id: Option<i64>,
         },
-        /// Graceful cancel of the current turn (no kill).
+        /// Graceful cancel of the current turn (no kill). An absent `taskId`
+        /// interrupts whatever is in flight; a present one scopes the cancel
+        /// to that task's run (additive: old hosts omit it).
         Interrupt {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            task_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             msg_id: Option<i64>,
         },
@@ -1019,7 +1023,11 @@ pub(crate) mod v2 {
                 })
             );
             assert_eq!(
-                serde_json::to_value(InboundFrameV2::Interrupt { msg_id: None }).unwrap(),
+                serde_json::to_value(InboundFrameV2::Interrupt {
+                    task_id: None,
+                    msg_id: None
+                })
+                .unwrap(),
                 json!({ "type": "interrupt" })
             );
             assert_eq!(
@@ -1027,7 +1035,14 @@ pub(crate) mod v2 {
                 json!({ "type": "ack", "id": 9 })
             );
             for frame in [
-                InboundFrameV2::Interrupt { msg_id: None },
+                InboundFrameV2::Interrupt {
+                    task_id: None,
+                    msg_id: None,
+                },
+                InboundFrameV2::Interrupt {
+                    task_id: Some("t-1".to_owned()),
+                    msg_id: Some(6),
+                },
                 InboundFrameV2::Close { msg_id: Some(4) },
                 InboundFrameV2::Close { msg_id: None },
                 config,
@@ -1035,6 +1050,30 @@ pub(crate) mod v2 {
             ] {
                 round_trip_inbound(&frame);
             }
+        }
+
+        #[test]
+        fn interrupt_task_id_is_additive() {
+            // Scoped form: envelope `taskId` lands in `task_id`.
+            let scoped: InboundFrameV2 =
+                serde_json::from_str(r#"{ "type": "interrupt", "taskId": "t-1" }"#).unwrap();
+            assert_eq!(
+                scoped,
+                InboundFrameV2::Interrupt {
+                    task_id: Some("t-1".to_owned()),
+                    msg_id: None,
+                }
+            );
+            // Legacy form: an interrupt without `taskId` must still parse.
+            let global: InboundFrameV2 =
+                serde_json::from_str(r#"{ "type": "interrupt" }"#).unwrap();
+            assert_eq!(
+                global,
+                InboundFrameV2::Interrupt {
+                    task_id: None,
+                    msg_id: None,
+                }
+            );
         }
 
         #[test]
