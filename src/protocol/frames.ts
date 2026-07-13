@@ -252,6 +252,12 @@ export const MessageFrame = z.looseObject({
 
 export const InterruptFrame = z.looseObject({
   type: z.literal("interrupt"),
+  /**
+   * Present → the interrupt is scoped to that task (the agent cancels the
+   * current turn only if that task owns it); absent → global (cancel the
+   * current turn regardless).
+   */
+  taskId: CorrelationId.optional(),
   outboxId: DeliveryId.optional(),
 });
 

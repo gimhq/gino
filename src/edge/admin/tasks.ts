@@ -6,7 +6,7 @@
 //   POST   /tasks/:id/assign          manual placement ({agent_id?}; set-once)
 //   POST   /tasks/:id/message         deliver input → task_upsert (if first) + message
 //   POST   /tasks/:id/interrupt       graceful cancel of the current turn
-//   POST   /tasks/:id/close           wind down + mark closed
+//   POST   /tasks/:id/close           mark closed + task-scoped interrupt (runner stays alive)
 //   GET    /tasks/:id/crons           list the cron mirror (read-only, OD14)
 //   POST   /tasks/:id/crons           create a trigger → cron_upsert command
 //   PUT    /tasks/:id/crons/:cronId   modify a trigger → cron_upsert command
@@ -27,10 +27,10 @@ import {
   assignTaskToAgent,
   closeTask,
   createTask,
-  emitClose,
   emitCronDelete,
   emitCronUpsert,
   emitInterrupt,
+  emitTaskUpsert,
   listTaskCrons,
   listTasks,
   placeTask,
@@ -257,21 +257,22 @@ export function adminTaskRoutes() {
     },
   );
 
-  // ── Close (wind down + mark closed; no host auto-terminal, DP4) ─────────────
+  // ── Close (mark closed + task-scoped interrupt; the runner stays alive) ─────
   router.post(
     "/:id/close",
     describeRoute({
       tags: [TAGS.Tasks],
-      summary: "Close a task (emit close + mark closed)",
+      summary: "Close a task (mark closed + task-scoped interrupt; the runner stays alive)",
       responses: { ...jsonOk(z.any(), "Closed"), ...errors(401, 404, 409) },
     }),
     (c) => {
       const db = c.get("db");
       const id = c.req.param("id");
       const task = requireTask(db, id);
-      const row = emitClose(db, sessions, task);
+      const interrupt = emitInterrupt(db, sessions, task);
       const closed = closeTask(db, id);
-      return c.json(ok({ task: serializeTask(closed), outboxId: row.id }));
+      emitTaskUpsert(db, sessions, closed); // carries status "closed" to the agent
+      return c.json(ok({ task: serializeTask(closed), outboxId: interrupt.id }));
     },
   );
 

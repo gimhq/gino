@@ -536,18 +536,7 @@ async function testLifecycle(): Promise<void> {
 
   await step("per-task close must NOT stop the agent serving other tasks", async () => {
     const alive = await agentExecutesNewTask(agentId, owner, "post-close", 12_000);
-    if (alive) {
-      check("agent still runs a new task after a per-task close", true);
-    }
-    else {
-      // Reported, not failed: a confirmed host↔runner semantics gap. The runner
-      // logs `close received; shutting down` / `gino-agent stopped` and the
-      // container exits — so a task placed here afterwards never runs.
-      note(
-        "per-task close shuts the whole runner down",
-        "`POST /tasks/:id/close` emits a protocol `close` frame, which protocol.md §4 defines as runner-level wind-down+exit (no taskId). The runner obeys and the WHOLE agent exits, so closing ONE task kills a multi-task agent (a subsequent task placed on it never runs). Fix: host should not emit the global `close` for a single task — mark the task closed and (if needed) `interrupt` the in-flight turn — or add a per-task close frame to the protocol + runner.",
-      );
-    }
+    check("agent still runs a new task after a per-task close", alive);
   });
 }
 
