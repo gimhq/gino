@@ -47,6 +47,13 @@ export interface InboundDeps {
   sender?: FrameSender;
   agentId: string;
   logger?: Logger;
+  /**
+   * M6 webhook egress trigger (HOST-M5M6-04): fired AFTER a `thread_message`
+   * is durably stored, so the webhook pump pushes the new row promptly. Purely
+   * a scheduling hint — delivery itself stays cursor-driven (egress re-reads
+   * the store), so a missed/failed notification loses nothing.
+   */
+  onTranscriptWrite?: (taskId: string) => void;
 }
 
 /** Build the `ack{id}` for a frame that carried its own `outboxId`, else null. */
@@ -182,6 +189,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
       }
       writeThreadMessage(db, { taskId: decoded.taskId, threadId: decoded.threadId, data });
+      deps.onTranscriptWrite?.(decoded.taskId);
       return ackFor(decoded);
     }
 
@@ -304,6 +312,8 @@ export class MalformedFrameError extends Error {
  * `MalformedFrameError` on an undecodable frame (→ 400, do not retry) and lets
  * a TRANSIENT storage failure propagate untagged (→ 5xx, the agent retries) —
  * HOST-M1M2-09. PERMANENT failures return the poison ack (2xx) like the WS path.
+ * The deps carry the optional `onTranscriptWrite` webhook-pump trigger
+ * (HOST-M5M6-04) exactly like the WS path.
  */
 export function ingestHttpFrame(deps: Omit<InboundDeps, "sender">, raw: string | ArrayBuffer | Uint8Array): Record<string, unknown> {
   const decoded = decodeFrame(raw);

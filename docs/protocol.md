@@ -143,12 +143,20 @@ Field semantics:
   `final_seq` (`thread_result`) is the last `seq` emitted on the thread (see §6).
 - `round_count` / `skipped_count` (`cron_state`) are the runner-local `cron_logs` summary;
   the host derives dispatched counts from its own mirror by `cron_id`.
-- `threadId` (`message`, host→agent) selects continuity: **present** → CONTINUE that
-  thread (resume its stored `engine_session_id`); **absent** → START A FRESH thread — the
-  agent mints a new unique `threadId` (no carried session) and returns it on the resulting
-  `thread_result`/`thread_message` so the host records it as the task's `current_thread_id`.
-  There is no implicit per-task continue on an absent `threadId` — every absent-`threadId`
-  message is a brand-new thread.
+- `threadId` (`message`, host→agent) selects continuity. The HOST mints conversation
+  thread ids (globally unique ULIDs, §6) and records each one as the task's
+  `current_thread_id` BEFORE emitting the frame; every `message` a conforming host sends
+  carries a `threadId`. On the agent: **present + known** → CONTINUE that thread (resume
+  its stored `engine_session_id`); **present + unknown** → CREATE ON FIRST SIGHT — the
+  agent creates a fresh thread under the host-supplied id with no carried session. Every
+  conversation starts via create-on-first-sight (the first message of a task, an explicit
+  new-thread request, and the fresh thread after an orphaned task is re-placed). An
+  **absent** `threadId` is tolerated defensively (the field stays optional on the wire):
+  the agent derives a deterministic thread id — stable across at-least-once replays — and
+  returns it on the resulting `thread_result`/`thread_message` frames; there is no
+  implicit per-task continue on an absent `threadId`. Cron-fired thread ids are the one
+  agent-minted family the host sees (`<cronId>@<epoch>` / `<cronId>@shared`, §7): they
+  arrive only on agent→host frames and are never a task's `current_thread_id`.
 
 The agent is **authoritative for scheduling and execution**; `thread_result` / `cron_state`
 are mirror-only writes on the host (read model). The host is a sink for results and a

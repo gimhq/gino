@@ -1,3 +1,4 @@
+import type { WebhookPump } from "./channels";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
 import type { Logger } from "./shared/lib/logger";
@@ -10,6 +11,7 @@ import { secureHeaders } from "hono/secure-headers";
 import { startLaunchReaper } from "./agents/launch-reaper";
 import { startLivenessSweep } from "./agents/liveness";
 import { sessions } from "./agents/sessions";
+import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
@@ -30,6 +32,8 @@ interface AppDeps {
   readonly config: Config;
   readonly db: AppDatabase;
   readonly logger: Logger;
+  /** M6 webhook egress pump (HOST-M5M6-04) — started by bootstrap; absent in tests that compose the app directly. */
+  readonly webhookPump?: WebhookPump;
 }
 
 export interface BootstrapResult {
@@ -74,7 +78,7 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Exported so tests can construct the app with injected deps (no env / no
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
-export function createApp({ config, db, logger }: AppDeps) {
+export function createApp({ config, db, logger, webhookPump }: AppDeps) {
   // HOST-M9-08 — surface the spoofable proxy configuration at composition
   // time: TRUST_PROXY without an allow-list means any direct client can
   // forge X-Forwarded-For and evade every IP-keyed control.
@@ -96,6 +100,9 @@ export function createApp({ config, db, logger }: AppDeps) {
     c.set("db", db);
     c.set("config", config);
     c.set("logger", logger);
+    if (webhookPump) {
+      c.set("webhookPump", webhookPump);
+    }
     return next();
   });
   api.use("*", loggingMiddleware());
@@ -180,7 +187,20 @@ export function bootstrap(): BootstrapResult {
   const config = loadConfig();
   const logger = createLogger(config);
   const db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger });
+
+  // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
+  // webhook delivery: pushed on inbound transcript writes, retried on a tick.
+  // Started here (not in `createApp`) so tests that build the app directly
+  // never spin a background timer.
+  const webhookPump = startWebhookPump({
+    db,
+    logger,
+    timeoutMs: config.WEBHOOK_TIMEOUT_MS,
+    maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
+    intervalMs: config.WEBHOOK_RETRY_INTERVAL_MS,
+  });
+
+  const app = createApp({ config, db, logger, webhookPump });
 
   // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
   // it never holds the process open; `stop()` is folded into `closeDb` so clean
@@ -207,6 +227,7 @@ export function bootstrap(): BootstrapResult {
       liveness.stop();
       outboxGc.stop();
       launchReaper.stop();
+      webhookPump.stop();
       db.close();
     },
   };
