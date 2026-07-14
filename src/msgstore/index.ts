@@ -28,6 +28,6 @@ export type { ThreadMessageWrite } from "./messages";
 export { getTranscript, writeThreadMessage } from "./messages";
 
 export { getTaskThreads, getThreadTaskId } from "./reads";
-export type { ThreadResultWrite } from "./thread-runs";
+export type { ThreadResultWrite, TranscriptCompleteness } from "./thread-runs";
 
-export { getThreadRun, writeThreadResult } from "./thread-runs";
+export { checkTranscriptCompleteness, getThreadRun, writeThreadResult } from "./thread-runs";

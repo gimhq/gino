@@ -175,8 +175,16 @@ describe("protocol v2 frame contract", () => {
       expect(r.success).toBe(false);
     });
 
-    it("bad enum (thread_message.kind)", () => {
+    // `kind` is an OPEN string (HOST-M1M2-04): an unrecognized value parses —
+    // the writer stores it opaquely and flags it — so version drift on this
+    // additive field can never poison a frame.
+    it("unrecognized thread_message.kind still parses (open string, HOST-M1M2-04)", () => {
       const r = AnyFrame.safeParse({ type: "thread_message", taskId: "t", threadId: "c", data: { seq: 1, kind: "screaming" } });
+      expect(r.success).toBe(true);
+    });
+
+    it("wrong kind type (thread_message.kind as number)", () => {
+      const r = AnyFrame.safeParse({ type: "thread_message", taskId: "t", threadId: "c", data: { seq: 1, kind: 7 } });
       expect(r.success).toBe(false);
     });
 
