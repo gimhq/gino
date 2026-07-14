@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
-import { ackMessage, ackOutbox, enqueue, gcOutbox, OUTBOX_RETENTION_MS, replayUnacked } from "@/protocol/outbox";
+import { ackMessage, ackOutbox, CLOSE_FRAME_TTL_MS, enqueue, gcOutbox, OUTBOX_RETENTION_MS, purgeAgentOutbox, replayUnacked } from "@/protocol/outbox";
 
 // M2 outbox — at-least-once host→agent: persist before send; replay unacked on
 // reconnect; stop replaying on ack{id} / msg_ack{msgId}.
@@ -236,5 +236,77 @@ describe("M2 outbox — retention GC", () => {
     sender.online = true;
     expect(replayUnacked(db, sender, agentId)).toBe(2);
     expect(sender.sent.map(s => s.frame.type)).toEqual(["message", "interrupt"]);
+  });
+});
+
+describe("M2 outbox — stale close TTL on replay (HOST-M3-13)", () => {
+  /** Backdate a row's created_at (the close TTL is measured against it). */
+  function createdAt(id: number, ts: number): void {
+    db.update(outbox).set({ createdAt: ts }).where(eq(outbox.id, id)).run();
+  }
+
+  it("skips + retires a close frame past the TTL — a stale stop cannot kill a later start", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const stale = enqueue(db, sender, { agentId, type: "close", data: { reason: "stop" } });
+    createdAt(stale.id, now - CLOSE_FRAME_TTL_MS - 1);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+    // Retired (marked acked) so it never rescans on the next reconnect.
+    expect(db.select().from(outbox).where(eq(outbox.id, stale.id)).get()?.ackedAt).not.toBeNull();
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(0);
+  });
+
+  it("delivers a close frame still within the TTL", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    enqueue(db, sender, { agentId, type: "close", data: { reason: "stop" } });
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "close" });
+  });
+
+  it("non-close frames replay regardless of age (only close carries the NOW intent)", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const old = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    createdAt(old.id, now - CLOSE_FRAME_TTL_MS * 100);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "task_upsert" });
+  });
+
+  it("honours a custom close TTL", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const row = enqueue(db, sender, { agentId, type: "close", data: { reason: "restart" } });
+    createdAt(row.id, now - 5000);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { closeTtlMs: 1000, now: () => now })).toBe(0);
+  });
+});
+
+describe("M2 outbox — purge on remove (HOST-M3-12)", () => {
+  it("deletes only the agent's UNACKED rows; acked rows stay for retention GC", () => {
+    const sender = fakeSender(false);
+    const unacked1 = enqueue(db, sender, { agentId, type: "close", data: { reason: "remove" } });
+    const unacked2 = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    const acked = enqueue(db, sender, { agentId, type: "interrupt" });
+    ackOutbox(db, agentId, acked.id);
+    const other = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
+    const foreign = enqueue(db, sender, { agentId: other, type: "close", data: { reason: "stop" } });
+
+    expect(purgeAgentOutbox(db, agentId)).toBe(2);
+
+    const remaining = db.select({ id: outbox.id }).from(outbox).all().map(r => r.id);
+    expect(remaining).not.toContain(unacked1.id);
+    expect(remaining).not.toContain(unacked2.id);
+    expect(remaining).toContain(acked.id);
+    expect(remaining).toContain(foreign.id);
   });
 });

@@ -116,11 +116,32 @@ export function ackMessage(db: AppDatabase, agentId: string, msgId: number): voi
 }
 
 /**
+ * TTL for durable `close` control frames (HOST-M3-13) — 15 minutes. A `close`
+ * queued by a stop/restart fallback while the agent was offline expresses a
+ * NOW intent, not a standing order: replaying it weeks later would kill a
+ * deliberate later start. Past the TTL the frame is skipped (and retired) on
+ * replay instead of delivered.
+ */
+export const CLOSE_FRAME_TTL_MS = 15 * 60 * 1000;
+
+export interface ReplayOptions {
+  /** TTL for `close` frames in ms. Defaults to `CLOSE_FRAME_TTL_MS`. */
+  readonly closeTtlMs?: number;
+  /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
+  readonly now?: () => number;
+  readonly logger?: Logger;
+}
+
+/**
  * Replay every unacked frame for an agent, in id order, on (re)connect. The
  * agent dedupes by id, so re-sending an already-processed-but-not-yet-acked
  * frame is safe. Returns the number of frames pushed.
+ *
+ * HOST-M3-13: a `close` frame older than its TTL is STALE — it is retired
+ * (marked acked so it never rescans) and logged instead of sent, so a stop
+ * issued while the agent was offline cannot kill a deliberate later start.
  */
-export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: string): number {
+export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: string, opts: ReplayOptions = {}): number {
   const rows = db
     .select()
     .from(outbox)
@@ -128,13 +149,39 @@ export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: str
     .orderBy(asc(outbox.id))
     .all();
 
+  const now = opts.now?.() ?? Date.now();
+  const closeCutoff = now - (opts.closeTtlMs ?? CLOSE_FRAME_TTL_MS);
+
   let sent = 0;
   for (const row of rows) {
+    if (row.type === "close" && row.createdAt < closeCutoff) {
+      db.update(outbox).set({ ackedAt: now }).where(eq(outbox.id, row.id)).run();
+      opts.logger?.warn(
+        { agentId, outboxId: row.id, ageMs: now - row.createdAt },
+        "stale close frame skipped on replay (past TTL) — retired without delivery",
+      );
+      continue;
+    }
     if (sender.send(agentId, encodeOutbox(row))) {
       sent += 1;
     }
   }
   return sent;
+}
+
+/**
+ * Purge an agent's UNACKED outbox rows (HOST-M3-12). Called on remove: the
+ * agent's connect token is revoked, so it can never reconnect to replay or ack
+ * — the rows are undeliverable by construction and would otherwise be immortal
+ * (retention GC only touches acked rows). Returns the number of rows deleted.
+ */
+export function purgeAgentOutbox(db: AppDatabase, agentId: string): number {
+  return db
+    .delete(outbox)
+    .where(and(eq(outbox.agentId, agentId), isNull(outbox.ackedAt)))
+    .returning({ id: outbox.id })
+    .all()
+    .length;
 }
 
 /** Default retention window for ACKED outbox rows (ms) — 7 days. */
