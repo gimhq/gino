@@ -56,6 +56,18 @@ describe("M3 registry — lifecycle + liveness", () => {
     expect(getAgent(db, agent.id)?.status).toBe("offline");
   });
 
+  it("removed is terminal — a late status write cannot resurrect the agent", () => {
+    const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+    setAgentStatus(db, agent.id, "online");
+    setAgentStatus(db, agent.id, "removed");
+
+    // The WS close the remove itself provoked lands afterwards (HOST-M3-01).
+    setAgentStatus(db, agent.id, "offline");
+    expect(getAgent(db, agent.id)?.status).toBe("removed");
+    setAgentStatus(db, agent.id, "online");
+    expect(getAgent(db, agent.id)?.status).toBe("removed");
+  });
+
   it("touchLiveness updates last_seen + active_threads", () => {
     const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
     touchLiveness(db, agent.id, 4);

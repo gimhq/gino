@@ -120,9 +120,19 @@ export function getAgentByConnectToken(db: AppDatabase, token: string): Agent | 
   return agent ?? null;
 }
 
-/** Drive the agent lifecycle status (`enrolled → online ⇄ offline → removed`). */
+/**
+ * Drive the agent lifecycle status (`enrolled → online ⇄ offline → removed`).
+ * `removed` is TERMINAL: a row already `removed` is never transitioned out —
+ * so the late WS close a remove provokes cannot resurrect the agent as
+ * `offline` (a resurrected row would again pass the `status === "removed"`
+ * fail-closed gates while its connect token stays revoked).
+ */
 export function setAgentStatus(db: AppDatabase, agentId: string, status: AgentStatus): void {
-  db.update(agents).set({ status }).where(eq(agents.id, agentId)).run();
+  db
+    .update(agents)
+    .set({ status })
+    .where(and(eq(agents.id, agentId), ne(agents.status, "removed")))
+    .run();
 }
 
 /**
