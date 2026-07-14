@@ -42,8 +42,8 @@ describe("hashToken / verifyToken", () => {
 
 describe("generateId", () => {
   it("prefixes when asked and stays opaque otherwise", () => {
-    expect(generateId("agent")).toMatch(/^agent_[0-9a-z]{8}$/);
-    expect(generateId()).toMatch(/^[0-9a-z]{8}$/);
+    expect(generateId("agent")).toMatch(/^agent_[0-9a-z]{16}$/);
+    expect(generateId()).toMatch(/^[0-9a-z]{16}$/);
   });
 });
 
