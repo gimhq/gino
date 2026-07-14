@@ -14,9 +14,17 @@
 //      resolution — every resolved A/AAAA must be public. This defeats
 //      DNS-rebinding / CNAMEs into private space (a host that passed the string
 //      check at registration can resolve into private space at delivery time).
-//      Delivery also refuses to auto-follow redirects (`redirect: "manual"`) and
-//      re-validates any `Location` through the same guard before following — so a
-//      validated public URL can't 3xx-bounce into internal space.
+//      For plain-http targets the request is PINNED to the vetted address
+//      (HOST-M5M6-07): the fetch connects to the resolved-and-validated IP with
+//      the Host header preserved, so fetch's own DNS lookup can never be rebound
+//      between validation and connect. https targets keep the hostname URL —
+//      TLS server-certificate validation binds the connection to the registered
+//      host (a rebound private endpoint cannot present a valid certificate for
+//      it), and connecting by IP would break SNI/certificate matching.
+//      Delivery never follows redirects (`redirect: "manual"`, HOST-M5M6-11): a
+//      3xx is a delivery failure, so the shared secret and transcript payload
+//      are never re-sent to a `Location` target that was never registered. Every
+//      request is bounded by a timeout (AbortSignal, HOST-M5M6-05).
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { isPrivateUpstreamHost } from "@/proxy";
@@ -55,7 +63,13 @@ export interface FetchResponse {
 /** The minimal `fetch` surface webhook delivery needs (injectable for tests — no real network). */
 export type FetchLike = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string; redirect?: "manual" | "error" | "follow" },
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    redirect?: "manual" | "error" | "follow";
+    signal?: AbortSignal;
+  },
 ) => Promise<FetchResponse>;
 
 /** Normalize a URL hostname for the IP/loopback checks (lower-case, IPv6 brackets stripped). */
@@ -102,10 +116,21 @@ export function assertSafeWebhookUrl(raw: string): URL {
  * injectable so tests never hit real DNS.
  */
 export async function assertSafeWebhookUrlResolved(raw: string, resolver: DnsResolver = defaultResolver): Promise<URL> {
+  return (await vetWebhookTarget(raw, resolver)).url;
+}
+
+/** A vetted delivery target: the validated URL plus the resolved-and-validated addresses (null for a literal-IP host — nothing was resolved). */
+interface VettedTarget {
+  url: URL;
+  addresses: ResolvedAddress[] | null;
+}
+
+/** The implementation behind `assertSafeWebhookUrlResolved`, keeping the vetted addresses so delivery can pin one (HOST-M5M6-07). */
+async function vetWebhookTarget(raw: string, resolver: DnsResolver): Promise<VettedTarget> {
   const url = assertSafeWebhookUrl(raw);
   const host = guardHost(url);
   if (isIP(host) !== 0) {
-    return url; // literal IP — already validated synchronously; nothing to resolve
+    return { url, addresses: null }; // literal IP — already validated synchronously; nothing to resolve
   }
   const addresses = await resolver(host);
   if (addresses.length === 0) {
@@ -116,7 +141,7 @@ export async function assertSafeWebhookUrlResolved(raw: string, resolver: DnsRes
       throw new AppError("webhook URL resolves to a private/loopback address", 422, "SSRF_BLOCKED");
     }
   }
-  return url;
+  return { url, addresses };
 }
 
 export interface WebhookPayload {
@@ -134,21 +159,28 @@ export interface WebhookResult {
 export interface DeliverOptions {
   /** Injectable DNS resolver for the delivery-time SSRF re-check (defaults to node:dns). */
   resolver?: DnsResolver;
+  /** Per-request delivery timeout in ms (defaults to `DEFAULT_WEBHOOK_TIMEOUT_MS`). */
+  timeoutMs?: number;
 }
 
-/** Cap on redirect hops we will re-validate and follow before giving up. */
-const MAX_WEBHOOK_REDIRECTS = 3;
+/** Default per-request delivery timeout (HOST-M5M6-05): a hung endpoint can never stall the push loop indefinitely. */
+export const DEFAULT_WEBHOOK_TIMEOUT_MS = 10_000;
 
 /**
- * Deliver one payload to one webhook endpoint (SSRF-guarded, redirect-safe).
- * The target URL is re-validated WITH DNS resolution before every request, and
- * redirects are NOT auto-followed (`redirect: "manual"`): a 3xx `Location` is
- * re-validated through the same guard (and the hop count is bounded) before the
- * follow-up request is issued, so a validated public URL can never bounce into
- * private/internal space. Returns the HTTP status and whether it was a 2xx — the
- * caller (egress) uses `ok` to decide whether to advance the cursor. An
- * SSRF-blocked / unresolvable target fails the delivery (`ok: false`) rather than
- * throwing, so one bad endpoint never aborts a channel's whole push.
+ * Deliver one payload to one webhook endpoint (SSRF-guarded, pinned, bounded).
+ * The target is re-validated WITH DNS resolution before the request; for a
+ * plain-http target the request is issued to the vetted resolved IP with the
+ * Host header preserved, so fetch's independent DNS lookup can never be rebound
+ * into private space between validation and connect (HOST-M5M6-07 — https
+ * targets keep the hostname URL: certificate validation pins the identity).
+ * Redirects are never followed — a 3xx is a delivery failure, so the shared
+ * secret and payload are never re-sent to an unregistered `Location` target
+ * (HOST-M5M6-11). Every request carries an abort timeout (HOST-M5M6-05).
+ * Returns the HTTP status and whether it was a 2xx — the caller (egress) uses
+ * `ok` to decide whether to advance the cursor. An SSRF-blocked / unresolvable /
+ * timed-out / unreachable target fails the delivery (`ok: false`, status 0 for
+ * transport failures) rather than throwing, so one bad endpoint never aborts a
+ * channel's whole push.
  */
 export async function deliverWebhook(
   endpoint: WebhookEndpoint,
@@ -157,46 +189,45 @@ export async function deliverWebhook(
   opts: DeliverOptions = {},
 ): Promise<WebhookResult> {
   const resolver = opts.resolver ?? defaultResolver;
-  let target: URL;
+  let target: VettedTarget;
   try {
-    target = await assertSafeWebhookUrlResolved(endpoint.url, resolver);
+    target = await vetWebhookTarget(endpoint.url, resolver);
   }
   catch {
     return { ok: false, status: 0 }; // SSRF-blocked / unresolvable → fail (cursor not advanced)
   }
 
-  const body = JSON.stringify(payload);
-  for (let hop = 0; ; hop++) {
-    const res = await fetchImpl(target.toString(), {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(endpoint.secret ? { "x-webhook-secret": endpoint.secret } : {}),
+  };
+
+  // HOST-M5M6-07 — pin the vetted address for http targets (see module header).
+  let requestUrl = target.url.toString();
+  const pin = target.addresses?.[0];
+  if (target.url.protocol === "http:" && pin) {
+    const pinned = new URL(target.url.toString());
+    pinned.hostname = pin.family === 6 ? `[${pin.address}]` : pin.address;
+    requestUrl = pinned.toString();
+    headers.host = target.url.host; // original hostname (+port) for the receiver's vhost routing
+  }
+
+  let res: FetchResponse;
+  try {
+    res = await fetchImpl(requestUrl, {
       method: "POST",
       redirect: "manual", // never auto-follow into an unvalidated host (SSRF redirect bypass)
-      headers: {
-        "content-type": "application/json",
-        ...(endpoint.secret ? { "x-webhook-secret": endpoint.secret } : {}),
-      },
-      body,
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_WEBHOOK_TIMEOUT_MS),
     });
-
-    // Not a 3xx → final result.
-    if (res.status < 300 || res.status >= 400) {
-      return { ok: res.status >= 200 && res.status < 300, status: res.status };
-    }
-
-    // 3xx — re-validate the Location (DNS-resolved) before following; bound the hops.
-    if (hop >= MAX_WEBHOOK_REDIRECTS) {
-      return { ok: false, status: res.status }; // too many redirects
-    }
-    const location = res.headers?.get("location");
-    if (!location) {
-      return { ok: false, status: res.status }; // 3xx without a Location → give up
-    }
-    let next: URL;
-    try {
-      next = await assertSafeWebhookUrlResolved(new URL(location, target).toString(), resolver);
-    }
-    catch {
-      return { ok: false, status: res.status }; // redirect target is SSRF-blocked → do NOT follow
-    }
-    target = next;
   }
+  catch {
+    return { ok: false, status: 0 }; // timeout / network error → failed delivery, never a thrown push
+  }
+
+  // HOST-M5M6-11 — a 3xx is a failure: the secret + transcript are never re-sent
+  // to a Location target (only "is it public" could ever be checked, not "is it
+  // the registered endpoint").
+  return { ok: res.status >= 200 && res.status < 300, status: res.status };
 }

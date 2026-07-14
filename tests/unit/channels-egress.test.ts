@@ -1,4 +1,4 @@
-import type { DnsResolver, FetchLike } from "@/channels";
+import type { DnsResolver, FetchLike, WebhookAttemptState } from "@/channels";
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
 import type { ThreadMessageData } from "@/protocol/frames";
@@ -284,6 +284,68 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
     expect(() => assertSafeWebhookUrl("ftp://example.com/x")).toThrow();
     // A public host passes.
     expect(assertSafeWebhookUrl("https://hooks.example.com/in").hostname).toBe("hooks.example.com");
+  });
+
+  it("dead-letters a persistently failing batch after maxAttempts and later messages still deliver (HOST-M5M6-05)", async () => {
+    const taskId = makeTask();
+    const base = channel(undefined, "webhook");
+    bindConversation(db, base.id, "conv-wh", taskId);
+    addWebhook(db, base.id, { url: "https://hooks.example.com/in" });
+    const ch = getChannel(db, base.id)!;
+    seed(taskId, ["user_input"]);
+
+    const publicResolver: DnsResolver = async () => [{ address: "93.184.216.34", family: 4 }];
+    const attempts = new Map<string, WebhookAttemptState>();
+    const fail: FetchLike = async () => ({ status: 500 });
+    const push = (fetchImpl: FetchLike) =>
+      pushChannelWebhooks(db, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
+
+    // Attempts 1..2 — bounded retries: the cursor stays pinned, nothing skipped yet.
+    for (let i = 0; i < 2; i++) {
+      expect((await push(fail))[0]!.ok).toBe(false);
+    }
+    expect(readCursor(db, ch.id, taskId)).toBe(0);
+
+    // Attempt 3 = maxAttempts → the poison batch is dead-lettered: the cursor
+    // advances PAST it so the channel is no longer wedged.
+    expect((await push(fail))[0]!.ok).toBe(false);
+    const skipped = readCursor(db, ch.id, taskId);
+    expect(skipped).toBeGreaterThan(0);
+
+    // A later message flows normally — head-of-line blocking is broken.
+    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "after-poison" } });
+    const delivered = await push(async () => ({ status: 200 }));
+    expect(delivered[0]!.ok).toBe(true);
+    expect(delivered[0]!.delivered).toBe(1); // only the post-poison row, never the skipped one
+    expect(readCursor(db, ch.id, taskId)).toBeGreaterThan(skipped);
+  });
+
+  it("a success (or new rows) resets the attempt budget — only the SAME failing batch is counted", async () => {
+    const taskId = makeTask();
+    const base = channel(undefined, "webhook");
+    bindConversation(db, base.id, "conv-wh", taskId);
+    addWebhook(db, base.id, { url: "https://hooks.example.com/in" });
+    const ch = getChannel(db, base.id)!;
+    seed(taskId, ["user_input"]);
+
+    const publicResolver: DnsResolver = async () => [{ address: "93.184.216.34", family: 4 }];
+    const attempts = new Map<string, WebhookAttemptState>();
+    const push = (fetchImpl: FetchLike) =>
+      pushChannelWebhooks(db, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
+
+    // Two failures, then a success: the budget is cleared, nothing skipped.
+    await push(async () => ({ status: 500 }));
+    await push(async () => ({ status: 500 }));
+    await push(async () => ({ status: 200 }));
+    expect(attempts.size).toBe(0);
+    const acked = readCursor(db, ch.id, taskId);
+    expect(acked).toBeGreaterThan(0);
+
+    // A NEW batch failing twice starts from a fresh budget (cursor moved).
+    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "next" } });
+    await push(async () => ({ status: 500 }));
+    await push(async () => ({ status: 500 }));
+    expect(readCursor(db, ch.id, taskId)).toBe(acked); // not dead-lettered — 2 < maxAttempts
   });
 
   it("a channel with no webhooks is a no-op push", async () => {

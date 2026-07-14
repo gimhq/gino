@@ -260,7 +260,9 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
 
-      const deps = { db, sender: sessions, agentId, logger };
+      // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+      const pump = c.get("webhookPump");
+      const deps = { db, sender: sessions, agentId, logger, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
@@ -339,7 +341,12 @@ export function agentRoutes() {
       // agent must drop it); a storage failure propagates to the error handler
       // as a 5xx so the agent retries the frame.
       try {
-        return c.json(ingestHttpFrame({ db: c.get("db"), agentId, logger: c.get("logger") }, raw));
+        // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+        const pump = c.get("webhookPump");
+        return c.json(ingestHttpFrame(
+          { db: c.get("db"), agentId, logger: c.get("logger"), ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
+          raw,
+        ));
       }
       catch (err) {
         if (err instanceof MalformedFrameError) {

@@ -72,6 +72,14 @@ export const configSchema = z.object({
   RATE_LIMIT_MESSAGES_MAX: z.coerce.number().int().min(1).default(300),
   RATE_LIMIT_MESSAGES_WINDOW_MS: z.coerce.number().int().min(1).default(60_000),
 
+  // ─── M6 — outbound webhook egress (HOST-M5M6-04/05) ───
+  // Per-request delivery timeout, the bounded attempt budget before a
+  // persistently failing batch is dead-lettered (skipped with a log), and the
+  // pump's retry-tick cadence for failed/backlogged pushes.
+  WEBHOOK_TIMEOUT_MS: z.coerce.number().int().min(1).default(10_000),
+  WEBHOOK_MAX_ATTEMPTS: z.coerce.number().int().min(1).default(5),
+  WEBHOOK_RETRY_INTERVAL_MS: z.coerce.number().int().min(100).default(15_000),
+
   // ─── M7 — credential proxy (`/llm/*`) ───
   // The host holds the real upstream LLM credentials; the engine reaches the
   // proxy via ANTHROPIC_BASE_URL/OPENAI_BASE_URL = `<hostUrl>/llm` and never

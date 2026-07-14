@@ -27,6 +27,7 @@
 import type { DnsResolver, FetchLike } from "./webhooks";
 import type { AppDatabase } from "@/db";
 import type { Channel, Message } from "@/db/schema";
+import type { Logger } from "@/shared/lib/logger";
 import { and, eq, gt } from "drizzle-orm";
 import { channelBindings, channelCursors, messages, tasks } from "@/db/schema";
 import { NotFoundError } from "@/shared/lib/errors";
@@ -251,17 +252,48 @@ export interface WebhookPushResult {
   ok: boolean;
 }
 
+/** Default bounded attempt budget before a persistently failing batch is dead-lettered (HOST-M5M6-05). */
+export const DEFAULT_WEBHOOK_MAX_ATTEMPTS = 5;
+
+/** Failed-push state for one `(channel, task)` batch: how often the SAME cursor position has failed. */
+export interface WebhookAttemptState {
+  cursor: number;
+  failures: number;
+}
+
+export interface WebhookPushOptions {
+  fetchImpl?: FetchLike;
+  resolver?: DnsResolver;
+  limit?: number;
+  /** Per-request delivery timeout (ms), passed through to `deliverWebhook`. */
+  timeoutMs?: number;
+  /**
+   * Poison policy (HOST-M5M6-05): attempt state keyed `"<channelId>:<taskId>"`,
+   * owned by the caller (the pump) so it survives across pushes. When the SAME
+   * batch (same cursor) has failed `maxAttempts` times, the batch is
+   * dead-lettered — logged and SKIPPED (cursor advanced past it) — so one
+   * poison message can never wedge a channel's egress forever. Omit to retry
+   * indefinitely (the pre-existing at-least-once behavior).
+   */
+  attempts?: Map<string, WebhookAttemptState>;
+  /** Attempt budget for the poison policy (defaults to `DEFAULT_WEBHOOK_MAX_ATTEMPTS`). */
+  maxAttempts?: number;
+  logger?: Logger;
+}
+
 /**
  * Push a channel's new messages to its registered outbound webhooks (the egress
  * adapter for `type: "webhook"` channels). Reads are non-destructive; the
  * cursor advances ONLY after every webhook returned 2xx for that task — so a
  * failed push re-reads from the store next time and nothing is lost
- * (cursor-driven delivery, §9). A channel with no webhooks is a no-op.
+ * (cursor-driven delivery, §9) — EXCEPT when the bounded-attempt poison policy
+ * (`opts.attempts`) dead-letters a batch that keeps failing. A channel with no
+ * webhooks is a no-op.
  */
 export async function pushChannelWebhooks(
   db: AppDatabase,
   channel: Channel,
-  opts: { fetchImpl?: FetchLike; resolver?: DnsResolver; limit?: number } = {},
+  opts: WebhookPushOptions = {},
 ): Promise<WebhookPushResult[]> {
   const webhooks = listWebhooks(channel);
   if (webhooks.length === 0) {
@@ -282,15 +314,38 @@ export async function pushChannelWebhooks(
           messages: delivery.messages,
         },
         opts.fetchImpl,
-        opts.resolver ? { resolver: opts.resolver } : {},
+        {
+          ...(opts.resolver ? { resolver: opts.resolver } : {}),
+          ...(opts.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
+        },
       );
       if (!res.ok) {
         ok = false;
       }
     }
-    // Cursor-driven: advance past this batch only once it is durably delivered.
+    const attemptKey = `${channel.id}:${delivery.taskId}`;
     if (ok) {
+      // Cursor-driven: advance past this batch only once it is durably delivered.
       ackCursor(db, channel.id, delivery.taskId, delivery.cursor);
+      opts.attempts?.delete(attemptKey);
+    }
+    else if (opts.attempts) {
+      // HOST-M5M6-05 — bounded retries: count failures of this exact batch (a
+      // moved cursor means new rows → a fresh budget). At the budget, skip the
+      // poison batch so later messages still flow.
+      const prev = opts.attempts.get(attemptKey);
+      const failures = prev && prev.cursor === delivery.cursor ? prev.failures + 1 : 1;
+      if (failures >= (opts.maxAttempts ?? DEFAULT_WEBHOOK_MAX_ATTEMPTS)) {
+        opts.logger?.warn(
+          { channelId: channel.id, taskId: delivery.taskId, cursor: delivery.cursor, failures, dropped: delivery.messages.length },
+          "webhook egress: batch dead-lettered after bounded attempts — cursor advanced past it",
+        );
+        ackCursor(db, channel.id, delivery.taskId, delivery.cursor);
+        opts.attempts.delete(attemptKey);
+      }
+      else {
+        opts.attempts.set(attemptKey, { cursor: delivery.cursor, failures });
+      }
     }
     results.push({
       taskId: delivery.taskId,
