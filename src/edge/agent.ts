@@ -5,7 +5,7 @@ import type { Agent } from "@/db/schema";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { correlateLaunch, enrollAgent, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
+import { correlateLaunch, enrollAgent, reEnrollByLaunchNonce, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
 import { sessions } from "@/agents/sessions";
 import {
   attachmentsBySha,
@@ -22,7 +22,7 @@ import {
   ShaMismatchError,
 } from "@/configstore";
 import { writeAttachmentDescriptors } from "@/msgstore";
-import { generateId } from "@/platform";
+import { generateId, hashToken } from "@/platform";
 import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
 import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
@@ -213,19 +213,40 @@ export function agentRoutes() {
       }
 
       const db = c.get("db");
+      const launchNonce = typeof body.launchNonce === "string" && body.launchNonce.length > 0 ? body.launchNonce : null;
+
+      // HOST-M3-06: registration is IDEMPOTENT per launch. A retry carrying a
+      // nonce that already correlated (the response was lost — the agent never
+      // saw its token) reuses the existing row with a ROTATED connect token
+      // instead of minting a duplicate whose launch binding lands on a ghost.
+      if (launchNonce) {
+        const existing = reEnrollByLaunchNonce(db, launchNonce);
+        if (existing) {
+          c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
+          const retryConfig = { ...agentConfig(existing.agent.id), ...globalConfig(db, existing.agent) };
+          return c.json({ agentId: existing.agent.id, connectToken: existing.connectToken, config: retryConfig });
+        }
+      }
+
+      // HOST-M3-09: the body's `access` is IGNORED — a register-token holder
+      // never self-declares `public`. Enrollment always lands `dedicated`; a
+      // host launch's admin allowlist applies at correlate, and flipping an
+      // agent `public` later is the admin-only access mutation.
       const { agent, connectToken } = enrollAgent(db, {
         ...(typeof body.name === "string" ? { name: body.name } : {}),
         source: typeof body.source === "string" ? body.source : "manual",
-        ...(typeof body.access === "string" ? { access: body.access } : {}),
         capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
+        // HOST-M3-15 provenance: which register token enrolled it — the
+        // sha-256 at-rest form (the shared plaintext is never stored).
+        registerTokenRef: hashToken(c.get("config").REGISTER_TOKEN),
       });
 
       // OD17 launch↔register correlation (OPTIONAL, backward-compatible): when
       // the agent echoes the per-launch nonce it was launched with, bind it to
       // that launch (launcher_kind + launch_ref). No nonce → unchanged: a manual
       // enroll never touches the pending-launch set.
-      if (typeof body.launchNonce === "string" && body.launchNonce.length > 0) {
-        const correlated = correlateLaunch(db, agent.id, body.launchNonce);
+      if (launchNonce) {
+        const correlated = correlateLaunch(db, agent.id, launchNonce);
         if (correlated) {
           c.get("logger").info({ agentId: agent.id, launcher: correlated.launcherKind, ref: correlated.launchRef }, "agent registration correlated to launch");
         }
@@ -266,7 +287,7 @@ export function agentRoutes() {
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
-          sessions.attach(agentId, ws, agent.connectTokenHash);
+          sessions.attach(agentId, ws);
           setAgentStatus(db, agentId, "online");
           // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
           // connection starts inside the sweep's grace window (never insta-swept

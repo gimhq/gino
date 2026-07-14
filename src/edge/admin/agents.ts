@@ -7,6 +7,7 @@
 //   POST   /agents/:id/restart    OOB restart (launcher | WS close)
 //   POST   /agents/:id/remove     OOB remove (revoke token + orphan tasks)
 //   POST   /agents/:id/grant      grant {owner_id} access  (OD13)
+//   POST   /agents/:id/access     set access policy {access} (OD13, HOST-M3-09)
 //   POST   /agents/:id/revoke     revoke {owner_id} access (OD13)
 //
 // Every response uses the shared `{ success, data }` envelope. The stored
@@ -22,6 +23,7 @@ import {
   removeAgentControl,
   restartAgent,
   revokeAgentOwner,
+  setAgentAccessControl,
   stopAgent,
 } from "@/agents/control";
 import { getAgent, getCapacity, listAgents, listGrants } from "@/agents/registry";
@@ -62,7 +64,13 @@ const launchBody = z.object({
   taskId: z.string().min(1).optional(),
   env: z.record(z.string(), z.string()).optional(),
   resources: z.record(z.string(), z.unknown()).optional(),
+  // HOST-M3-09: the launch is an ADMIN request, so `public` may be allowlisted
+  // here — applied when the launched agent's registration correlates. The
+  // agent's own register body can never set it.
+  access: z.enum(["dedicated", "public"]).optional(),
 });
+
+const accessBody = z.object({ access: z.enum(["dedicated", "public"]) });
 
 export function adminAgentRoutes() {
   const router = new Hono<AppEnv>();
@@ -110,6 +118,7 @@ export function adminAgentRoutes() {
           ...(body.taskId ? { workload: { taskId: body.taskId } } : {}),
           ...(body.env ? { env: body.env } : {}),
           ...(body.resources ? { resources: body.resources } : {}),
+          ...(body.access ? { access: body.access } : {}),
         },
       );
       return c.json(ok(result));
@@ -195,6 +204,25 @@ export function adminAgentRoutes() {
       const { owner_id } = c.req.valid("json");
       grantAgentOwner({ db: c.get("db"), sender: sessions, logger: c.get("logger") }, id, owner_id);
       return c.json(ok({ agentId: id, ownerId: owner_id, granted: true }));
+    },
+  );
+
+  // HOST-M3-09: making an agent `public` (or back `dedicated`) is an
+  // admin-only mutation — enrollment always lands `dedicated` regardless of
+  // what the register body claims.
+  router.post(
+    "/:id/access",
+    describeRoute({
+      tags: [TAGS.Agents],
+      summary: "Set an agent's access policy (OD13 — admin-only)",
+      responses: { ...jsonOk(z.any(), "Access set"), ...errors(401, 404, 410, 422) },
+    }),
+    validator("json", accessBody),
+    (c) => {
+      const id = c.req.param("id");
+      const { access } = c.req.valid("json");
+      setAgentAccessControl({ db: c.get("db"), sender: sessions, logger: c.get("logger") }, id, access);
+      return c.json(ok({ agentId: id, access }));
     },
   );
 

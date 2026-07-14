@@ -36,8 +36,21 @@ export const agents = sqliteTable("agents", {
   status: text("status").notNull(), // enrolled | online | offline | removed
   launcherKind: text("launcher_kind"), // OOB routing
   launchRef: text("launch_ref"),
+  launchNonce: text("launch_nonce").unique(), // OD17 idempotency key: a register RETRY with the same nonce reuses this row (HOST-M3-06)
   activeThreads: integer("active_threads").default(0),
   lastSeen: integer("last_seen"),
+  createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
+});
+
+// Launch↔register correlation (OD17), PERSISTED (HOST-M3-05): a pending launch
+// must survive a host restart so a late registration still binds its
+// `launcher_kind`/`launch_ref`, and so the TTL reaper can tear down a runtime
+// whose agent never registered (the in-memory map lost both on restart).
+export const pendingLaunches = sqliteTable("pending_launches", {
+  nonce: text("nonce").primaryKey(), // the per-launch GINO_LAUNCH_NONCE
+  launcherKind: text("launcher_kind").notNull(),
+  launchRef: text("launch_ref"), // runtime handle (container id); null if the launcher started nothing
+  access: text("access").notNull().default("dedicated"), // admin-allowlisted access applied at correlate (HOST-M3-09)
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
 });
 
@@ -238,6 +251,8 @@ export const routerState = sqliteTable("router_state", {
 
 export type Agent = typeof agents.$inferSelect;
 export type NewAgent = typeof agents.$inferInsert;
+export type PendingLaunchRow = typeof pendingLaunches.$inferSelect;
+export type NewPendingLaunchRow = typeof pendingLaunches.$inferInsert;
 export type AgentGrant = typeof agentGrants.$inferSelect;
 export type NewAgentGrant = typeof agentGrants.$inferInsert;
 export type Task = typeof tasks.$inferSelect;

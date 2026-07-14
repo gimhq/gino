@@ -46,7 +46,7 @@ function taskApp() {
 function enrolledAgent(opts: { online?: boolean } = {}): string {
   const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
   if (opts.online) {
-    sessions.attach(agentId, { send: () => {}, close: () => {} }, "hash");
+    sessions.attach(agentId, { send: () => {}, close: () => {} });
     attached.push(agentId);
   }
   return agentId;

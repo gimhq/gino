@@ -150,6 +150,49 @@ describe("M3 /admin/agents — grant/revoke (OD13)", () => {
   });
 });
 
+describe("HOST-M3-09 /admin/agents/:id/access — admin-only access mutation", () => {
+  async function setAccess(agentId: string, access: string) {
+    return admin(`/agents/${agentId}/access`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ access }),
+    });
+  }
+
+  it("flips a dedicated agent public and back", async () => {
+    const { agentId } = await enroll(); // always lands dedicated (HOST-M3-09)
+    let get = await admin(`/agents/${agentId}`);
+    expect(((await get.json()) as { data: { access: string } }).data.access).toBe("dedicated");
+
+    expect((await setAccess(agentId, "public")).status).toBe(200);
+    get = await admin(`/agents/${agentId}`);
+    expect(((await get.json()) as { data: { access: string } }).data.access).toBe("public");
+
+    expect((await setAccess(agentId, "dedicated")).status).toBe(200);
+    get = await admin(`/agents/${agentId}`);
+    expect(((await get.json()) as { data: { access: string } }).data.access).toBe("dedicated");
+  });
+
+  it("rejects an invalid access value (422), an unknown agent (404), a removed agent (410)", async () => {
+    const { agentId } = await enroll();
+    expect((await setAccess(agentId, "everyone")).status).toBe(422);
+    expect((await setAccess("no-such-agent", "public")).status).toBe(404);
+
+    await admin(`/agents/${agentId}/remove`, { method: "POST" });
+    expect((await setAccess(agentId, "public")).status).toBe(410);
+  });
+
+  it("requires the channel bearer (401 without)", async () => {
+    const { agentId } = await enroll();
+    const res = await app.fetch(new Request(`http://local/api/admin/agents/${agentId}/access`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ access: "public" }),
+    }));
+    expect(res.status).toBe(401);
+  });
+});
+
 describe("M3 /admin/agents — stop + remove", () => {
   it("stop on a manual agent falls back to a WS close", async () => {
     const { agentId } = await enroll();

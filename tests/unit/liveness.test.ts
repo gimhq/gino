@@ -90,7 +90,7 @@ describe("M3 liveness sweep", () => {
         closed.push({ code, reason });
       },
     };
-    sessions.attach(agentId, zombie, "hash");
+    sessions.attach(agentId, zombie);
 
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
     expect(sweepLiveness({ db, sessions, now: () => future })).toBe(1);
