@@ -58,11 +58,11 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
       ? () => server.stop(true)
       : async () => {
         await Promise.race([
-          server.stop(true),
+          server.stop(false),
           new Promise<void>(resolve => setTimeout(resolve, 25_000).unref?.()),
         ]);
         try {
-          server.stop(false);
+          server.stop(true);
         }
         catch {}
       };
