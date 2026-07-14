@@ -37,6 +37,13 @@ export interface InboundDeps {
   sender?: FrameSender;
   agentId: string;
   logger?: Logger;
+  /**
+   * M6 webhook egress trigger (HOST-M5M6-04): fired AFTER a `thread_message`
+   * is durably stored, so the webhook pump pushes the new row promptly. Purely
+   * a scheduling hint — delivery itself stays cursor-driven (egress re-reads
+   * the store), so a missed/failed notification loses nothing.
+   */
+  onTranscriptWrite?: (taskId: string) => void;
 }
 
 /** Build the `ack{id}` for a frame that carried its own `outboxId`, else null. */
@@ -116,6 +123,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       }
       const data = ThreadMessageData.parse(decoded.data);
       writeThreadMessage(db, { taskId: decoded.taskId, threadId: decoded.threadId, data });
+      deps.onTranscriptWrite?.(decoded.taskId);
       return ackFor(decoded);
     }
 
@@ -203,11 +211,16 @@ export function handleInboundFrame(deps: InboundDeps, raw: string | ArrayBuffer 
  * storage failure so the route surfaces a non-2xx and the agent retries; throws
  * a tagged error on a malformed frame.
  */
-export function ingestHttpFrame(db: AppDatabase, agentId: string, raw: string | ArrayBuffer | Uint8Array): Record<string, unknown> {
+export function ingestHttpFrame(
+  db: AppDatabase,
+  agentId: string,
+  raw: string | ArrayBuffer | Uint8Array,
+  onTranscriptWrite?: (taskId: string) => void,
+): Record<string, unknown> {
   const decoded = decodeFrame(raw);
   if (!decoded) {
     throw new Error("malformed frame");
   }
-  const ack = applyFrame({ db, agentId }, decoded);
+  const ack = applyFrame({ db, agentId, ...(onTranscriptWrite ? { onTranscriptWrite } : {}) }, decoded);
   return ack ?? { ok: true };
 }

@@ -18,6 +18,7 @@ export {
   advanceCursor,
   type BoundTask,
   DEFAULT_POLL_LIMIT,
+  DEFAULT_WEBHOOK_MAX_ATTEMPTS,
   isTaskOnChannel,
   listBoundTasks,
   MAX_POLL_LIMIT,
@@ -29,6 +30,8 @@ export {
   type TailOptions,
   type TailResult,
   tailTask,
+  type WebhookAttemptState,
+  type WebhookPushOptions,
   type WebhookPushResult,
 } from "./egress";
 
@@ -38,6 +41,13 @@ export {
   routeInbound,
   type RouteResult,
 } from "./ingress";
+
+export {
+  DEFAULT_WEBHOOK_RETRY_INTERVAL_MS,
+  startWebhookPump,
+  type WebhookPump,
+  type WebhookPumpDeps,
+} from "./pump";
 
 export {
   addWebhook,
@@ -57,6 +67,7 @@ export {
 export {
   assertSafeWebhookUrl,
   assertSafeWebhookUrlResolved,
+  DEFAULT_WEBHOOK_TIMEOUT_MS,
   type DeliverOptions,
   deliverWebhook,
   type DnsResolver,

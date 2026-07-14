@@ -260,7 +260,9 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
 
-      const deps = { db, sender: sessions, agentId, logger };
+      // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+      const pump = c.get("webhookPump");
+      const deps = { db, sender: sessions, agentId, logger, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
@@ -336,7 +338,8 @@ export function agentRoutes() {
       }
       const raw = await c.req.text();
       try {
-        return c.json(ingestHttpFrame(c.get("db"), agentId, raw));
+        // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+        return c.json(ingestHttpFrame(c.get("db"), agentId, raw, c.get("webhookPump")?.notifyTask));
       }
       catch (err) {
         c.get("logger").warn({ err, agentId }, "agent output fallback: frame rejected");
