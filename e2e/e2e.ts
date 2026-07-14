@@ -10,6 +10,7 @@
 const BASE = process.env.BASE ?? "http://host:3000/api";
 const REG = process.env.REGISTER_TOKEN ?? "e2e-register-secret";
 const CHAN = process.env.CHANNEL_TOKEN ?? "e2e-channel-secret";
+const ADMIN = process.env.ADMIN_TOKEN ?? "e2e-admin-secret";
 const AGENT_NAME = process.env.AGENT_NAME ?? "e2e-runner";
 const INJECTED_KEY = process.env.PROXY_KEY ?? "sk-ant-host-real";
 
@@ -17,7 +18,6 @@ const INJECTED_KEY = process.env.PROXY_KEY ?? "sk-ant-host-real";
 
 interface Result { name: string; ok: boolean; detail?: string }
 const results: Result[] = [];
-const knownIssues: { name: string; detail: string }[] = [];
 let currentGroup = "";
 
 function group(name: string): void {
@@ -35,13 +35,6 @@ function record(name: string, ok: boolean, detail?: string): void {
 
 function check(name: string, cond: boolean, detail?: string): void {
   record(name, cond, detail);
-}
-
-/** Record a pre-existing/known issue: reported loudly, but never fails the suite. */
-function note(name: string, detail: string): void {
-  knownIssues.push({ name: `${currentGroup} › ${name}`, detail });
-  // eslint-disable-next-line no-console
-  console.log(`  ⚠ KNOWN ISSUE: ${name} — ${detail}`);
 }
 
 /** Run an async step; a throw is a failed check (so one bug never aborts the suite). */
@@ -75,13 +68,17 @@ async function http(method: string, path: string, opts: { headers?: Record<strin
 }
 
 const jsonHeaders = { "content-type": "application/json" };
-const bearer = { Authorization: `Bearer ${CHAN}` };
+// Two DISTINCT bearers (HOST-XC-02): the channel token authenticates only the
+// user I/O plane (/messages/*); the admin token only the control plane
+// (/admin/*, /system/lode/*, /api/metrics). Neither falls back to the other.
+const channelBearer = { Authorization: `Bearer ${CHAN}` };
+const adminBearer = { Authorization: `Bearer ${ADMIN}` };
 
 const admin = (method: string, path: string, body?: unknown): Promise<Res> =>
-  http(method, `/admin${path}`, { headers: { ...bearer, ...jsonHeaders }, body: body == null ? undefined : JSON.stringify(body) });
+  http(method, `/admin${path}`, { headers: { ...adminBearer, ...jsonHeaders }, body: body == null ? undefined : JSON.stringify(body) });
 
 const msg = (method: string, path: string, body?: unknown): Promise<Res> =>
-  http(method, `/messages${path}`, { headers: { ...bearer, ...jsonHeaders }, body: body == null ? undefined : JSON.stringify(body) });
+  http(method, `/messages${path}`, { headers: { ...channelBearer, ...jsonHeaders }, body: body == null ? undefined : JSON.stringify(body) });
 
 async function registerAgent(name: string): Promise<{ status: number; agentId: string; connectToken: string; config: any }> {
   const r = await http("POST", "/agent/register", {
@@ -141,6 +138,24 @@ async function testAuthGates(): Promise<void> {
   await step("admin w/o bearer → 401", async () => {
     const r = await http("GET", "/admin/agents");
     check("401", r.status === 401, `status ${r.status}`);
+  });
+  // HOST-XC-02 privilege separation: the wrong KIND of valid token is rejected —
+  // the channel token must not reach the control plane, and vice versa.
+  await step("admin w/ CHANNEL token → 401 (no fallback)", async () => {
+    const r = await http("GET", "/admin/agents", { headers: channelBearer });
+    check("401", r.status === 401, `status ${r.status}`);
+  });
+  await step("metrics w/ CHANNEL token → 401 (admin-only surface)", async () => {
+    const r = await http("GET", "/metrics", { headers: channelBearer });
+    check("401", r.status === 401, `status ${r.status}`);
+  });
+  await step("messages w/ ADMIN token → 401 (no fallback)", async () => {
+    const r = await http("POST", "/messages/no-such-channel/poll", { headers: { ...adminBearer, ...jsonHeaders }, body: JSON.stringify({ conversation_ref: "x" }) });
+    check("401", r.status === 401, `status ${r.status}`);
+  });
+  await step("admin w/ ADMIN token → 200 (the right token works)", async () => {
+    const r = await http("GET", "/admin/agents", { headers: adminBearer });
+    check("200", r.status === 200, `status ${r.status} body ${r.text.slice(0, 120)}`);
   });
   await step("llm w/o credential → 401", async () => {
     const r = await http("GET", "/llm/v1/models");
@@ -206,8 +221,11 @@ async function testTaskRoundTrip(): Promise<void> {
       const done = threads.find(t => t.run?.status === "succeeded");
       return done ?? null;
     }, 40_000);
-    const contents: string[] = (view.messages ?? []).map((m: any) => m.content);
     check("thread run succeeded", view.run?.status === "succeeded", JSON.stringify(view.run));
+    // The task view carries bounded thread SUMMARIES only (HOST-M1M2-16); the
+    // transcript itself is paged per thread via `?thread=`.
+    const page = await admin("GET", `/tasks/${taskId}?thread=${view.threadId}`);
+    const contents: string[] = (page.json?.data?.messages ?? []).map((m: any) => m.content);
     check("transcript carries the echoed nonce", contents.some(c => typeof c === "string" && c.includes(nonce)), JSON.stringify(contents));
     // eslint-disable-next-line no-console
     console.log(`    transcript=${JSON.stringify(contents)} session=${view.run?.engineSessionId ?? view.run?.engine_session_id}`);
@@ -279,10 +297,9 @@ async function testCrons(): Promise<void> {
     const r = await admin("POST", "/tasks", { owner_id: owner, engine: "claude", model: "sonnet", name: "cron-host" });
     assert(r.status === 201, `status ${r.status}`);
     taskId = r.json?.data?.task?.id;
-    // The agent's `crons` table FK-references its local `tasks` row, which only
-    // exists after a `task_upsert` frame — seeded by the FIRST message. Schedule a
-    // cron BEFORE any message and the agent rejects cron_upsert on an unknown task
-    // (FK constraint). Seed it here; the probe at the end exercises the broken order.
+    // Exercise the common order: the task is seeded on the agent by a first
+    // message BEFORE the cron arrives. (The reverse order — cron first — is
+    // exercised by the probe at the end.)
     await admin("POST", `/tasks/${taskId}/message`, { text: "seed task_upsert" });
     await sleep(1500); // let the agent apply task_upsert before the cron arrives
   });
@@ -297,13 +314,16 @@ async function testCrons(): Promise<void> {
   });
   await step("host mirror populates from the agent's cron_state (proves it FIRED)", async () => {
     assert(taskId, "no task");
-    // The mirror is written ONLY from an inbound `cron_state`, which the agent
-    // emits when a cron FIRES — so the cron appearing here proves the full
+    // The host seeds a prompt-only mirror row at POST time, so the row's mere
+    // existence proves nothing. The scheduling fields + roundCount are filled
+    // in ONLY from an inbound `cron_state`, which the agent emits when the
+    // cron FIRES — so waiting for roundCount ≥ 1 proves the full
     // emit→apply→fire→cron_state→mirror round-trip (OD14: crons live on the agent).
-    const cron = await waitFor("cron_state mirror", async () => {
+    const cron = await waitFor("cron_state mirror shows a fire", async () => {
       const r = await admin("GET", `/tasks/${taskId}/crons`);
       const crons: any[] = r.json?.data ?? [];
-      return crons.find(c => c.id === cronId) ?? null;
+      const hit = crons.find(c => c.id === cronId);
+      return hit != null && (hit.roundCount ?? 0) >= 1 ? hit : null;
     }, 25_000);
     check("mirror has the cron", cron.id === cronId, JSON.stringify(cron));
     check("mirror carries scheduling fields", cron.scheduleType === "interval", JSON.stringify({ scheduleType: cron.scheduleType, status: cron.status }));
@@ -315,26 +335,27 @@ async function testCrons(): Promise<void> {
     check("200", r.status === 200, `status ${r.status}`);
   });
   await step("probe: cron on a never-messaged task (ordering)", async () => {
-    // Create a task and schedule a cron WITHOUT ever messaging it. The host
-    // accepts (201) but the agent has no task_upsert yet → cron_upsert hits the
-    // FK constraint and is silently dropped (never fires, mirror stays empty).
+    // Create a task and schedule a cron WITHOUT ever messaging it. This used
+    // to fail silently (the agent's crons FK-referenced a task row that only a
+    // first message would seed); the agent now seeds a minimal task row when a
+    // cron arrives before its task_upsert (P2-19), so the cron must apply AND
+    // fire. The host-seeded mirror row alone proves nothing — wait for a real
+    // fire (roundCount ≥ 1).
     const owner2 = "owner-cron-probe";
     await admin("POST", `/agents/${agentId}/grant`, { owner_id: owner2 });
     const t = await admin("POST", "/tasks", { owner_id: owner2, engine: "claude", model: "sonnet", name: "cron-noseed" });
     const t2 = t.json?.data?.task?.id;
     const c = await admin("POST", `/tasks/${t2}/crons`, { kind: "schedule", continuity: "continue", schedule_type: "interval", schedule_value: "1000", prompt: "x" });
     check("host accepts the cron (201)", c.status === 201, `status ${c.status}`);
-    await sleep(6000);
-    const mirror = (await admin("GET", `/tasks/${t2}/crons`)).json?.data ?? [];
-    if (mirror.length === 0) {
-      note(
-        "scheduling a cron before the first message silently fails on the agent",
-        "host returns 201 but emits no task_upsert until the first message; the agent's crons FK-references an unknown task → `FOREIGN KEY constraint failed`, the cron never applies/fires. Fix host to seed task_upsert on first cron (as it does on first message).",
-      );
-    }
-    else {
-      check("cron on un-messaged task applied", true);
-    }
+    const probeCronId = c.json?.data?.cronId;
+    const fired = await waitFor("probe cron fire", async () => {
+      const mirror: any[] = (await admin("GET", `/tasks/${t2}/crons`)).json?.data ?? [];
+      const hit = mirror.find(x => x.id === probeCronId);
+      return hit != null && (hit.roundCount ?? 0) >= 1 ? hit : null;
+    }, 15_000);
+    check("cron on un-messaged task applied + fired", (fired.roundCount ?? 0) >= 1, JSON.stringify(fired));
+    // Stop the 1s-interval probe so it doesn't keep firing through later groups.
+    await admin("DELETE", `/tasks/${t2}/crons/${probeCronId}`);
   });
 }
 
@@ -425,13 +446,13 @@ async function testProvisioning(): Promise<void> {
   let dirSha = "";
 
   await step("upload CLAUDE.md (file) + skill dir → 201 (+ dedup)", async () => {
-    const f = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...bearer }, body: "# e2e global instructions" });
+    const f = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...adminBearer }, body: "# e2e global instructions" });
     assert(f.status === 201, `file status ${f.status} body ${f.text.slice(0, 160)}`);
     fileSha = f.json?.data?.sha256;
-    const d = await http("POST", "/admin/config/artifacts?name=e2e-skill&kind=dir&content_type=application/gzip", { headers: { ...bearer }, body: "skill-bundle-bytes" });
+    const d = await http("POST", "/admin/config/artifacts?name=e2e-skill&kind=dir&content_type=application/gzip", { headers: { ...adminBearer }, body: "skill-bundle-bytes" });
     assert(d.status === 201, `dir status ${d.status}`);
     dirSha = d.json?.data?.sha256;
-    const again = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...bearer }, body: "# e2e global instructions" });
+    const again = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...adminBearer }, body: "# e2e global instructions" });
     check("dedup → same sha", again.json?.data?.sha256 === fileSha, `${again.json?.data?.sha256} vs ${fileSha}`);
   });
   await step("PUT global desired entries → host resolves targets", async () => {
@@ -571,13 +592,6 @@ async function main(): Promise<void> {
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   // eslint-disable-next-line no-console
   console.log(`RESULT: ${passed}/${results.length} checks passed`);
-  if (knownIssues.length) {
-    // eslint-disable-next-line no-console
-    console.log(`\nKNOWN ISSUES (reported, not counted as failures): ${knownIssues.length}`);
-    for (const k of knownIssues)
-      // eslint-disable-next-line no-console
-      console.log(`  ⚠ ${k.name}\n      ${k.detail}`);
-  }
   if (failed.length) {
     // eslint-disable-next-line no-console
     console.log(`\nFAILED:`);

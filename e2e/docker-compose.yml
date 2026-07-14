@@ -46,6 +46,9 @@ services:
       GINO_LOG_LEVEL: info
       GINO_REGISTER_TOKEN: e2e-register-secret
       GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
+      # Distinct control-plane bearer for /admin/*, /system/lode/*, /api/metrics
+      # (HOST-XC-02: no fallback to the channel token; unset fails closed).
+      GINO_HTTP_ADMIN_TOKEN: e2e-admin-secret
       # Credential proxy → mock upstream (private IP, so allow it explicitly).
       GINO_PROXY_ANTHROPIC_BASE_URL: http://mock-llm:4000
       GINO_PROXY_ANTHROPIC_API_KEY: sk-ant-host-real
@@ -90,5 +93,6 @@ services:
       BASE: http://host:3000/api
       REGISTER_TOKEN: e2e-register-secret
       CHANNEL_TOKEN: e2e-channel-secret
+      ADMIN_TOKEN: e2e-admin-secret
       AGENT_NAME: e2e-runner
       PROXY_KEY: sk-ant-host-real

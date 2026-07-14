@@ -38,6 +38,9 @@ services:
       GINO_LOG_LEVEL: info
       GINO_REGISTER_TOKEN: e2e-register-secret
       GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
+      # Distinct control-plane bearer for /admin/* (HOST-XC-02: no fallback to
+      # the channel token; unset fails closed).
+      GINO_HTTP_ADMIN_TOKEN: e2e-admin-secret
       # REAL upstream. The proxy injects whichever credential the user provided
       # (api key wins over oauth token); both default empty so a missing one is a
       # clear "unconfigured" rather than a baked-in secret.
@@ -87,6 +90,6 @@ services:
     environment:
       BASE: http://host:3000/api
       REGISTER_TOKEN: e2e-register-secret
-      CHANNEL_TOKEN: e2e-channel-secret
+      ADMIN_TOKEN: e2e-admin-secret
       AGENT_NAME: e2e-real-runner
       REAL_MODEL: "${REAL_MODEL:-claude-haiku}"
