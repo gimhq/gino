@@ -9,9 +9,9 @@
 //   • the `message` frame carries `msgId` and is acked by `msg_ack{msgId}` so
 //     M4 (B3) can advance its delivery cursor only after the agent has DURABLY
 //     stored the input. The message's `msgId` IS the row id — derived at encode
-//     time, never stored separately — so a `message` row is atomically born with
-//     its delivery id and the ack just marks the row delivered (the cursor
-//     advance is a B3 seam).
+//     time, never stored (there is no `msg_id` column) — so a `message` row is
+//     atomically born with its delivery id and the ack just marks the row
+//     delivered (the cursor advance is a B3 seam).
 //
 // Layering: the outbox talks to the live socket only through the abstract
 // `FrameSender` (sessions implements it), and rebuilds the wire frame via the
@@ -40,16 +40,21 @@ export interface EnqueueInput {
 }
 
 /**
+ * An enqueued outbox row. `msgId` is NOT a column — for a `message` row it is
+ * the derived delivery id (= row id), attached so callers can surface it.
+ */
+export type EnqueuedOutbox = Outbox & { msgId?: number };
+
+/**
  * Persist a host→agent frame and, if the agent is online, send it. The row is
  * written FIRST (durability before delivery); the live push is best-effort —
  * a miss is recovered by `replayUnacked` on reconnect. A `message` frame's
  * delivery id (`msgId`) IS the row id: it exists the instant the single INSERT
  * commits, so there is no crash window in which a durable `message` row lacks
  * an ackable id. The returned row carries the derived `msgId` for callers that
- * surface it (the `msg_id` column itself is never written — legacy rows that
- * have it stored ack identically because its value always equalled the id).
+ * surface it.
  */
-export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
+export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): EnqueuedOutbox {
   const inserted = db
     .insert(outbox)
     .values({

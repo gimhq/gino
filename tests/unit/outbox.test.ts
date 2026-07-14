@@ -151,16 +151,15 @@ describe("M2 outbox — atomic message delivery id", () => {
     expect(replayUnacked(db, sender, agentId)).toBe(0);
   });
 
-  it("a crash-window row (msg_id never back-filled) is still deliverable and ackable", () => {
-    // Pre-fix, enqueue back-filled msg_id in a second statement; a crash in
-    // between left exactly this durable shape. It must replay WITH a msgId and
-    // be ackable, not loop forever as an id-less frame.
+  it("a bare-inserted message row (bypassing enqueue) is still deliverable and ackable", () => {
+    // The delivery id is derived from the row id at encode time — there is no
+    // msg_id column to back-fill — so ANY durable message row replays WITH a
+    // msgId and is ackable, not stuck as an id-less frame.
     const raw = db
       .insert(outbox)
       .values({ agentId, type: "message", taskId: "t-1", dataJson: { text: "orphan" } })
       .returning()
       .get();
-    expect(raw.msgId).toBeNull();
 
     const sender = fakeSender(true);
     expect(replayUnacked(db, sender, agentId)).toBe(1);
