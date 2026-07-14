@@ -19,7 +19,7 @@
 import type { AppDatabase } from "@/db";
 import type { Outbox, Task } from "@/db/schema";
 import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
-import type { FrameSender } from "@/protocol/outbox";
+import type { EnqueuedOutbox, FrameSender } from "@/protocol/outbox";
 import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
@@ -109,8 +109,8 @@ export interface MessageInput {
 }
 
 export interface MessageResult {
-  /** The `message` outbox row (carries `msgId`, acked by `msg_ack`). */
-  message: Outbox;
+  /** The `message` outbox row (carries the derived `msgId`, acked by `msg_ack`). */
+  message: EnqueuedOutbox;
   /** The thread the message was delivered on (the task's ongoing thread). */
   threadId: string;
 }
