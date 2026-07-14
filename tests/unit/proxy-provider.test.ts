@@ -34,13 +34,19 @@ describe("M7 proxy/provider — path allow-list", () => {
 });
 
 describe("M7 proxy/provider — provider detection", () => {
-  it("x-api-key header → anthropic regardless of path", () => {
-    expect(detectProvider(h({ "x-api-key": "sk-ant-x" }), "/v1/chat/completions")).toBe("anthropic");
+  it("OpenAI-only paths win over an x-api-key header (HOST-M7-05)", () => {
+    expect(detectProvider(h({ "x-api-key": "sk-ant-x" }), "/v1/chat/completions")).toBe("openai");
+    expect(detectProvider(h({ "x-api-key": "sk-ant-x" }), "/v1/responses")).toBe("openai");
   });
 
-  it("anthropic-only paths → anthropic", () => {
+  it("anthropic-only paths → anthropic (with or without headers)", () => {
     expect(detectProvider(h({}), "/v1/messages")).toBe("anthropic");
     expect(detectProvider(h({}), "/api/oauth/token")).toBe("anthropic");
+    expect(detectProvider(h({ authorization: "Bearer tok" }), "/v1/messages")).toBe("anthropic");
+  });
+
+  it("shared paths: x-api-key header decides anthropic", () => {
+    expect(detectProvider(h({ "x-api-key": "sk-ant-x" }), "/v1/models")).toBe("anthropic");
   });
 
   it("everything else → openai", () => {

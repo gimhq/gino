@@ -14,6 +14,14 @@ import { claudeToOpenAIRequest, createTranslatorState, openAIEventToClaudeSSE } 
 const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const OPENAI_WS_BETA = "responses_websockets=2026-02-06";
 
+// Watchdogs (HOST-M7-04): a stalled upstream must not pin the engine's HTTP
+// request forever, and a slow-reading client must not grow the SSE buffer
+// without bound.
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 180_000;
+/** Max bytes queued in the SSE writable before the upstream is cut off. */
+const MAX_SSE_BUFFER_BYTES = 1 << 20; // 1 MiB
+
 /** Minimal WebSocket surface the bridge drives — matched by the real WS + fakes. */
 export interface BridgeSocket {
   onopen: ((ev: unknown) => void) | null;
@@ -41,6 +49,10 @@ export interface BridgeDeps {
   readonly wsUrl?: string;
   /** Request abort signal — tears down the upstream WS when the client goes away. */
   readonly signal?: AbortSignal;
+  /** Max ms for the upstream WS to open before the stream errors (tests). */
+  readonly connectTimeoutMs?: number;
+  /** Max ms between upstream frames before the stream errors (tests). */
+  readonly idleTimeoutMs?: number;
 }
 
 function errorResponse(status: number, errType: string, message: string): Response {
@@ -77,7 +89,12 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   const originalTools = body.tools as Array<Record<string, unknown>> | undefined;
   const openaiReq = claudeToOpenAIRequest(body as Parameters<typeof claudeToOpenAIRequest>[0], targetModel);
 
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  // The writable side is byte-counted so `writer.desiredSize` reflects how far
+  // a slow-reading client has let the SSE queue grow (backpressure gate below).
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>(
+    undefined,
+    new ByteLengthQueuingStrategy({ highWaterMark: MAX_SSE_BUFFER_BYTES }),
+  );
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const state = createTranslatorState();
@@ -92,17 +109,60 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   let opened = false;
   const ws = wsFactory(wsUrl, { headers });
 
+  // Connect + idle watchdogs (HOST-M7-04): a half-open or silent upstream must
+  // not leave the SSE response hanging forever.
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  function clearTimers(): void {
+    if (connectTimer) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+  const closeWriter = () => {
+    clearTimers();
+    void writer.close().catch(() => {});
+  };
+
   const writeLine = (line: string) => {
+    // Backpressure gate (HOST-M7-04): `desiredSize` ≤ 0 means the client has
+    // let ≥ MAX_SSE_BUFFER_BYTES pile up unread — cut the upstream off instead
+    // of queueing without bound. (null = stream already errored/released.)
+    if (writer.desiredSize !== null && writer.desiredSize <= 0) {
+      logger?.warn({ targetModel }, "proxy bridge: SSE buffer full (slow client) — closing upstream WS");
+      ws.close();
+      closeWriter();
+      return;
+    }
     // A rejected write means the client canceled the response stream — tear
     // down the upstream WS instead of letting it generate into the void.
     void writer.write(encoder.encode(`${line}\n`)).catch(() => ws.close());
   };
-  const closeWriter = () => {
-    void writer.close().catch(() => {});
+
+  const failStream = (message: string) => {
+    logger?.error({ targetModel, error: message }, "proxy bridge: upstream watchdog fired");
+    writeLine(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message } })}\n`);
+    closeWriter();
+    ws.close();
   };
+  const armIdleTimer = () => {
+    if (idleTimer)
+      clearTimeout(idleTimer);
+    idleTimer = setTimeout(failStream, deps.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS, "Upstream idle timeout");
+  };
+  connectTimer = setTimeout(failStream, deps.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, "Upstream connect timeout");
 
   ws.onopen = () => {
     opened = true;
+    if (connectTimer) {
+      clearTimeout(connectTimer);
+      connectTimer = null;
+    }
+    armIdleTimer();
     logger?.debug({ targetModel }, "proxy bridge: WS connected");
     ws.send(JSON.stringify({
       type: "response.create",
@@ -112,6 +172,7 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   };
 
   ws.onmessage = (event) => {
+    armIdleTimer();
     const raw = typeof event.data === "string" ? event.data : "";
     if (!raw)
       return;
