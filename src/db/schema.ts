@@ -211,6 +211,10 @@ export const configArtifacts = sqliteTable(
     size: integer("size").notNull(),
     contentType: text("content_type"),
     storeRef: text("store_ref").notNull(),
+    // When the GC first observed this artifact unreferenced (HOST-M8-06):
+    // droppability ages from THIS timestamp (grace after un-reference), never
+    // from created_at. NULL = referenced (or not yet observed unreferenced).
+    unreferencedSince: integer("unreferenced_since"),
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [primaryKey({ columns: [t.name, t.sha256] })], // M8 registry: bytes (host = sole source)

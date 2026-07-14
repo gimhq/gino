@@ -15,6 +15,7 @@ import {
   getGlobalConfigVersion,
   GLOBAL_SCOPE,
   isShaInAgentDesiredSet,
+  MissingBlobError,
   resolveBlobRef,
   resolveEntriesForEngines,
   sha256Hex,
@@ -124,16 +125,43 @@ function serveBySha(c: Context<AppEnv>, requesterId: string, sha256: string): Re
   return serveBlob(c, { sha256 });
 }
 
+/** True iff a request `If-None-Match` header matches the blob's strong ETag. */
+function ifNoneMatchHits(header: string | undefined, etag: string): boolean {
+  if (!header) {
+    return false;
+  }
+  return header
+    .split(",")
+    .map(v => v.trim())
+    .some(v => v === "*" || v === etag || v === `W/${etag}`);
+}
+
 /**
  * Serve a resolved blob from the unified store, integrity-checked against the
- * full sha256 (B6 byte channel). A missing blob 404s; a stored-bytes/sha256
- * mismatch is a 409 (the host never serves corrupt/tampered bytes).
+ * full sha256 (B6 byte channel). A missing blob 404s — including a dangling
+ * registry/descriptor row whose bytes are gone (HOST-M8-12), never a 500; a
+ * stored-bytes/sha256 mismatch is a 409 (the host never serves corrupt/
+ * tampered bytes). Responses are content-addressed and immutable, so they
+ * carry `Cache-Control: private, immutable` + a strong sha256 `ETag`, and a
+ * matching `If-None-Match` short-circuits to a bodyless 304 (HOST-M8-14).
  */
 function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): Response {
   const db = c.get("db");
   const resolved = resolveBlobRef(db, sel);
   if (!resolved) {
     throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
+  }
+  const etag = `"${resolved.sha256}"`;
+  const cacheHeaders = {
+    // `private` keeps shared caches out (auth rides the non-standard
+    // x-internal-token header, which does not inhibit them); the bytes behind
+    // a sha256 never change, hence `immutable`.
+    "cache-control": "private, max-age=31536000, immutable",
+    "etag": etag,
+    "x-content-sha256": resolved.sha256,
+  };
+  if (ifNoneMatchHits(c.req.header("if-none-match"), etag)) {
+    return new Response(null, { status: 304, headers: cacheHeaders });
   }
   const store = createStore(c.get("config"));
   try {
@@ -145,7 +173,7 @@ function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): R
       headers: {
         "content-type": resolved.contentType,
         "content-length": String(bytes.byteLength),
-        "x-content-sha256": resolved.sha256,
+        ...cacheHeaders,
       },
     });
   }
@@ -153,6 +181,10 @@ function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): R
     if (err instanceof ShaMismatchError) {
       c.get("logger").error({ err, ref: resolved.ref }, "attachment serve: sha256 integrity failure");
       return c.json({ success: false, error: { code: "BLOB_INTEGRITY", message: "stored bytes failed sha256 verification" } }, 409);
+    }
+    if (err instanceof MissingBlobError) {
+      c.get("logger").error({ err, ref: resolved.ref, sha256: resolved.sha256 }, "attachment serve: registry row points at a missing blob (dangling row — HOST-M8-12)");
+      throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
     }
     throw err;
   }

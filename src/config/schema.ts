@@ -30,6 +30,14 @@ export const configSchema = z.object({
   // attachments (`store/<name>/<sha256[:12]>`). Defaulted under the runtime
   // `data/` dir (gitignored) so existing token-less config still constructs.
   STORE_DIR: z.string().default("data/store"),
+  // Store GC sweep (HOST-M8-11, OD11). The periodic sweep always RUNS (it
+  // reconciles un-reference marks + reports droppable/orphan counts) but only
+  // DELETES when CONFIG_GC_ENABLED=true — dry-run by default, per OD11.
+  // CONFIG_GC_MAX_AGE_MS is the grace after un-reference (and the FS-orphan
+  // age guard) before anything is reclaimable.
+  CONFIG_GC_ENABLED: z.enum(["true", "false"]).default("false").transform(v => v === "true"),
+  CONFIG_GC_INTERVAL_MS: z.coerce.number().int().min(1000).default(60 * 60 * 1000),
+  CONFIG_GC_MAX_AGE_MS: z.coerce.number().int().min(1).default(7 * 24 * 60 * 60 * 1000),
 
   // Token auth secrets (M1 / OD12 / HOST-XC-02). REGISTER_TOKEN — the shared,
   // long-lived bootstrap secret for POST /agent/register. HTTP_CHANNEL_TOKEN —

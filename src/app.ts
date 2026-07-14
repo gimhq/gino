@@ -13,6 +13,7 @@ import { startLivenessSweep } from "./agents/liveness";
 import { sessions } from "./agents/sessions";
 import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
+import { createStore, startConfigStoreGc } from "./configstore";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
 import { docsCspRelax, mountDocs } from "./modules/docs";
@@ -217,6 +218,18 @@ export function bootstrap(): BootstrapResult {
   // so this also reaps orphans left by a host restart.
   const launchReaper = startLaunchReaper({ db, logger });
 
+  // M8 store GC (HOST-M8-11) — the periodic refcount/orphan sweep over the
+  // unified blob store. Dry-run (observability only) unless CONFIG_GC_ENABLED,
+  // per OD11. Same lifecycle as the other background timers.
+  const configStoreGc = startConfigStoreGc({
+    db,
+    logger,
+    store: createStore(config),
+    enabled: config.CONFIG_GC_ENABLED,
+    maxAgeMs: config.CONFIG_GC_MAX_AGE_MS,
+    intervalMs: config.CONFIG_GC_INTERVAL_MS,
+  });
+
   return {
     fetch: (req, env) => app.fetch(req, env),
     websocket,
@@ -227,6 +240,7 @@ export function bootstrap(): BootstrapResult {
       liveness.stop();
       outboxGc.stop();
       launchReaper.stop();
+      configStoreGc.stop();
       webhookPump.stop();
       db.close();
     },
