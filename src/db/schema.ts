@@ -14,6 +14,7 @@
 //     default to `Date.now()` at insert time (host = sole writer); optional
 //     timestamps are nullable integers.
 //   - Structured columns are stored as TEXT with `{ mode: "json" }`.
+import { sql } from "drizzle-orm";
 import { index, integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 export const SCHEMA_VERSION = 2 as const;
@@ -67,6 +68,7 @@ export const tasks = sqliteTable("tasks", {
   agentId: text("agent_id").references(() => agents.id), // placement, SET ONCE; NULL = pending-assignment
   currentThreadId: text("current_thread_id"), // ongoing thread (resume target)
   assignedAt: integer("assigned_at"),
+  seededAt: integer("seeded_at"), // first task_upsert seed enqueued (durable — survives outbox GC)
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   updatedAt: integer("updated_at").notNull().$defaultFn(() => Date.now()),
 });
@@ -154,7 +156,13 @@ export const outbox = sqliteTable("outbox", {
   dataJson: text("data_json", { mode: "json" }).$type<Record<string, unknown>>().notNull(), // at-least-once host→agent
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   ackedAt: integer("acked_at"),
-});
+}, t => [
+  // Reconnect replay scan (`agent_id = ? AND acked_at IS NULL`) — partial, so
+  // only in-flight rows are indexed and acked history costs nothing.
+  index("outbox_agent_unacked_idx").on(t.agentId).where(sql`acked_at IS NULL`),
+  // `msg_ack{msgId}` lookup (`msg_id = ? AND agent_id = ?`).
+  index("outbox_msg_ack_idx").on(t.agentId, t.msgId).where(sql`msg_id IS NOT NULL`),
+]);
 
 export const channels = sqliteTable("channels", {
   id: text("id").primaryKey(),

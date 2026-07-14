@@ -15,7 +15,7 @@ import type { EntryInput } from "@/configstore";
 // M8/B6 — `meta` carries an optional passthrough seam (no config storage here).
 import type { AppDatabase } from "@/db";
 import type { NewTask, Task } from "@/db/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { resolveEntries, setEntries } from "@/configstore";
 import { crons, tasks } from "@/db/schema";
 import { ulid } from "@/platform";
@@ -144,6 +144,20 @@ export function setStatus(db: AppDatabase, taskId: string, status: string): Task
     .where(eq(tasks.id, taskId))
     .returning()
     .get();
+}
+
+/**
+ * Record that the task's `task_upsert` seed frame has been enqueued
+ * (`seeded_at`). Durable on the task row — outbox retention GC cannot un-seed
+ * a task by deleting its acked history. Set once (an already-set timestamp is
+ * kept); re-placement work clears it elsewhere, never here.
+ */
+export function markSeeded(db: AppDatabase, taskId: string): void {
+  db
+    .update(tasks)
+    .set({ seededAt: Date.now() })
+    .where(and(eq(tasks.id, taskId), isNull(tasks.seededAt)))
+    .run();
 }
 
 /**

@@ -244,6 +244,15 @@ describe("v2 host schema (§6)", () => {
     expect(first?.dataJson).toEqual({ taskId: "t1" });
   });
 
+  it("carries the outbox replay + msg_ack indexes (HOST-M9-07)", () => {
+    const rows = db.all(
+      sql`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'outbox'`,
+    ) as { name: string }[];
+    const names = new Set(rows.map(r => r.name));
+    expect(names.has("outbox_agent_unacked_idx")).toBe(true);
+    expect(names.has("outbox_msg_ack_idx")).toBe(true);
+  });
+
   it("accepts representative rows for the remaining §6 tables", () => {
     // crons / thread_runs → tasks; channels → channel_bindings/cursors;
     // attachments; config_artifacts; router_state. Exercises every table's

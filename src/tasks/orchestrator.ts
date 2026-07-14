@@ -20,14 +20,14 @@ import type { AppDatabase } from "@/db";
 import type { Outbox, Task } from "@/db/schema";
 import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
 import type { FrameSender } from "@/protocol/outbox";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
-import { outbox } from "@/db/schema";
+import { tasks } from "@/db/schema";
 import { ulid } from "@/platform";
 import { enqueue } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
-import { setCurrentThread } from "./store";
+import { markSeeded, setCurrentThread } from "./store";
 
 /** A task with no `agent_id` has no SOURCE target — work cannot be emitted yet. */
 function requirePlacement(task: Task): string {
@@ -41,14 +41,18 @@ function requirePlacement(task: Task): string {
   return task.agentId;
 }
 
-/** True once a `task_upsert` has been emitted for this task (so we seed only once). */
+/**
+ * True once a `task_upsert` has been emitted for this task (so we seed only
+ * once). Reads the durable `tasks.seeded_at` flag — NOT outbox history, which
+ * the retention GC deletes once acked.
+ */
 export function hasSeededTask(db: AppDatabase, taskId: string): boolean {
   const row = db
-    .select({ id: outbox.id })
-    .from(outbox)
-    .where(and(eq(outbox.taskId, taskId), eq(outbox.type, "task_upsert")))
+    .select({ seededAt: tasks.seededAt })
+    .from(tasks)
+    .where(eq(tasks.id, taskId))
     .get();
-  return row != null;
+  return row?.seededAt != null;
 }
 
 /**
@@ -88,7 +92,12 @@ export function emitTaskUpsert(
   if (entries.length > 0) {
     data.entries = entries;
   }
-  return enqueue(db, sender, { agentId, type: "task_upsert", taskId: task.id, data });
+  const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: task.id, data });
+  // Durable seed flag AFTER the frame is enqueued: a crash between the two
+  // re-seeds on the next message (the agent upserts idempotently) — safe;
+  // the reverse order could mark a task seeded whose frame never existed.
+  markSeeded(db, task.id);
+  return row;
 }
 
 export interface MessageInput {

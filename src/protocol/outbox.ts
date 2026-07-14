@@ -16,7 +16,8 @@
 // M2 `encodeOutbox` codec — it never hand-rolls the envelope.
 import type { AppDatabase } from "@/db";
 import type { Outbox } from "@/db/schema";
-import { and, asc, eq, isNull, ne } from "drizzle-orm";
+import type { Logger } from "@/shared/lib/logger";
+import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
 import { outbox } from "@/db/schema";
 import { encodeOutbox } from "./envelope";
 
@@ -118,4 +119,76 @@ export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: str
     }
   }
   return sent;
+}
+
+/** Default retention window for ACKED outbox rows (ms) — 7 days. */
+export const OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Default cadence of the periodic retention sweep (ms) — hourly. */
+export const OUTBOX_GC_INTERVAL_MS = 60 * 60 * 1000;
+
+export interface OutboxGcOptions {
+  /** Retention window for acked rows in ms. Defaults to `OUTBOX_RETENTION_MS`. */
+  readonly retentionMs?: number;
+  /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
+  readonly now?: () => number;
+}
+
+/**
+ * Retention GC: delete ACKED rows whose `acked_at` is older than the retention
+ * window. Unacked rows are NEVER deleted — they are still owed to the agent
+ * (at-least-once, §4.2) and stay until acked, however old. Seed state is not
+ * inferred from outbox history (it lives on `tasks.seeded_at`), so dropping
+ * acked frames is safe. Returns the number of rows deleted.
+ */
+export function gcOutbox(db: AppDatabase, opts: OutboxGcOptions = {}): number {
+  const now = opts.now?.() ?? Date.now();
+  const cutoff = now - (opts.retentionMs ?? OUTBOX_RETENTION_MS);
+  return db
+    .delete(outbox)
+    .where(and(isNotNull(outbox.ackedAt), lt(outbox.ackedAt, cutoff)))
+    .returning({ id: outbox.id })
+    .all()
+    .length;
+}
+
+export interface OutboxGcDeps extends OutboxGcOptions {
+  readonly db: AppDatabase;
+  readonly logger?: Logger;
+  /** Sweep cadence in ms. Defaults to `OUTBOX_GC_INTERVAL_MS`. */
+  readonly intervalMs?: number;
+}
+
+export interface OutboxGcHandle {
+  /** Stop the periodic GC (call on shutdown). Idempotent. */
+  readonly stop: () => void;
+  /** Run a GC pass immediately; returns the number of rows deleted. */
+  readonly gc: () => number;
+}
+
+/**
+ * Start the periodic outbox retention GC. The timer is `unref`'d so it never
+ * keeps the process alive on its own; `stop()` clears it. A failing pass is
+ * logged and swallowed so the loop survives a transient DB error.
+ */
+export function startOutboxGc(deps: OutboxGcDeps): OutboxGcHandle {
+  const tick = () => {
+    try {
+      const deleted = gcOutbox(deps.db, deps);
+      if (deleted > 0) {
+        deps.logger?.info({ deleted }, "outbox gc: deleted acked rows past retention");
+      }
+    }
+    catch (err) {
+      deps.logger?.error({ err }, "outbox gc failed");
+    }
+  };
+
+  const timer = setInterval(tick, deps.intervalMs ?? OUTBOX_GC_INTERVAL_MS);
+  timer.unref?.();
+
+  return {
+    stop: () => clearInterval(timer),
+    gc: () => gcOutbox(deps.db, deps),
+  };
 }
