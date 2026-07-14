@@ -90,7 +90,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
     },
   },
   { name: "task_delete", dir: "host", frame: { type: "task_delete", taskId: "t-1" } },
-  { name: "cron_upsert", dir: "host", frame: { type: "cron_upsert", taskId: "t-1", cronId: "cr-1", data: { kind: "cron", schedule_type: "interval", schedule_value: "5m", continuity: "isolated" } } },
+  { name: "cron_upsert", dir: "host", frame: { type: "cron_upsert", taskId: "t-1", cronId: "cr-1", data: { kind: "cron", prompt: "run the daily digest", schedule_type: "interval", schedule_value: "5m", continuity: "isolated" } } },
   { name: "cron_delete", dir: "host", frame: { type: "cron_delete", taskId: "t-1", cronId: "cr-1" } },
   { name: "message", dir: "host", frame: { type: "message", taskId: "t-1", threadId: "c-9@1718", msgId: 5, data: { text: "hello" } } },
   { name: "message (no thread)", dir: "host", frame: { type: "message", taskId: "t-1", data: { text: "kick off" } } },
@@ -166,7 +166,15 @@ describe("protocol v2 frame contract", () => {
     });
 
     it("missing a required envelope id (cron_upsert without cronId)", () => {
-      const r = HostFrame.safeParse({ type: "cron_upsert", taskId: "t-1", data: { kind: "cron", continuity: "isolated" } });
+      const r = HostFrame.safeParse({ type: "cron_upsert", taskId: "t-1", data: { kind: "cron", prompt: "p", continuity: "isolated" } });
+      expect(r.success).toBe(false);
+    });
+
+    // HOST-M4-10: the agent's CronUpsertData requires `prompt`; the host
+    // schema must reject a promptless command instead of emitting one the
+    // agent cannot parse.
+    it("missing required data field (cron_upsert.prompt)", () => {
+      const r = HostFrame.safeParse({ type: "cron_upsert", taskId: "t", cronId: "cr", data: { kind: "cron", continuity: "isolated" } });
       expect(r.success).toBe(false);
     });
 
@@ -175,8 +183,16 @@ describe("protocol v2 frame contract", () => {
       expect(r.success).toBe(false);
     });
 
-    it("bad enum (thread_message.kind)", () => {
+    // `kind` is an OPEN string (HOST-M1M2-04): an unrecognized value parses —
+    // the writer stores it opaquely and flags it — so version drift on this
+    // additive field can never poison a frame.
+    it("unrecognized thread_message.kind still parses (open string, HOST-M1M2-04)", () => {
       const r = AnyFrame.safeParse({ type: "thread_message", taskId: "t", threadId: "c", data: { seq: 1, kind: "screaming" } });
+      expect(r.success).toBe(true);
+    });
+
+    it("wrong kind type (thread_message.kind as number)", () => {
+      const r = AnyFrame.safeParse({ type: "thread_message", taskId: "t", threadId: "c", data: { seq: 1, kind: 7 } });
       expect(r.success).toBe(false);
     });
 

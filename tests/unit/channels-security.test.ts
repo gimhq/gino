@@ -24,8 +24,10 @@ import { createTask } from "@/tasks";
 //     surfaces 404 otherwise.
 //   FINDING 2 (SSRF): deliverWebhook auto-followed redirects (a public URL could
 //     3xx into private space) and assertSafeWebhookUrl checked only the hostname
-//     string (DNS-rebind / CNAME bypass). The fix uses redirect:"manual" +
-//     Location re-validation and resolves DNS, rejecting any private/loopback IP.
+//     string (DNS-rebind / CNAME bypass). The fix uses redirect:"manual" and
+//     resolves DNS, rejecting any private/loopback IP. HOST-M5M6-11 tightened
+//     this further: a 3xx is now a delivery FAILURE — the secret + transcript
+//     are never re-sent to a Location target, public or not.
 
 const THREAD = "thread-sec-1";
 
@@ -76,7 +78,7 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     expect(isTaskOnChannel(db, ch, victim)).toBe(false);
 
     // It must NOT leak the transcript by any path.
-    expect404(() => pollChannel(db, ch, { taskId: victim, after: 0, peek: true }));
+    expect404(() => pollChannel(db, ch, { taskId: victim, after: 0 }));
   });
 
   it("allows an explicit taskId that shares the channel's owner", () => {
@@ -109,9 +111,9 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     seed(bound);
 
     // conversationRef-resolved and all-bound fan-out are channel-scoped and
-    // unchanged (peek+after:0 so the two reads don't couple via the cursor).
-    expect(pollChannel(db, ch, { conversationRef: "conv-y", after: 0, peek: true })[0]!.messages).toHaveLength(1);
-    expect(pollChannel(db, ch, { after: 0, peek: true }).some(d => d.taskId === bound)).toBe(true);
+    // unchanged (reads are non-destructive, so the two polls don't couple).
+    expect(pollChannel(db, ch, { conversationRef: "conv-y", after: 0 })[0]!.messages).toHaveLength(1);
+    expect(pollChannel(db, ch, { after: 0 }).some(d => d.taskId === bound)).toBe(true);
   });
 });
 
@@ -152,22 +154,16 @@ describe("M6 security — FINDING 2a: webhook redirect SSRF (no auto-follow into
     expect(calls).toHaveLength(1);
   });
 
-  it("follows a bounded redirect into a re-validated PUBLIC host", async () => {
+  it("treats EVERY 3xx as a delivery failure — even a PUBLIC Location is never followed (HOST-M5M6-11)", async () => {
     const { calls, fetchImpl } = scriptedFetch([
       { status: 302, location: "https://final.example.com/hook" },
       { status: 200 },
     ]);
     const res = await deliverWebhook(ENDPOINT, PAYLOAD, fetchImpl, { resolver: publicResolver });
-    expect(res.ok).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(calls[1]).toContain("final.example.com");
-  });
-
-  it("gives up after too many redirects (bounded hops)", async () => {
-    const { calls, fetchImpl } = scriptedFetch([{ status: 302, location: "https://loop.example.com/x" }]);
-    const res = await deliverWebhook(ENDPOINT, PAYLOAD, fetchImpl, { resolver: publicResolver });
-    expect(res.ok).toBe(false);
-    expect(calls.length).toBeLessThanOrEqual(4); // initial + at most MAX_WEBHOOK_REDIRECTS follows
+    expect(res.ok).toBe(false); // cursor not advanced — the batch re-delivers to the REGISTERED endpoint
+    expect(res.status).toBe(302);
+    expect(calls).toHaveLength(1); // the payload (and secret) are sent exactly once, to the registered URL only
+    expect(calls[0]).toContain("hooks.example.com");
   });
 
   it("delivers normally to a public host (no regression)", async () => {

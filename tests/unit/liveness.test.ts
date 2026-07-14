@@ -1,8 +1,10 @@
+import type { WsLike } from "@/agents/sessions";
 import type { AppDatabase } from "@/db";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { OFFLINE_GRACE_MS, sweepLiveness } from "@/agents/liveness";
 import { enrollAgent, getAgent, setAgentStatus, touchLiveness } from "@/agents/registry";
+import { SessionRegistry } from "@/agents/sessions";
 import { createDb } from "@/db";
 import { tasks } from "@/db/schema";
 
@@ -76,5 +78,51 @@ describe("M3 liveness sweep", () => {
     expect(sweepLiveness({ db, now: () => future })).toBe(1);
     expect(sweepLiveness({ db, now: () => future })).toBe(0);
     expect(getAgent(db, agentId)?.status).toBe("offline");
+  });
+
+  it("closes + detaches the swept agent's zombie socket (HOST-M3-14)", () => {
+    const agentId = onlineAgentWithTask();
+    const sessions = new SessionRegistry();
+    const closed: Array<{ code?: number | undefined; reason?: string | undefined }> = [];
+    const zombie: WsLike = {
+      send: () => {},
+      close: (code?: number, reason?: string) => {
+        closed.push({ code, reason });
+      },
+    };
+    sessions.attach(agentId, zombie);
+
+    const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
+    expect(sweepLiveness({ db, sessions, now: () => future })).toBe(1);
+
+    // Both views converge: DB says offline AND the session registry is empty.
+    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(sessions.isOnline(agentId)).toBe(false);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]?.code).toBe(1001);
+  });
+
+  it("sweeps cleanly when the swept agent has no attached session", () => {
+    const agentId = onlineAgentWithTask();
+    const sessions = new SessionRegistry();
+    const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
+    expect(sweepLiveness({ db, sessions, now: () => future })).toBe(1);
+    expect(getAgent(db, agentId)?.status).toBe("offline");
+  });
+
+  it("a heartbeat after the sweep restores online — but never out of removed (HOST-M3-03)", () => {
+    const agentId = onlineAgentWithTask();
+    const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
+    expect(sweepLiveness({ db, now: () => future })).toBe(1);
+    expect(getAgent(db, agentId)?.status).toBe("offline");
+
+    // Heartbeat starvation ends; the still-connected agent resumes beating.
+    touchLiveness(db, agentId, 2);
+    expect(getAgent(db, agentId)?.status).toBe("online");
+
+    // A removed agent is terminal: liveness never resurrects it.
+    setAgentStatus(db, agentId, "removed");
+    touchLiveness(db, agentId, 2);
+    expect(getAgent(db, agentId)?.status).toBe("removed");
   });
 });

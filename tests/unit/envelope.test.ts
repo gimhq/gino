@@ -13,7 +13,6 @@ function outboxRow(over: Partial<Outbox>): Outbox {
     taskId: null,
     threadId: null,
     cronId: null,
-    msgId: null,
     dataJson: {},
     createdAt: 0,
     ackedAt: null,
@@ -68,8 +67,11 @@ describe("M2 envelope — encode", () => {
     expect(frame.msgId).toBeUndefined();
   });
 
-  it("a message frame carries msgId (acked by msg_ack), not outboxId", () => {
-    const frame = encodeOutbox(outboxRow({ id: 8, type: "message", msgId: 8, taskId: "t-1", threadId: "c-1", dataJson: { text: "hi" } }));
+  // HOST-M1M2-07 / HOST-M4-07: the delivery id is DERIVED from the row id at
+  // encode time (there is no stored msg_id column), so every durable message
+  // row encodes to an ackable frame.
+  it("a message frame carries msgId = row id (acked by msg_ack), not outboxId", () => {
+    const frame = encodeOutbox(outboxRow({ id: 8, type: "message", taskId: "t-1", threadId: "c-1", dataJson: { text: "hi" } }));
     expect(frame).toEqual({ type: "message", msgId: 8, taskId: "t-1", threadId: "c-1", data: { text: "hi" } });
     expect(frame.outboxId).toBeUndefined();
   });

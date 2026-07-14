@@ -8,15 +8,18 @@
 //   • generic host→agent frames carry `outboxId` and are acked by `ack{id}`;
 //   • the `message` frame carries `msgId` and is acked by `msg_ack{msgId}` so
 //     M4 (B3) can advance its delivery cursor only after the agent has DURABLY
-//     stored the input. For B1b the message's `msgId` reuses the row id and the
-//     ack just marks the row delivered (the cursor advance is a B3 seam).
+//     stored the input. The message's `msgId` IS the row id — derived at encode
+//     time, never stored (there is no `msg_id` column) — so a `message` row is
+//     atomically born with its delivery id and the ack just marks the row
+//     delivered (the cursor advance is a B3 seam).
 //
 // Layering: the outbox talks to the live socket only through the abstract
 // `FrameSender` (sessions implements it), and rebuilds the wire frame via the
 // M2 `encodeOutbox` codec — it never hand-rolls the envelope.
 import type { AppDatabase } from "@/db";
 import type { Outbox } from "@/db/schema";
-import { and, asc, eq, isNull, ne } from "drizzle-orm";
+import type { Logger } from "@/shared/lib/logger";
+import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
 import { outbox } from "@/db/schema";
 import { encodeOutbox } from "./envelope";
 
@@ -37,13 +40,21 @@ export interface EnqueueInput {
 }
 
 /**
+ * An enqueued outbox row. `msgId` is NOT a column — for a `message` row it is
+ * the derived delivery id (= row id), attached so callers can surface it.
+ */
+export type EnqueuedOutbox = Outbox & { msgId?: number };
+
+/**
  * Persist a host→agent frame and, if the agent is online, send it. The row is
  * written FIRST (durability before delivery); the live push is best-effort —
- * a miss is recovered by `replayUnacked` on reconnect. For a `message` frame
- * the row's `msgId` is set to its own id so the frame carries a stable delivery
- * id the agent echoes in `msg_ack`.
+ * a miss is recovered by `replayUnacked` on reconnect. A `message` frame's
+ * delivery id (`msgId`) IS the row id: it exists the instant the single INSERT
+ * commits, so there is no crash window in which a durable `message` row lacks
+ * an ackable id. The returned row carries the derived `msgId` for callers that
+ * surface it.
  */
-export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
+export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): EnqueuedOutbox {
   const inserted = db
     .insert(outbox)
     .values({
@@ -52,22 +63,32 @@ export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInpu
       taskId: input.taskId ?? null,
       threadId: input.threadId ?? null,
       cronId: input.cronId ?? null,
-      msgId: null,
       dataJson: input.data ?? {},
     })
     .returning()
     .get();
 
-  let row = inserted;
-  if (input.type === "message") {
-    db.update(outbox).set({ msgId: inserted.id }).where(eq(outbox.id, inserted.id)).run();
-    row = { ...inserted, msgId: inserted.id };
-  }
+  const row = input.type === "message" ? { ...inserted, msgId: inserted.id } : inserted;
 
   if (sender.isOnline(input.agentId)) {
     sender.send(input.agentId, encodeOutbox(row));
   }
   return row;
+}
+
+/**
+ * Persist + push a LIVE-ONLY control frame (at-most-once). The row rides the
+ * normal outbox path (uniform encode + audit trail) but is stamped acked
+ * immediately, so it is NEVER replayed on reconnect: a cancel signal is only
+ * meaningful against the turn that is running right now — replaying a stale
+ * one would kill an arbitrary future turn (HOST-M4-03). Delivery is the live
+ * push or nothing.
+ */
+export function enqueueLiveOnly(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
+  const row = enqueue(db, sender, input);
+  const ackedAt = Date.now();
+  db.update(outbox).set({ ackedAt }).where(eq(outbox.id, row.id)).run();
+  return { ...row, ackedAt };
 }
 
 /**
@@ -86,7 +107,8 @@ export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
 
 /**
  * Agent durably stored a `message` (`msg_ack{msgId}`) → mark it delivered.
- * Scoped to the authenticated agent's own rows.
+ * A message's `msgId` is its row id, so the match keys on `id` +
+ * `type = 'message'`, scoped to the authenticated agent's own rows.
  * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
  * row acked is enough to stop replay.
  */
@@ -94,16 +116,37 @@ export function ackMessage(db: AppDatabase, agentId: string, msgId: number): voi
   db
     .update(outbox)
     .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.msgId, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
+    .where(and(eq(outbox.id, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
     .run();
+}
+
+/**
+ * TTL for durable `close` control frames (HOST-M3-13) — 15 minutes. A `close`
+ * queued by a stop/restart fallback while the agent was offline expresses a
+ * NOW intent, not a standing order: replaying it weeks later would kill a
+ * deliberate later start. Past the TTL the frame is skipped (and retired) on
+ * replay instead of delivered.
+ */
+export const CLOSE_FRAME_TTL_MS = 15 * 60 * 1000;
+
+export interface ReplayOptions {
+  /** TTL for `close` frames in ms. Defaults to `CLOSE_FRAME_TTL_MS`. */
+  readonly closeTtlMs?: number;
+  /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
+  readonly now?: () => number;
+  readonly logger?: Logger;
 }
 
 /**
  * Replay every unacked frame for an agent, in id order, on (re)connect. The
  * agent dedupes by id, so re-sending an already-processed-but-not-yet-acked
  * frame is safe. Returns the number of frames pushed.
+ *
+ * HOST-M3-13: a `close` frame older than its TTL is STALE — it is retired
+ * (marked acked so it never rescans) and logged instead of sent, so a stop
+ * issued while the agent was offline cannot kill a deliberate later start.
  */
-export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: string): number {
+export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: string, opts: ReplayOptions = {}): number {
   const rows = db
     .select()
     .from(outbox)
@@ -111,11 +154,109 @@ export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: str
     .orderBy(asc(outbox.id))
     .all();
 
+  const now = opts.now?.() ?? Date.now();
+  const closeCutoff = now - (opts.closeTtlMs ?? CLOSE_FRAME_TTL_MS);
+
   let sent = 0;
   for (const row of rows) {
+    if (row.type === "close" && row.createdAt < closeCutoff) {
+      db.update(outbox).set({ ackedAt: now }).where(eq(outbox.id, row.id)).run();
+      opts.logger?.warn(
+        { agentId, outboxId: row.id, ageMs: now - row.createdAt },
+        "stale close frame skipped on replay (past TTL) — retired without delivery",
+      );
+      continue;
+    }
     if (sender.send(agentId, encodeOutbox(row))) {
       sent += 1;
     }
   }
   return sent;
+}
+
+/**
+ * Purge an agent's UNACKED outbox rows (HOST-M3-12). Called on remove: the
+ * agent's connect token is revoked, so it can never reconnect to replay or ack
+ * — the rows are undeliverable by construction and would otherwise be immortal
+ * (retention GC only touches acked rows). Returns the number of rows deleted.
+ */
+export function purgeAgentOutbox(db: AppDatabase, agentId: string): number {
+  return db
+    .delete(outbox)
+    .where(and(eq(outbox.agentId, agentId), isNull(outbox.ackedAt)))
+    .returning({ id: outbox.id })
+    .all()
+    .length;
+}
+
+/** Default retention window for ACKED outbox rows (ms) — 7 days. */
+export const OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Default cadence of the periodic retention sweep (ms) — hourly. */
+export const OUTBOX_GC_INTERVAL_MS = 60 * 60 * 1000;
+
+export interface OutboxGcOptions {
+  /** Retention window for acked rows in ms. Defaults to `OUTBOX_RETENTION_MS`. */
+  readonly retentionMs?: number;
+  /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
+  readonly now?: () => number;
+}
+
+/**
+ * Retention GC: delete ACKED rows whose `acked_at` is older than the retention
+ * window. Unacked rows are NEVER deleted — they are still owed to the agent
+ * (at-least-once, §4.2) and stay until acked, however old. Seed state is not
+ * inferred from outbox history (it lives on `tasks.seeded_at`), so dropping
+ * acked frames is safe. Returns the number of rows deleted.
+ */
+export function gcOutbox(db: AppDatabase, opts: OutboxGcOptions = {}): number {
+  const now = opts.now?.() ?? Date.now();
+  const cutoff = now - (opts.retentionMs ?? OUTBOX_RETENTION_MS);
+  return db
+    .delete(outbox)
+    .where(and(isNotNull(outbox.ackedAt), lt(outbox.ackedAt, cutoff)))
+    .returning({ id: outbox.id })
+    .all()
+    .length;
+}
+
+export interface OutboxGcDeps extends OutboxGcOptions {
+  readonly db: AppDatabase;
+  readonly logger?: Logger;
+  /** Sweep cadence in ms. Defaults to `OUTBOX_GC_INTERVAL_MS`. */
+  readonly intervalMs?: number;
+}
+
+export interface OutboxGcHandle {
+  /** Stop the periodic GC (call on shutdown). Idempotent. */
+  readonly stop: () => void;
+  /** Run a GC pass immediately; returns the number of rows deleted. */
+  readonly gc: () => number;
+}
+
+/**
+ * Start the periodic outbox retention GC. The timer is `unref`'d so it never
+ * keeps the process alive on its own; `stop()` clears it. A failing pass is
+ * logged and swallowed so the loop survives a transient DB error.
+ */
+export function startOutboxGc(deps: OutboxGcDeps): OutboxGcHandle {
+  const tick = () => {
+    try {
+      const deleted = gcOutbox(deps.db, deps);
+      if (deleted > 0) {
+        deps.logger?.info({ deleted }, "outbox gc: deleted acked rows past retention");
+      }
+    }
+    catch (err) {
+      deps.logger?.error({ err }, "outbox gc failed");
+    }
+  };
+
+  const timer = setInterval(tick, deps.intervalMs ?? OUTBOX_GC_INTERVAL_MS);
+  timer.unref?.();
+
+  return {
+    stop: () => clearInterval(timer),
+    gc: () => gcOutbox(deps.db, deps),
+  };
 }

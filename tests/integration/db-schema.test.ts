@@ -23,11 +23,14 @@ import {
 } from "@/db/schema";
 import { ulid } from "@/shared/lib/id";
 
-// The 14 §6 tables (docs/host-v2-design.md). The schema is "clean v2": no v1
-// legacy tables (scheduled_tasks / task_run_logs / sessions / registered_groups).
+// The 14 §6 tables (docs/host-v2-design.md) plus `pending_launches`
+// (HOST-M3-05: the persisted launch↔register correlation set). The schema is
+// "clean v2": no v1 legacy tables (scheduled_tasks / task_run_logs / sessions
+// / registered_groups).
 const EXPECTED_TABLES = [
   "agents",
   "agent_grants",
+  "pending_launches",
   "tasks",
   "crons",
   "thread_runs",
@@ -70,7 +73,7 @@ function tableNames(): Set<string> {
 }
 
 describe("v2 host schema (§6)", () => {
-  it("migrates a fresh db and creates all 14 §6 tables", () => {
+  it("migrates a fresh db and creates all §6 tables (+ pending_launches)", () => {
     const names = tableNames();
     for (const t of EXPECTED_TABLES) {
       expect(names.has(t)).toBe(true);
@@ -174,12 +177,12 @@ describe("v2 host schema (§6)", () => {
     ).toThrow();
   });
 
-  it("enforces the messages (thread_id, seq) composite PK", () => {
+  it("enforces the messages (thread_id, seq) unique key", () => {
     const taskId = ulid();
     const threadId = ulid();
     db.insert(messages).values({ taskId, threadId, seq: 1, kind: "user", content: "hi" }).run();
     db.insert(messages).values({ taskId, threadId, seq: 2, kind: "assistant", content: "yo" }).run();
-    // Same (thread_id, seq) collides on the PK.
+    // Same (thread_id, seq) collides on the unique index.
     expect(() =>
       db.insert(messages).values({ taskId, threadId, seq: 1, kind: "user", content: "dup" }).run(),
     ).toThrow();
@@ -242,6 +245,22 @@ describe("v2 host schema (§6)", () => {
     expect(typeof first?.id).toBe("number");
     expect(second!.id).toBeGreaterThan(first!.id);
     expect(first?.dataJson).toEqual({ taskId: "t1" });
+  });
+
+  it("carries the outbox replay index; the vestigial msg_ack index is gone (HOST-M9-07)", () => {
+    const rows = db.all(
+      sql`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'outbox'`,
+    ) as { name: string }[];
+    const names = new Set(rows.map(r => r.name));
+    expect(names.has("outbox_agent_unacked_idx")).toBe(true);
+    // msgId is derived from the row id (HOST-M1M2-07 follow-up): no stored
+    // msg_id column, no msg_ack index.
+    expect(names.has("outbox_msg_ack_idx")).toBe(false);
+  });
+
+  it("carries NO vestigial outbox.msg_id column", () => {
+    const cols = db.all(sql`PRAGMA table_info(outbox)`) as { name: string }[];
+    expect(cols.map(c => c.name)).not.toContain("msg_id");
   });
 
   it("accepts representative rows for the remaining §6 tables", () => {

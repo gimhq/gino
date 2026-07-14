@@ -120,19 +120,21 @@ agent-architecture); bytes never travel in frames.
 
 | type | envelope ids | data | meaning |
 |---|---|---|---|
-| `task_upsert` | `taskId` | `{name?, kind?, status?}` | seed/modify a task (the global top entity) |
+| `task_upsert` | `taskId` | `{name?, kind?, status?, engine?, model?, workdir?, meta?, entries?}` | seed/modify a task (the global top entity); `engine`/`model`/`workdir`/`meta` are the task definition, `entries` the task-scope provisioning set (M8) |
 | `task_delete` | `taskId` | — | remove a task |
-| `cron_upsert` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity, next_run?, status?}` | seed/modify a trigger under a task |
+| `cron_upsert` | `taskId`, `cronId` | `{kind, prompt, schedule_type?, schedule_value?, continuity, next_run?, status?}` | seed/modify a trigger under a task; `prompt` (required) is the recurring instruction the cron runs each fire |
 | `cron_delete` | `taskId`, `cronId` | — | remove a trigger |
 | `message` | `taskId`, `threadId?` | `{text, attachments?}` | user/system input for a task (optionally a live thread) |
-| `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn |
+| `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn. Delivery is LIVE-ONLY (at-most-once): the host sends it to an online agent and never replays it on reconnect — a stale cancel must not fire against a future turn |
 | `close` | — | — | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
 | `config_update` | — | `{<config fields>}` | live config change (opaque overlay) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
 
 Field semantics:
-- `kind` (`thread_message`) ∈ `{user_input, assistant_text, thinking, tool_use,
-  tool_result, status, error}`; `thinking`/`status` are config-filterable.
+- `kind` (`thread_message`) is an open string; the recognized set is
+  `{user_input, assistant_text, thinking, tool_use, tool_result, status, error}` —
+  a receiver stores an unrecognized `kind` opaquely instead of rejecting the
+  frame (additive-compatibility, §1). `thinking`/`status` are config-filterable.
 - `status` (`thread_result`) is a terminal thread state ∈ `{succeeded, failed, cancelled}`.
 - `failure_reason` follows the taxonomy in agent-architecture §6 (`runner.*` / `agent.*`);
   NULL on success. A resume-unsafe failure (e.g. `agent.invalid_request`) omits
@@ -141,12 +143,20 @@ Field semantics:
   `final_seq` (`thread_result`) is the last `seq` emitted on the thread (see §6).
 - `round_count` / `skipped_count` (`cron_state`) are the runner-local `cron_logs` summary;
   the host derives dispatched counts from its own mirror by `cron_id`.
-- `threadId` (`message`, host→agent) selects continuity: **present** → CONTINUE that
-  thread (resume its stored `engine_session_id`); **absent** → START A FRESH thread — the
-  agent mints a new unique `threadId` (no carried session) and returns it on the resulting
-  `thread_result`/`thread_message` so the host records it as the task's `current_thread_id`.
-  There is no implicit per-task continue on an absent `threadId` — every absent-`threadId`
-  message is a brand-new thread.
+- `threadId` (`message`, host→agent) selects continuity. The HOST mints conversation
+  thread ids (globally unique ULIDs, §6) and records each one as the task's
+  `current_thread_id` BEFORE emitting the frame; every `message` a conforming host sends
+  carries a `threadId`. On the agent: **present + known** → CONTINUE that thread (resume
+  its stored `engine_session_id`); **present + unknown** → CREATE ON FIRST SIGHT — the
+  agent creates a fresh thread under the host-supplied id with no carried session. Every
+  conversation starts via create-on-first-sight (the first message of a task, an explicit
+  new-thread request, and the fresh thread after an orphaned task is re-placed). An
+  **absent** `threadId` is tolerated defensively (the field stays optional on the wire):
+  the agent derives a deterministic thread id — stable across at-least-once replays — and
+  returns it on the resulting `thread_result`/`thread_message` frames; there is no
+  implicit per-task continue on an absent `threadId`. Cron-fired thread ids are the one
+  agent-minted family the host sees (`<cronId>@<epoch>` / `<cronId>@shared`, §7): they
+  arrive only on agent→host frames and are never a task's `current_thread_id`.
 
 The agent is **authoritative for scheduling and execution**; `thread_result` / `cron_state`
 are mirror-only writes on the host (read model). The host is a sink for results and a
@@ -340,16 +350,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "maximum": 9007199254740991
                 },
                 "kind": {
-                  "type": "string",
-                  "enum": [
-                    "user_input",
-                    "assistant_text",
-                    "thinking",
-                    "tool_use",
-                    "tool_result",
-                    "status",
-                    "error"
-                  ]
+                  "type": "string"
                 },
                 "role": {
                   "type": "string"
@@ -643,6 +644,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                 "kind": {
                   "type": "string"
                 },
+                "prompt": {
+                  "type": "string"
+                },
                 "schedule_type": {
                   "type": "string"
                 },
@@ -661,6 +665,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               },
               "required": [
                 "kind",
+                "prompt",
                 "continuity"
               ],
               "additionalProperties": {}
@@ -1009,16 +1014,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "maximum": 9007199254740991
                 },
                 "kind": {
-                  "type": "string",
-                  "enum": [
-                    "user_input",
-                    "assistant_text",
-                    "thinking",
-                    "tool_use",
-                    "tool_result",
-                    "status",
-                    "error"
-                  ]
+                  "type": "string"
                 },
                 "role": {
                   "type": "string"
@@ -1313,6 +1309,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                 "kind": {
                   "type": "string"
                 },
+                "prompt": {
+                  "type": "string"
+                },
                 "schedule_type": {
                   "type": "string"
                 },
@@ -1331,6 +1330,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               },
               "required": [
                 "kind",
+                "prompt",
                 "continuity"
               ],
               "additionalProperties": {}

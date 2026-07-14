@@ -7,7 +7,7 @@ import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createApp } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { listArtifacts } from "@/configstore";
+import { getEntries, listArtifacts } from "@/configstore";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
 import { createTask, emitTaskUpsert, getTask, setPlacement } from "@/tasks";
@@ -29,6 +29,8 @@ const config = loadConfigStrict({
   GINO_STORE_DIR: storeDir,
   GINO_REGISTER_TOKEN: REGISTER,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL,
+  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  GINO_HTTP_ADMIN_TOKEN: CHANNEL,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
 });
@@ -60,6 +62,13 @@ const admin = { authorization: `Bearer ${CHANNEL}` };
 function uploadArtifact(name: string, kind: string, bytes: string, contentType?: string) {
   const q = new URLSearchParams({ name, kind, ...(contentType ? { content_type: contentType } : {}) });
   return app.fetch(new Request(`http://local/api/admin/config/artifacts?${q}`, { method: "POST", headers: admin, body: bytes }));
+}
+
+/** Upload an artifact and return its real content sha256 (entries validate against the registry, HOST-M8-07). */
+async function uploadSha(name: string, kind: string, bytes: string): Promise<string> {
+  const res = await uploadArtifact(name, kind, bytes);
+  expect(res.status).toBe(201);
+  return ((await res.json()) as { data: { sha256: string } }).data.sha256;
 }
 
 function putEntries(scope: string, entries: unknown[], engine?: string) {
@@ -96,6 +105,18 @@ describe("admin config — artifact upload (content-addressed + deduped)", () =>
     expect(listArtifacts(db).filter(x => x.name === "CLAUDE.md")).toHaveLength(1);
   });
 
+  it("re-uploading identical bytes with a different kind updates the row (HOST-M8-13)", async () => {
+    const first = await uploadArtifact("mislabelled", "file", "actually-a-bundle");
+    expect(first.status).toBe(201);
+    expect((await first.json() as { data: { kind: string } }).data.kind).toBe("file");
+
+    // The corrective re-ingest wins — not silently ignored.
+    const fixed = await uploadArtifact("mislabelled", "dir", "actually-a-bundle");
+    expect(fixed.status).toBe(201);
+    expect((await fixed.json() as { data: { kind: string } }).data.kind).toBe("dir");
+    expect(listArtifacts(db).filter(x => x.name === "mislabelled")).toHaveLength(1);
+  });
+
   it("rejects a bad kind / missing metadata (400)", async () => {
     expect((await uploadArtifact("x", "weird", "y")).status).toBe(400);
     const noName = await app.fetch(new Request("http://local/api/admin/config/artifacts", { method: "POST", headers: admin, body: "z" }));
@@ -105,13 +126,11 @@ describe("admin config — artifact upload (content-addressed + deduped)", () =>
 
 describe("global delivery — register / GET /agent/config carry config.entries", () => {
   it("a registering agent receives the resolved GLOBAL set for its engine", async () => {
-    const clHash = "a".repeat(64);
-    const skHash = "b".repeat(64);
-    await uploadArtifact("CLAUDE.md", "file", "# global instructions", "text/markdown");
-    await uploadArtifact("reviewer", "dir", "skill-bundle-bytes", "application/gzip");
+    const clSha = await uploadSha("CLAUDE.md", "file", "# global instructions");
+    const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
     const put = await putEntries("global", [
-      { name: "CLAUDE.md", sha256: clHash, kind: "file" },
-      { name: "reviewer", sha256: skHash, kind: "dir" },
+      { name: "CLAUDE.md", sha256: clSha, kind: "file" },
+      { name: "reviewer", sha256: skSha, kind: "dir" },
     ]);
     expect(put.status).toBe(200);
     // A GLOBAL write mints a monotonic version (HOST-M8-01) and reports it.
@@ -133,8 +152,10 @@ describe("global delivery — register / GET /agent/config carry config.entries"
   });
 
   it("every global PUT advances the version; a task-scope PUT does not", async () => {
-    const v1 = (await (await putEntries("global", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }])).json() as { data: { version: number } }).data.version;
-    const v2 = (await (await putEntries("global", [{ name: "CLAUDE.md", sha256: "c".repeat(64), kind: "file" }])).json() as { data: { version: number } }).data.version;
+    const shaA = await uploadSha("ver-a.md", "file", "version bump a");
+    const shaB = await uploadSha("ver-b.md", "file", "version bump b");
+    const v1 = (await (await putEntries("global", [{ name: "ver-a.md", sha256: shaA, kind: "file" }])).json() as { data: { version: number } }).data.version;
+    const v2 = (await (await putEntries("global", [{ name: "ver-b.md", sha256: shaB, kind: "file" }])).json() as { data: { version: number } }).data.version;
     expect(v2).toBe(v1 + 1);
 
     // Task scope: no version minted (the response carries none).
@@ -142,19 +163,64 @@ describe("global delivery — register / GET /agent/config carry config.entries"
     const { agentId } = await reg.json() as { agentId: string };
     const task = createTask(db, { ownerId: "owner-v", engine: "claude", model: "sonnet" });
     setPlacement(db, task.id, agentId);
-    const taskPut = await (await putEntries(task.id, [{ name: "reviewer", sha256: "b".repeat(64), kind: "dir" }])).json() as { data: { version?: number } };
+    const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
+    const taskPut = await (await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }])).json() as { data: { version?: number } };
     expect(taskPut.data.version).toBeUndefined();
   });
 
   it("a codex agent receives codex-resolved targets, never another engine's", async () => {
     // A multi-engine global pair: explicit CLAUDE.md + AGENTS.md targets.
+    const sha = await uploadSha("pair.md", "file", "multi-engine pair");
     await putEntries("global", [
-      { name: "CLAUDE.md", sha256: "a".repeat(64), target: "CLAUDE.md", kind: "file" },
-      { name: "AGENTS.md", sha256: "a".repeat(64), target: "AGENTS.md", kind: "file" },
+      { name: "CLAUDE.md", sha256: sha, target: "CLAUDE.md", kind: "file" },
+      { name: "AGENTS.md", sha256: sha, target: "AGENTS.md", kind: "file" },
     ]);
     const reg = await register(["codex"]);
     const body = await reg.json() as { config: { entries: { target: string }[] } };
     expect(body.config.entries.map(e => e.target)).toEqual(["AGENTS.md"]);
+  });
+
+  it("a MULTI-engine agent receives the union of its engines' targets (HOST-M8-03)", async () => {
+    const sha = await uploadSha("pair.md", "file", "multi-engine pair");
+    await putEntries("global", [
+      { name: "CLAUDE.md", sha256: sha, target: "CLAUDE.md", kind: "file" },
+      { name: "AGENTS.md", sha256: sha, target: "AGENTS.md", kind: "file" },
+    ]);
+    const reg = await register(["claude", "codex"]);
+    expect(reg.status).toBe(200);
+    const body = await reg.json() as { agentId: string; connectToken: string; config: { entries: { target: string }[] } };
+    // NOT just engines[0]: both engines' rows are delivered on register…
+    expect(body.config.entries.map(e => e.target).sort()).toEqual(["AGENTS.md", "CLAUDE.md"]);
+
+    // …and on the config pull mirror.
+    const cfg = await app.fetch(new Request(`http://local/api/agent/config/${body.agentId}`, { headers: { "x-internal-token": body.connectToken } }));
+    const cfgBody = await cfg.json() as { entries: { target: string }[] };
+    expect(cfgBody.entries.map(e => e.target).sort()).toEqual(["AGENTS.md", "CLAUDE.md"]);
+  });
+});
+
+describe("entry write validation — the admin surface 422s bad desired sets", () => {
+  it("rejects an entry whose sha256 was never ingested (HOST-M8-07)", async () => {
+    const res = await putEntries("global", [{ name: "ghost.md", sha256: "e".repeat(64), kind: "file" }]);
+    expect(res.status).toBe(422);
+    const body = await res.json() as { error: { details: { problems: string[] } } };
+    expect(body.error.details.problems.join(" ")).toContain("e".repeat(64));
+  });
+
+  it("rejects a scope that is neither 'global' nor an existing task id (HOST-M8-07)", async () => {
+    const sha = await uploadSha("pair.md", "file", "multi-engine pair");
+    const res = await putEntries("no-such-task", [{ name: "pair.md", sha256: sha, kind: "file" }]);
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects traversal-shaped targets and names (HOST-M8-08)", async () => {
+    const sha = await uploadSha("pair.md", "file", "multi-engine pair");
+    for (const target of ["../../home/user/.bashrc", "/etc/passwd", "C:\\windows\\system32\\evil", "\\\\host\\share\\x"]) {
+      const res = await putEntries("global", [{ name: "pair.md", sha256: sha, target, kind: "file" }]);
+      expect(res.status).toBe(422);
+    }
+    const badName = await putEntries("global", [{ name: "..", sha256: sha, kind: "dir" }]);
+    expect(badName.status).toBe(422);
   });
 });
 
@@ -168,13 +234,14 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
     setPlacement(db, task.id, agentId);
 
     // Declare the task-scope desired set via the admin surface (scope = task id).
-    const put = await putEntries(task.id, [{ name: "reviewer", sha256: "b".repeat(64), kind: "dir" }]);
+    const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
+    const put = await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }]);
     expect(put.status).toBe(200);
 
     // The orchestrator resolves config_entries WHERE scope=<task_id> into the frame.
     const row = emitTaskUpsert(db, sender, getTask(db, task.id)!);
     const data = row.dataJson as { entries?: { name: string; sha256: string; target: string; kind: string }[] };
-    expect(data.entries).toEqual([{ name: "reviewer", sha256: "b".repeat(64), target: ".claude/skills/reviewer", kind: "dir" }]);
+    expect(data.entries).toEqual([{ name: "reviewer", sha256: skSha, target: ".claude/skills/reviewer", kind: "dir" }]);
   });
 
   it("a task with no declared set emits no entries (backward-compatible)", async () => {
@@ -184,5 +251,22 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
     setPlacement(db, task.id, agentId);
     const row = emitTaskUpsert(db, sender, getTask(db, task.id)!);
     expect((row.dataJson as { entries?: unknown }).entries).toBeUndefined();
+  });
+
+  it("closing a task via the admin surface drops its task-scope entries (HOST-M8-10)", async () => {
+    const reg = await register(["claude"]);
+    const { agentId } = await reg.json() as { agentId: string };
+    const task = createTask(db, { ownerId: "owner-3", engine: "claude", model: "sonnet" });
+    setPlacement(db, task.id, agentId);
+
+    const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
+    expect((await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }])).status).toBe(200);
+    expect(getEntries(db, task.id)).toHaveLength(1);
+
+    const closed = await app.fetch(new Request(`http://local/api/admin/tasks/${task.id}/close`, { method: "POST", headers: admin }));
+    expect(closed.status).toBe(200);
+
+    // The orphaned scope no longer pins the artifact in the GC root set.
+    expect(getEntries(db, task.id)).toHaveLength(0);
   });
 });

@@ -84,10 +84,27 @@ export const ThreadResultData = z.looseObject({
 });
 export type ThreadResultData = z.infer<typeof ThreadResultData>;
 
+/**
+ * The `kind` values this host build knows about. `kind` is deliberately NOT a
+ * closed `z.enum` (HOST-M1M2-04): the protocol is additive-by-design (§1), so
+ * an agent build that emits a new transcript kind must not produce a frame the
+ * host refuses forever. The inbound handler stores any string `kind` and
+ * warn-logs values outside this set; readers treat unknown kinds as opaque.
+ */
+export const RECOGNIZED_MESSAGE_KINDS: ReadonlySet<string> = new Set([
+  "user_input",
+  "assistant_text",
+  "thinking",
+  "tool_use",
+  "tool_result",
+  "status",
+  "error",
+]);
+
 /** `thread_message.data` — one ordered transcript event (→ `messages`). */
 export const ThreadMessageData = z.looseObject({
   seq: z.number().int(),
-  kind: z.enum(["user_input", "assistant_text", "thinking", "tool_use", "tool_result", "status", "error"]),
+  kind: z.string(),
   role: z.string().optional(),
   content: z.string().optional(),
   tool: z.string().optional(),
@@ -145,9 +162,15 @@ export const TaskUpsertData = z.looseObject({
 });
 export type TaskUpsertData = z.infer<typeof TaskUpsertData>;
 
-/** `cron_upsert.data` — a scheduling COMMAND (`continuity` required here). */
+/**
+ * `cron_upsert.data` — a scheduling COMMAND (`continuity` required here).
+ * `prompt` is the recurring instruction the cron runs each fire — REQUIRED:
+ * the agent's `CronUpsertData` rejects a promptless command, so the host
+ * schema matches it (HOST-M4-10).
+ */
 export const CronUpsertData = z.looseObject({
   kind: z.string(),
+  prompt: z.string(),
   schedule_type: z.string().optional(),
   schedule_value: z.string().optional(),
   continuity: z.string(),

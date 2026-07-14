@@ -12,8 +12,8 @@ import type { Agent, AgentGrant } from "@/db/schema";
 // It also owns `agent_grants` (the OD13 access policy) + the capacity (DP3) and
 // removal helpers the control layer (M3 `control.ts`) builds on.
 import { randomBytes } from "node:crypto";
-import { and, desc, eq, ne } from "drizzle-orm";
-import { agentGrants, agents, tasks } from "@/db/schema";
+import { and, desc, eq, lt, ne } from "drizzle-orm";
+import { agentGrants, agents, pendingLaunches, tasks } from "@/db/schema";
 import { hashToken, ulid, verifyToken } from "@/platform";
 
 export type AgentStatus = "enrolled" | "online" | "offline" | "removed";
@@ -27,7 +27,13 @@ export interface EnrollInput {
   name?: string;
   /** How the agent runs (`manual` | `docker` | `vm` | …); defaults to `manual`. */
   source?: string;
-  /** Access policy (OD13): `dedicated` (granted owners only) | `public`. */
+  /**
+   * Access policy (OD13): `dedicated` (granted owners only) | `public`.
+   * TRUSTED CALLERS ONLY (HOST-M3-09) — the register edge must NEVER forward
+   * the request body's `access` here: a register-token holder would otherwise
+   * self-declare `public` and become a dispatch target for every owner.
+   * `public` is set by the admin access mutation or an admin launch allowlist.
+   */
   access?: string;
   capabilities: AgentCapabilities;
   /** Which shared register token enrolled it (audit; the token itself is shared). */
@@ -139,6 +145,11 @@ export function setAgentStatus(db: AppDatabase, agentId: string, status: AgentSt
  * Liveness touch from a `heartbeat` (or any inbound frame): bump `last_seen`
  * and, when reported, `active_threads`. The full offline-grace sweep that flips
  * a silent agent to `offline` is B2 — this is the light update it builds on.
+ *
+ * HOST-M3-03: a frame from an `offline` agent proves the socket is alive
+ * (sweep-marked offline during heartbeat starvation, socket never dropped), so
+ * restore `online`. The transition is a guarded CAS out of `offline` ONLY —
+ * `removed` stays terminal and `enrolled` is untouched.
  */
 export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: number): void {
   db
@@ -148,6 +159,11 @@ export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: 
       ...(activeThreads != null ? { activeThreads } : {}),
     })
     .where(eq(agents.id, agentId))
+    .run();
+  db
+    .update(agents)
+    .set({ status: "online" })
+    .where(and(eq(agents.id, agentId), eq(agents.status, "offline")))
     .run();
 }
 
@@ -167,6 +183,20 @@ export function revokeOwner(db: AppDatabase, agentId: string, ownerId: string): 
   db
     .delete(agentGrants)
     .where(and(eq(agentGrants.agentId, agentId), eq(agentGrants.ownerId, ownerId)))
+    .run();
+}
+
+/**
+ * Set an agent's access policy (OD13). ADMIN-ONLY mutation (HOST-M3-09) —
+ * routed like grant/revoke through the control layer; enrollment itself always
+ * lands `dedicated` (or the launch config's admin allowlist via
+ * `correlateLaunch`), never a register-body value.
+ */
+export function setAgentAccess(db: AppDatabase, agentId: string, access: "dedicated" | "public"): void {
+  db
+    .update(agents)
+    .set({ access })
+    .where(and(eq(agents.id, agentId), ne(agents.status, "removed")))
     .run();
 }
 
@@ -271,45 +301,118 @@ export function removeAgent(db: AppDatabase, agentId: string): RemoveAgentResult
 // pending launch here keyed by that nonce; the agent echoes the nonce in `POST
 // /agent/register`, and `correlateLaunch` binds the new `agentId` to the launch
 // (`launcher_kind` + `launch_ref`) so OOB control (M3 `control.ts`) routes to
-// the owning launcher. The launch→register window is short and PROCESS-LOCAL —
-// the host that launched is the host the container dials back to — so the
-// pending set lives in memory (the v2 data model has no `launches` table).
+// the owning launcher.
+//
+// HOST-M3-05: the pending set is PERSISTED (`pending_launches`) — a host
+// restart must neither orphan a running container (the TTL reaper in
+// `launch-reaper.ts` still finds the row and tears the runtime down) nor break
+// a late registration's correlation. The launch→register window stays short:
+// rows are consumed on correlate or reaped past the TTL.
 
 export interface PendingLaunch {
   readonly launcherKind: string;
   /** The launcher's runtime handle (e.g. a container id); null if it started nothing. */
   readonly launchRef: string | null;
+  /** Admin-allowlisted access applied at correlate (HOST-M3-09); defaults to `dedicated`. */
+  readonly access?: string;
 }
 
-const pendingLaunches = new Map<string, PendingLaunch>();
+/** A pending launch that outlived the TTL — the reaper tears its runtime down. */
+export interface ExpiredPendingLaunch extends PendingLaunch {
+  readonly nonce: string;
+}
 
 /** Record a pending launch keyed by its per-launch nonce (called by `control.launchAgent`). */
-export function recordPendingLaunch(nonce: string, pending: PendingLaunch): void {
-  pendingLaunches.set(nonce, pending);
+export function recordPendingLaunch(db: AppDatabase, nonce: string, pending: PendingLaunch): void {
+  db
+    .insert(pendingLaunches)
+    .values({
+      nonce,
+      launcherKind: pending.launcherKind,
+      launchRef: pending.launchRef,
+      access: pending.access ?? "dedicated",
+    })
+    .run();
 }
 
 /**
  * Correlate a registering agent to its launch by nonce (OD17). When the nonce
- * matches a pending launch, bind the agent (`launcher_kind` + `launch_ref`) and
- * CONSUME the entry; returns the bound launch. An unknown/absent nonce returns
- * `null` and changes nothing — so a register WITHOUT a nonce (manual enroll) is
- * entirely unaffected (backward-compatible).
+ * matches a pending launch, bind the agent (`launcher_kind` + `launch_ref` +
+ * the nonce itself, the HOST-M3-06 idempotency key) and CONSUME the entry;
+ * returns the bound launch. The launch's admin-allowlisted `access` is applied
+ * here (HOST-M3-09) — never taken from the register body. An unknown/absent
+ * nonce returns `null` and changes nothing — so a register WITHOUT a nonce
+ * (manual enroll) is entirely unaffected (backward-compatible).
  */
 export function correlateLaunch(db: AppDatabase, agentId: string, nonce: string): PendingLaunch | null {
-  const pending = pendingLaunches.get(nonce);
+  const pending = db
+    .delete(pendingLaunches)
+    .where(eq(pendingLaunches.nonce, nonce))
+    .returning()
+    .get();
   if (!pending) {
     return null;
   }
-  pendingLaunches.delete(nonce);
   db
     .update(agents)
-    .set({ launcherKind: pending.launcherKind, launchRef: pending.launchRef })
+    .set({
+      launcherKind: pending.launcherKind,
+      launchRef: pending.launchRef,
+      launchNonce: nonce,
+      access: pending.access,
+    })
     .where(eq(agents.id, agentId))
     .run();
-  return pending;
+  return { launcherKind: pending.launcherKind, launchRef: pending.launchRef, access: pending.access };
 }
 
-/** Whether a launch nonce is still awaiting its registration (consumed on correlate). */
-export function hasPendingLaunch(nonce: string): boolean {
-  return pendingLaunches.has(nonce);
+/** Whether a launch nonce is still awaiting its registration (consumed on correlate, reaped past TTL). */
+export function hasPendingLaunch(db: AppDatabase, nonce: string): boolean {
+  return db.select({ nonce: pendingLaunches.nonce }).from(pendingLaunches).where(eq(pendingLaunches.nonce, nonce)).get() != null;
+}
+
+/**
+ * Pending launches recorded before `cutoff` (epoch ms) — launches whose agent
+ * never registered inside the TTL. Read by the reaper (HOST-M3-05), which
+ * tears down each runtime and then `deletePendingLaunch`es the row.
+ */
+export function listExpiredPendingLaunches(db: AppDatabase, cutoff: number): ExpiredPendingLaunch[] {
+  return db
+    .select()
+    .from(pendingLaunches)
+    .where(lt(pendingLaunches.createdAt, cutoff))
+    .all()
+    .map(row => ({ nonce: row.nonce, launcherKind: row.launcherKind, launchRef: row.launchRef, access: row.access }));
+}
+
+/** Drop a pending launch (reaper teardown done — or the runtime is unreachable). */
+export function deletePendingLaunch(db: AppDatabase, nonce: string): void {
+  db.delete(pendingLaunches).where(eq(pendingLaunches.nonce, nonce)).run();
+}
+
+/**
+ * Idempotent re-enroll (HOST-M3-06): a register RETRY carrying a launch nonce
+ * that already correlated (the response was lost in transit — the retrying
+ * agent never saw its token) returns the EXISTING agent row instead of minting
+ * a duplicate. The connect token is ROTATED and returned fresh: only its hash
+ * is at rest, and the original plaintext reached nobody. A `removed` agent is
+ * never resurrected (returns `null` → the retry enrolls a fresh row).
+ */
+export function reEnrollByLaunchNonce(db: AppDatabase, nonce: string): EnrollResult | null {
+  const existing = db
+    .select()
+    .from(agents)
+    .where(and(eq(agents.launchNonce, nonce), ne(agents.status, "removed")))
+    .get();
+  if (!existing) {
+    return null;
+  }
+  const connectToken = mintConnectToken();
+  const agent = db
+    .update(agents)
+    .set({ connectTokenHash: hashToken(connectToken) })
+    .where(eq(agents.id, existing.id))
+    .returning()
+    .get();
+  return { agent: agent ?? existing, connectToken };
 }

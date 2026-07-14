@@ -1,4 +1,5 @@
 import type { FetchLike, ProxyConfig } from "@/proxy";
+import type { Logger } from "@/shared/lib/logger";
 import { describe, expect, it } from "bun:test";
 import { CredentialStore } from "@/proxy";
 
@@ -107,6 +108,27 @@ describe("M7 proxy/credentials — codex OAuth refresh", () => {
     clock = 10_000_000; // force the next call to refresh again
     await store.refreshCodex();
     expect(seen).toEqual(["rt-1", "rt-2"]);
+  });
+
+  it("never logs the token-endpoint error body verbatim (HOST-M7-06)", async () => {
+    const entries: string[] = [];
+    const record = (...args: unknown[]) => entries.push(JSON.stringify(args));
+    const logger = { debug: record, info: record, warn: record, error: record, fatal: record, flush: () => {}, reopen: () => {} } as unknown as Logger;
+
+    // JSON error envelope: only the standard OAuth `error` code is logged.
+    const jsonBody = { error: "invalid_grant", error_description: "secret-echo-a1b2c3" };
+    const fetchJson: FetchLike = async () => jsonResponse(jsonBody, 400);
+    await new CredentialStore(makeConfig({ codex: { refreshToken: "rt-secret-x9y8" } }), { fetchImpl: fetchJson, logger }).refreshCodex();
+
+    // Non-JSON body: only its length is logged, never its content.
+    const fetchText: FetchLike = async () => new Response("raw-secret-blob-d4e5f6", { status: 500 });
+    await new CredentialStore(makeConfig({ codex: { refreshToken: "rt-secret-x9y8" } }), { fetchImpl: fetchText, logger }).refreshCodex();
+
+    const logged = entries.join("\n");
+    expect(logged).toContain("invalid_grant");
+    expect(logged).not.toContain("secret-echo-a1b2c3");
+    expect(logged).not.toContain("raw-secret-blob-d4e5f6");
+    expect(logged).not.toContain("rt-secret-x9y8");
   });
 
   it("keeps working (returns prior token) when refresh fails", async () => {

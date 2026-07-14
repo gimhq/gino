@@ -5,30 +5,32 @@ import type { Agent } from "@/db/schema";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { correlateLaunch, enrollAgent, setAgentStatus, verifyConnectToken } from "@/agents/registry";
+import { correlateLaunch, enrollAgent, reEnrollByLaunchNonce, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
 import { sessions } from "@/agents/sessions";
 import {
   attachmentsBySha,
   createStore,
-  DEFAULT_ENGINE,
   getArtifactBySha,
   getAttachmentById,
   getGlobalConfigVersion,
   GLOBAL_SCOPE,
   isShaInAgentDesiredSet,
+  MissingBlobError,
   resolveBlobRef,
-  resolveEntriesForEngine,
+  resolveEntriesForEngines,
   sha256Hex,
   ShaMismatchError,
 } from "@/configstore";
 import { writeAttachmentDescriptors } from "@/msgstore";
-import { generateId } from "@/platform";
-import { handleInboundFrame, ingestHttpFrame } from "@/protocol/inbound";
+import { generateId, hashToken, safeEqual } from "@/platform";
+import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
 import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
+import { readBodyCapped } from "@/shared/lib/body-limit";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
-import { connectTokenAuth, registerTokenAuth } from "@/shared/middleware/auth";
+import { bearerToken, connectTokenAuth } from "@/shared/middleware/auth";
+import { rateLimit } from "@/shared/middleware/rate-limit";
 import { getTask } from "@/tasks";
 
 /**
@@ -54,21 +56,17 @@ function agentConfig(agentId: string) {
   };
 }
 
-/** An agent's primary engine (the first declared capability), defaulting to claude. */
-function primaryEngine(agent: Agent): string {
-  return agent.capabilities.engines[0] ?? DEFAULT_ENGINE;
-}
-
 /**
- * M8 — the resolved GLOBAL desired set for the agent's engine plus the
- * host-assigned monotonic `version`, delivered on register / `GET
- * /agent/config` (additive; the agent reconciles only when the version
- * advances — agent-architecture §9b). Empty entries when nothing is declared,
- * so the response stays backward-compatible.
+ * M8 — the resolved GLOBAL desired set covering ALL the agent's declared
+ * engines (HOST-M8-03 — a multi-engine agent lands every engine's targets, not
+ * just its first capability's) plus the host-assigned monotonic `version`,
+ * delivered on register / `GET /agent/config` (additive; the agent reconciles
+ * only when the version advances — agent-architecture §9b). Empty entries when
+ * nothing is declared, so the response stays backward-compatible.
  */
 function globalConfig(db: AppDatabase, agent: Agent) {
   return {
-    entries: resolveEntriesForEngine(db, GLOBAL_SCOPE, primaryEngine(agent)),
+    entries: resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines),
     version: getGlobalConfigVersion(db),
   };
 }
@@ -127,16 +125,43 @@ function serveBySha(c: Context<AppEnv>, requesterId: string, sha256: string): Re
   return serveBlob(c, { sha256 });
 }
 
+/** True iff a request `If-None-Match` header matches the blob's strong ETag. */
+function ifNoneMatchHits(header: string | undefined, etag: string): boolean {
+  if (!header) {
+    return false;
+  }
+  return header
+    .split(",")
+    .map(v => v.trim())
+    .some(v => v === "*" || v === etag || v === `W/${etag}`);
+}
+
 /**
  * Serve a resolved blob from the unified store, integrity-checked against the
- * full sha256 (B6 byte channel). A missing blob 404s; a stored-bytes/sha256
- * mismatch is a 409 (the host never serves corrupt/tampered bytes).
+ * full sha256 (B6 byte channel). A missing blob 404s — including a dangling
+ * registry/descriptor row whose bytes are gone (HOST-M8-12), never a 500; a
+ * stored-bytes/sha256 mismatch is a 409 (the host never serves corrupt/
+ * tampered bytes). Responses are content-addressed and immutable, so they
+ * carry `Cache-Control: private, immutable` + a strong sha256 `ETag`, and a
+ * matching `If-None-Match` short-circuits to a bodyless 304 (HOST-M8-14).
  */
 function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): Response {
   const db = c.get("db");
   const resolved = resolveBlobRef(db, sel);
   if (!resolved) {
     throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
+  }
+  const etag = `"${resolved.sha256}"`;
+  const cacheHeaders = {
+    // `private` keeps shared caches out (auth rides the non-standard
+    // x-internal-token header, which does not inhibit them); the bytes behind
+    // a sha256 never change, hence `immutable`.
+    "cache-control": "private, max-age=31536000, immutable",
+    "etag": etag,
+    "x-content-sha256": resolved.sha256,
+  };
+  if (ifNoneMatchHits(c.req.header("if-none-match"), etag)) {
+    return new Response(null, { status: 304, headers: cacheHeaders });
   }
   const store = createStore(c.get("config"));
   try {
@@ -148,7 +173,7 @@ function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): R
       headers: {
         "content-type": resolved.contentType,
         "content-length": String(bytes.byteLength),
-        "x-content-sha256": resolved.sha256,
+        ...cacheHeaders,
       },
     });
   }
@@ -156,6 +181,10 @@ function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): R
     if (err instanceof ShaMismatchError) {
       c.get("logger").error({ err, ref: resolved.ref }, "attachment serve: sha256 integrity failure");
       return c.json({ success: false, error: { code: "BLOB_INTEGRITY", message: "stored bytes failed sha256 verification" } }, 409);
+    }
+    if (err instanceof MissingBlobError) {
+      c.get("logger").error({ err, ref: resolved.ref, sha256: resolved.sha256 }, "attachment serve: registry row points at a missing blob (dangling row — HOST-M8-12)");
+      throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
     }
     throw err;
   }
@@ -188,34 +217,88 @@ export function agentRoutes() {
   // ── Enrollment (M3) — register token; version-gated; mints the connect token.
   router.post(
     "/register",
-    registerTokenAuth,
+    // HOST-M1M2-10 / HOST-M9-02: throttle enrollment per client IP BEFORE the
+    // token check, so shared-secret brute force and register-retry loops are
+    // bounded. Over-limit renders the protocol §3 `register_error{rate_limited}`
+    // envelope (Retry-After is set by the middleware).
+    rateLimit({
+      bucket: "agent-register",
+      limits: config => ({ windowMs: config.RATE_LIMIT_REGISTER_WINDOW_MS, max: config.RATE_LIMIT_REGISTER_MAX }),
+      onLimit: c => c.json(registerError("rate_limited"), 429),
+    }),
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Enroll an agent (returns agentId + connect token + config)",
-      responses: { 200: { description: "Enrolled" }, ...errors(400, 401) },
+      responses: {
+        200: { description: "Enrolled" },
+        400: { description: "`register_error{invalid_body|unsupported_protocol}` (protocol §3)" },
+        401: { description: "`register_error{invalid_register_token}` (protocol §3)" },
+        403: { description: "`register_error{registration_disabled}` (protocol §3)" },
+        429: { description: "Rate limited (`register_error{rate_limited}`, protocol §3)" },
+      },
     }),
     async (c) => {
+      // HOST-M1M2-14: EVERY register failure renders the protocol §3
+      // `register_error` envelope (an agent parses `reason` to decide between
+      // "exit permanently" and "retry") — token validation lives here, in the
+      // handler, so a bad token never falls through to the scaffold's generic
+      // 401 envelope. The shared register token rides in the body
+      // (`{ registerToken }`) with an `Authorization: Bearer` fallback; the
+      // comparison is constant-time and fails CLOSED on an unconfigured secret.
       const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+      const expected = c.get("config").REGISTER_TOKEN;
+      const bodyToken = body && typeof body.registerToken === "string" ? body.registerToken : null;
+      const provided = bearerToken(c) ?? bodyToken;
+      if (!expected || !provided || !safeEqual(provided, expected)) {
+        return c.json(registerError("invalid_register_token"), 401);
+      }
+      if (!c.get("config").REGISTER_ENABLED) {
+        return c.json(registerError("registration_disabled"), 403);
+      }
+      if (body == null || typeof body !== "object" || Array.isArray(body)) {
+        return c.json(registerError("invalid_body"), 400);
+      }
 
       // Version gate (protocol §1): reject anything but the current major.
-      if (!body || !isSupportedProtocol(body.protocolVersion)) {
+      if (!isSupportedProtocol(body.protocolVersion)) {
         return c.json(registerError("unsupported_protocol"), 400);
       }
 
       const db = c.get("db");
+      const launchNonce = typeof body.launchNonce === "string" && body.launchNonce.length > 0 ? body.launchNonce : null;
+
+      // HOST-M3-06: registration is IDEMPOTENT per launch. A retry carrying a
+      // nonce that already correlated (the response was lost — the agent never
+      // saw its token) reuses the existing row with a ROTATED connect token
+      // instead of minting a duplicate whose launch binding lands on a ghost.
+      if (launchNonce) {
+        const existing = reEnrollByLaunchNonce(db, launchNonce);
+        if (existing) {
+          c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
+          const retryConfig = { ...agentConfig(existing.agent.id), ...globalConfig(db, existing.agent) };
+          return c.json({ agentId: existing.agent.id, connectToken: existing.connectToken, config: retryConfig });
+        }
+      }
+
+      // HOST-M3-09: the body's `access` is IGNORED — a register-token holder
+      // never self-declares `public`. Enrollment always lands `dedicated`; a
+      // host launch's admin allowlist applies at correlate, and flipping an
+      // agent `public` later is the admin-only access mutation.
       const { agent, connectToken } = enrollAgent(db, {
         ...(typeof body.name === "string" ? { name: body.name } : {}),
         source: typeof body.source === "string" ? body.source : "manual",
-        ...(typeof body.access === "string" ? { access: body.access } : {}),
         capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
+        // HOST-M3-15 provenance: which register token enrolled it — the
+        // sha-256 at-rest form (the shared plaintext is never stored).
+        registerTokenRef: hashToken(c.get("config").REGISTER_TOKEN),
       });
 
       // OD17 launch↔register correlation (OPTIONAL, backward-compatible): when
       // the agent echoes the per-launch nonce it was launched with, bind it to
       // that launch (launcher_kind + launch_ref). No nonce → unchanged: a manual
       // enroll never touches the pending-launch set.
-      if (typeof body.launchNonce === "string" && body.launchNonce.length > 0) {
-        const correlated = correlateLaunch(db, agent.id, body.launchNonce);
+      if (launchNonce) {
+        const correlated = correlateLaunch(db, agent.id, launchNonce);
         if (correlated) {
           c.get("logger").info({ agentId: agent.id, launcher: correlated.launcherKind, ref: correlated.launchRef }, "agent registration correlated to launch");
         }
@@ -250,13 +333,19 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
 
-      const deps = { db, sender: sessions, agentId, logger };
+      // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+      const pump = c.get("webhookPump");
+      const deps = { db, sender: sessions, agentId, logger, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
-          sessions.attach(agentId, ws, agent.connectTokenHash);
+          sessions.attach(agentId, ws);
           setAgentStatus(db, agentId, "online");
-          const replayed = replayUnacked(db, sessions, agentId);
+          // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
+          // connection starts inside the sweep's grace window (never insta-swept
+          // on a stale or NULL `last_seen` before its first heartbeat).
+          touchLiveness(db, agentId);
+          const replayed = replayUnacked(db, sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
@@ -270,11 +359,14 @@ export function agentRoutes() {
           // Blob payloads are not produced by the bun adapter — ignored.
         },
         onClose(_evt, ws) {
-          sessions.detach(agentId, ws);
-          setAgentStatus(db, agentId, "offline");
-          logger.info({ agentId }, "agent ws detached");
-          // TODO(B2): offline-grace sweep flips silent agents; here we just mark
-          // the socket gone — tasks/crons survive on the agent (DP4).
+          // HOST-M1M2-05 / HOST-M3-02: only the CURRENT socket's close marks the
+          // agent offline — a superseded socket's late close (dirty reconnect)
+          // must not clobber the live session's `online` status.
+          const evicted = sessions.detach(agentId, ws);
+          if (evicted) {
+            setAgentStatus(db, agentId, "offline");
+          }
+          logger.info({ agentId, evicted }, "agent ws detached");
         },
       };
     }),
@@ -308,7 +400,7 @@ export function agentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Post agent output (pre-WS fallback) — routed through M2 inbound",
-      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401) },
+      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401, 500) },
     }),
     async (c) => {
       const agentId = c.req.param("agentId");
@@ -318,12 +410,24 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       const raw = await c.req.text();
+      // HOST-M1M2-09: only an undecodable frame is 400 (permanently bad — the
+      // agent must drop it); a storage failure propagates to the error handler
+      // as a 5xx so the agent retries the frame.
       try {
-        return c.json(ingestHttpFrame(c.get("db"), agentId, raw));
+        // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
+        const pump = c.get("webhookPump");
+        return c.json(ingestHttpFrame(
+          { db: c.get("db"), agentId, logger: c.get("logger"), ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
+          raw,
+        ));
       }
       catch (err) {
-        c.get("logger").warn({ err, agentId }, "agent output fallback: frame rejected");
-        return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed or unprocessable frame" } }, 400);
+        if (err instanceof MalformedFrameError) {
+          c.get("logger").warn({ err, agentId }, "agent output fallback: malformed frame rejected");
+          return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed frame" } }, 400);
+        }
+        c.get("logger").error({ err, agentId }, "agent output fallback: storage failure (agent should retry)");
+        throw err;
       }
     },
   );
@@ -379,7 +483,7 @@ export function agentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Ingest attachment bytes → store + descriptor",
-      responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401) },
+      responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401, 413) },
     }),
     async (c) => {
       const requesterId = c.get("agentId");
@@ -399,7 +503,9 @@ export function agentRoutes() {
       const direction: "inbound" | "outbound" = directionRaw === "inbound" ? "inbound" : "outbound";
       const declaredSha = c.req.query("sha256");
 
-      const bytes = new Uint8Array(await c.req.arrayBuffer());
+      // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
+      // streamed size are capped (413 via PayloadTooLargeError) before hashing.
+      const bytes = await readBodyCapped(c.req.raw, c.get("config").MAX_UPLOAD_BYTES);
       const sha256 = sha256Hex(bytes);
       if (declaredSha && declaredSha !== sha256) {
         return c.json({ success: false, error: { code: "SHA_MISMATCH", message: `computed ${sha256} != declared ${declaredSha}` } }, 400);

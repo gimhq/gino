@@ -11,7 +11,9 @@ import {
   getTaskThreads,
   getThreadRun,
   getTranscript,
+  TRANSCRIPT_READ_LIMIT,
   writeAttachmentDescriptors,
+  writeCronPrompt,
   writeCronState,
   writeThreadMessage,
   writeThreadResult,
@@ -236,6 +238,38 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
     expect(getCron(db, bad)?.nextRun).toBeNull();
   });
 
+  it("reads a timezone-less ISO next_run as UTC regardless of host TZ (HOST-XC-01)", () => {
+    const taskId = seedTask();
+    const priorTz = process.env.TZ;
+    try {
+      process.env.TZ = "America/New_York"; // UTC-4/-5 — local parse would shift the epoch
+      const tzLess = ulid();
+      writeCronState(db, {
+        taskId,
+        cronId: tzLess,
+        data: { kind: "cron", continuity: "fresh", next_run: "2026-07-10T09:00:00", round_count: 0, skipped_count: 0 },
+      });
+      expect(getCron(db, tzLess)?.nextRun).toBe(Date.UTC(2026, 6, 10, 9, 0, 0));
+
+      // An explicit offset is still honored, not double-shifted.
+      const offset = ulid();
+      writeCronState(db, {
+        taskId,
+        cronId: offset,
+        data: { kind: "cron", continuity: "fresh", next_run: "2026-07-10T09:00:00+02:00", round_count: 0, skipped_count: 0 },
+      });
+      expect(getCron(db, offset)?.nextRun).toBe(Date.UTC(2026, 6, 10, 7, 0, 0));
+    }
+    finally {
+      if (priorTz === undefined) {
+        delete process.env.TZ;
+      }
+      else {
+        process.env.TZ = priorTz;
+      }
+    }
+  });
+
   it("mirrors updated round_count/status and preserves prompt across updates", () => {
     const taskId = seedTask();
     const cronId = ulid();
@@ -290,6 +324,43 @@ function countCrons(cronId: string): number {
   ) as { c: number }[];
   return rows[0]?.c ?? 0;
 }
+
+describe("writeCronPrompt → crons.prompt (dispatch-side write, HOST-M5M6-09)", () => {
+  it("seeds the prompt before the first cron_state; the mirror preserves it", () => {
+    const taskId = seedTask();
+    const cronId = ulid();
+    writeCronPrompt(db, { taskId, cronId, prompt: "send the daily digest" });
+    expect(getCron(db, cronId)?.prompt).toBe("send the daily digest");
+
+    writeCronState(db, {
+      taskId,
+      cronId,
+      data: { kind: "schedule", continuity: "isolated", status: "scheduled", round_count: 1, skipped_count: 0 },
+    });
+    const cron = getCron(db, cronId);
+    expect(cron?.prompt).toBe("send the daily digest");
+    expect(cron?.kind).toBe("schedule");
+    expect(cron?.roundCount).toBe(1);
+    expect(countCrons(cronId)).toBe(1);
+  });
+
+  it("updates only the prompt when the mirror row already exists", () => {
+    const taskId = seedTask();
+    const cronId = ulid();
+    writeCronState(db, {
+      taskId,
+      cronId,
+      data: { kind: "interval", schedule_type: "every", schedule_value: "5m", continuity: "fresh", round_count: 2, skipped_count: 0 },
+    });
+    writeCronPrompt(db, { taskId, cronId, prompt: "rotated command" });
+    const cron = getCron(db, cronId);
+    expect(cron?.prompt).toBe("rotated command");
+    expect(cron?.kind).toBe("interval");
+    expect(cron?.scheduleValue).toBe("5m");
+    expect(cron?.roundCount).toBe(2);
+    expect(countCrons(cronId)).toBe(1);
+  });
+});
 
 describe("writeAttachmentDescriptors → attachments (idempotent on id)", () => {
   it("inserts descriptors, defaulting direction to outbound", () => {
@@ -375,5 +446,23 @@ describe("read models", () => {
     const transcript = getTranscript(db, mine);
     expect(transcript.length).toBe(1);
     expect(transcript[0]?.content).toBe("mine");
+  });
+
+  it("getTranscript is bounded (HOST-M5M6-08): caps at TRANSCRIPT_READ_LIMIT and pages with afterSeq", () => {
+    const taskId = seedTask();
+    const threadId = ulid();
+    const total = TRANSCRIPT_READ_LIMIT + 5;
+    for (let seq = 1; seq <= total; seq++) {
+      writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+    }
+
+    // A bare read never materializes the whole thread — and an oversized limit
+    // is clamped to the same cap.
+    expect(getTranscript(db, threadId)).toHaveLength(TRANSCRIPT_READ_LIMIT);
+    expect(getTranscript(db, threadId, { limit: total * 10 })).toHaveLength(TRANSCRIPT_READ_LIMIT);
+
+    // Paging with afterSeq walks the remainder (bounded ≠ unreachable).
+    const page2 = getTranscript(db, threadId, { afterSeq: TRANSCRIPT_READ_LIMIT });
+    expect(page2.map(m => m.seq)).toEqual([1, 2, 3, 4, 5].map(i => TRANSCRIPT_READ_LIMIT + i));
   });
 });

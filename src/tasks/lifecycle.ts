@@ -16,6 +16,7 @@
 // `migrate(task)` here by design: callers just `createTask` + `placeTask` anew.
 import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
+import { clearEntries } from "@/configstore";
 import { setStatus } from "./store";
 
 /**
@@ -38,12 +39,20 @@ export type TaskStatus = (typeof TASK_STATUS)[keyof typeof TASK_STATUS];
  * Record a user/agent-decided status transition. This is the ONLY status writer
  * the admin surface uses; the host never forces a terminal state on its own
  * (DP4). Returns the updated task (404 if unknown).
+ *
+ * A transition to `closed` also drops the task's scope from the M8 desired set
+ * (HOST-M8-10): its `config_entries` rows stop pinning artifacts in the GC
+ * root set. Re-opening a task does not resurrect them — re-declare if needed.
  */
 export function transitionTaskStatus(db: AppDatabase, taskId: string, status: string): Task {
-  return setStatus(db, taskId, status);
+  const task = setStatus(db, taskId, status);
+  if (status === TASK_STATUS.closed) {
+    clearEntries(db, taskId);
+  }
+  return task;
 }
 
 /** Mark a task `closed` (user/admin `/close`); pairs with a task-scoped `interrupt` + `task_upsert{status:"closed"}`. */
 export function closeTask(db: AppDatabase, taskId: string): Task {
-  return setStatus(db, taskId, TASK_STATUS.closed);
+  return transitionTaskStatus(db, taskId, TASK_STATUS.closed);
 }

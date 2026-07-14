@@ -18,9 +18,11 @@ describe("ulid", () => {
 });
 
 describe("nanoid", () => {
-  it("produces 8-char lowercase alphanumeric ids", () => {
+  // HOST-M9-11 — 16 chars (~82.7 bits) so row-volume ids (attachments) stay
+  // collision-free; the old 8-char form hit 50 % collision odds at ~1.7 M ids.
+  it("produces 16-char lowercase alphanumeric ids", () => {
     const id = nanoid();
-    expect(id).toHaveLength(8);
-    expect(id).toMatch(/^[0-9a-z]{8}$/);
+    expect(id).toHaveLength(16);
+    expect(id).toMatch(/^[0-9a-z]{16}$/);
   });
 });

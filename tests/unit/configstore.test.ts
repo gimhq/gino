@@ -1,5 +1,5 @@
 import type { AppDatabase } from "@/db";
-import { existsSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
@@ -11,6 +11,7 @@ import {
   getArtifactBySha,
   ingestArtifact,
   listArtifacts,
+  MissingBlobError,
   sha256Hex,
   ShaMismatchError,
 } from "@/configstore";
@@ -77,8 +78,46 @@ describe("BlobStore — content-addressed put/read", () => {
     expect(() => store.put("", enc.encode("x"))).toThrow(ConfigStoreError);
   });
 
-  it("read of a missing ref throws", () => {
+  it("read of a missing ref throws MissingBlobError", () => {
     expect(() => store.read("nope/000000000000")).toThrow(ConfigStoreError);
+    expect(() => store.read("nope/000000000000")).toThrow(MissingBlobError);
+  });
+
+  it("self-heals a corrupted/squatted leaf on re-put instead of no-opping (HOST-M8-04)", () => {
+    const bytes = enc.encode("the real artifact bytes");
+    const blob = store.put("skill.md", bytes);
+
+    // Corrupt the stored file underneath the content address (bit rot / a
+    // prefix-squatted leaf) — the old dedup would have trusted the path and
+    // left the wrong bytes in place forever.
+    writeFileSync(resolve(storeDir, blob.ref), "WRONG BYTES");
+    expect(() => store.readVerified(blob.ref, blob.sha256)).toThrow(ShaMismatchError);
+
+    // Re-ingesting the correct bytes repairs the blob (no permanent 409).
+    const healed = store.put("skill.md", bytes);
+    expect(healed.ref).toBe(blob.ref);
+    expect(new TextDecoder().decode(store.readVerified(blob.ref, blob.sha256))).toBe("the real artifact bytes");
+  });
+
+  it("enforces root containment of ANY ref before touching the filesystem (HOST-M8-09)", () => {
+    // A traversal-shaped ref (e.g. an agent-supplied attachment descriptor)
+    // must never resolve outside the store root — on any store operation.
+    const secret = resolve(storeDir, "..", `gino-secret-${process.pid}.txt`);
+    writeFileSync(secret, "host-private bytes");
+    try {
+      const escape = `../${secret.split("/").pop()}`;
+      expect(() => store.read(escape)).toThrow(ConfigStoreError);
+      expect(() => store.readVerified(escape, sha256Hex(enc.encode("host-private bytes")))).toThrow(ConfigStoreError);
+      expect(() => store.sizeOf(escape)).toThrow(ConfigStoreError);
+      expect(() => store.delete(escape)).toThrow(ConfigStoreError);
+      expect(() => store.exists(escape)).toThrow(ConfigStoreError);
+      expect(() => store.read("/etc/hostname")).toThrow(ConfigStoreError);
+      expect(() => store.read("name/../../x")).toThrow(ConfigStoreError);
+      expect(existsSync(secret)).toBe(true); // delete() never reached it
+    }
+    finally {
+      rmSync(secret, { force: true });
+    }
   });
 });
 
@@ -105,6 +144,23 @@ describe("config_artifacts registry — ingest/get/list", () => {
     ingestArtifact(db, store, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v1") });
     ingestArtifact(db, store, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v2") });
     expect(listArtifacts(db).filter(a => a.name === "CLAUDE.md")).toHaveLength(2);
+  });
+
+  it("re-ingesting identical (name, bytes) with different metadata UPDATES kind/content_type (HOST-M8-13)", () => {
+    const bytes = enc.encode("bundle-bytes");
+    const first = ingestArtifact(db, store, { name: "bundle", kind: "file", bytes, contentType: "text/plain" });
+    expect(first.kind).toBe("file");
+    expect(first.contentType).toBe("text/plain");
+
+    // The corrective re-ingest is NOT silently ignored: metadata last-write-wins.
+    const second = ingestArtifact(db, store, { name: "bundle", kind: "dir", bytes, contentType: "application/gzip" });
+    expect(second.sha256).toBe(first.sha256);
+    expect(second.kind).toBe("dir");
+    expect(second.contentType).toBe("application/gzip");
+
+    // Still one content-addressed row + one physical blob (the bytes dedup).
+    expect(listArtifacts(db).filter(a => a.name === "bundle")).toHaveLength(1);
+    expect(readdirSync(resolve(storeDir, "bundle"))).toHaveLength(1);
   });
 
   it("a file artifact carries kind:file (a skill is just kind:dir — one abstraction)", () => {

@@ -15,7 +15,7 @@ import type { EntryInput } from "@/configstore";
 // M8/B6 — `meta` carries an optional passthrough seam (no config storage here).
 import type { AppDatabase } from "@/db";
 import type { NewTask, Task } from "@/db/schema";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { resolveEntries, setEntries } from "@/configstore";
 import { crons, tasks } from "@/db/schema";
 import { ulid } from "@/platform";
@@ -114,6 +114,13 @@ export function listTasks(db: AppDatabase, filter: ListTasksFilter = {}): Task[]
  * placement records `agent_id` + `assigned_at`; re-pinning the SAME agent is an
  * idempotent no-op; re-pinning a DIFFERENT agent is rejected (409) because a
  * task lives on exactly one agent for life. "Moving agents" is a brand-new task.
+ *
+ * The pin also RESETS the placement-scoped state — `seeded_at` and
+ * `current_thread_id` — so an orphaned task (agent removed → `agent_id` nulled)
+ * re-placed on a NEW agent is re-seeded (`task_upsert`) and opens a fresh
+ * thread instead of dragging the removed agent's dead thread along. Both
+ * columns are always NULL on a first placement, so the reset only bites on
+ * re-placement.
  */
 export function setPlacement(db: AppDatabase, taskId: string, agentId: string): Task {
   const task = requireTask(db, taskId);
@@ -129,7 +136,7 @@ export function setPlacement(db: AppDatabase, taskId: string, agentId: string): 
   }
   return db
     .update(tasks)
-    .set({ agentId, assignedAt: Date.now(), updatedAt: Date.now() })
+    .set({ agentId, assignedAt: Date.now(), seededAt: null, currentThreadId: null, updatedAt: Date.now() })
     .where(eq(tasks.id, taskId))
     .returning()
     .get();
@@ -144,6 +151,20 @@ export function setStatus(db: AppDatabase, taskId: string, status: string): Task
     .where(eq(tasks.id, taskId))
     .returning()
     .get();
+}
+
+/**
+ * Record that the task's `task_upsert` seed frame has been enqueued
+ * (`seeded_at`). Durable on the task row — outbox retention GC cannot un-seed
+ * a task by deleting its acked history. Set once (an already-set timestamp is
+ * kept); re-placement work clears it elsewhere, never here.
+ */
+export function markSeeded(db: AppDatabase, taskId: string): void {
+  db
+    .update(tasks)
+    .set({ seededAt: Date.now() })
+    .where(and(eq(tasks.id, taskId), isNull(tasks.seededAt)))
+    .run();
 }
 
 /**

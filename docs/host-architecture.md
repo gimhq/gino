@@ -100,11 +100,15 @@ src/
 ### M1 — Edge (transport + auth)
 One `OpenAPIHono` app on `GINO_PORT`. Owns transport, auth, rate-limit, SSRF guard, structured errors —
 then delegates. Routes are **fully explicit prefixes, no catch-all**: `/agent/*` data-plane (→ M2/M3),
-`/admin/*` control (`HTTP_CHANNEL_TOKEN` bearer → M3/M4), `/messages/*` + webhooks (→ M6), and **`/llm/*`**
-credential proxy (→ M7). Explicit prefixes make unknown paths a clean 404 (no fall-through to the proxy).
-Three token kinds: **register token** — a **shared, long-lived, general** bootstrap secret (rotatable);
+`/admin/*` control (`HTTP_ADMIN_TOKEN` bearer → M3/M4), `/messages/*` + webhooks (`HTTP_CHANNEL_TOKEN`
+bearer → M6), and **`/llm/*`** credential proxy (→ M7). Explicit prefixes make unknown paths a clean 404
+(no fall-through to the proxy).
+Four token kinds: **register token** — a **shared, long-lived, general** bootstrap secret (rotatable);
 **connect token** — **per-agent, private**, minted at register, hashed in `agents.connect_token_hash`,
-**revoked on remove**; **channel token** — admin/user I/O.
+**revoked on remove**; **channel token** — user message I/O (`/messages/*`); **admin token** — the control
+plane (`/admin/*`, `/system/lode/*`, `GET /metrics`). Channel and admin are **distinct secrets**
+(HOST-XC-02): a channel credential never grants admin control, and an unset admin token fails closed —
+there is no fallback between the two.
 
 ### M2 — Protocol adapter (the only coupling)
 The sole code that knows the wire. One JSON object per frame: envelope (`type`; delivery `outboxId`/`msgId`;
@@ -128,7 +132,9 @@ puts an owner's task on an agent the owner is **permitted** to use.
 - **Registry** (`agents` table, PK `id` = the wire `agentId`): enroll on `POST /agent/register` (auth: the
   **shared, long-lived register token**) — version-gate, generate `agentId`, mint the **per-agent connect
   token** (store hash; **revoked on remove**), persist `capabilities` (engines + `max_threads`; host may
-  override `max_threads`) + `source` + `access`, correlate to a launch via nonce. Lifecycle:
+  override `max_threads`) + `source` (a client-supplied `access` is IGNORED — enrollment always lands
+  `dedicated`; flipping an agent `public` is an admin-only mutation, HOST-M3-09), correlate to a launch
+  via nonce. Lifecycle:
   `enrolled → online ⇄ offline → removed`.
 - **Sessions**: `agentId → { ws, connectTokenHash, outboxCursor, inboxDedup }`. An agent **dials out**; the
   host never connects in. On (re)connect: auth by hash, attach WS, **replay unacked outbox**, resume.

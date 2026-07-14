@@ -1,9 +1,8 @@
 // M3 — SESSIONS (live connection registry; the host→agent push surface).
 //
 // An agent always DIALS OUT (protocol §2): the host never connects in. This
-// registry maps `agentId → { ws, connectTokenHash }` for the currently-attached
-// sockets and is the one place that turns a host→agent frame into bytes on the
-// wire. Durability is NOT here — the durable host→agent queue is the M2 `outbox`
+// registry maps `agentId → { ws }` for the currently-attached sockets and is
+// the one place that turns a host→agent frame into bytes on the wire. Durability is NOT here — the durable host→agent queue is the M2 `outbox`
 // (it persists before send and replays on reconnect). Sessions only knows
 // "is this agent online, and how do I push a frame to it right now".
 //
@@ -19,12 +18,23 @@ export interface WsLike {
   send: (data: string) => void;
   readyState?: number;
   close: (code?: number, reason?: string) => void;
+  /**
+   * The underlying transport socket, when the handle is a wrapper. The hono/bun
+   * adapter constructs a FRESH `WSContext` per event around the same raw Bun
+   * socket, so current-socket checks must compare `raw` — wrapper identity
+   * differs between `onOpen` and `onClose` for the same connection.
+   */
+  raw?: unknown;
+}
+
+/** Same connection: identical handle, or both wrap the same raw socket. */
+function sameSocket(a: WsLike, b: WsLike): boolean {
+  return a === b || (a.raw != null && a.raw === b.raw);
 }
 
 interface Session {
   agentId: string;
   ws: WsLike;
-  connectTokenHash: string;
 }
 
 const WS_OPEN = 1;
@@ -43,9 +53,9 @@ export class SessionRegistry {
    * live host→agent pipes. The caller flips the agent `online` in the registry
    * and then replays the unacked outbox.
    */
-  attach(agentId: string, ws: WsLike, connectTokenHash: string): void {
+  attach(agentId: string, ws: WsLike): void {
     const existing = this.sessions.get(agentId);
-    if (existing && existing.ws !== ws) {
+    if (existing && !sameSocket(existing.ws, ws)) {
       try {
         existing.ws.close(1012, "superseded by reconnect");
       }
@@ -53,23 +63,26 @@ export class SessionRegistry {
         // The stale socket may already be gone — detaching is best-effort.
       }
     }
-    this.sessions.set(agentId, { agentId, ws, connectTokenHash });
+    this.sessions.set(agentId, { agentId, ws });
   }
 
   /**
    * Detach the agent's socket. When `ws` is given, only detaches if it is still
    * the current socket — so a late `close` from a superseded socket cannot evict
-   * the live reconnect.
+   * the live reconnect. Returns whether the CURRENT session was evicted, so the
+   * caller can skip status bookkeeping for a superseded socket's close
+   * (HOST-M1M2-05 / HOST-M3-02).
    */
-  detach(agentId: string, ws?: WsLike): void {
+  detach(agentId: string, ws?: WsLike): boolean {
     const existing = this.sessions.get(agentId);
     if (!existing) {
-      return;
+      return false;
     }
-    if (ws && existing.ws !== ws) {
-      return;
+    if (ws && !sameSocket(existing.ws, ws)) {
+      return false;
     }
     this.sessions.delete(agentId);
+    return true;
   }
 
   get(agentId: string): Session | undefined {

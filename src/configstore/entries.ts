@@ -6,12 +6,15 @@
 // `CLAUDE.md` + `.claude/skills/<n>`, codex → `AGENTS.md`); the AGENT stays
 // engine-agnostic — it only ever sees `target`/`kind`, never "claude vs codex".
 // A multi-engine standard lands as two rows (a `CLAUDE.md` + an `AGENTS.md`
-// target); on delivery we hand each agent only the rows its engine lands.
+// target); on delivery we hand each agent only the rows its engines land.
 import type { AppDatabase } from "@/db";
 import type { ConfigEntry as ConfigEntryRow } from "@/db/schema";
 import type { ConfigEntry } from "@/protocol/frames";
 import { and, eq } from "drizzle-orm";
 import { configEntries, routerState, tasks } from "@/db/schema";
+import { ValidationError } from "@/shared/lib/errors";
+import { getArtifactBySha } from "./artifacts";
+import { isSafeName } from "./store";
 
 /** The per-agent (non-task) scope name. */
 export const GLOBAL_SCOPE = "global" as const;
@@ -108,6 +111,61 @@ function dedupeByTarget(entries: ConfigEntry[]): ConfigEntry[] {
   return [...byTarget.values()];
 }
 
+/** 64 lowercase hex chars — the canonical shape `sha256Hex` produces. */
+const RE_SHA256_HEX = /^[0-9a-f]{64}$/;
+
+/** Windows drive prefix (`C:...`) — an absolute landing shape we never accept. */
+const RE_DRIVE_PREFIX = /^[a-z]:/i;
+
+/**
+ * True iff `target` is a safe RELATIVE landing path: no absolute / drive / UNC
+ * shapes, no backslashes, and no `.` / `..` / empty segments — so the
+ * agent-side join `<project dir>/<target>` can never escape the project root
+ * (HOST-M8-08).
+ */
+function isSafeTarget(target: string): boolean {
+  if (target.length === 0 || target.includes("\\") || RE_DRIVE_PREFIX.test(target)) {
+    return false;
+  }
+  return target.split("/").every(seg => seg !== "" && seg !== "." && seg !== "..");
+}
+
+/**
+ * Write-time validation of a scope's desired set (HOST-M8-07 / HOST-M8-08):
+ * `scope` must be `'global'` or an existing task id; every entry must carry a
+ * safe single-segment `name`, a safe relative `target`, and a canonical sha256
+ * that an ingested `config_artifacts` row actually holds. The host never
+ * declares bytes it cannot serve and never delivers a landing path that could
+ * escape the agent-side project root. Throws a 422 `ValidationError` whose
+ * details name every offending entry.
+ */
+function assertValidEntries(db: AppDatabase, scope: string, entries: ConfigEntry[]): void {
+  const problems: string[] = [];
+  if (scope !== GLOBAL_SCOPE) {
+    const task = db.select({ id: tasks.id }).from(tasks).where(eq(tasks.id, scope)).get();
+    if (!task) {
+      problems.push(`scope ${JSON.stringify(scope)} is neither 'global' nor an existing task id`);
+    }
+  }
+  for (const e of entries) {
+    if (!isSafeName(e.name)) {
+      problems.push(`entry ${JSON.stringify(e.name)}: name is not a single safe path segment`);
+    }
+    if (!RE_SHA256_HEX.test(e.sha256)) {
+      problems.push(`entry ${JSON.stringify(e.name)}: sha256 must be 64 lowercase hex chars`);
+    }
+    else if (!getArtifactBySha(db, e.sha256)) {
+      problems.push(`entry ${JSON.stringify(e.name)}: no ingested artifact holds sha256 ${e.sha256}`);
+    }
+    if (!isSafeTarget(e.target)) {
+      problems.push(`entry ${JSON.stringify(e.name)}: target ${JSON.stringify(e.target)} must be a relative path with no traversal`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new ValidationError("config entries rejected", { problems });
+  }
+}
+
 /**
  * The host-assigned monotonic GLOBAL config version (restart-durable, kept in
  * `router_state`). The agent reconciles the global scope only when this
@@ -126,10 +184,13 @@ export function getGlobalConfigVersion(db: AppDatabase): number {
  * ONE transaction — a crash or insert error can never leave the scope wiped
  * (all-or-nothing). A GLOBAL write also bumps the monotonic config version in
  * the same transaction, so the version advances iff the set actually changed
- * durably. Returns the persisted set.
+ * durably. Every write is validated first (HOST-M8-07 / HOST-M8-08) — an
+ * unknown scope, an undeclarable sha256, or a traversal-shaped name/target is
+ * rejected with a 422 before anything is touched. Returns the persisted set.
  */
 export function setEntries(db: AppDatabase, scope: string, entries: ConfigEntry[]): ConfigEntry[] {
   const next = dedupeByTarget(entries);
+  assertValidEntries(db, scope, next);
   db.transaction((tx) => {
     tx.delete(configEntries).where(eq(configEntries.scope, scope)).run();
     if (next.length > 0) {
@@ -155,6 +216,16 @@ export function setEntries(db: AppDatabase, scope: string, entries: ConfigEntry[
 /** Raw `config_entries` rows for a scope (admin/inspection). */
 export function getEntries(db: AppDatabase, scope: string): ConfigEntryRow[] {
   return db.select().from(configEntries).where(eq(configEntries.scope, scope)).all();
+}
+
+/**
+ * Drop a scope's desired set entirely — the task lifecycle cleanup
+ * (HOST-M8-10): a closed task's `config_entries` rows leave the desired set so
+ * they stop pinning artifacts in the GC root set. Task scopes carry no config
+ * version, so nothing is bumped.
+ */
+export function clearEntries(db: AppDatabase, scope: string): void {
+  db.delete(configEntries).where(eq(configEntries.scope, scope)).run();
 }
 
 /**
@@ -186,16 +257,29 @@ export function isShaInAgentDesiredSet(db: AppDatabase, agentId: string, sha256:
 }
 
 /**
- * The desired set for a scope, filtered to one engine's targets — the DELIVERY
- * shape handed to an agent (register/config `config.entries`, or
- * `task_upsert.data.entries`). Engine-agnostic targets are delivered to every
- * engine; engine-owned targets only to their engine.
+ * The desired set for a scope, filtered to a set of engines — the DELIVERY
+ * shape handed to an agent (register/config `config.entries`, live
+ * `config_update`). A multi-engine agent receives the UNION of all its
+ * declared engines' targets (HOST-M8-03), never just its first capability.
+ * Engine-agnostic targets are delivered to every engine; an engine-owned
+ * target only when the agent declared that engine. An empty list falls back to
+ * the default engine.
  */
-export function resolveEntriesForEngine(db: AppDatabase, scope: string, engine: string): ConfigEntry[] {
+export function resolveEntriesForEngines(db: AppDatabase, scope: string, engines: string[]): ConfigEntry[] {
+  const declared = new Set(engines.length > 0 ? engines : [DEFAULT_ENGINE]);
   return getEntries(db, scope)
     .filter((r) => {
       const owner = targetEngine(r.target);
-      return owner === null || owner === engine;
+      return owner === null || declared.has(owner);
     })
     .map(r => ({ name: r.name, sha256: r.sha256, target: r.target, kind: r.kind }));
+}
+
+/**
+ * Single-engine delivery shape (`task_upsert.data.entries` — a task carries
+ * exactly one engine). For an agent's global scope use
+ * `resolveEntriesForEngines` with its full capability list.
+ */
+export function resolveEntriesForEngine(db: AppDatabase, scope: string, engine: string): ConfigEntry[] {
+  return resolveEntriesForEngines(db, scope, [engine]);
 }

@@ -19,13 +19,12 @@ it doubles as a wire-compatibility check.
 Two modes:
 
 - **Hermetic (default, `run.sh`)** — fake engine + mock LLM upstream; deterministic,
-  credential-free, 51/51 checks. This file + `TEST-COVERAGE.md`.
+  credential-free, 56/56 checks. This file + `TEST-COVERAGE.md`.
 - **Real flow (`run-real.sh`)** — the **real Claude CLI** drives a **real model**
   through the host `/llm` proxy to **real Anthropic**. Needs a credential you supply
   (`GINO_PROXY_ANTHROPIC_API_KEY` or `_OAUTH_TOKEN`). See `REAL-FLOW-REPORT.md`.
 
-Exit code is the tester's: `0` = all functional checks passed. Known issues
-(see below) are reported but do **not** fail the suite.
+Exit code is the tester's: `0` = all functional checks passed.
 
 Requirements: Docker + compose v2, and a cargo registry cache or network (the
 runner is compiled in `rust:1.96-bookworm`). No Anthropic/OpenAI credentials are
@@ -60,13 +59,16 @@ self-registers (`POST /agent/register`), opens its WebSocket, and runs tasks via
 the fake `claude` engine. The host writes its db/store to a tmpfs (the repo is
 bind-mounted read-only), so a run never touches the working tree.
 
-## Coverage (51 checks)
+## Coverage (56 checks)
 
 See [`TEST-COVERAGE.md`](TEST-COVERAGE.md) for the full check-by-check matrix
 (every request, what it asserts, and the path it proves). Summary:
 
 - **health & version** — `/health`, `/health/ready`, `/system/version`
-- **auth gates** — register / admin / `/llm` all fail-closed (401)
+- **auth gates** — register / admin / `/llm` all fail-closed (401), plus the
+  admin/channel token split (HOST-XC-02): the channel token on `/admin` or
+  `/metrics` and the admin token on `/messages` are all rejected (401, no
+  fallback), while the admin token is accepted on `/admin`
 - **agent enrollment** — the real runner registers + attaches over WS, shows online
 - **task round-trip** — create → auto-dispatch → message → the runner executes via
   the engine → `thread_result` → the transcript mirrors the echoed prompt
@@ -102,15 +104,11 @@ This e2e found three host-v2 ↔ runner-v2 interop bugs on first integration.
    longer emits the runner-level `close` for a single task, and the suite now
    **hard-asserts** the agent keeps serving other tasks after a per-task close.
 
-3. **[OPEN] Scheduling a cron before the first message silently fails.** The agent's
+3. **[FIXED] Scheduling a cron before the first message silently failed.** The agent's
    `crons` table FK-references its local `tasks` row, which only exists after a
    `task_upsert` frame — and the host seeds `task_upsert` lazily on the first
    *message*, not the first cron. So `POST /tasks/:id/crons` on a never-messaged task
-   returns 201 host-side, but the agent rejects `cron_upsert` with
-   `FOREIGN KEY constraint failed` and the cron never applies or fires. Suggested
-   fix: the host should seed `task_upsert` on the first cron too (as it does on the
-   first message).
-
-Issue 3 is reported as a **KNOWN ISSUE** in the run output and does not fail
-the suite; it is a design-level decision left for the maintainer rather than
-changed unilaterally.
+   returned 201 host-side while the agent rejected `cron_upsert` with
+   `FOREIGN KEY constraint failed` and the cron never applied or fired. Fixed
+   agent-side (P2-19): a `cron_upsert` for an unknown task seeds a minimal task
+   row. The suite now hard-asserts the cron applies AND fires in that order.

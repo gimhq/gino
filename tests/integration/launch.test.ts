@@ -6,9 +6,11 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { createDockerLauncher, dockerLauncher, registerLauncher } from "@/agents/launchers";
+import { getAgent, listAgents, verifyConnectToken } from "@/agents/registry";
 import { createApp } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
+import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 
 // D-B2b — launch + launch↔register nonce correlation (OD17), end-to-end through
@@ -26,6 +28,8 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
+  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
 });
@@ -33,11 +37,11 @@ const config = loadConfigStrict({
 let db: AppDatabase;
 let app: ReturnType<typeof createApp>;
 
-/** Captured docker argv across the suite (the recording `spawn` pushes here). */
-let spawnCalls: string[][] = [];
+/** Captured docker argv + spawn env across the suite (the recording `spawn` pushes here). */
+let spawnCalls: { cmd: string[]; env: Record<string, string> | undefined }[] = [];
 
-const recordingSpawn: SpawnFn = async (cmd) => {
-  spawnCalls.push([...cmd]);
+const recordingSpawn: SpawnFn = async (cmd, opts) => {
+  spawnCalls.push({ cmd: [...cmd], env: opts?.env });
   // `docker run -d` (the only command the launch path issues) prints the id.
   return { exitCode: 0, stdout: "ctr-launch-1\n", stderr: "" };
 };
@@ -107,14 +111,22 @@ describe("D-B2b /admin/agents/launch — auth + wiring", () => {
     expect(body.data.nonce).toMatch(/^[0-9a-f]{48}$/); // 24 bytes hex
 
     // The launcher shelled out `docker run -d` with the host-generated nonce
-    // and the host-authoritative bootstrap env (NEVER the client's register token).
+    // and the host-authoritative bootstrap env (NEVER the client's register
+    // token). Values ride the spawn env, not the argv (HOST-M3-11): the argv
+    // only names the keys via value-less `-e`.
     expect(spawnCalls).toHaveLength(1);
-    const cmd = spawnCalls[0]!;
+    const { cmd, env } = spawnCalls[0]!;
     expect(cmd.slice(0, 3)).toEqual(["docker", "run", "-d"]);
-    expect(cmd).toContain("GINO_HOST_URL=https://host.example");
-    expect(cmd).toContain(`GINO_REGISTER_TOKEN=${REGISTER_TOKEN}`);
-    expect(cmd).toContain(`GINO_LAUNCH_NONCE=${body.data.nonce}`);
-    expect(cmd).toContain("ANTHROPIC_BASE_URL=https://host.example/llm");
+    for (const key of ["GINO_HOST_URL", "GINO_REGISTER_TOKEN", "GINO_LAUNCH_NONCE", "ANTHROPIC_BASE_URL"]) {
+      expect(cmd).toContain(key);
+    }
+    expect(cmd.some(arg => arg.includes(REGISTER_TOKEN))).toBe(false);
+    expect(env).toMatchObject({
+      GINO_HOST_URL: "https://host.example",
+      GINO_REGISTER_TOKEN: REGISTER_TOKEN,
+      GINO_LAUNCH_NONCE: body.data.nonce,
+      ANTHROPIC_BASE_URL: "https://host.example/llm",
+    });
   });
 
   it("422 when hostUrl is missing (route is validated)", async () => {
@@ -174,19 +186,69 @@ describe("D-B2b launch↔register correlation (OD17)", () => {
   });
 });
 
-describe("D-B2b control.launchAgent — nonce is single-use", () => {
-  it("a nonce correlates only once (second register with the same nonce binds nothing)", async () => {
+describe("HOST-M3-06 — registration is idempotent per launch nonce", () => {
+  it("a register retry with the same nonce reuses the agent row (no duplicate) and rotates the token", async () => {
     const launched = await launch({ kind: "docker", hostUrl: "https://host.example" });
     const { data } = await launched.json() as { data: { nonce: string; ref: string } };
 
+    const before = listAgents(db).length;
     const first = await register({ launchNonce: data.nonce });
-    const { agentId: firstId } = await first.json() as { agentId: string };
-    const second = await register({ launchNonce: data.nonce });
-    const { agentId: secondId } = await second.json() as { agentId: string };
+    const { agentId: firstId, connectToken: firstToken } = await first.json() as { agentId: string; connectToken: string };
 
-    const firstAgent = (await (await admin(`/agents/${firstId}`)).json() as { data: { launchRef: string | null } }).data;
-    const secondAgent = (await (await admin(`/agents/${secondId}`)).json() as { data: { launchRef: string | null } }).data;
-    expect(firstAgent.launchRef).toBe(data.ref); // first consumed the pending launch
-    expect(secondAgent.launchRef).toBeNull(); // nonce already consumed
+    // The response is "lost" — the agent retries with the SAME nonce.
+    const second = await register({ launchNonce: data.nonce });
+    expect(second.status).toBe(200);
+    const { agentId: secondId, connectToken: secondToken } = await second.json() as { agentId: string; connectToken: string };
+
+    expect(secondId).toBe(firstId); // same agent row — no ghost duplicate
+    expect(listAgents(db).length).toBe(before + 1); // exactly one row minted
+    expect(secondToken).not.toBe(firstToken); // connect token rotated on retry
+    expect(verifyConnectToken(db, firstId, secondToken)?.id).toBe(firstId); // retry token works
+    expect(verifyConnectToken(db, firstId, firstToken)).toBeNull(); // the lost token is dead
+
+    // The launch binding stays on the one live row.
+    const agent = (await (await admin(`/agents/${firstId}`)).json() as { data: { launchRef: string | null } }).data;
+    expect(agent.launchRef).toBe(data.ref);
+  });
+
+  it("a retry against a removed agent does not resurrect it", async () => {
+    const launched = await launch({ kind: "docker", hostUrl: "https://host.example" });
+    const { data } = await launched.json() as { data: { nonce: string } };
+
+    const first = await register({ launchNonce: data.nonce });
+    const { agentId } = await first.json() as { agentId: string };
+    await admin(`/agents/${agentId}/remove`, { method: "POST" });
+
+    const retry = await register({ launchNonce: data.nonce });
+    expect(retry.status).toBe(200);
+    const { agentId: retryId } = await retry.json() as { agentId: string };
+    expect(retryId).not.toBe(agentId); // fresh enrollment, not a resurrection
+    expect(getAgent(db, agentId)?.status).toBe("removed");
+  });
+});
+
+describe("HOST-M3-09 — access policy is never client-declared at enroll", () => {
+  it("a register body claiming access:'public' is ignored — the agent lands dedicated", async () => {
+    const reg = await register({ access: "public" });
+    expect(reg.status).toBe(200);
+    const { agentId } = await reg.json() as { agentId: string };
+    expect(getAgent(db, agentId)?.access).toBe("dedicated");
+  });
+
+  it("an admin launch may allowlist public — applied at correlate, register body still ignored", async () => {
+    const launched = await launch({ kind: "docker", hostUrl: "https://host.example", access: "public" });
+    const { data } = await launched.json() as { data: { nonce: string } };
+
+    const reg = await register({ launchNonce: data.nonce, access: "dedicated" });
+    const { agentId } = await reg.json() as { agentId: string };
+    expect(getAgent(db, agentId)?.access).toBe("public"); // the ADMIN allowlist won, not the body
+  });
+});
+
+describe("HOST-M3-15 — register token provenance", () => {
+  it("registerTokenRef is populated at enroll with the token's at-rest hash", async () => {
+    const reg = await register({});
+    const { agentId } = await reg.json() as { agentId: string };
+    expect(getAgent(db, agentId)?.registerTokenRef).toBe(hashToken(REGISTER_TOKEN));
   });
 });

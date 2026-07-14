@@ -30,6 +30,8 @@ const config = loadConfigStrict({
   GINO_STORE_DIR: storeDir,
   GINO_REGISTER_TOKEN: REGISTER,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL,
+  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  GINO_HTTP_ADMIN_TOKEN: CHANNEL,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
 });
@@ -173,6 +175,50 @@ describe("GET /agent/attachments — a placed agent downloads", () => {
     const got = await downloadById(a.connectToken, data.id);
     expect(got.status).toBe(409);
     expect((await got.json() as { error: { code: string } }).error.code).toBe("BLOB_INTEGRITY");
+  });
+
+  it("404s (not 500) when a descriptor row points at a deleted blob — HOST-M8-12", async () => {
+    const a = await register();
+    const taskId = placeTaskOn(a.agentId);
+    const res = await ingest(a.connectToken, `name=dangling.txt&task_id=${taskId}&thread_id=th1`, "soon to vanish");
+    const { data } = await res.json() as { data: { id: string; ref: string } };
+    // Simulate a crash between a GC row delete and blob delete (or manual FS surgery).
+    rmSync(resolve(storeDir, data.ref), { force: true });
+
+    const got = await downloadById(a.connectToken, data.id);
+    expect(got.status).toBe(404);
+  });
+
+  it("serves immutable cache headers + a sha256 ETag, and 304s a matching If-None-Match — HOST-M8-14", async () => {
+    const a = await register();
+    const taskId = placeTaskOn(a.agentId);
+    const payload = "cache me by content address";
+    const res = await ingest(a.connectToken, `name=cached.txt&task_id=${taskId}&thread_id=th1`, payload);
+    const { data } = await res.json() as { data: { id: string; sha256: string } };
+
+    const full = await downloadById(a.connectToken, data.id);
+    expect(full.status).toBe(200);
+    expect(full.headers.get("cache-control")).toBe("private, max-age=31536000, immutable");
+    expect(full.headers.get("etag")).toBe(`"${data.sha256}"`);
+
+    // Revalidation with the ETag → bodyless 304 (headers intact, no bytes shipped).
+    const revalidate = await app.fetch(new Request(`http://local/api/agent/attachments/${data.id}`, {
+      headers: { ...tok(a.connectToken), "if-none-match": `"${data.sha256}"` },
+    }));
+    expect(revalidate.status).toBe(304);
+    expect(revalidate.headers.get("etag")).toBe(`"${data.sha256}"`);
+    expect(await revalidate.text()).toBe("");
+
+    // A weak validator for the same sha also revalidates; a stale one re-serves.
+    const weak = await app.fetch(new Request(`http://local/api/agent/attachments/${data.id}`, {
+      headers: { ...tok(a.connectToken), "if-none-match": `W/"${data.sha256}"` },
+    }));
+    expect(weak.status).toBe(304);
+    const stale = await app.fetch(new Request(`http://local/api/agent/attachments/${data.id}`, {
+      headers: { ...tok(a.connectToken), "if-none-match": `"${"0".repeat(64)}"` },
+    }));
+    expect(stale.status).toBe(200);
+    expect(await stale.text()).toBe(payload);
   });
 });
 

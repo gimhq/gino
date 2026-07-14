@@ -8,12 +8,13 @@
 // Conventions:
 //   - snake_case column names; camelCase TS keys.
 //   - Host-generated string PKs (`id`) are text ULIDs (see shared/lib/id.ts).
-//     The two exceptions are `outbox.id` (integer autoincrement) and
-//     `messages.seq` (per-thread integer serial, part of a composite PK).
+//     The exceptions are `outbox.id` and `messages.id` (integer autoincrement)
+//     and `messages.seq` (per-thread integer serial, unique with `thread_id`).
 //   - Timestamps are integer epoch-milliseconds. `created_at` / `updated_at`
 //     default to `Date.now()` at insert time (host = sole writer); optional
 //     timestamps are nullable integers.
 //   - Structured columns are stored as TEXT with `{ mode: "json" }`.
+import { sql } from "drizzle-orm";
 import { index, integer, primaryKey, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
 
 export const SCHEMA_VERSION = 2 as const;
@@ -35,8 +36,21 @@ export const agents = sqliteTable("agents", {
   status: text("status").notNull(), // enrolled | online | offline | removed
   launcherKind: text("launcher_kind"), // OOB routing
   launchRef: text("launch_ref"),
+  launchNonce: text("launch_nonce").unique(), // OD17 idempotency key: a register RETRY with the same nonce reuses this row (HOST-M3-06)
   activeThreads: integer("active_threads").default(0),
   lastSeen: integer("last_seen"),
+  createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
+});
+
+// Launch↔register correlation (OD17), PERSISTED (HOST-M3-05): a pending launch
+// must survive a host restart so a late registration still binds its
+// `launcher_kind`/`launch_ref`, and so the TTL reaper can tear down a runtime
+// whose agent never registered (the in-memory map lost both on restart).
+export const pendingLaunches = sqliteTable("pending_launches", {
+  nonce: text("nonce").primaryKey(), // the per-launch GINO_LAUNCH_NONCE
+  launcherKind: text("launcher_kind").notNull(),
+  launchRef: text("launch_ref"), // runtime handle (container id); null if the launcher started nothing
+  access: text("access").notNull().default("dedicated"), // admin-allowlisted access applied at correlate (HOST-M3-09)
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
 });
 
@@ -67,6 +81,7 @@ export const tasks = sqliteTable("tasks", {
   agentId: text("agent_id").references(() => agents.id), // placement, SET ONCE; NULL = pending-assignment
   currentThreadId: text("current_thread_id"), // ongoing thread (resume target)
   assignedAt: integer("assigned_at"),
+  seededAt: integer("seeded_at"), // first task_upsert seed enqueued (durable — survives outbox GC)
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   updatedAt: integer("updated_at").notNull().$defaultFn(() => Date.now()),
 });
@@ -109,6 +124,11 @@ export const threadRuns = sqliteTable("thread_runs", {
 export const messages = sqliteTable(
   "messages",
   {
+    // Stable store position (the M6 egress cursor key, HOST-M5M6-03). An
+    // explicit INTEGER PRIMARY KEY is a rowid alias, so VACUUM never renumbers
+    // it; AUTOINCREMENT additionally forbids value reuse after deletes, so a
+    // persisted cursor can never silently point at a different row.
+    id: integer("id").primaryKey({ autoIncrement: true }),
     taskId: text("task_id").notNull(),
     threadId: text("thread_id").notNull(),
     seq: integer("seq").notNull(), // per-thread serial
@@ -121,7 +141,7 @@ export const messages = sqliteTable(
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [
-    primaryKey({ columns: [t.threadId, t.seq] }),
+    unique("messages_thread_seq_unq").on(t.threadId, t.seq), // idempotent-write key (protocol §6)
     index("messages_task_thread_seq_idx").on(t.taskId, t.threadId, t.seq),
   ],
 );
@@ -150,11 +170,16 @@ export const outbox = sqliteTable("outbox", {
   taskId: text("task_id"),
   threadId: text("thread_id"),
   cronId: text("cron_id"),
-  msgId: integer("msg_id"),
   dataJson: text("data_json", { mode: "json" }).$type<Record<string, unknown>>().notNull(), // at-least-once host→agent
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   ackedAt: integer("acked_at"),
-});
+}, t => [
+  // Reconnect replay scan (`agent_id = ? AND acked_at IS NULL`) — partial, so
+  // only in-flight rows are indexed and acked history costs nothing.
+  // (`msg_ack{msgId}` keys on the integer PK directly — a message's delivery
+  // id IS its row id — so no dedicated msg_ack index is needed.)
+  index("outbox_agent_unacked_idx").on(t.agentId).where(sql`acked_at IS NULL`),
+]);
 
 export const channels = sqliteTable("channels", {
   id: text("id").primaryKey(),
@@ -186,6 +211,10 @@ export const configArtifacts = sqliteTable(
     size: integer("size").notNull(),
     contentType: text("content_type"),
     storeRef: text("store_ref").notNull(),
+    // When the GC first observed this artifact unreferenced (HOST-M8-06):
+    // droppability ages from THIS timestamp (grace after un-reference), never
+    // from created_at. NULL = referenced (or not yet observed unreferenced).
+    unreferencedSince: integer("unreferenced_since"),
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [primaryKey({ columns: [t.name, t.sha256] })], // M8 registry: bytes (host = sole source)
@@ -226,6 +255,8 @@ export const routerState = sqliteTable("router_state", {
 
 export type Agent = typeof agents.$inferSelect;
 export type NewAgent = typeof agents.$inferInsert;
+export type PendingLaunchRow = typeof pendingLaunches.$inferSelect;
+export type NewPendingLaunchRow = typeof pendingLaunches.$inferInsert;
 export type AgentGrant = typeof agentGrants.$inferSelect;
 export type NewAgentGrant = typeof agentGrants.$inferInsert;
 export type Task = typeof tasks.$inferSelect;

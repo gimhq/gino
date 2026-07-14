@@ -17,6 +17,8 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
+  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
 });
@@ -62,18 +64,18 @@ describe("M1 edge skeleton — topology", () => {
   });
 });
 
-describe("M1 edge skeleton — /admin/* channel token", () => {
-  it("401 without the channel bearer", async () => {
+describe("M1 edge skeleton — /admin/* admin token (HOST-XC-02; equals the channel token here by explicit config)", () => {
+  it("401 without the admin bearer", async () => {
     const res = await app.fetch(url("/api/admin/agents"));
     expect(res.status).toBe(401);
   });
 
-  // The /admin surface is reachable behind the channel bearer. `/admin/agents`
+  // The /admin surface is reachable behind the admin bearer. `/admin/agents`
   // (M3/B2) + `/admin/tasks` (M4/B3) + `/admin/channels` (M6/B4) + `/admin/config`
   // (M8/B6) are all LIVE. The Config surface now validates its input (a missing
   // `name`/`kind` → 400 in the standard envelope) instead of the old 501 stub —
   // reachable + authorized, not a placeholder.
-  it("config surface is live (400 on a bad request) with the channel bearer", async () => {
+  it("config surface is live (400 on a bad request) with the admin bearer", async () => {
     const res = await app.fetch(new Request("http://local/api/admin/config/artifacts", {
       method: "POST",
       headers: { authorization: `Bearer ${CHANNEL_TOKEN}` },
@@ -82,7 +84,7 @@ describe("M1 edge skeleton — /admin/* channel token", () => {
     expect(await res.json()).toMatchObject({ success: false, error: { code: "BAD_REQUEST" } });
   });
 
-  it("/admin/agents + /admin/tasks + /admin/channels are live (200 list) with the channel bearer", async () => {
+  it("/admin/agents + /admin/tasks + /admin/channels are live (200 list) with the admin bearer", async () => {
     for (const path of ["/api/admin/agents", "/api/admin/tasks", "/api/admin/channels"]) {
       const res = await app.fetch(new Request(`http://local${path}`, {
         headers: { authorization: `Bearer ${CHANNEL_TOKEN}` },

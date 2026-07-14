@@ -4,9 +4,11 @@ import type { ClientSocket, CodexRelay, ProxyHandler, WsFactory } from "@/proxy"
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { buildProxyConfig, createCodexRelay, createProxyHandler, CredentialStore, verifyProxyCredential } from "@/proxy";
+import { hashToken } from "@/platform";
+import { buildProxyConfig, createCodexRelay, createProxyHandler, CredentialStore, extractProxyCredential, verifyProxyCredential } from "@/proxy";
 import { UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, raw, TAGS } from "@/shared/lib/openapi";
+import { rateLimit } from "@/shared/middleware/rate-limit";
 
 /**
  * Validate the engine's proxy credential; 401 (UnauthorizedError) on failure.
@@ -75,6 +77,28 @@ export function llmRoutes(opts: LlmRoutesOptions = {}) {
     }
     return proxy;
   };
+
+  // HOST-M7-03: throttle the whole /llm surface ahead of auth. A VERIFIED
+  // proxy credential drains its own per-principal budget (keyed by token
+  // hash, never the raw secret) so agents sharing a NAT don't collide; an
+  // absent or invalid credential falls back to the client IP, so failed-auth
+  // floods cannot rotate guessed tokens to evade the limit.
+  router.use("*", rateLimit({
+    bucket: "llm",
+    limits: config => ({ windowMs: config.RATE_LIMIT_LLM_WINDOW_MS, max: config.RATE_LIMIT_LLM_MAX }),
+    key: (c) => {
+      const config = c.var.config;
+      const cred = extractProxyCredential(c.req.raw.headers);
+      if (!cred)
+        return null;
+      const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
+      const ok = verifyProxyCredential(c.req.raw.headers, {
+        db: c.var.db,
+        staticKey: config.PROXY_STATIC_KEY || undefined,
+      }, pathname);
+      return ok ? `cred:${hashToken(cred)}` : null;
+    },
+  }));
 
   // Proxy-credential auth on every /llm route — including the WS handshake, so
   // an unauthenticated upgrade is rejected (401) before any socket opens.

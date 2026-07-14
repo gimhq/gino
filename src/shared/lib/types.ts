@@ -1,3 +1,4 @@
+import type { WebhookPump } from "@/channels/pump";
 import type { Config } from "@/config";
 import type { AppDatabase } from "@/db";
 import type { Logger } from "@/shared/lib/logger";
@@ -23,5 +24,11 @@ export interface AppEnv {
      * client-supplied param) — the authorization subject for the byte channel.
      */
     agentId: string;
+    /**
+     * M6 webhook egress pump (HOST-M5M6-04). Present only when bootstrap
+     * started one — the inbound routes use it to trigger a push when a
+     * transcript row lands; absent in tests that compose the app directly.
+     */
+    webhookPump?: WebhookPump;
   };
 }

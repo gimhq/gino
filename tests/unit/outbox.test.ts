@@ -1,9 +1,11 @@
 import type { AppDatabase } from "@/db";
 import type { FrameSender } from "@/protocol/outbox";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { eq } from "drizzle-orm";
 import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
-import { ackMessage, ackOutbox, enqueue, replayUnacked } from "@/protocol/outbox";
+import { outbox } from "@/db/schema";
+import { ackMessage, ackOutbox, CLOSE_FRAME_TTL_MS, enqueue, gcOutbox, OUTBOX_RETENTION_MS, purgeAgentOutbox, replayUnacked } from "@/protocol/outbox";
 
 // M2 outbox — at-least-once host→agent: persist before send; replay unacked on
 // reconnect; stop replaying on ack{id} / msg_ack{msgId}.
@@ -127,5 +129,183 @@ describe("M2 outbox — ack stops replay", () => {
     sender.online = true;
     expect(replayUnacked(db, sender, agentId)).toBe(3);
     expect(sender.sent.map(s => s.frame.type)).toEqual(["task_upsert", "message", "interrupt"]);
+  });
+});
+
+// HOST-M1M2-07 / HOST-M4-07: a `message` row's delivery id is its row id,
+// assigned by the single INSERT — there is no insert-then-update window in
+// which a durable row exists without an ackable id.
+describe("M2 outbox — atomic message delivery id", () => {
+  it("the DURABLE message row is born ackable: replay + msg_ack + no re-replay", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
+
+    // Replay re-reads the persisted row (not enqueue's in-memory return), so
+    // the frame's msgId comes straight from what the single INSERT committed.
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+    expect(sender.sent[0]!.frame.msgId).toBe(row.id);
+
+    ackMessage(db, agentId, sender.sent[0]!.frame.msgId as number);
+    sender.sent.length = 0;
+    expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("a bare-inserted message row (bypassing enqueue) is still deliverable and ackable", () => {
+    // The delivery id is derived from the row id at encode time — there is no
+    // msg_id column to back-fill — so ANY durable message row replays WITH a
+    // msgId and is ackable, not stuck as an id-less frame.
+    const raw = db
+      .insert(outbox)
+      .values({ agentId, type: "message", taskId: "t-1", dataJson: { text: "orphan" } })
+      .returning()
+      .get();
+
+    const sender = fakeSender(true);
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "message", msgId: raw.id });
+
+    ackMessage(db, agentId, raw.id);
+    sender.sent.length = 0;
+    expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("msg_ack{id} of a NON-message frame does NOT ack it (match is id + type='message')", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
+
+    ackMessage(db, agentId, row.id);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+  });
+});
+
+describe("M2 outbox — retention GC", () => {
+  /** Backdate a row's acked_at (the GC cutoff is measured against it). */
+  function ackAt(id: number, ackedAt: number): void {
+    db.update(outbox).set({ ackedAt }).where(eq(outbox.id, id)).run();
+  }
+
+  it("deletes acked rows past the retention window; keeps recent acked rows", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const oldAcked = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    const recentAcked = enqueue(db, sender, { agentId, type: "interrupt", taskId: "t-1" });
+    ackAt(oldAcked.id, now - OUTBOX_RETENTION_MS - 1);
+    ackAt(recentAcked.id, now - 1000);
+
+    expect(gcOutbox(db, { now: () => now })).toBe(1);
+
+    const remaining = db.select({ id: outbox.id }).from(outbox).all().map(r => r.id);
+    expect(remaining).toEqual([recentAcked.id]);
+  });
+
+  it("NEVER deletes unacked rows, however old", () => {
+    const sender = fakeSender(false);
+    const unacked = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
+
+    // A year past any retention window: the row is still owed to the agent.
+    expect(gcOutbox(db, { now: () => Date.now() + 365 * 24 * 60 * 60 * 1000 })).toBe(0);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "message", msgId: unacked.id });
+  });
+
+  it("honours a custom retention window", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const row = enqueue(db, sender, { agentId, type: "interrupt" });
+    ackAt(row.id, now - 5000);
+
+    expect(gcOutbox(db, { retentionMs: 10_000, now: () => now })).toBe(0);
+    expect(gcOutbox(db, { retentionMs: 1000, now: () => now })).toBe(1);
+  });
+
+  it("replay after GC still returns the surviving unacked frames in id order", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const acked = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "b" } });
+    enqueue(db, sender, { agentId, type: "interrupt" });
+    ackAt(acked.id, now - OUTBOX_RETENTION_MS - 1);
+
+    expect(gcOutbox(db, { now: () => now })).toBe(1);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(2);
+    expect(sender.sent.map(s => s.frame.type)).toEqual(["message", "interrupt"]);
+  });
+});
+
+describe("M2 outbox — stale close TTL on replay (HOST-M3-13)", () => {
+  /** Backdate a row's created_at (the close TTL is measured against it). */
+  function createdAt(id: number, ts: number): void {
+    db.update(outbox).set({ createdAt: ts }).where(eq(outbox.id, id)).run();
+  }
+
+  it("skips + retires a close frame past the TTL — a stale stop cannot kill a later start", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const stale = enqueue(db, sender, { agentId, type: "close", data: { reason: "stop" } });
+    createdAt(stale.id, now - CLOSE_FRAME_TTL_MS - 1);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+    // Retired (marked acked) so it never rescans on the next reconnect.
+    expect(db.select().from(outbox).where(eq(outbox.id, stale.id)).get()?.ackedAt).not.toBeNull();
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(0);
+  });
+
+  it("delivers a close frame still within the TTL", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    enqueue(db, sender, { agentId, type: "close", data: { reason: "stop" } });
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "close" });
+  });
+
+  it("non-close frames replay regardless of age (only close carries the NOW intent)", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const old = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    createdAt(old.id, now - CLOSE_FRAME_TTL_MS * 100);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { now: () => now })).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "task_upsert" });
+  });
+
+  it("honours a custom close TTL", () => {
+    const sender = fakeSender(false);
+    const now = Date.now();
+    const row = enqueue(db, sender, { agentId, type: "close", data: { reason: "restart" } });
+    createdAt(row.id, now - 5000);
+
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId, { closeTtlMs: 1000, now: () => now })).toBe(0);
+  });
+});
+
+describe("M2 outbox — purge on remove (HOST-M3-12)", () => {
+  it("deletes only the agent's UNACKED rows; acked rows stay for retention GC", () => {
+    const sender = fakeSender(false);
+    const unacked1 = enqueue(db, sender, { agentId, type: "close", data: { reason: "remove" } });
+    const unacked2 = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
+    const acked = enqueue(db, sender, { agentId, type: "interrupt" });
+    ackOutbox(db, agentId, acked.id);
+    const other = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
+    const foreign = enqueue(db, sender, { agentId: other, type: "close", data: { reason: "stop" } });
+
+    expect(purgeAgentOutbox(db, agentId)).toBe(2);
+
+    const remaining = db.select({ id: outbox.id }).from(outbox).all().map(r => r.id);
+    expect(remaining).not.toContain(unacked1.id);
+    expect(remaining).not.toContain(unacked2.id);
+    expect(remaining).toContain(acked.id);
+    expect(remaining).toContain(foreign.id);
   });
 });

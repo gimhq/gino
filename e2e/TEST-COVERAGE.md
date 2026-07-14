@@ -1,7 +1,7 @@
 # E2E test coverage
 
 What the docker-compose e2e (`./e2e/run.sh`) actually exercises, check by check.
-Latest run: **51/51 functional checks passed**, 1 known issue reported (see end).
+Latest run: **56/56 functional checks passed**.
 
 The suite is a **black-box integration test**: it drives only the host's public
 HTTP API and observes effects through it, while a **real gino-agent** does the
@@ -29,7 +29,7 @@ the real code path.
 - Liveness is probed by **work** (does a fresh task actually run?), not the `online`
   flag — a dead agent still reads online for the offline-grace window (~3×heartbeat).
 
-## Coverage matrix (51 checks across 11 groups)
+## Coverage matrix (56 checks across 11 groups)
 
 ### 1. Health & version — 3 checks
 | Check | Request | Asserts |
@@ -38,14 +38,20 @@ the real code path.
 | ready (200) | `GET /health/ready` | DB reachable → `ready` |
 | 200 + data | `GET /system/version` | build info envelope |
 
-### 2. Auth gates (fail-closed) — 3 checks
+### 2. Auth gates (fail-closed) — 7 checks
 | Check | Request | Asserts |
 |-------|---------|---------|
 | register 401 | `POST /agent/register` w/ wrong register token | 401 |
-| admin 401 | `GET /admin/agents` w/o channel bearer | 401 |
+| admin 401 | `GET /admin/agents` w/o bearer | 401 |
+| admin w/ channel token 401 | `GET /admin/agents` w/ the CHANNEL bearer | 401 — the channel token does not reach the control plane (HOST-XC-02, no fallback) |
+| metrics w/ channel token 401 | `GET /metrics` w/ the CHANNEL bearer | 401 — metrics is an admin-only surface |
+| messages w/ admin token 401 | `POST /messages/:id/poll` w/ the ADMIN bearer | 401 — the admin token does not reach the user I/O plane |
+| admin w/ admin token 200 | `GET /admin/agents` w/ the ADMIN bearer | 200 — the right token works |
 | llm 401 | `GET /llm/v1/models` w/o connect token | 401 |
 
-Covers all three token kinds (register / channel / connect) rejecting unauthenticated calls.
+Covers all four token kinds (register / channel / admin / connect) rejecting
+unauthenticated calls, plus the admin/channel privilege separation in both
+directions (wrong-kind-of-token → 401).
 
 ### 3. Real agent enrollment over WebSocket — 2 checks
 | Check | Observed via | Asserts |
@@ -80,15 +86,16 @@ The core path: `host → outbox → WS → runner → engine → WS → host →
 
 Proves the inbound message → task routing → real run → outbound transcript loop.
 
-### 6. Crons: command → agent → host mirror — 6 checks (+1 known issue)
+### 6. Crons: command → agent → host mirror — 7 checks
 | Check | Request | Asserts |
 |-------|---------|---------|
 | cronId + outboxId | `POST /admin/tasks/:id/crons` (after a message seeds the task) | host emits a `cron_upsert` command |
-| mirror has the cron | `GET /admin/tasks/:id/crons` (poll ≤25s) | the agent applied + **fired** it, reported `cron_state`, and M5 wrote the read-only mirror |
+| mirror has the cron | `GET /admin/tasks/:id/crons` (poll ≤25s for `roundCount ≥ 1` — the host seeds a prompt-only row at POST, so only a fire-driven update counts) | the agent applied + **fired** it, reported `cron_state`, and M5 wrote the read-only mirror |
 | mirror carries scheduling fields | same | `scheduleType=interval` round-tripped |
-| mirror shows it fired (roundCount ≥ 1) | same | a real fire happened on the agent (the mirror is fire-driven) |
+| mirror shows it fired (roundCount ≥ 1) | same | a real fire happened on the agent (the scheduling fields are fire-driven) |
 | 200 | `DELETE /admin/tasks/:id/crons/:cronId` | `cron_delete` command emitted |
-| host accepts the cron (201) | probe: cron on an un-messaged task | host returns 201 (→ see known issue #1) |
+| host accepts the cron (201) | probe: cron on an un-messaged task | host returns 201 |
+| cron on un-messaged task applied + fired | same probe (poll ≤15s) | the agent seeds a minimal task row when the cron arrives before its `task_upsert` (P2-19), so the cron applies AND fires |
 
 Proves the OD14 cron model end to end: emit → apply → fire → `cron_state` → mirror.
 
@@ -135,22 +142,15 @@ Authenticated by the per-agent connect token; authorized by task placement.
 | close 200 | `POST /admin/tasks/:id/close` | host side succeeds |
 | agent still runs a new task after a per-task close | run a fresh task (≤12s) | per-task close is **non-destructive** — the runner keeps serving other tasks (hard assertion) |
 
-## Known issues (reported, do not fail the suite)
+## Formerly-known issues (now fixed and hard-asserted)
 
-These are pre-existing host↔runner design gaps the suite surfaces and reports
-without changing wire semantics unilaterally.
-
-1. **Cron before the first message fails on the agent.** The agent's `crons` table
-   FK-references its local `tasks` row, created only by a `task_upsert` frame — which
-   the host seeds lazily on the first *message*, not the first cron. So
-   `POST /admin/tasks/:id/crons` on a never-messaged task returns 201 host-side, but
-   the agent rejects `cron_upsert` with `FOREIGN KEY constraint failed` and the cron
-   never applies/fires. Suggested fix: seed `task_upsert` on the first cron too.
-
-> Two earlier bugs are **fixed** and now hard-asserted: the runner rejecting the
-> host's register config via `deny_unknown_fields` (`gino-agent/src/config.rs`),
-> and a per-task close shutting the whole runner down (the host no longer emits
-> the runner-level `close` frame for a single task — see lifecycle check above).
+> Three earlier bugs are **fixed** and now hard-asserted: the runner rejecting the
+> host's register config via `deny_unknown_fields` (`gino-agent/src/config.rs`);
+> a per-task close shutting the whole runner down (the host no longer emits
+> the runner-level `close` frame for a single task — see lifecycle check above);
+> and a cron scheduled before the task's first message being silently dropped on
+> the agent (fixed agent-side by P2-19: a `cron_upsert` for an unknown task seeds
+> a minimal task row — see the cron-ordering probe above).
 
 ## Not covered (out of scope for this harness)
 

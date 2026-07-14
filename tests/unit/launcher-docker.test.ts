@@ -1,20 +1,26 @@
-import type { SpawnFn, SpawnResult } from "@/agents/launchers";
+import type { SpawnFn, SpawnOptions, SpawnResult } from "@/agents/launchers";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import process from "node:process";
 import { describe, expect, it } from "bun:test";
-import { createDockerLauncher, DOCKER_LAUNCHER_KIND, dockerLauncher } from "@/agents/launchers";
+import { createDockerLauncher, DOCKER_LAUNCHER_KIND, dockerLauncher, DockerOpTimeoutError } from "@/agents/launchers";
 
 // M3 docker launcher — the first REAL launcher, exercised against a MOCKED
 // docker CLI (the `spawn` seam). NO real docker, NO containers. Assertions
 // pin the exact `docker` argv (incl. the injected bootstrap env) the launcher
 // shells out, and the inspect→state mapping.
 
-/** A recording `spawn` double: captures every argv and returns a canned result. */
+/** A recording `spawn` double: captures every argv (+opts) and returns a canned result. */
 function recordingSpawn(result: Partial<SpawnResult> = {}) {
   const calls: string[][] = [];
-  const spawn: SpawnFn = async (cmd) => {
+  const optsCalls: (SpawnOptions | undefined)[] = [];
+  const spawn: SpawnFn = async (cmd, opts) => {
     calls.push([...cmd]);
+    optsCalls.push(opts);
     return { exitCode: 0, stdout: "container-abc123\n", stderr: "", ...result };
   };
-  return { calls, spawn };
+  return { calls, optsCalls, spawn };
 }
 
 describe("M3 docker launcher — registry + capabilities", () => {
@@ -37,7 +43,7 @@ describe("M3 docker launcher — registry + capabilities", () => {
 
 describe("M3 docker launcher — launch (docker run -d + injected env)", () => {
   it("injects GINO_HOST_URL, GINO_REGISTER_TOKEN, the nonce + LLM base urls", async () => {
-    const { calls, spawn } = recordingSpawn();
+    const { calls, optsCalls, spawn } = recordingSpawn();
     const launcher = createDockerLauncher({ image: "gino/agent:latest", spawn });
 
     const res = await launcher.launch({
@@ -51,26 +57,47 @@ describe("M3 docker launcher — launch (docker run -d + injected env)", () => {
     const cmd = calls[0]!;
     expect(cmd[0]).toBe("docker");
     expect(cmd.slice(1, 3)).toEqual(["run", "-d"]);
-    // Bootstrap env injected as `-e K=V` pairs.
-    expect(cmd).toContain("GINO_HOST_URL=https://host.example");
-    expect(cmd).toContain("GINO_REGISTER_TOKEN=reg-tok");
-    expect(cmd).toContain("GINO_LAUNCH_NONCE=nonce-xyz");
-    expect(cmd).toContain("ANTHROPIC_BASE_URL=https://host.example/llm");
-    expect(cmd).toContain("OPENAI_BASE_URL=https://host.example/llm");
-    expect(cmd).toContain("EXTRA=1"); // caller env passed through
+    // Bootstrap env named via value-less `-e KEY` (HOST-M3-11); the values
+    // ride the spawn seam's `env` option, off the argv.
+    for (const key of ["GINO_HOST_URL", "GINO_REGISTER_TOKEN", "GINO_LAUNCH_NONCE", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "EXTRA"]) {
+      expect(cmd).toContain(key);
+      expect(cmd[cmd.indexOf(key) - 1]).toBe("-e");
+    }
+    expect(optsCalls[0]?.env).toEqual({
+      GINO_HOST_URL: "https://host.example",
+      GINO_REGISTER_TOKEN: "reg-tok",
+      GINO_LAUNCH_NONCE: "nonce-xyz",
+      ANTHROPIC_BASE_URL: "https://host.example/llm",
+      OPENAI_BASE_URL: "https://host.example/llm",
+      EXTRA: "1",
+    });
     // The image is the final positional arg (after every flag).
     expect(cmd.at(-1)).toBe("gino/agent:latest");
   });
 
-  it("trims a trailing slash off hostUrl when building the /llm base", async () => {
+  it("HOST-M3-11: no env value — the register token above all — appears in the argv", async () => {
     const { calls, spawn } = recordingSpawn();
+    await createDockerLauncher({ image: "img", spawn }).launch({
+      hostUrl: "https://host.example",
+      registerToken: "super-secret-token",
+      workload: {},
+      env: { GINO_LAUNCH_NONCE: "nonce-abc" },
+    });
+    const cmd = calls[0]!;
+    expect(cmd.some(arg => arg.includes("super-secret-token"))).toBe(false);
+    expect(cmd.some(arg => arg.includes("nonce-abc"))).toBe(false);
+    expect(cmd.some(arg => arg.includes("="))).toBe(false); // no -e KEY=VALUE form at all
+  });
+
+  it("trims a trailing slash off hostUrl when building the /llm base", async () => {
+    const { optsCalls, spawn } = recordingSpawn();
     await createDockerLauncher({ image: "img", spawn }).launch({
       hostUrl: "https://host.example/",
       registerToken: "t",
       workload: {},
     });
-    expect(calls[0]).toContain("ANTHROPIC_BASE_URL=https://host.example/llm");
-    expect(calls[0]).toContain("GINO_HOST_URL=https://host.example/"); // raw host url preserved
+    expect(optsCalls[0]?.env?.ANTHROPIC_BASE_URL).toBe("https://host.example/llm");
+    expect(optsCalls[0]?.env?.GINO_HOST_URL).toBe("https://host.example/"); // raw host url preserved
   });
 
   it("takes the image from req.resources.image over the constructor default", async () => {
@@ -154,5 +181,76 @@ describe("M3 docker launcher — inspect (docker inspect → coarse state)", () 
     const { calls, spawn } = recordingSpawn({ stdout: "running\n" });
     await createDockerLauncher({ spawn }).inspect("c-9");
     expect(calls[0]).toEqual(["docker", "inspect", "-f", "{{.State.Status}}", "c-9"]);
+  });
+});
+
+describe("M3 docker launcher — per-op deadline (HOST-M3-10)", () => {
+  /** A `spawn` double that never resolves — a wedged docker daemon. */
+  function hangingSpawn() {
+    const signals: (AbortSignal | undefined)[] = [];
+    const spawn: SpawnFn = (_cmd, opts) => {
+      signals.push(opts?.signal);
+      return new Promise<SpawnResult>(() => {}); // hangs forever
+    };
+    return { signals, spawn };
+  }
+
+  it("a hanging control op rejects with the DISTINCT DockerOpTimeoutError at the deadline", async () => {
+    const { signals, spawn } = hangingSpawn();
+    const launcher = createDockerLauncher({ spawn, opTimeoutMs: 25 });
+    const err = await launcher.stop("c-1").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(DockerOpTimeoutError);
+    expect((err as Error).message).toMatch(/timed out after 25ms/);
+    // The kill path fired: the seam's abort signal was aborted.
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("a hanging launch times out too (no admin request hangs on `docker run`)", async () => {
+    const { spawn } = hangingSpawn();
+    const launcher = createDockerLauncher({ image: "img", spawn, opTimeoutMs: 25 });
+    await expect(launcher.launch({ hostUrl: "http://h", registerToken: "t", workload: {} }))
+      .rejects
+      .toBeInstanceOf(DockerOpTimeoutError);
+  });
+
+  it("a hanging inspect degrades to 'unknown' (best-effort observation, no throw)", async () => {
+    const { spawn } = hangingSpawn();
+    const launcher = createDockerLauncher({ spawn, opTimeoutMs: 25 });
+    expect(await launcher.inspect("c-1")).toBe("unknown");
+  });
+
+  it("kills the REAL child process at the deadline (default Bun.spawn seam)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gino-docker-timeout-"));
+    const pidFile = join(dir, "pid");
+    const script = join(dir, "fake-docker.sh");
+    // A fake docker binary that records its pid and wedges.
+    writeFileSync(script, `#!/bin/sh\necho $$ > ${pidFile}\nexec sleep 60\n`, { mode: 0o755 });
+
+    try {
+      const launcher = createDockerLauncher({ docker: script, opTimeoutMs: 200 });
+      await expect(launcher.stop("c-1")).rejects.toBeInstanceOf(DockerOpTimeoutError);
+
+      const pid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+      expect(pid).toBeGreaterThan(0);
+      // The child must be dead (or dying) after the deadline fired.
+      const deadline = Date.now() + 2000;
+      let alive = true;
+      while (alive && Date.now() < deadline) {
+        try {
+          process.kill(pid, 0);
+          await new Promise(r => setTimeout(r, 50));
+        }
+        catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+    }
+    finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

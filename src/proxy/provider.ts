@@ -41,14 +41,19 @@ export function isAnthropicPassthroughPath(pathname: string): boolean {
 
 /**
  * Detect which upstream a request targets, given the `/llm`-stripped path and
- * the request headers:
- *   - an `x-api-key` header, or an Anthropic-only path → anthropic
- *   - everything else → openai
+ * the request headers. Provider-exclusive paths win outright; the `x-api-key`
+ * heuristic only decides shared paths, so an OpenAI-only endpoint reached with
+ * an `x-api-key` header is not misrouted to anthropic (HOST-M7-05):
+ *   - an Anthropic-only path → anthropic
+ *   - an OpenAI-only path → openai
+ *   - shared paths: `x-api-key` header → anthropic, else openai
  */
 export function detectProvider(headers: Headers, pathname: string): ProxyProvider {
-  if (headers.get("x-api-key"))
-    return "anthropic";
   if (ANTHROPIC_PATH_PREFIXES.some(p => pathname.startsWith(p)))
+    return "anthropic";
+  if (OPENAI_PATH_PREFIXES.some(p => pathname.startsWith(p)))
+    return "openai";
+  if (headers.get("x-api-key"))
     return "anthropic";
   return "openai";
 }

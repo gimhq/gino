@@ -6,11 +6,12 @@
 // runner-local `round_count` / `skipped_count` summary is mirrored verbatim.
 //
 // The `crons` row carries two columns the `cron_state` frame does not: `prompt`
-// (the work command, owned by the dispatch side) and `continuity` is optional
-// on the wire. So the UPSERT preserves `prompt` across mirror updates (never
-// clobbers it) and only overwrites `continuity` when the frame actually carries
-// it. `next_run` arrives as a string on the wire but the column is epoch-ms, so
-// it is coerced.
+// (the work command, owned by the dispatch side — persisted at `cron_upsert`
+// emit time via `writeCronPrompt`, the one dispatch-side write into this
+// mirror) and `continuity` is optional on the wire. So the state UPSERT
+// preserves `prompt` across mirror updates (never clobbers it) and only
+// overwrites `continuity` when the frame actually carries it. `next_run`
+// arrives as a string on the wire but the column is epoch-ms, so it is coerced.
 import type { AppDatabase } from "@/db";
 import type { Cron } from "@/db/schema";
 import type { CronStateData } from "@/protocol/frames";
@@ -23,7 +24,15 @@ export interface CronStateWrite {
   data: CronStateData;
 }
 
-/** Coerce the wire `next_run` (string: epoch-ms or ISO) to epoch-ms, or null. */
+/** ISO date-time with a time part but NO timezone designator (`Z`/offset). */
+const TZ_LESS_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+/**
+ * Coerce the wire `next_run` (string: epoch-ms or ISO) to epoch-ms, or null.
+ * ECMAScript reads a timezone-less ISO date-time in the host's LOCAL zone, so
+ * the stored value would shift with the host `TZ` (HOST-XC-01) — the wire value
+ * is UTC, so pin a TZ-less string with an explicit `Z` before parsing.
+ */
 function toEpochMs(value: string | undefined): number | null {
   if (value == null) {
     return null;
@@ -31,7 +40,7 @@ function toEpochMs(value: string | undefined): number | null {
   if (/^\d+$/.test(value)) {
     return Number(value);
   }
-  const parsed = Date.parse(value);
+  const parsed = Date.parse(TZ_LESS_ISO.test(value) ? `${value}Z` : value);
   return Number.isNaN(parsed) ? null : parsed;
 }
 
@@ -73,6 +82,26 @@ export function writeCronState(db: AppDatabase, { taskId, cronId, data }: CronSt
         ...(data.continuity !== undefined ? { continuity: data.continuity } : {}),
       },
     })
+    .run();
+}
+
+export interface CronPromptWrite {
+  taskId: string;
+  cronId: string;
+  prompt: string;
+}
+
+/**
+ * Persist the dispatch-owned `prompt` when a `cron_upsert` COMMAND is emitted —
+ * `cron_state` never carries it, so without this write the mirror column stays
+ * empty forever (HOST-M5M6-09). INSERT a stub row when the command precedes the
+ * first `cron_state` (the usual order — the host mints the id); on conflict
+ * update ONLY `prompt`, leaving every mirror field to `writeCronState`.
+ */
+export function writeCronPrompt(db: AppDatabase, { taskId, cronId, prompt }: CronPromptWrite): void {
+  db.insert(crons)
+    .values({ id: cronId, taskId, kind: "", prompt, continuity: "" })
+    .onConflictDoUpdate({ target: crons.id, set: { prompt, updatedAt: Date.now() } })
     .run();
 }
 

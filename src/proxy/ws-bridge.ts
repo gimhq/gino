@@ -1,21 +1,22 @@
 import type { BridgeSocket, WsFactory } from "./bridge";
 import type { CredentialStore } from "./credentials";
 // M7 — raw Codex WebSocket relay for `/llm/v1/responses` (the Codex SDK's
-// streaming endpoint). This is a typed, tested SCAFFOLD: the bidirectional
-// relay state machine (auth → open upstream with injected OAuth creds → buffer
-// client frames until upstream is ready → relay both directions → propagate
-// close) is implemented and unit-tested here, but the actual HTTP→WS UPGRADE is
-// a server-level concern (Bun's `websocket` handler is registered in
-// `src/index.ts`, which is OUT OF SCOPE for this lane — it lands with the B1
-// spine wiring). Until then `src/edge/llm.ts` returns a 501 for this route.
+// streaming endpoint). This relay is LIVE and production-reachable: the
+// HTTP→WS upgrade is wired in `src/edge/llm.ts`, which authenticates the
+// request BEFORE upgrading, builds a `ClientSocket` from the upgraded peer,
+// and hands it to `createCodexRelay`. The relay state machine covers auth →
+// open upstream with injected OAuth creds → buffer client frames (bounded)
+// until upstream is ready → relay both directions → propagate close/teardown.
 //
 // Ported from the v1 WS proxy (backup/pre-hostv2 src/api/ws-proxy.ts), reshaped
 // to take an injectable upstream `WsFactory` + an abstract client socket so the
-// relay is exercised with no real network. When B1 wires the upgrade, the
-// route handler builds a `ClientSocket` from the upgraded peer and hands it +
-// the request headers to `createCodexRelay`.
+// relay is exercised with no real network.
 import type { Logger } from "@/shared/lib/logger";
 import { CODEX_WS_URL } from "./bridge";
+
+// Cap on client frames buffered before the upstream opens (HOST-M7-04): a
+// client streaming into a slow upstream dial must not grow memory unbounded.
+const MAX_PREOPEN_BUFFER_BYTES = 1 << 20; // 1 MiB
 
 const defaultWsFactory: WsFactory = (url, opts) => {
   const Ctor = WebSocket as unknown as new (u: string, o: { headers: Record<string, string> }) => BridgeSocket;
@@ -62,6 +63,7 @@ export function createCodexRelay(client: ClientSocket, deps: CodexRelayDeps): Co
   let upstream: BridgeSocket | null = null;
   let upstreamOpen = false;
   const buffer: Array<string | ArrayBuffer> = [];
+  let bufferedBytes = 0;
 
   async function start(): Promise<void> {
     const cred = await store.getOpenAI();
@@ -83,6 +85,7 @@ export function createCodexRelay(client: ClientSocket, deps: CodexRelayDeps): Co
       for (const frame of buffer)
         upstream?.send(typeof frame === "string" ? frame : new TextDecoder().decode(frame));
       buffer.length = 0;
+      bufferedBytes = 0;
     };
     upstream.onmessage = (event) => {
       const data = event.data;
@@ -112,6 +115,19 @@ export function createCodexRelay(client: ClientSocket, deps: CodexRelayDeps): Co
       upstream.send(typeof data === "string" ? data : new TextDecoder().decode(data));
       return;
     }
+    // Bounded pre-open queue (HOST-M7-04): overflow tears the relay down
+    // instead of buffering without limit while the upstream dial is slow.
+    const size = typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
+    if (bufferedBytes + size > MAX_PREOPEN_BUFFER_BYTES) {
+      logger?.warn({ bufferedBytes, size }, "proxy ws: pre-connect buffer overflow — closing");
+      try {
+        client.close(1009, "Pre-connect buffer overflow");
+      }
+      catch { /* already closed */ }
+      onClientClose();
+      return;
+    }
+    bufferedBytes += size;
     buffer.push(data); // queued until upstream opens
   }
 

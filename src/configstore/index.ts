@@ -34,6 +34,7 @@ export {
   listArtifacts,
 } from "./artifacts";
 export {
+  clearEntries,
   DEFAULT_ENGINE,
   ENGINE_TARGETS,
   type EntryInput,
@@ -43,15 +44,20 @@ export {
   isShaInAgentDesiredSet,
   resolveEntries,
   resolveEntriesForEngine,
+  resolveEntriesForEngines,
   resolveTarget,
   setEntries,
   targetEngine,
 } from "./entries";
 export {
+  CONFIG_GC_INTERVAL_MS,
+  type ConfigStoreGcDeps,
+  type ConfigStoreGcHandle,
   DEFAULT_MAX_AGE_MS,
   type DroppableArtifact,
   findDroppable,
   referencedShas,
+  startConfigStoreGc,
   sweep,
   type SweepResult,
 } from "./gc";
@@ -65,8 +71,10 @@ export {
 export {
   BlobStore,
   ConfigStoreError,
+  MissingBlobError,
   sha256Hex,
   SHA_PREFIX_LEN,
   ShaMismatchError,
   type StoredBlob,
+  type StoreLeaf,
 } from "./store";

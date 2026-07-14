@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
-import { channelTokenAuth, connectTokenAuth, registerTokenAuth } from "@/shared/middleware/auth";
+import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
 import { errorHandler } from "@/shared/middleware/error-handler";
 
 // ─── platform crypto ───
@@ -42,8 +42,8 @@ describe("hashToken / verifyToken", () => {
 
 describe("generateId", () => {
   it("prefixes when asked and stays opaque otherwise", () => {
-    expect(generateId("agent")).toMatch(/^agent_[0-9a-z]{8}$/);
-    expect(generateId()).toMatch(/^[0-9a-z]{8}$/);
+    expect(generateId("agent")).toMatch(/^agent_[0-9a-z]{16}$/);
+    expect(generateId()).toMatch(/^[0-9a-z]{16}$/);
   });
 });
 
@@ -52,6 +52,7 @@ describe("generateId", () => {
 const TEST_CONFIG = {
   REGISTER_TOKEN: "reg-secret",
   HTTP_CHANNEL_TOKEN: "chan-secret",
+  HTTP_ADMIN_TOKEN: "admin-secret",
 } as unknown as Config;
 
 // Minimal app: inject config into context (as app.ts does), apply the
@@ -69,43 +70,9 @@ function appWith(mw: MiddlewareHandler<AppEnv>, config: Config = TEST_CONFIG) {
   return app;
 }
 
-describe("registerTokenAuth", () => {
-  it("401 when the body carries no register token", async () => {
-    const app = appWith(registerTokenAuth);
-    const res = await app.request("/", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-    expect(res.status).toBe(401);
-  });
-
-  it("401 on a wrong register token", async () => {
-    const app = appWith(registerTokenAuth);
-    const res = await app.request("/", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ registerToken: "nope" }),
-    });
-    expect(res.status).toBe(401);
-  });
-
-  it("passes with the correct register token in the body", async () => {
-    const app = appWith(registerTokenAuth);
-    const res = await app.request("/", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ registerToken: "reg-secret" }),
-    });
-    expect(res.status).toBe(200);
-  });
-
-  it("fails closed when the expected register token is unconfigured", async () => {
-    const app = appWith(registerTokenAuth, { REGISTER_TOKEN: "", HTTP_CHANNEL_TOKEN: "" } as unknown as Config);
-    const res = await app.request("/", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ registerToken: "" }),
-    });
-    expect(res.status).toBe(401);
-  });
-});
+// Register-token validation moved INTO the register handler (HOST-M1M2-14) so
+// failures render the protocol §3 `register_error` envelope — covered by
+// tests/unit/edge-input-hardening.test.ts.
 
 describe("connectTokenAuth (token → agent identity)", () => {
   // A real in-memory db with one enrolled agent: the middleware resolves the
@@ -174,5 +141,50 @@ describe("channelTokenAuth", () => {
     const app = appWith(channelTokenAuth);
     const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer chan-secret" } });
     expect(res.status).toBe(200);
+  });
+
+  it("401 on the ADMIN token (no cross-grant, HOST-XC-02)", async () => {
+    const app = appWith(channelTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("adminTokenAuth (HOST-XC-02)", () => {
+  it("401 without an Authorization bearer", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET" });
+    expect(res.status).toBe(401);
+  });
+
+  it("401 on a wrong bearer token", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer nope" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("401 on the CHANNEL token — a channel credential never grants admin", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer chan-secret" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("passes with the correct admin bearer", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(200);
+  });
+
+  it("fails CLOSED when unconfigured — no fallback to the channel token", async () => {
+    const noAdmin = { ...TEST_CONFIG, HTTP_ADMIN_TOKEN: "" } as Config;
+    const app = appWith(adminTokenAuth, noAdmin);
+    for (const headers of [
+      undefined,
+      { authorization: "Bearer chan-secret" },
+      { authorization: "Bearer " },
+    ]) {
+      const res = await app.request("/", { method: "GET", ...(headers ? { headers } : {}) });
+      expect(res.status).toBe(401);
+    }
   });
 });

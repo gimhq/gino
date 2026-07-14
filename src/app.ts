@@ -1,3 +1,4 @@
+import type { WebhookPump } from "./channels";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
 import type { Logger } from "./shared/lib/logger";
@@ -7,13 +8,21 @@ import { websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
+import { startLaunchReaper } from "./agents/launch-reaper";
 import { startLivenessSweep } from "./agents/liveness";
+import { sessions } from "./agents/sessions";
+import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
+import { createStore, startConfigStoreGc } from "./configstore";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
 import { docsCspRelax, mountDocs } from "./modules/docs";
+import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
+import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
+import { renderPrometheus } from "./shared/lib/metrics";
+import { adminTokenAuth } from "./shared/middleware/auth";
 import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
@@ -24,6 +33,8 @@ interface AppDeps {
   readonly config: Config;
   readonly db: AppDatabase;
   readonly logger: Logger;
+  /** M6 webhook egress pump (HOST-M5M6-04) — started by bootstrap; absent in tests that compose the app directly. */
+  readonly webhookPump?: WebhookPump;
 }
 
 export interface BootstrapResult {
@@ -68,7 +79,16 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Exported so tests can construct the app with injected deps (no env / no
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
-export function createApp({ config, db, logger }: AppDeps) {
+export function createApp({ config, db, logger, webhookPump }: AppDeps) {
+  // HOST-M9-08 — surface the spoofable proxy configuration at composition
+  // time: TRUST_PROXY without an allow-list means any direct client can
+  // forge X-Forwarded-For and evade every IP-keyed control.
+  if (isSpoofableProxyConfig(config)) {
+    logger.warn(
+      "TRUST_PROXY is enabled without TRUSTED_PROXY_IPS — forwarding headers are accepted from ANY peer, so client IPs are forgeable; set GINO_TRUSTED_PROXY_IPS to the proxy addresses",
+    );
+  }
+
   const api = new Hono<AppEnv>();
 
   // Hono's `requestId()` accepts a well-formed inbound `X-Request-Id` and
@@ -81,6 +101,9 @@ export function createApp({ config, db, logger }: AppDeps) {
     c.set("db", db);
     c.set("config", config);
     c.set("logger", logger);
+    if (webhookPump) {
+      c.set("webhookPump", webhookPump);
+    }
     return next();
   });
   api.use("*", loggingMiddleware());
@@ -90,6 +113,12 @@ export function createApp({ config, db, logger }: AppDeps) {
   // `openAPIRouteHandler` still walks the full route table lazily at request
   // time, so routes registered below are included in the spec.
   mountDocs(api, config);
+
+  // HOST-M9-09 — Prometheus scrape endpoint for the in-process registry.
+  // Guarded by the admin bearer (same credential as /admin/*, HOST-XC-02); an
+  // unconfigured token fails closed, so this is never an open surface. The
+  // logging middleware's SKIP_METRICS_RE keeps scrapes out of the metrics.
+  api.get("/metrics", adminTokenAuth, c => c.text(renderPrometheus()));
 
   api.route("/", publicRoutes());
 
@@ -159,13 +188,47 @@ export function bootstrap(): BootstrapResult {
   const config = loadConfig();
   const logger = createLogger(config);
   const db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger });
+
+  // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
+  // webhook delivery: pushed on inbound transcript writes, retried on a tick.
+  // Started here (not in `createApp`) so tests that build the app directly
+  // never spin a background timer.
+  const webhookPump = startWebhookPump({
+    db,
+    logger,
+    timeoutMs: config.WEBHOOK_TIMEOUT_MS,
+    maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
+    intervalMs: config.WEBHOOK_RETRY_INTERVAL_MS,
+  });
+
+  const app = createApp({ config, db, logger, webhookPump });
 
   // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
   // it never holds the process open; `stop()` is folded into `closeDb` so clean
   // shutdown halts it before the DB closes. Started here (not in `createApp`)
   // so tests that build the app directly never spin a background timer.
-  const liveness = startLivenessSweep({ db, logger });
+  const liveness = startLivenessSweep({ db, logger, sessions });
+
+  // M2 outbox retention — periodic GC of acked rows past the retention window
+  // (unacked rows are never touched). Same lifecycle as the liveness sweep.
+  const outboxGc = startOutboxGc({ db, logger });
+
+  // M3 pending-launch reaper (HOST-M3-05) — tears down runtimes whose agent
+  // never registered inside the TTL. The `pending_launches` table is persisted,
+  // so this also reaps orphans left by a host restart.
+  const launchReaper = startLaunchReaper({ db, logger });
+
+  // M8 store GC (HOST-M8-11) — the periodic refcount/orphan sweep over the
+  // unified blob store. Dry-run (observability only) unless CONFIG_GC_ENABLED,
+  // per OD11. Same lifecycle as the other background timers.
+  const configStoreGc = startConfigStoreGc({
+    db,
+    logger,
+    store: createStore(config),
+    enabled: config.CONFIG_GC_ENABLED,
+    maxAgeMs: config.CONFIG_GC_MAX_AGE_MS,
+    intervalMs: config.CONFIG_GC_INTERVAL_MS,
+  });
 
   return {
     fetch: (req, env) => app.fetch(req, env),
@@ -175,6 +238,10 @@ export function bootstrap(): BootstrapResult {
     db,
     closeDb: () => {
       liveness.stop();
+      outboxGc.stop();
+      launchReaper.stop();
+      configStoreGc.stop();
+      webhookPump.stop();
       db.close();
     },
   };

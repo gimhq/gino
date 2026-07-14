@@ -111,7 +111,7 @@ export class CredentialStore {
       });
       if (!resp.ok) {
         const text = await resp.text().catch(() => "");
-        this.logger?.error({ status: resp.status, body: text.slice(0, 200) }, "proxy: codex token refresh failed");
+        this.logger?.error({ status: resp.status, error: oauthErrorCode(text) }, "proxy: codex token refresh failed");
         return this.codexAccessToken; // keep any prior token
       }
       const data = await resp.json() as {
@@ -135,6 +135,21 @@ export class CredentialStore {
       return this.codexAccessToken;
     }
   }
+}
+
+/**
+ * Reduce a token-endpoint error body to its standard OAuth `error` code for
+ * logging. The raw body is never logged (HOST-M7-06) — it is secret-adjacent
+ * and could echo request material.
+ */
+function oauthErrorCode(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown };
+    if (typeof parsed.error === "string")
+      return parsed.error.slice(0, 64);
+  }
+  catch { /* non-JSON body — fall through */ }
+  return `<unrecognized body, ${body.length} chars>`;
 }
 
 function staticCredential(upstream: ProviderUpstream): ResolvedCredential {
