@@ -1,9 +1,9 @@
 import type { AppDatabase } from "@/db";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent, grantOwner, touchLiveness } from "@/agents/registry";
+import { enrollAgent, grantOwner, removeAgent, touchLiveness } from "@/agents/registry";
 import { createDb } from "@/db";
 import { assignTaskToAgent, placeTask } from "@/tasks/dispatch";
-import { createTask, getTask } from "@/tasks/store";
+import { createTask, getTask, setStatus } from "@/tasks/store";
 
 // M4 dispatch — owner-pinned placement (§3): dedicated-preferred, public-fallback,
 // pending-assignment when none, no-spill, pin-once.
@@ -139,6 +139,43 @@ describe("M4 dispatch — pin-once (set once, no migration)", () => {
       code = (err as { statusCode?: number }).statusCode;
     }
     expect(code).toBe(409);
+  });
+
+  it("re-assigning the SAME agent is a full no-op — a closed task stays closed (HOST-M4-06)", () => {
+    const a = makeAgent({ access: "public" });
+    const task = newTask();
+    expect(assignTaskToAgent(db, task.id, a).status).toBe("active");
+
+    setStatus(db, task.id, "closed"); // task wound down (e.g. POST /tasks/:id/close)
+    const replay = assignTaskToAgent(db, task.id, a); // client retry of the assign
+    expect(replay.reason).toBe("already-placed");
+    expect(replay.agentId).toBe(a);
+    expect(replay.status).toBe("closed");
+    expect(getTask(db, task.id)?.status).toBe("closed"); // NOT resurrected to active
+  });
+
+  it("re-assigning the SAME agent to an active task reports already-placed (HOST-M4-06)", () => {
+    const a = makeAgent({ access: "public" });
+    const task = newTask();
+    assignTaskToAgent(db, task.id, a);
+
+    const replay = assignTaskToAgent(db, task.id, a);
+    expect(replay.reason).toBe("already-placed");
+    expect(replay.status).toBe("active");
+  });
+
+  it("re-placing an orphaned CLOSED task records the pin but does not reactivate it (HOST-M4-06)", () => {
+    makeAgent({ access: "public" });
+    const task = newTask();
+    const first = placeTask(db, task.id);
+    setStatus(db, task.id, "closed");
+    removeAgent(db, first.agentId!); // orphans the task (agent_id → NULL)
+
+    const b = makeAgent({ access: "public" });
+    const r = placeTask(db, task.id);
+    expect(r.agentId).toBe(b);
+    expect(r.status).toBe("closed");
+    expect(getTask(db, task.id)?.status).toBe("closed");
   });
 
   it("manual assign validates permission + engine (422 on mismatch)", () => {
