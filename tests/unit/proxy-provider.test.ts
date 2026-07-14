@@ -99,8 +99,33 @@ describe("M7 proxy/provider — SSRF guard", () => {
       expect(isPrivateUpstreamHost(ip)).toBe(true);
   });
 
+  it("flags unspecified, CGNAT, multicast, and reserved IPv4 ranges (HOST-M5M6-02)", () => {
+    for (const ip of ["0.0.0.0", "0.1.2.3", "100.64.0.1", "100.127.255.255", "192.0.0.1", "192.0.2.1", "198.18.0.1", "198.51.100.7", "203.0.113.9", "224.0.0.1", "240.0.0.1", "255.255.255.255"])
+      expect(isPrivateUpstreamHost(ip)).toBe(true);
+  });
+
+  it("flags IPv4-embedding and reserved IPv6 forms (HOST-M5M6-02)", () => {
+    for (const ip of [
+      "::", // unspecified
+      "::ffff:127.0.0.1", // IPv4-mapped loopback (dotted tail)
+      "::ffff:7f00:1", // IPv4-mapped loopback (hex groups — WHATWG URL serialization)
+      "::ffff:169.254.169.254", // IPv4-mapped cloud metadata
+      "::ffff:a9fe:a9fe", // same, hex groups
+      "::ffff:10.0.0.1", // IPv4-mapped private
+      "::127.0.0.1", // deprecated IPv4-compatible
+      "64:ff9b::127.0.0.1", // NAT64 wrapping loopback
+      "2002:7f00:1::", // 6to4 wrapping loopback
+      "100::1", // discard-only
+      "ff02::1", // multicast
+      "2001:db8::1", // documentation
+      "2001::1", // Teredo
+    ]) {
+      expect(isPrivateUpstreamHost(ip)).toBe(true);
+    }
+  });
+
   it("allows public literal IPs and hostnames", () => {
-    for (const host of ["8.8.8.8", "1.1.1.1", "api.anthropic.com", "api.openai.com", "2001:4860:4860::8888"])
+    for (const host of ["8.8.8.8", "1.1.1.1", "9.255.255.255", "100.63.255.255", "100.128.0.0", "223.255.255.255", "api.anthropic.com", "api.openai.com", "2001:4860:4860::8888", "::ffff:8.8.8.8", "::ffff:808:808", "64:ff9b::8.8.8.8", "2002:808:808::"])
       expect(isPrivateUpstreamHost(host)).toBe(false);
   });
 });
