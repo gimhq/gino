@@ -29,6 +29,7 @@ import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerE
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
 import { connectTokenAuth, registerTokenAuth } from "@/shared/middleware/auth";
+import { rateLimit } from "@/shared/middleware/rate-limit";
 import { getTask } from "@/tasks";
 
 /**
@@ -188,11 +189,20 @@ export function agentRoutes() {
   // ── Enrollment (M3) — register token; version-gated; mints the connect token.
   router.post(
     "/register",
+    // HOST-M1M2-10 / HOST-M9-02: throttle enrollment per client IP BEFORE the
+    // token check, so shared-secret brute force and register-retry loops are
+    // bounded. Over-limit renders the protocol §3 `register_error{rate_limited}`
+    // envelope (Retry-After is set by the middleware).
+    rateLimit({
+      bucket: "agent-register",
+      limits: config => ({ windowMs: config.RATE_LIMIT_REGISTER_WINDOW_MS, max: config.RATE_LIMIT_REGISTER_MAX }),
+      onLimit: c => c.json(registerError("rate_limited"), 429),
+    }),
     registerTokenAuth,
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Enroll an agent (returns agentId + connect token + config)",
-      responses: { 200: { description: "Enrolled" }, ...errors(400, 401) },
+      responses: { 200: { description: "Enrolled" }, ...errors(400, 401), 429: { description: "Rate limited (`register_error{rate_limited}`, protocol §3)" } },
     }),
     async (c) => {
       const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;

@@ -15,9 +15,11 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { sessions } from "@/agents/sessions";
 import { pollChannel, requireChannel, routeInbound } from "@/channels";
+import { hashToken, safeEqual } from "@/platform";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import { channelTokenAuth } from "@/shared/middleware/auth";
+import { bearerToken, channelTokenAuth } from "@/shared/middleware/auth";
+import { rateLimit } from "@/shared/middleware/rate-limit";
 
 /** Long-poll bounds: a poll waits at most this long for new messages, checking every interval. */
 const LONG_POLL_MAX_MS = 30_000;
@@ -79,6 +81,21 @@ async function runPoll(db: AppDatabase, channelRef: string, params: PollParams) 
 
 export function messagesRoutes() {
   const router = new Hono<AppEnv>();
+
+  // HOST-M9-02: throttle the channel I/O surface ahead of auth. A VALID
+  // channel bearer drains the principal budget (keyed by token hash, never
+  // the raw secret); an absent or invalid bearer falls back to the client IP,
+  // so brute-force guessing of the shared token cannot rotate keys to evade
+  // the limit.
+  router.use("*", rateLimit({
+    bucket: "messages",
+    limits: config => ({ windowMs: config.RATE_LIMIT_MESSAGES_WINDOW_MS, max: config.RATE_LIMIT_MESSAGES_MAX }),
+    key: (c) => {
+      const expected = c.var.config.HTTP_CHANNEL_TOKEN;
+      const bearer = bearerToken(c);
+      return expected && bearer && safeEqual(bearer, expected) ? `tok:${hashToken(bearer)}` : null;
+    },
+  }));
 
   // The channel token (admin/user bearer) guards every channel I/O route (401 without).
   router.use("*", channelTokenAuth);
