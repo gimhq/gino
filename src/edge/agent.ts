@@ -270,7 +270,7 @@ export function agentRoutes() {
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
           touchLiveness(db, agentId);
-          const replayed = replayUnacked(db, sessions, agentId);
+          const replayed = replayUnacked(db, sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
