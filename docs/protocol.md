@@ -120,12 +120,12 @@ agent-architecture); bytes never travel in frames.
 
 | type | envelope ids | data | meaning |
 |---|---|---|---|
-| `task_upsert` | `taskId` | `{name?, kind?, status?}` | seed/modify a task (the global top entity) |
+| `task_upsert` | `taskId` | `{name?, kind?, status?, engine?, model?, workdir?, meta?, entries?}` | seed/modify a task (the global top entity); `engine`/`model`/`workdir`/`meta` are the task definition, `entries` the task-scope provisioning set (M8) |
 | `task_delete` | `taskId` | — | remove a task |
-| `cron_upsert` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity, next_run?, status?}` | seed/modify a trigger under a task |
+| `cron_upsert` | `taskId`, `cronId` | `{kind, prompt, schedule_type?, schedule_value?, continuity, next_run?, status?}` | seed/modify a trigger under a task; `prompt` (required) is the recurring instruction the cron runs each fire |
 | `cron_delete` | `taskId`, `cronId` | — | remove a trigger |
 | `message` | `taskId`, `threadId?` | `{text, attachments?}` | user/system input for a task (optionally a live thread) |
-| `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn |
+| `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn. Delivery is LIVE-ONLY (at-most-once): the host sends it to an online agent and never replays it on reconnect — a stale cancel must not fire against a future turn |
 | `close` | — | — | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
 | `config_update` | — | `{<config fields>}` | live config change (opaque overlay) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
@@ -643,6 +643,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                 "kind": {
                   "type": "string"
                 },
+                "prompt": {
+                  "type": "string"
+                },
                 "schedule_type": {
                   "type": "string"
                 },
@@ -661,6 +664,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               },
               "required": [
                 "kind",
+                "prompt",
                 "continuity"
               ],
               "additionalProperties": {}
@@ -1313,6 +1317,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                 "kind": {
                   "type": "string"
                 },
+                "prompt": {
+                  "type": "string"
+                },
                 "schedule_type": {
                   "type": "string"
                 },
@@ -1331,6 +1338,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               },
               "required": [
                 "kind",
+                "prompt",
                 "continuity"
               ],
               "additionalProperties": {}

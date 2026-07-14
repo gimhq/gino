@@ -14,7 +14,7 @@
 import type { AppDatabase } from "@/db";
 import type { Message } from "@/db/schema";
 import type { ThreadMessageData } from "@/protocol/frames";
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, sql } from "drizzle-orm";
 import { messages } from "@/db/schema";
 
 export interface ThreadMessageWrite {
@@ -70,4 +70,23 @@ export function getTranscript(db: AppDatabase, threadId: string, opts: Transcrip
     .orderBy(messages.seq)
     .limit(limit)
     .all();
+}
+
+export interface TranscriptStats {
+  messageCount: number;
+  /** Highest stored `seq`, or null when the thread has no transcript rows. */
+  lastSeq: number | null;
+}
+
+/** Per-thread transcript summary (count + last seq) for bounded list views. */
+export function getTranscriptStats(db: AppDatabase, threadId: string): TranscriptStats {
+  const row = db
+    .select({
+      messageCount: sql<number>`count(*)`,
+      lastSeq: sql<number | null>`max(${messages.seq})`,
+    })
+    .from(messages)
+    .where(eq(messages.threadId, threadId))
+    .get();
+  return { messageCount: row?.messageCount ?? 0, lastSeq: row?.lastSeq ?? null };
 }

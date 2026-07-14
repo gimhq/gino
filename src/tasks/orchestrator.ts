@@ -26,7 +26,7 @@ import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesFor
 import { tasks } from "@/db/schema";
 import { writeCronPrompt } from "@/msgstore";
 import { ulid } from "@/platform";
-import { enqueue } from "@/protocol/outbox";
+import { enqueue, enqueueLiveOnly } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
 import { markSeeded, setCurrentThread } from "./store";
 
@@ -166,7 +166,7 @@ export function sendTaskMessage(
 export interface CronUpsertInput {
   /** Reuse an existing cron id (update) or omit to mint a new one (create). */
   cronId?: string;
-  data: CronUpsertData & { prompt?: string };
+  data: CronUpsertData;
 }
 
 export interface CronUpsertResult {
@@ -178,13 +178,18 @@ export interface CronUpsertResult {
  * Emit a `cron_upsert` COMMAND. The cron then LIVES ON THE AGENT (OD14): the
  * agent owns, fires, and persists it; the host schedules nothing and keeps only
  * the `cron_state` mirror. `data` carries the schedule + `continuity` (+ the
- * `prompt` work command, additive on the wire). The host mints the `cronId` on
- * create so it can address later upsert/delete commands. When the command
- * carries a `prompt` it is persisted into the `crons` mirror here — the
- * `cron_state` frame never echoes it (HOST-M5M6-09).
+ * `prompt` work command — required, the agent rejects a promptless command).
+ * The host mints the `cronId` on create so it can address later upsert/delete
+ * commands. The `prompt` is persisted into the `crons` mirror here — the
+ * `cron_state` frame never echoes it (HOST-M5M6-09). Like the first message,
+ * the first cron SEEDS a never-seeded task (`task_upsert` before the command)
+ * so the agent has the task row the cron FK-references (HOST-M4-02).
  */
 export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task, input: CronUpsertInput): CronUpsertResult {
   const agentId = requirePlacement(task);
+  if (!hasSeededTask(db, task.id)) {
+    emitTaskUpsert(db, sender, task);
+  }
   const cronId = input.cronId ?? ulid();
   const cron = enqueue(db, sender, {
     agentId,
@@ -193,9 +198,7 @@ export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task,
     cronId,
     data: input.data,
   });
-  if (input.data.prompt !== undefined) {
-    writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
-  }
+  writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
   return { cron, cronId };
 }
 
@@ -207,12 +210,22 @@ export function emitCronDelete(db: AppDatabase, sender: FrameSender, task: Task,
 
 /**
  * Emit an `interrupt` — graceful cancel of the task's current turn (the engine
- * stays alive). Carried with `taskId` so it is scoped to this task (additive on
- * the wire; the agent ignores ids it does not need).
+ * stays alive). Carries `taskId`, which §5 makes NORMATIVE: the agent cancels
+ * only if this task owns the in-flight turn, so another task's work is never
+ * killed (HOST-M1M2-03). The signal is LIVE-ONLY: it requires the agent online
+ * (409 otherwise) and is never replayed on reconnect — a stale cancel must not
+ * fire against an arbitrary future turn (HOST-M4-03).
  */
 export function emitInterrupt(db: AppDatabase, sender: FrameSender, task: Task): Outbox {
   const agentId = requirePlacement(task);
-  return enqueue(db, sender, { agentId, type: "interrupt", taskId: task.id });
+  if (!sender.isOnline(agentId)) {
+    throw new AppError(
+      `agent ${agentId} is offline — interrupt is a live-only signal and cannot be queued`,
+      409,
+      "AGENT_OFFLINE",
+    );
+  }
+  return enqueueLiveOnly(db, sender, { agentId, type: "interrupt", taskId: task.id });
 }
 
 /**

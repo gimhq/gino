@@ -145,9 +145,15 @@ export const TaskUpsertData = z.looseObject({
 });
 export type TaskUpsertData = z.infer<typeof TaskUpsertData>;
 
-/** `cron_upsert.data` — a scheduling COMMAND (`continuity` required here). */
+/**
+ * `cron_upsert.data` — a scheduling COMMAND (`continuity` required here).
+ * `prompt` is the recurring instruction the cron runs each fire — REQUIRED:
+ * the agent's `CronUpsertData` rejects a promptless command, so the host
+ * schema matches it (HOST-M4-10).
+ */
 export const CronUpsertData = z.looseObject({
   kind: z.string(),
+  prompt: z.string(),
   schedule_type: z.string().optional(),
   schedule_value: z.string().optional(),
   continuity: z.string(),

@@ -194,14 +194,15 @@ describe("D-B3 end-to-end — create → pin → send → run → mirror", () =>
     await waitFor(conn.received, f => f.type === "ack" && f.id === 1001, "ack thread_message");
     await waitFor(conn.received, f => f.type === "ack" && f.id === 1002, "ack thread_result");
 
-    // 7. M5 stored it; /admin/tasks/:id MIRRORS the thread + transcript.
+    // 7. M5 stored it; /admin/tasks/:id MIRRORS the thread as a SUMMARY
+    //    (HOST-M1M2-16) and pages the transcript via ?thread=.
     const getRes = await admin(`/tasks/${taskId}`);
     expect(getRes.status).toBe(200);
     const view = await getRes.json() as {
       data: {
         agentId: string;
         currentThreadId: string;
-        threads: Array<{ threadId: string; run: { status: string; finalSeq: number; engineSessionId: string } | null; messages: Array<{ seq: number; content: string }> }>;
+        threads: Array<{ threadId: string; run: { status: string; finalSeq: number; engineSessionId: string } | null; messageCount: number; lastSeq: number | null }>;
       };
     };
     expect(view.data.agentId).toBe(agentId);
@@ -211,7 +212,14 @@ describe("D-B3 end-to-end — create → pin → send → run → mirror", () =>
     expect(thread!.run?.status).toBe("succeeded");
     expect(thread!.run?.finalSeq).toBe(1);
     expect(thread!.run?.engineSessionId).toBe("sess-1");
-    expect(thread!.messages.map(m => m.content)).toEqual(["done the thing"]);
+    expect(thread!.messageCount).toBe(1);
+    expect(thread!.lastSeq).toBe(1);
+
+    const pageRes = await admin(`/tasks/${taskId}?thread=${threadId}`);
+    expect(pageRes.status).toBe(200);
+    const page = await pageRes.json() as { data: { threadId: string; messages: Array<{ seq: number; content: string }> } };
+    expect(page.data.threadId).toBe(threadId);
+    expect(page.data.messages.map(m => m.content)).toEqual(["done the thing"]);
 
     // 8. The outbox DELIVERED the commands and they are now ACKED (durable path).
     const ackedTaskUpsert = db.select().from(outbox).where(and(eq(outbox.taskId, taskId), eq(outbox.type, "task_upsert"), isNotNull(outbox.ackedAt))).all();
