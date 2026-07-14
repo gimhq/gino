@@ -8,8 +8,10 @@
 //   • generic host→agent frames carry `outboxId` and are acked by `ack{id}`;
 //   • the `message` frame carries `msgId` and is acked by `msg_ack{msgId}` so
 //     M4 (B3) can advance its delivery cursor only after the agent has DURABLY
-//     stored the input. For B1b the message's `msgId` reuses the row id and the
-//     ack just marks the row delivered (the cursor advance is a B3 seam).
+//     stored the input. The message's `msgId` IS the row id — derived at encode
+//     time, never stored separately — so a `message` row is atomically born with
+//     its delivery id and the ack just marks the row delivered (the cursor
+//     advance is a B3 seam).
 //
 // Layering: the outbox talks to the live socket only through the abstract
 // `FrameSender` (sessions implements it), and rebuilds the wire frame via the
@@ -40,9 +42,12 @@ export interface EnqueueInput {
 /**
  * Persist a host→agent frame and, if the agent is online, send it. The row is
  * written FIRST (durability before delivery); the live push is best-effort —
- * a miss is recovered by `replayUnacked` on reconnect. For a `message` frame
- * the row's `msgId` is set to its own id so the frame carries a stable delivery
- * id the agent echoes in `msg_ack`.
+ * a miss is recovered by `replayUnacked` on reconnect. A `message` frame's
+ * delivery id (`msgId`) IS the row id: it exists the instant the single INSERT
+ * commits, so there is no crash window in which a durable `message` row lacks
+ * an ackable id. The returned row carries the derived `msgId` for callers that
+ * surface it (the `msg_id` column itself is never written — legacy rows that
+ * have it stored ack identically because its value always equalled the id).
  */
 export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
   const inserted = db
@@ -53,17 +58,12 @@ export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInpu
       taskId: input.taskId ?? null,
       threadId: input.threadId ?? null,
       cronId: input.cronId ?? null,
-      msgId: null,
       dataJson: input.data ?? {},
     })
     .returning()
     .get();
 
-  let row = inserted;
-  if (input.type === "message") {
-    db.update(outbox).set({ msgId: inserted.id }).where(eq(outbox.id, inserted.id)).run();
-    row = { ...inserted, msgId: inserted.id };
-  }
+  const row = input.type === "message" ? { ...inserted, msgId: inserted.id } : inserted;
 
   if (sender.isOnline(input.agentId)) {
     sender.send(input.agentId, encodeOutbox(row));
@@ -87,7 +87,8 @@ export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
 
 /**
  * Agent durably stored a `message` (`msg_ack{msgId}`) → mark it delivered.
- * Scoped to the authenticated agent's own rows.
+ * A message's `msgId` is its row id, so the match keys on `id` +
+ * `type = 'message'`, scoped to the authenticated agent's own rows.
  * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
  * row acked is enough to stop replay.
  */
@@ -95,7 +96,7 @@ export function ackMessage(db: AppDatabase, agentId: string, msgId: number): voi
   db
     .update(outbox)
     .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.msgId, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
+    .where(and(eq(outbox.id, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
     .run();
 }
 

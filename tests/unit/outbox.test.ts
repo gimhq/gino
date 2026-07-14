@@ -132,6 +132,55 @@ describe("M2 outbox — ack stops replay", () => {
   });
 });
 
+// HOST-M1M2-07 / HOST-M4-07: a `message` row's delivery id is its row id,
+// assigned by the single INSERT — there is no insert-then-update window in
+// which a durable row exists without an ackable id.
+describe("M2 outbox — atomic message delivery id", () => {
+  it("the DURABLE message row is born ackable: replay + msg_ack + no re-replay", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
+
+    // Replay re-reads the persisted row (not enqueue's in-memory return), so
+    // the frame's msgId comes straight from what the single INSERT committed.
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+    expect(sender.sent[0]!.frame.msgId).toBe(row.id);
+
+    ackMessage(db, agentId, sender.sent[0]!.frame.msgId as number);
+    sender.sent.length = 0;
+    expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("a crash-window row (msg_id never back-filled) is still deliverable and ackable", () => {
+    // Pre-fix, enqueue back-filled msg_id in a second statement; a crash in
+    // between left exactly this durable shape. It must replay WITH a msgId and
+    // be ackable, not loop forever as an id-less frame.
+    const raw = db
+      .insert(outbox)
+      .values({ agentId, type: "message", taskId: "t-1", dataJson: { text: "orphan" } })
+      .returning()
+      .get();
+    expect(raw.msgId).toBeNull();
+
+    const sender = fakeSender(true);
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "message", msgId: raw.id });
+
+    ackMessage(db, agentId, raw.id);
+    sender.sent.length = 0;
+    expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("msg_ack{id} of a NON-message frame does NOT ack it (match is id + type='message')", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
+
+    ackMessage(db, agentId, row.id);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+  });
+});
+
 describe("M2 outbox — retention GC", () => {
   /** Backdate a row's acked_at (the GC cutoff is measured against it). */
   function ackAt(id: number, ackedAt: number): void {
