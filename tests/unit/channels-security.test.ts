@@ -76,7 +76,7 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     expect(isTaskOnChannel(db, ch, victim)).toBe(false);
 
     // It must NOT leak the transcript by any path.
-    expect404(() => pollChannel(db, ch, { taskId: victim, after: 0, peek: true }));
+    expect404(() => pollChannel(db, ch, { taskId: victim, after: 0 }));
   });
 
   it("allows an explicit taskId that shares the channel's owner", () => {
@@ -109,9 +109,9 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     seed(bound);
 
     // conversationRef-resolved and all-bound fan-out are channel-scoped and
-    // unchanged (peek+after:0 so the two reads don't couple via the cursor).
-    expect(pollChannel(db, ch, { conversationRef: "conv-y", after: 0, peek: true })[0]!.messages).toHaveLength(1);
-    expect(pollChannel(db, ch, { after: 0, peek: true }).some(d => d.taskId === bound)).toBe(true);
+    // unchanged (reads are non-destructive, so the two polls don't couple).
+    expect(pollChannel(db, ch, { conversationRef: "conv-y", after: 0 })[0]!.messages).toHaveLength(1);
+    expect(pollChannel(db, ch, { after: 0 }).some(d => d.taskId === bound)).toBe(true);
   });
 });
 

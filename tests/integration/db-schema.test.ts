@@ -174,12 +174,12 @@ describe("v2 host schema (§6)", () => {
     ).toThrow();
   });
 
-  it("enforces the messages (thread_id, seq) composite PK", () => {
+  it("enforces the messages (thread_id, seq) unique key", () => {
     const taskId = ulid();
     const threadId = ulid();
     db.insert(messages).values({ taskId, threadId, seq: 1, kind: "user", content: "hi" }).run();
     db.insert(messages).values({ taskId, threadId, seq: 2, kind: "assistant", content: "yo" }).run();
-    // Same (thread_id, seq) collides on the PK.
+    // Same (thread_id, seq) collides on the unique index.
     expect(() =>
       db.insert(messages).values({ taskId, threadId, seq: 1, kind: "user", content: "dup" }).run(),
     ).toThrow();

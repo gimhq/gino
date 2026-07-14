@@ -14,10 +14,13 @@
 export const MODULE = "channels" as const;
 
 export {
+  ackCursor,
   advanceCursor,
   type BoundTask,
+  DEFAULT_POLL_LIMIT,
   isTaskOnChannel,
   listBoundTasks,
+  MAX_POLL_LIMIT,
   pollChannel,
   type PollDelivery,
   type PollOptions,

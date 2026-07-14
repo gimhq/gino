@@ -11,6 +11,7 @@ import {
   getTaskThreads,
   getThreadRun,
   getTranscript,
+  TRANSCRIPT_READ_LIMIT,
   writeAttachmentDescriptors,
   writeCronPrompt,
   writeCronState,
@@ -445,5 +446,23 @@ describe("read models", () => {
     const transcript = getTranscript(db, mine);
     expect(transcript.length).toBe(1);
     expect(transcript[0]?.content).toBe("mine");
+  });
+
+  it("getTranscript is bounded (HOST-M5M6-08): caps at TRANSCRIPT_READ_LIMIT and pages with afterSeq", () => {
+    const taskId = seedTask();
+    const threadId = ulid();
+    const total = TRANSCRIPT_READ_LIMIT + 5;
+    for (let seq = 1; seq <= total; seq++) {
+      writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+    }
+
+    // A bare read never materializes the whole thread — and an oversized limit
+    // is clamped to the same cap.
+    expect(getTranscript(db, threadId)).toHaveLength(TRANSCRIPT_READ_LIMIT);
+    expect(getTranscript(db, threadId, { limit: total * 10 })).toHaveLength(TRANSCRIPT_READ_LIMIT);
+
+    // Paging with afterSeq walks the remainder (bounded ≠ unreachable).
+    const page2 = getTranscript(db, threadId, { afterSeq: TRANSCRIPT_READ_LIMIT });
+    expect(page2.map(m => m.seq)).toEqual([1, 2, 3, 4, 5].map(i => TRANSCRIPT_READ_LIMIT + i));
   });
 });
