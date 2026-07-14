@@ -1,10 +1,12 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
+import { Database } from "bun:sqlite";
 import cac from "cac";
 import { consola } from "consola";
 import { BUILD_INFO } from "./build-info";
-import { ROOT_DIR } from "./dirs";
+import { embeddedMigrations } from "./db/embedded-migrations";
+import { DATA_DIR, IS_COMPILED, ROOT_DIR } from "./dirs";
 
 const migrateLog = consola.withTag("migrate");
 
@@ -84,9 +86,9 @@ function runMigrateSubcommand(opts: { check?: boolean }): number {
     consola.error("Usage: gino migrate --check");
     return 2;
   }
-  const pending = listFsPendingMigrations();
+  const pending = listPendingMigrations({ dbPath: resolveDbPath() });
   if (pending === null) {
-    migrateLog.error("cannot read drizzle/ folder; check that the binary has access to migrations.");
+    migrateLog.error("cannot read migrations (no embedded set and no drizzle/ folder).");
     return 2;
   }
   if (pending.length === 0) {
@@ -99,30 +101,95 @@ function runMigrateSubcommand(opts: { check?: boolean }): number {
   return 0;
 }
 
+// Same DB path resolution as `loadConfig` (src/config.ts) without pulling in
+// full config validation: GINO_DB_PATH (or the schema default), relative paths
+// resolved against DATA_DIR.
+function resolveDbPath(): string {
+  const p = process.env.GINO_DB_PATH ?? "data/db/gino.db";
+  return p.startsWith("/") ? p : resolve(DATA_DIR, p);
+}
+
+interface JournalEntry { tag: string; when: number }
+
 /**
- * Compare `drizzle/meta/_journal.json` against the migration `.sql` files on
- * disk. Does NOT open the DB — `migrate --check` is meant to run against a
- * snapshot or a locked environment. Returns `null` when the journal cannot be
- * read (compiled binary without filesystem access).
+ * List the migrations the next boot would actually apply (HOST-M9-10):
+ * bundled journal entries whose `when` is newer than the last applied
+ * `created_at` row in the target DB's `__drizzle_migrations` table — the
+ * exact predicate drizzle's bun-sqlite migrator uses. The DB is opened
+ * read-only; a missing DB file or journal table means nothing has been
+ * applied yet, so every bundled migration is pending. Returns `null` when no
+ * migration source can be read.
  */
-function listFsPendingMigrations(): string[] | null {
-  const fsMigrationsFolder = resolve(ROOT_DIR, "drizzle");
-  const journalPath = resolve(fsMigrationsFolder, "meta/_journal.json");
+export function listPendingMigrations(opts: { dbPath: string; migrationsFolder?: string }): string[] | null {
+  const entries = readJournalEntries(opts.migrationsFolder);
+  if (entries === null)
+    return null;
+  const lastApplied = readLastAppliedMillis(opts.dbPath);
+  return entries
+    .filter(e => e.when > lastApplied)
+    .map(e => e.tag);
+}
+
+// Migration source mirrors `runMigrations` (src/db/index.ts, HOST-M9-13):
+// packaged builds read the embedded set; dev reads `<ROOT_DIR>/drizzle`
+// (or an explicit folder, used by tests).
+function readJournalEntries(migrationsFolder?: string): JournalEntry[] | null {
+  if (!migrationsFolder && (IS_COMPILED || embeddedMigrations.size > 0)) {
+    const raw = embeddedMigrations.get("meta/_journal.json");
+    if (!raw)
+      return null;
+    return parseJournal(raw, tag => embeddedMigrations.has(`${tag}.sql`));
+  }
+  const folder = migrationsFolder ?? resolve(ROOT_DIR, "drizzle");
+  const journalPath = resolve(folder, "meta/_journal.json");
   if (!existsSync(journalPath))
     return null;
   try {
-    const journal = JSON.parse(readFileSync(journalPath, "utf-8")) as { entries: { tag: string }[] };
-    const entries = journal.entries ?? [];
     const knownTags = new Set(
-      readdirSync(fsMigrationsFolder)
+      readdirSync(folder)
         .filter(f => f.endsWith(".sql"))
         .map(f => f.replace(/\.sql$/, "")),
     );
-    return entries
-      .map(e => e.tag)
-      .filter(tag => knownTags.has(tag));
+    return parseJournal(readFileSync(journalPath, "utf-8"), tag => knownTags.has(tag));
   }
   catch {
     return null;
+  }
+}
+
+function parseJournal(raw: string, hasSql: (tag: string) => boolean): JournalEntry[] | null {
+  try {
+    const journal = JSON.parse(raw) as { entries?: { tag: string; when: number }[] };
+    return (journal.entries ?? [])
+      .filter(e => hasSql(e.tag))
+      .map(e => ({ tag: e.tag, when: e.when }));
+  }
+  catch {
+    return null;
+  }
+}
+
+function readLastAppliedMillis(dbPath: string): number {
+  if (!existsSync(dbPath))
+    return 0;
+  let db: Database;
+  try {
+    db = new Database(dbPath, { readonly: true });
+  }
+  catch {
+    return 0;
+  }
+  try {
+    const row = db
+      .query("SELECT max(created_at) AS m FROM __drizzle_migrations")
+      .get() as { m: number | string | null } | null;
+    return Number(row?.m ?? 0);
+  }
+  catch {
+    // Table absent — the DB predates the migrator or is empty.
+    return 0;
+  }
+  finally {
+    db.close();
   }
 }
