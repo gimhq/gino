@@ -24,8 +24,8 @@ export { writeAttachmentDescriptors } from "./attachments";
 export type { CronPromptWrite, CronStateWrite } from "./crons";
 export { getCron, writeCronPrompt, writeCronState } from "./crons";
 
-export type { ThreadMessageWrite } from "./messages";
-export { getTranscript, writeThreadMessage } from "./messages";
+export type { ThreadMessageWrite, TranscriptReadOptions } from "./messages";
+export { getTranscript, TRANSCRIPT_READ_LIMIT, writeThreadMessage } from "./messages";
 
 export { getTaskThreads, getThreadTaskId } from "./reads";
 export type { ThreadResultWrite } from "./thread-runs";
