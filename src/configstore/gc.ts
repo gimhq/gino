@@ -2,17 +2,27 @@ import type { BlobStore } from "./store";
 // M8 — REFCOUNT / GC (the sweep backing BOTH stores; disabled by default, OD11).
 //
 // A blob `(name, sha256)` is droppable when NOTHING references its `sha256` —
-// neither a `config_entries` desired-set row NOR an `attachments` descriptor —
-// AND it has aged out (LRU by `created_at`). The same refcount backs the config
-// store and the attachment store (one unified store). Per OD11 the sweep is a
-// GUARDED no-op by default: it computes the droppable set but DELETES NOTHING
-// unless explicitly `enabled` — so normal operation never auto-evicts.
+// neither a `config_entries` desired-set row, NOR an `attachments` descriptor,
+// NOR an in-flight (unacked) outbox frame naming the sha (HOST-M8-06) — AND it
+// has stayed unreferenced for a grace period. Aging runs from the moment the
+// sweep FIRST observed the artifact unreferenced (`unreferenced_since`), never
+// from `created_at`, so a just-swapped-out artifact survives a rollback window.
+// The sweep is also filesystem-aware (HOST-M8-05): store leaves no DB row
+// references (crash orphans, stale `.tmp-*` files) are reclaimed once aged.
+// Per OD11 the sweep is a GUARDED no-op by default: it computes the droppable
+// set but DELETES NOTHING unless explicitly `enabled` — so normal operation
+// never auto-evicts.
 import type { AppDatabase } from "@/db";
-import { and, eq } from "drizzle-orm";
-import { attachments, configArtifacts, configEntries } from "@/db/schema";
+import type { Logger } from "@/shared/lib/logger";
+import { and, eq, isNull } from "drizzle-orm";
+import { attachments, configArtifacts, configEntries, outbox } from "@/db/schema";
+import { SHA_PREFIX_LEN } from "./store";
 
-/** Default LRU age before an unreferenced artifact is droppable (7 days). */
+/** Default grace before an unreferenced artifact/orphan leaf is droppable (7 days). */
 export const DEFAULT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Default cadence of the periodic GC sweep (ms) — hourly. */
+export const CONFIG_GC_INTERVAL_MS = 60 * 60 * 1000;
 
 export interface DroppableArtifact {
   name: string;
@@ -21,9 +31,22 @@ export interface DroppableArtifact {
   createdAt: number;
 }
 
+/** Shas named by a frame payload's `entries` array (in-flight desired-set refs). */
+function entryShasOf(data: unknown): string[] {
+  const entries = (data as { entries?: unknown })?.entries;
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+  return entries
+    .map(e => (e as { sha256?: unknown })?.sha256)
+    .filter((s): s is string => typeof s === "string");
+}
+
 /**
- * The LIVE set: every `sha256` referenced by the desired set (`config_entries`)
- * OR an attachment descriptor (`attachments`). An artifact whose `sha256` is in
+ * The LIVE set: every `sha256` referenced by the desired set (`config_entries`),
+ * an attachment descriptor (`attachments`), OR an in-flight UNACKED outbox frame
+ * whose payload names entries (HOST-M8-06 — a replayable `task_upsert` still
+ * owed to an offline agent pins its shas). An artifact whose `sha256` is in
  * this set is pinned and never droppable.
  */
 export function referencedShas(db: AppDatabase): Set<string> {
@@ -34,30 +57,58 @@ export function referencedShas(db: AppDatabase): Set<string> {
   for (const r of db.select({ sha256: attachments.sha256 }).from(attachments).all()) {
     live.add(r.sha256);
   }
+  for (const r of db.select({ dataJson: outbox.dataJson }).from(outbox).where(isNull(outbox.ackedAt)).all()) {
+    for (const sha of entryShasOf(r.dataJson)) {
+      live.add(sha);
+    }
+  }
   return live;
 }
 
 export interface GcOptions {
   /** Wall clock for the age test (defaults to now). */
   now?: number;
-  /** LRU age threshold; an artifact younger than this is kept (defaults to 7d). */
+  /** Grace after un-reference before an artifact is droppable (defaults to 7d). */
   maxAgeMs?: number;
 }
 
 /**
- * Artifacts that are BOTH unreferenced (refcount 0) AND aged out — the droppable
- * set. Pure computation: it deletes nothing.
+ * Artifacts that are BOTH unreferenced (refcount 0) AND past the un-reference
+ * grace — the droppable set. Reconciles the `unreferenced_since` marks as a
+ * side effect: a row first observed unreferenced is stamped `now` (aging
+ * starts), a re-referenced row is cleared (aging resets) — so droppability
+ * always ages from the LAST un-reference, never from `created_at` (HOST-M8-06).
  */
 export function findDroppable(db: AppDatabase, opts: GcOptions = {}): DroppableArtifact[] {
   const now = opts.now ?? Date.now();
   const maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
   const live = referencedShas(db);
-  return db
-    .select()
-    .from(configArtifacts)
-    .all()
-    .filter(a => !live.has(a.sha256) && now - a.createdAt >= maxAgeMs)
-    .map(a => ({ name: a.name, sha256: a.sha256, storeRef: a.storeRef, createdAt: a.createdAt }));
+  const rows = db.select().from(configArtifacts).all();
+  const droppable: DroppableArtifact[] = [];
+  for (const a of rows) {
+    if (live.has(a.sha256)) {
+      if (a.unreferencedSince != null) {
+        db
+          .update(configArtifacts)
+          .set({ unreferencedSince: null })
+          .where(and(eq(configArtifacts.name, a.name), eq(configArtifacts.sha256, a.sha256)))
+          .run();
+      }
+      continue;
+    }
+    if (a.unreferencedSince == null) {
+      db
+        .update(configArtifacts)
+        .set({ unreferencedSince: now })
+        .where(and(eq(configArtifacts.name, a.name), eq(configArtifacts.sha256, a.sha256)))
+        .run();
+      continue;
+    }
+    if (now - a.unreferencedSince >= maxAgeMs) {
+      droppable.push({ name: a.name, sha256: a.sha256, storeRef: a.storeRef, createdAt: a.createdAt });
+    }
+  }
+  return droppable;
 }
 
 export interface SweepOptions extends GcOptions {
@@ -72,28 +123,134 @@ export interface SweepResult {
   scanned: number;
   droppable: number;
   dropped: number;
+  /** Store leaves no DB row references (crash orphans + stale `.tmp-*`), aged out. */
+  orphanLeaves: number;
+  orphansDropped: number;
+}
+
+/** Every store-leaf `ref` a DB row still points at (never an FS orphan). */
+function referencedRefs(db: AppDatabase): Set<string> {
+  const refs = new Set<string>();
+  for (const r of db.select({ ref: configArtifacts.storeRef }).from(configArtifacts).all()) {
+    refs.add(r.ref);
+  }
+  for (const r of db.select({ ref: attachments.ref }).from(attachments).all()) {
+    refs.add(r.ref);
+  }
+  return refs;
 }
 
 /**
- * Refcount/LRU sweep. By default (OD11) a DRY RUN: it returns the droppable
- * count with `dropped: 0` and leaves both the blob store and `config_artifacts`
- * untouched. With `enabled: true` it deletes each droppable blob + its registry
- * row (the GC is opt-in, never automatic).
+ * Refcount/LRU sweep over BOTH the registry and the physical store. By default
+ * (OD11) a DRY RUN: it reports the droppable/orphan counts and deletes nothing.
+ * With `enabled: true`:
+ *
+ * - Each droppable artifact is evicted ROW-FIRST, blob second (HOST-M8-12): a
+ *   crash between the two leaves an orphan BLOB the next sweep reclaims —
+ *   never a dangling registry row that would 404/500 on serve. The blob is
+ *   only removed when no surviving row still points at the same leaf.
+ * - Aged filesystem orphans — leaves without any `config_artifacts.store_ref`
+ *   or `attachments.ref`, plus stale `.tmp-*` files — are reclaimed
+ *   (HOST-M8-05). A recent leaf (inside the grace window) counts as in-flight
+ *   and is left alone, as is any blob whose leaf name matches a live sha.
  */
 export function sweep(db: AppDatabase, store: BlobStore, opts: SweepOptions = {}): SweepResult {
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
   const scanned = db.select({ sha256: configArtifacts.sha256 }).from(configArtifacts).all().length;
   const droppable = findDroppable(db, opts);
-  if (!opts.enabled) {
-    return { scanned, droppable: droppable.length, dropped: 0 };
-  }
+
   let dropped = 0;
-  for (const a of droppable) {
-    store.delete(a.storeRef);
-    db
-      .delete(configArtifacts)
-      .where(and(eq(configArtifacts.name, a.name), eq(configArtifacts.sha256, a.sha256)))
-      .run();
-    dropped += 1;
+  if (opts.enabled) {
+    for (const a of droppable) {
+      // Row FIRST (HOST-M8-12): the registry never points at deleted bytes.
+      db
+        .delete(configArtifacts)
+        .where(and(eq(configArtifacts.name, a.name), eq(configArtifacts.sha256, a.sha256)))
+        .run();
+      // Same leaf may back another row (12-hex prefix reuse) — keep it then.
+      if (!referencedRefs(db).has(a.storeRef)) {
+        store.delete(a.storeRef);
+      }
+      dropped += 1;
+    }
   }
-  return { scanned, droppable: droppable.length, dropped };
+
+  // Filesystem pass (HOST-M8-05): reclaim aged leaves nothing references.
+  const liveRefs = referencedRefs(db);
+  const livePrefixes = new Set([...referencedShas(db)].map(sha => sha.slice(0, SHA_PREFIX_LEN)));
+  const orphans = store.listLeaves().filter((leaf) => {
+    if (now - leaf.mtimeMs < maxAgeMs) {
+      return false; // recent = possibly in-flight (mid-ingest) — a root.
+    }
+    if (leaf.isTmp) {
+      return true; // an aged temp file is never addressable — always junk.
+    }
+    const base = leaf.ref.split("/").pop() ?? "";
+    return !liveRefs.has(leaf.ref) && !livePrefixes.has(base);
+  });
+  let orphansDropped = 0;
+  if (opts.enabled) {
+    for (const leaf of orphans) {
+      store.delete(leaf.ref);
+      orphansDropped += 1;
+    }
+  }
+
+  return { scanned, droppable: droppable.length, dropped, orphanLeaves: orphans.length, orphansDropped };
+}
+
+export interface ConfigStoreGcDeps {
+  readonly db: AppDatabase;
+  readonly store: BlobStore;
+  readonly logger?: Logger;
+  /** OD11 guard — false/omitted keeps every periodic pass a DRY RUN. */
+  readonly enabled?: boolean;
+  /** Grace after un-reference (and FS-orphan age guard) in ms. Defaults to 7d. */
+  readonly maxAgeMs?: number;
+  /** Sweep cadence in ms. Defaults to `CONFIG_GC_INTERVAL_MS`. */
+  readonly intervalMs?: number;
+  /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
+  readonly now?: () => number;
+}
+
+export interface ConfigStoreGcHandle {
+  /** Stop the periodic sweep (call on shutdown). Idempotent. */
+  readonly stop: () => void;
+  /** Run a sweep pass immediately; returns its result. */
+  readonly sweep: () => SweepResult;
+}
+
+/**
+ * Start the periodic config-store GC sweep (HOST-M8-11 — the production caller
+ * the documented reclamation was missing). The timer is `unref`'d so it never
+ * keeps the process alive on its own; `stop()` clears it. A failing pass is
+ * logged and swallowed so the loop survives a transient DB/FS error. Per OD11
+ * the pass stays a DRY RUN (observability only) unless `enabled` is set.
+ */
+export function startConfigStoreGc(deps: ConfigStoreGcDeps): ConfigStoreGcHandle {
+  const pass = (): SweepResult => sweep(deps.db, deps.store, {
+    ...(deps.enabled != null ? { enabled: deps.enabled } : {}),
+    ...(deps.maxAgeMs != null ? { maxAgeMs: deps.maxAgeMs } : {}),
+    ...(deps.now ? { now: deps.now() } : {}),
+  });
+  const tick = () => {
+    try {
+      const result = pass();
+      if (result.droppable > 0 || result.dropped > 0 || result.orphanLeaves > 0) {
+        deps.logger?.info({ ...result, enabled: deps.enabled === true }, "config store gc sweep");
+      }
+    }
+    catch (err) {
+      deps.logger?.error({ err }, "config store gc failed");
+    }
+  };
+
+  const timer = setInterval(tick, deps.intervalMs ?? CONFIG_GC_INTERVAL_MS);
+  timer.unref?.();
+
+  return {
+    stop: () => clearInterval(timer),
+    sweep: pass,
+  };
 }

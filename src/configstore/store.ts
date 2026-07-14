@@ -8,8 +8,8 @@
 // blob never serves silently. The host NEVER touches an agent's filesystem —
 // this is purely the host-side blob index the byte channel reads from.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 
 /** How many hex chars of the sha256 name the content-addressed leaf. */
@@ -30,6 +30,18 @@ export class ShaMismatchError extends ConfigStoreError {
   constructor(message: string) {
     super(message);
     this.name = "ShaMismatchError";
+  }
+}
+
+/**
+ * Thrown when a `ref` resolves to no physical blob (HOST-M8-12) — a dangling
+ * registry/descriptor row (e.g. a crash between a GC row delete and blob
+ * delete). The serve path maps this to a 404, never an unhandled 500.
+ */
+export class MissingBlobError extends ConfigStoreError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MissingBlobError";
   }
 }
 
@@ -74,27 +86,47 @@ export class BlobStore {
     return `${name}/${sha256.slice(0, SHA_PREFIX_LEN)}`;
   }
 
+  /**
+   * Resolve a `ref` to its absolute path, ENFORCING root containment
+   * (HOST-M8-09): the resolved path must be strictly inside the store root, so
+   * a traversal-shaped ref (`../../data/gino.db`, an absolute path, …) can
+   * never reach the filesystem — regardless of where the ref came from.
+   */
   private abs(ref: string): string {
-    return join(this.root, ref);
+    const root = resolve(this.root);
+    const path = resolve(root, ref);
+    if (!path.startsWith(root + sep)) {
+      throw new ConfigStoreError(`ref escapes the store root: ${JSON.stringify(ref)}`);
+    }
+    return path;
   }
 
   /**
    * Content-address + persist bytes. Returns the `{name, sha256, size, ref}`
    * descriptor. The write is idempotent: when the content-addressed path
-   * already exists the bytes are not rewritten (dedup). The write itself is
-   * temp-file + rename so a reader never observes a partial blob.
+   * already exists AND its bytes still hash to the same sha256 the write is a
+   * dedup no-op. When the existing bytes DON'T match (bit rot, tampering, or a
+   * 48-bit prefix collision squatting the leaf — HOST-M8-04) the blob is
+   * rewritten from the incoming payload (self-heal) instead of no-opping, so a
+   * re-ingest of the correct bytes always repairs the store. The write itself
+   * is temp-file + rename so a reader never observes a partial blob.
    */
   put(name: string, bytes: Uint8Array): StoredBlob {
     assertSafeName(name);
     const sha256 = sha256Hex(bytes);
     const ref = this.refFor(name, sha256);
     const path = this.abs(ref);
-    if (!existsSync(path)) {
-      mkdirSync(dirname(path), { recursive: true });
-      const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-      writeFileSync(tmp, bytes);
-      renameSync(tmp, path);
+    if (existsSync(path)) {
+      const existing = sha256Hex(new Uint8Array(readFileSync(path)));
+      if (existing === sha256) {
+        return { name, sha256, size: bytes.byteLength, ref };
+      }
+      console.warn(`[configstore] blob ${ref} holds bytes hashing to ${existing}, expected ${sha256} — rewriting from the incoming payload (HOST-M8-04 self-heal)`);
     }
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+    writeFileSync(tmp, bytes);
+    renameSync(tmp, path);
     return { name, sha256, size: bytes.byteLength, ref };
   }
 
@@ -106,7 +138,7 @@ export class BlobStore {
   read(ref: string): Uint8Array {
     const path = this.abs(ref);
     if (!existsSync(path)) {
-      throw new ConfigStoreError(`missing blob: ${ref}`);
+      throw new MissingBlobError(`missing blob: ${ref}`);
     }
     return new Uint8Array(readFileSync(path));
   }
@@ -135,4 +167,38 @@ export class BlobStore {
   delete(ref: string): void {
     rmSync(this.abs(ref), { force: true });
   }
+
+  /**
+   * Every physical leaf under the store root — blobs AND leftover `.tmp-*`
+   * files. The filesystem-aware GC input (HOST-M8-05): a leaf no DB row
+   * references is an orphan the sweep may reclaim; `mtimeMs` is its age guard.
+   */
+  listLeaves(): StoreLeaf[] {
+    if (!existsSync(this.root)) {
+      return [];
+    }
+    const leaves: StoreLeaf[] = [];
+    for (const dir of readdirSync(this.root, { withFileTypes: true })) {
+      if (!dir.isDirectory()) {
+        continue;
+      }
+      for (const leaf of readdirSync(join(this.root, dir.name), { withFileTypes: true })) {
+        if (!leaf.isFile()) {
+          continue;
+        }
+        const ref = `${dir.name}/${leaf.name}`;
+        leaves.push({ ref, mtimeMs: statSync(join(this.root, dir.name, leaf.name)).mtimeMs, isTmp: leaf.name.includes(".tmp-") });
+      }
+    }
+    return leaves;
+  }
+}
+
+/** One physical file under the store root (see `BlobStore.listLeaves`). */
+export interface StoreLeaf {
+  /** Store-relative `<name>/<leaf>` path. */
+  ref: string;
+  mtimeMs: number;
+  /** True for an in-flight/leftover temp file (`*.tmp-<pid>-<ts>`). */
+  isTmp: boolean;
 }
