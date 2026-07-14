@@ -107,4 +107,70 @@ describe("M7 proxy/bridge — Claude→OpenAI Messages→Responses", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ error: { type: "invalid_request_error" } });
   });
+
+  // HOST-M7-04 — connect/idle watchdogs and SSE backpressure.
+  it("errors the stream and closes the WS when the upstream never opens (connect timeout)", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", {
+      store,
+      wsFactory: ws.factory,
+      connectTimeoutMs: 10,
+    });
+    // Never fire onopen — the watchdog must finalize the stream on its own.
+    const text = await res.text();
+    expect(text).toContain("Upstream connect timeout");
+    expect(ws.closed()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("errors the stream and closes the WS when the upstream goes silent (idle timeout)", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", {
+      store,
+      wsFactory: ws.factory,
+      idleTimeoutMs: 10,
+    });
+    ws.socket().onopen?.(null);
+    // No frames after open — the idle watchdog must finalize the stream.
+    const text = await res.text();
+    expect(text).toContain("Upstream idle timeout");
+    expect(ws.closed()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("upstream frames reset the idle watchdog; a normal completion carries no error event", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [{ role: "user", content: "hi" }] }), "gpt-5", {
+      store,
+      wsFactory: ws.factory,
+      idleTimeoutMs: 50,
+    });
+    ws.socket().onopen?.(null);
+    const emit = (obj: unknown) => ws.socket().onmessage?.({ data: JSON.stringify(obj) });
+    emit({ type: "response.created", response: { id: "resp_1", model: "gpt-5" } });
+    await Bun.sleep(30);
+    emit({ type: "response.output_text.delta", delta: "tick" });
+    await Bun.sleep(30); // total elapsed > idleTimeoutMs, but each frame re-armed the timer
+    emit({ type: "response.completed", response: { usage: { input_tokens: 1, output_tokens: 1 } } });
+    const text = await res.text();
+    expect(text).toContain("event: message_stop");
+    expect(text).not.toContain("Upstream idle timeout");
+  });
+
+  it("closes the upstream WS when a slow client lets the SSE buffer exceed the cap", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory });
+    ws.socket().onopen?.(null);
+    const emit = (obj: unknown) => ws.socket().onmessage?.({ data: JSON.stringify(obj) });
+    emit({ type: "response.created", response: { id: "resp_1", model: "gpt-5" } });
+    emit({ type: "response.content_part.added" });
+    // Nobody reads the response body; flood > 1 MiB of deltas — the bridge
+    // must cut the upstream off instead of queueing without bound.
+    const bigDelta = "x".repeat(64 * 1024);
+    for (let i = 0; i < 20 && ws.closed() === 0; i++)
+      emit({ type: "response.output_text.delta", delta: bigDelta });
+    expect(ws.closed()).toBe(1);
+  });
 });

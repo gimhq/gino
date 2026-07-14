@@ -80,7 +80,15 @@ function resolveUpstream(rawUrl: string, label: string, allowPrivate: boolean): 
   return url;
 }
 
-/** Build the structured proxy config from the host `Config`. */
+/**
+ * Build the structured proxy config from the host `Config`.
+ *
+ * Upstream credentials (provider API keys, codex OAuth refresh/access tokens)
+ * are held as plaintext in this env-derived config and in the in-memory
+ * `CredentialStore` — accepted risk by design (HOST-M7-06): the host process
+ * is the trust boundary, secrecy relies on host env/process isolation, and the
+ * proxy modules never write these values to logs or disk.
+ */
 export function buildProxyConfig(config: Config, logger?: Logger): ProxyConfig {
   const allowPrivate = config.PROXY_ALLOW_PRIVATE_UPSTREAM;
   return {
