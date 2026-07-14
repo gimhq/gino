@@ -12,6 +12,7 @@ import { loadConfig } from "./config";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
 import { docsCspRelax, mountDocs } from "./modules/docs";
+import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
 import { createLogger } from "./shared/lib/logger";
 import { errorHandler } from "./shared/middleware/error-handler";
@@ -167,6 +168,10 @@ export function bootstrap(): BootstrapResult {
   // so tests that build the app directly never spin a background timer.
   const liveness = startLivenessSweep({ db, logger });
 
+  // M2 outbox retention — periodic GC of acked rows past the retention window
+  // (unacked rows are never touched). Same lifecycle as the liveness sweep.
+  const outboxGc = startOutboxGc({ db, logger });
+
   return {
     fetch: (req, env) => app.fetch(req, env),
     websocket,
@@ -175,6 +180,7 @@ export function bootstrap(): BootstrapResult {
     db,
     closeDb: () => {
       liveness.stop();
+      outboxGc.stop();
       db.close();
     },
   };

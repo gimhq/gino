@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
+import { outbox } from "@/db/schema";
 import { getCron } from "@/msgstore";
+import { gcOutbox, OUTBOX_RETENTION_MS } from "@/protocol/outbox";
 import {
   broadcastGlobalConfig,
   emitClose,
@@ -14,6 +16,7 @@ import {
   emitInterrupt,
   emitMessage,
   emitTaskUpsert,
+  hasSeededTask,
   sendTaskMessage,
 } from "@/tasks/orchestrator";
 import { createTask, getTask, setPlacement } from "@/tasks/store";
@@ -135,6 +138,23 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
     // Exactly one task_upsert frame went out.
     expect(sender.sent.filter(s => s.frame.type === "task_upsert")).toHaveLength(1);
     expect(sender.sent.filter(s => s.frame.type === "message")).toHaveLength(2);
+  });
+
+  it("seed state survives outbox retention GC (durable tasks.seeded_at flag)", () => {
+    const task = placedTask();
+    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    expect(first.taskUpsert).toBeDefined();
+
+    // Ack the whole history and GC far past the retention window: the seed
+    // frame's outbox row is gone, but the durable flag keeps the task seeded.
+    db.update(outbox).set({ ackedAt: Date.now() }).run();
+    expect(gcOutbox(db, { now: () => Date.now() + OUTBOX_RETENTION_MS + 1000 })).toBeGreaterThan(0);
+    expect(db.select().from(outbox).all()).toHaveLength(0);
+    expect(hasSeededTask(db, task.id)).toBe(true);
+
+    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "more" });
+    expect(second.taskUpsert).toBeUndefined();
+    expect(sender.sent.filter(s => s.frame.type === "task_upsert")).toHaveLength(1);
   });
 });
 
