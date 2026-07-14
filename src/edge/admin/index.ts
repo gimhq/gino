@@ -1,23 +1,24 @@
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
-import { channelTokenAuth } from "@/shared/middleware/auth";
+import { adminTokenAuth } from "@/shared/middleware/auth";
 import { adminAgentRoutes } from "./agents";
 import { adminChannelRoutes } from "./channels";
 import { adminConfigRoutes } from "./config";
 import { adminTaskRoutes } from "./tasks";
 
 /**
- * M1 — `/admin/*` control API (mounted at `/admin`). Guarded by the channel
- * token (`Authorization: Bearer`). Agents (M3) + Tasks/Crons (M4) + Channels
- * (M6) + Config/Skills (M8) are LIVE. Explicit routes only — no catch-all, so
- * an unknown `/admin/...` path 404s (when authorised) rather than falling
+ * M1 — `/admin/*` control API (mounted at `/admin`). Guarded by the admin
+ * token (`Authorization: Bearer`, HOST-XC-02 — the channel token does NOT
+ * grant this surface). Agents (M3) + Tasks/Crons (M4) + Channels (M6) +
+ * Config/Skills (M8) are LIVE. Explicit routes only — no catch-all, so an
+ * unknown `/admin/...` path 404s (when authorised) rather than falling
  * through.
  */
 export function adminRoutes() {
   const router = new Hono<AppEnv>();
 
-  // Channel-token bearer guards every admin route (incl. the mounted sub-routers).
-  router.use("*", channelTokenAuth);
+  // Admin-token bearer guards every admin route (incl. the mounted sub-routers).
+  router.use("*", adminTokenAuth);
 
   // Agents (M3) — live OOB observe + control API.
   router.route("/agents", adminAgentRoutes());

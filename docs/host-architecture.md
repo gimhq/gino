@@ -100,11 +100,15 @@ src/
 ### M1 — Edge (transport + auth)
 One `OpenAPIHono` app on `GINO_PORT`. Owns transport, auth, rate-limit, SSRF guard, structured errors —
 then delegates. Routes are **fully explicit prefixes, no catch-all**: `/agent/*` data-plane (→ M2/M3),
-`/admin/*` control (`HTTP_CHANNEL_TOKEN` bearer → M3/M4), `/messages/*` + webhooks (→ M6), and **`/llm/*`**
-credential proxy (→ M7). Explicit prefixes make unknown paths a clean 404 (no fall-through to the proxy).
-Three token kinds: **register token** — a **shared, long-lived, general** bootstrap secret (rotatable);
+`/admin/*` control (`HTTP_ADMIN_TOKEN` bearer → M3/M4), `/messages/*` + webhooks (`HTTP_CHANNEL_TOKEN`
+bearer → M6), and **`/llm/*`** credential proxy (→ M7). Explicit prefixes make unknown paths a clean 404
+(no fall-through to the proxy).
+Four token kinds: **register token** — a **shared, long-lived, general** bootstrap secret (rotatable);
 **connect token** — **per-agent, private**, minted at register, hashed in `agents.connect_token_hash`,
-**revoked on remove**; **channel token** — admin/user I/O.
+**revoked on remove**; **channel token** — user message I/O (`/messages/*`); **admin token** — the control
+plane (`/admin/*`, `/system/lode/*`, `GET /metrics`). Channel and admin are **distinct secrets**
+(HOST-XC-02): a channel credential never grants admin control, and an unset admin token fails closed —
+there is no fallback between the two.
 
 ### M2 — Protocol adapter (the only coupling)
 The sole code that knows the wire. One JSON object per frame: envelope (`type`; delivery `outboxId`/`msgId`;

@@ -7,7 +7,7 @@ import { getLodeSummary, requestLodeRestart, requestLodeRollback, requestLodeUpd
 import { ok } from "@/shared/lib/api-response";
 import { AppError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonOk, resolver, SECURITY, TAGS, validator } from "@/shared/lib/openapi";
-import { channelTokenAuth } from "@/shared/middleware/auth";
+import { adminTokenAuth } from "@/shared/middleware/auth";
 
 // A lode version token: a concrete version or the "latest" channel pointer.
 const lodeVersion = z.union([
@@ -30,8 +30,9 @@ function lodeNotActive(): never {
  * System routes — liveness + readiness probes for the orchestrator, the
  * build-version read (with the lode loader's upgrade view), and the lode
  * operator actions (`/system/lode/*`). The probes + version read are public;
- * the mutating lode actions are channel-token guarded per-route (this router is
- * mounted on the public surface, so health stays unauthenticated).
+ * the mutating lode actions are admin-token guarded per-route (HOST-XC-02;
+ * this router is mounted on the public surface, so health stays
+ * unauthenticated).
  */
 export function systemRoutes() {
   const router = new Hono<AppEnv>();
@@ -92,7 +93,7 @@ export function systemRoutes() {
   );
 
   // Restart the running version via lode (also applies a pending lode.toml edit —
-  // the relaunch re-reads it). Channel-token guarded; 409 when not under lode.
+  // the relaunch re-reads it). Admin-token guarded; 409 when not under lode.
   router.post(
     "/system/lode/restart",
     describeRoute({
@@ -105,7 +106,7 @@ export function systemRoutes() {
         ...errors(401, 409),
       },
     }),
-    channelTokenAuth,
+    adminTokenAuth,
     (c) => {
       const result = requestLodeRestart();
       if (result.status === "not_active")
@@ -128,7 +129,7 @@ export function systemRoutes() {
         ...errors(401, 409, 422),
       },
     }),
-    channelTokenAuth,
+    adminTokenAuth,
     validator("json", lodeUpdateSchema),
     (c) => {
       const { target } = c.req.valid("json");
@@ -153,7 +154,7 @@ export function systemRoutes() {
         ...errors(401, 409, 422),
       },
     }),
-    channelTokenAuth,
+    adminTokenAuth,
     validator("json", lodeRollbackSchema),
     (c) => {
       const { version } = c.req.valid("json");
@@ -180,7 +181,7 @@ export function systemRoutes() {
         ...errors(401, 409, 422),
       },
     }),
-    channelTokenAuth,
+    adminTokenAuth,
     validator("json", lodeHoldSchema),
     (c) => {
       const { hold } = c.req.valid("json");

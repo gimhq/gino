@@ -21,7 +21,7 @@ import { publicRoutes } from "./routes";
 import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
 import { renderPrometheus } from "./shared/lib/metrics";
-import { channelTokenAuth } from "./shared/middleware/auth";
+import { adminTokenAuth } from "./shared/middleware/auth";
 import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
@@ -114,10 +114,10 @@ export function createApp({ config, db, logger, webhookPump }: AppDeps) {
   mountDocs(api, config);
 
   // HOST-M9-09 — Prometheus scrape endpoint for the in-process registry.
-  // Guarded by the admin channel bearer (same credential as /admin/*); an
+  // Guarded by the admin bearer (same credential as /admin/*, HOST-XC-02); an
   // unconfigured token fails closed, so this is never an open surface. The
   // logging middleware's SKIP_METRICS_RE keeps scrapes out of the metrics.
-  api.get("/metrics", channelTokenAuth, c => c.text(renderPrometheus()));
+  api.get("/metrics", adminTokenAuth, c => c.text(renderPrometheus()));
 
   api.route("/", publicRoutes());
 

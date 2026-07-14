@@ -23,6 +23,8 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
+  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
 });

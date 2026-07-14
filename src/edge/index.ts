@@ -3,7 +3,7 @@
 // The edge owns the explicit v2 prefix topology. `edgeRoutes()` composes the
 // three prefix routers; `app.ts` mounts it onto the single `Hono<AppEnv>` app
 // after the public (system) routes. Each prefix router carries its own auth
-// (register/connect token on `/agent/*`, channel token on `/admin/*`) and
+// (register/connect token on `/agent/*`, admin token on `/admin/*`, channel token on `/messages/*`) and
 // returns 501 stubs until B1–B6 fill them in. `/llm/*` (M7) is the credential
 // proxy for the engine's LLM traffic (B5).
 //

@@ -4,7 +4,7 @@ import { getAgentByConnectToken } from "@/agents/registry";
 import { safeEqual } from "@/platform";
 import { ForbiddenError, UnauthorizedError } from "@/shared/lib/errors";
 
-// ─── Three-token auth (M1 / OD12) ───
+// ─── Four-token auth (M1 / OD12 / HOST-XC-02) ───
 //
 // register token  — shared, long-lived bootstrap secret on POST /agent/register
 //                   (carried in the request body per protocol §3). Validated IN
@@ -15,8 +15,15 @@ import { ForbiddenError, UnauthorizedError } from "@/shared/lib/errors";
 //                   `x-internal-token`. B0 is a PLACEHOLDER: presence/non-empty
 //                   only. The per-agent `agents.connect_token_hash` lookup
 //                   (verifyToken) lands with M3 in B2 — see the TODO below.
-// channel token   — admin/user bearer on /admin/*, header
+// channel token   — user I/O bearer on /messages/*, header
 //                   `Authorization: Bearer <token>`.
+// admin token     — control-plane bearer on /admin/*, /system/lode/*, and
+//                   GET /metrics (HOST-XC-02). A DISTINCT secret from the
+//                   channel token: an integration holding the channel token to
+//                   push/poll messages must not reach agent remove, task
+//                   dispatch, or lode update. There is NO fallback from one
+//                   token to the other; a single-operator deployment may
+//                   explicitly set both env vars to the same value.
 //
 // All comparisons are constant-time via platform `safeEqual`. Misconfiguration
 // (an empty expected secret) fails CLOSED: every request is rejected. Failures
@@ -66,9 +73,21 @@ export const connectTokenAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next();
 };
 
-/** /admin/* — validate the `GINO_HTTP_CHANNEL_TOKEN` admin/user bearer. */
+/** /messages/* — validate the `GINO_HTTP_CHANNEL_TOKEN` user I/O bearer. */
 export const channelTokenAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const expected = c.get("config").HTTP_CHANNEL_TOKEN;
+  requireSecret(expected, bearerToken(c));
+  await next();
+};
+
+/**
+ * /admin/*, /system/lode/*, GET /metrics — validate the `GINO_HTTP_ADMIN_TOKEN`
+ * control-plane bearer (HOST-XC-02). Unconfigured (empty) fails CLOSED: every
+ * admin request is rejected until the token is set. Never falls back to the
+ * channel token.
+ */
+export const adminTokenAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const expected = c.get("config").HTTP_ADMIN_TOKEN;
   requireSecret(expected, bearerToken(c));
   await next();
 };
