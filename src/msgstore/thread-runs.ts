@@ -15,8 +15,8 @@
 import type { AppDatabase } from "@/db";
 import type { ThreadRun } from "@/db/schema";
 import type { ThreadResultData } from "@/protocol/frames";
-import { eq } from "drizzle-orm";
-import { threadRuns } from "@/db/schema";
+import { count, eq, max } from "drizzle-orm";
+import { messages, threadRuns } from "@/db/schema";
 
 export interface ThreadResultWrite {
   taskId: string;
@@ -63,6 +63,37 @@ export function writeThreadResult(
       },
     })
     .run();
+}
+
+export interface TranscriptCompleteness {
+  /** True iff the stored transcript is exactly `1..=final_seq`. */
+  complete: boolean;
+  messageCount: number;
+  maxSeq: number | null;
+  finalSeq: number;
+}
+
+/**
+ * Compare the stored transcript against `thread_result.final_seq` (protocol §6:
+ * the host verifies it received `1..=final_seq`) — HOST-M1M2-13. `(thread_id,
+ * seq)` is unique, so `COUNT(*) == final_seq && MAX(seq) == final_seq` holds
+ * exactly when every seq in `1..=final_seq` is present (seq ≥ 1 per §6).
+ * Diagnostic only — the caller logs/flags a gap, it never blocks the ack.
+ */
+export function checkTranscriptCompleteness(db: AppDatabase, threadId: string, finalSeq: number): TranscriptCompleteness {
+  const row = db
+    .select({ messageCount: count(), maxSeq: max(messages.seq) })
+    .from(messages)
+    .where(eq(messages.threadId, threadId))
+    .get();
+  const messageCount = row?.messageCount ?? 0;
+  const maxSeq = row?.maxSeq ?? null;
+  return {
+    complete: messageCount === finalSeq && (maxSeq ?? 0) === finalSeq,
+    messageCount,
+    maxSeq,
+    finalSeq,
+  };
 }
 
 /** The run record for a thread (terminal summary), or `undefined` if none yet. */
