@@ -2,10 +2,11 @@
 // token via the parent router). The task identity + dispatch + work surface (§7):
 //   GET    /tasks                     list tasks (+ filters owner_id/agent_id/status)
 //   POST   /tasks                     create a task → auto-dispatch (owner-pinned)
-//   GET    /tasks/:id                 one task (+ threads + transcripts + cron mirror)
+//   GET    /tasks/:id                 one task (+ thread summaries + cron mirror);
+//                                     ?thread=&after=&limit= pages one transcript
 //   POST   /tasks/:id/assign          manual placement ({agent_id?}; set-once)
 //   POST   /tasks/:id/message         deliver input → task_upsert (if first) + message
-//   POST   /tasks/:id/interrupt       graceful cancel of the current turn
+//   POST   /tasks/:id/interrupt       task-scoped cancel of the current turn (live-only)
 //   POST   /tasks/:id/close           mark closed + task-scoped interrupt (runner stays alive)
 //   GET    /tasks/:id/crons           list the cron mirror (read-only, OD14)
 //   POST   /tasks/:id/crons           create a trigger → cron_upsert command
@@ -15,13 +16,16 @@
 // Every host→agent effect goes through the M2 outbox (orchestrator). Crons/
 // threads/messages are M5 read-only mirrors here. Responses use the shared
 // `{ success, data }` envelope.
+import type { AppDatabase } from "@/db";
 import type { Cron, Task } from "@/db/schema";
+import type { CronUpsertData } from "@/protocol/frames";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
 import { sessions } from "@/agents/sessions";
-import { getTaskThreads, getThreadRun, getTranscript } from "@/msgstore";
+import { getCron, getTaskThreads, getThreadRun, getTranscriptPage, getTranscriptStats } from "@/msgstore";
 import { ok } from "@/shared/lib/api-response";
+import { AppError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 import {
   assignTaskToAgent,
@@ -36,6 +40,8 @@ import {
   placeTask,
   requireTask,
   sendTaskMessage,
+  TASK_STATUS,
+  transitionTaskStatus,
 } from "@/tasks";
 
 /** Public projection of a task row. */
@@ -95,7 +101,10 @@ const messageBody = z.object({
   new_thread: z.boolean().optional(),
 });
 
-const cronBody = z.object({
+// Create requires `prompt` (the wire `cron_upsert.data.prompt` is required —
+// the agent rejects a promptless command, HOST-M4-10); update may omit it to
+// keep the cron's existing prompt.
+const updateCronBody = z.object({
   kind: z.string().min(1),
   continuity: z.string().min(1),
   schedule_type: z.string().optional(),
@@ -104,19 +113,39 @@ const cronBody = z.object({
   status: z.string().optional(),
   prompt: z.string().optional(),
 });
+const createCronBody = updateCronBody.extend({ prompt: z.string().min(1) });
 
 /** Build a `cron_upsert` data payload from a validated body (drops undefined keys). */
-function cronData(body: z.infer<typeof cronBody>) {
+function cronData(body: z.infer<typeof updateCronBody>, prompt: string): CronUpsertData {
   return {
     kind: body.kind,
+    prompt,
     continuity: body.continuity,
     ...(body.schedule_type != null ? { schedule_type: body.schedule_type } : {}),
     ...(body.schedule_value != null ? { schedule_value: body.schedule_value } : {}),
     ...(body.next_run != null ? { next_run: body.next_run } : {}),
     ...(body.status != null ? { status: body.status } : {}),
-    ...(body.prompt != null ? { prompt: body.prompt } : {}),
   };
 }
+
+/** The cron mirror row for `cronId` under `taskId`, or 404 (HOST-M4-11). */
+function requireCron(db: AppDatabase, taskId: string, cronId: string): Cron {
+  const cron = getCron(db, cronId);
+  if (!cron || cron.taskId !== taskId) {
+    throw new AppError(`cron ${cronId} not found on task ${taskId}`, 404, "CRON_NOT_FOUND");
+  }
+  return cron;
+}
+
+/** Transcript paging bounds for the task detail view (HOST-M1M2-16). */
+const TRANSCRIPT_PAGE_LIMIT = 200;
+const TRANSCRIPT_PAGE_MAX = 1000;
+
+const detailQuery = z.object({
+  thread: z.string().min(1).optional(),
+  after: z.coerce.number().int().nonnegative().optional(),
+  limit: z.coerce.number().int().positive().max(TRANSCRIPT_PAGE_MAX).optional(),
+});
 
 export function adminTaskRoutes() {
   const router = new Hono<AppEnv>();
@@ -171,22 +200,43 @@ export function adminTaskRoutes() {
     },
   );
 
-  // ── Get one (+ threads + transcripts + cron mirror) ────────────────────────
+  // ── Get one (+ thread summaries + cron mirror; ?thread= pages a transcript) ─
   router.get(
     "/:id",
     describeRoute({
       tags: [TAGS.Tasks],
-      summary: "Get a task (+ threads, transcripts, cron mirror)",
-      responses: { ...jsonOk(z.any(), "Task"), ...errors(401, 404) },
+      summary: "Get a task (+ thread summaries, cron mirror); ?thread=&after=&limit= pages one transcript",
+      responses: { ...jsonOk(z.any(), "Task"), ...errors(401, 404, 422) },
     }),
+    validator("query", detailQuery),
     (c) => {
       const db = c.get("db");
       const id = c.req.param("id");
       const task = requireTask(db, id);
-      const threads = getTaskThreads(db, id).map(threadId => ({
+      const q = c.req.valid("query");
+      const threadIds = getTaskThreads(db, id);
+
+      // Transcript page (HOST-M1M2-16): a bounded seq-cursor read of ONE
+      // thread, never the full transcript of every thread.
+      if (q.thread != null) {
+        if (!threadIds.includes(q.thread)) {
+          throw new AppError(`thread ${q.thread} not found on task ${id}`, 404, "THREAD_NOT_FOUND");
+        }
+        const page = getTranscriptPage(db, q.thread, {
+          ...(q.after != null ? { after: q.after } : {}),
+          limit: q.limit ?? TRANSCRIPT_PAGE_LIMIT,
+        });
+        return c.json(ok({
+          threadId: q.thread,
+          run: getThreadRun(db, q.thread) ?? null,
+          messages: page,
+        }));
+      }
+
+      const threads = threadIds.map(threadId => ({
         threadId,
         run: getThreadRun(db, threadId) ?? null,
-        messages: getTranscript(db, threadId),
+        ...getTranscriptStats(db, threadId),
       }));
       return c.json(ok({
         ...serializeTask(task),
@@ -269,10 +319,19 @@ export function adminTaskRoutes() {
       const db = c.get("db");
       const id = c.req.param("id");
       const task = requireTask(db, id);
-      const interrupt = emitInterrupt(db, sessions, task);
+      // Never-placed: no agent to command — just record the terminal status
+      // instead of 409ing on placement (HOST-M4-09).
+      if (task.agentId == null) {
+        const closed = transitionTaskStatus(db, id, TASK_STATUS.closed);
+        return c.json(ok({ task: serializeTask(closed), outboxId: null }));
+      }
+      // The interrupt is a live-only signal (HOST-M4-03): best-effort while the
+      // agent is online; an offline agent still learns the terminal status from
+      // the durable task_upsert below.
+      const interrupt = sessions.isOnline(task.agentId) ? emitInterrupt(db, sessions, task) : null;
       const closed = closeTask(db, id);
       emitTaskUpsert(db, sessions, closed); // carries status "closed" to the agent
-      return c.json(ok({ task: serializeTask(closed), outboxId: interrupt.id }));
+      return c.json(ok({ task: serializeTask(closed), outboxId: interrupt?.id ?? null }));
     },
   );
 
@@ -299,11 +358,12 @@ export function adminTaskRoutes() {
       summary: "Create a trigger → cron_upsert command (the agent owns + fires it)",
       responses: { ...jsonCreated(z.any(), "Cron command sent"), ...errors(401, 404, 409, 422) },
     }),
-    validator("json", cronBody),
+    validator("json", createCronBody),
     (c) => {
       const db = c.get("db");
       const task = requireTask(db, c.req.param("id"));
-      const { cron, cronId } = emitCronUpsert(db, sessions, task, { data: cronData(c.req.valid("json")) });
+      const b = c.req.valid("json");
+      const { cron, cronId } = emitCronUpsert(db, sessions, task, { data: cronData(b, b.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }), 201);
     },
   );
@@ -312,15 +372,20 @@ export function adminTaskRoutes() {
     "/:id/crons/:cronId",
     describeRoute({
       tags: [TAGS.Tasks],
-      summary: "Modify a trigger → cron_upsert command",
+      summary: "Modify a trigger → cron_upsert command (404 on an unknown cronId)",
       responses: { ...jsonOk(z.any(), "Cron command sent"), ...errors(401, 404, 409, 422) },
     }),
-    validator("json", cronBody),
+    validator("json", updateCronBody),
     (c) => {
       const db = c.get("db");
       const task = requireTask(db, c.req.param("id"));
       const cronId = c.req.param("cronId");
-      const { cron } = emitCronUpsert(db, sessions, task, { cronId, data: cronData(c.req.valid("json")) });
+      // Update addresses an EXISTING trigger only — an unknown id must 404, not
+      // silently create a second cron (HOST-M4-11). Omitted prompt → keep the
+      // cron's current one (the wire field is required, HOST-M4-10).
+      const existing = requireCron(db, task.id, cronId);
+      const b = c.req.valid("json");
+      const { cron } = emitCronUpsert(db, sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }));
     },
   );
@@ -329,13 +394,14 @@ export function adminTaskRoutes() {
     "/:id/crons/:cronId",
     describeRoute({
       tags: [TAGS.Tasks],
-      summary: "Remove a trigger → cron_delete command",
+      summary: "Remove a trigger → cron_delete command (404 on an unknown cronId)",
       responses: { ...jsonOk(z.any(), "Cron delete sent"), ...errors(401, 404, 409) },
     }),
     (c) => {
       const db = c.get("db");
       const task = requireTask(db, c.req.param("id"));
       const cronId = c.req.param("cronId");
+      requireCron(db, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
       const row = emitCronDelete(db, sessions, task, cronId);
       return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
     },

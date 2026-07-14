@@ -8,7 +8,7 @@
 import type { AppDatabase } from "@/db";
 import type { Message } from "@/db/schema";
 import type { ThreadMessageData } from "@/protocol/frames";
-import { eq } from "drizzle-orm";
+import { and, eq, gt, sql } from "drizzle-orm";
 import { messages } from "@/db/schema";
 
 export interface ThreadMessageWrite {
@@ -49,4 +49,45 @@ export function getTranscript(db: AppDatabase, threadId: string): Message[] {
     .where(eq(messages.threadId, threadId))
     .orderBy(messages.seq)
     .all();
+}
+
+export interface TranscriptPageOptions {
+  /** Cursor: return only rows with `seq > after` (0/absent → from the start). */
+  after?: number;
+  /** Page size (rows). */
+  limit: number;
+}
+
+/**
+ * One transcript page, `seq > after ORDER BY seq LIMIT n` — the same
+ * seq-cursor read shape the channel poll uses, so an admin client pages a
+ * long thread instead of loading it whole (HOST-M1M2-16).
+ */
+export function getTranscriptPage(db: AppDatabase, threadId: string, opts: TranscriptPageOptions): Message[] {
+  return db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.threadId, threadId), gt(messages.seq, opts.after ?? 0)))
+    .orderBy(messages.seq)
+    .limit(opts.limit)
+    .all();
+}
+
+export interface TranscriptStats {
+  messageCount: number;
+  /** Highest stored `seq`, or null when the thread has no transcript rows. */
+  lastSeq: number | null;
+}
+
+/** Per-thread transcript summary (count + last seq) for bounded list views. */
+export function getTranscriptStats(db: AppDatabase, threadId: string): TranscriptStats {
+  const row = db
+    .select({
+      messageCount: sql<number>`count(*)`,
+      lastSeq: sql<number | null>`max(${messages.seq})`,
+    })
+    .from(messages)
+    .where(eq(messages.threadId, threadId))
+    .get();
+  return { messageCount: row?.messageCount ?? 0, lastSeq: row?.lastSeq ?? null };
 }

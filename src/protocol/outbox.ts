@@ -72,6 +72,21 @@ export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInpu
 }
 
 /**
+ * Persist + push a LIVE-ONLY control frame (at-most-once). The row rides the
+ * normal outbox path (uniform encode + audit trail) but is stamped acked
+ * immediately, so it is NEVER replayed on reconnect: a cancel signal is only
+ * meaningful against the turn that is running right now — replaying a stale
+ * one would kill an arbitrary future turn (HOST-M4-03). Delivery is the live
+ * push or nothing.
+ */
+export function enqueueLiveOnly(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
+  const row = enqueue(db, sender, input);
+  const ackedAt = Date.now();
+  db.update(outbox).set({ ackedAt }).where(eq(outbox.id, row.id)).run();
+  return { ...row, ackedAt };
+}
+
+/**
  * Agent acked a generic host→agent frame (`ack{id}`) → stop replaying it.
  * Scoped to the authenticated agent's own rows (outbox ids are a global
  * autoincrement, so a foreign id is trivially guessable), and to non-`message`
