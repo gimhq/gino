@@ -247,13 +247,20 @@ describe("v2 host schema (§6)", () => {
     expect(first?.dataJson).toEqual({ taskId: "t1" });
   });
 
-  it("carries the outbox replay + msg_ack indexes (HOST-M9-07)", () => {
+  it("carries the outbox replay index; the vestigial msg_ack index is gone (HOST-M9-07)", () => {
     const rows = db.all(
       sql`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'outbox'`,
     ) as { name: string }[];
     const names = new Set(rows.map(r => r.name));
     expect(names.has("outbox_agent_unacked_idx")).toBe(true);
-    expect(names.has("outbox_msg_ack_idx")).toBe(true);
+    // msgId is derived from the row id (HOST-M1M2-07 follow-up): no stored
+    // msg_id column, no msg_ack index.
+    expect(names.has("outbox_msg_ack_idx")).toBe(false);
+  });
+
+  it("carries NO vestigial outbox.msg_id column", () => {
+    const cols = db.all(sql`PRAGMA table_info(outbox)`) as { name: string }[];
+    expect(cols.map(c => c.name)).not.toContain("msg_id");
   });
 
   it("accepts representative rows for the remaining §6 tables", () => {

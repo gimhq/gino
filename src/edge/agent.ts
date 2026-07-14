@@ -23,7 +23,7 @@ import {
 } from "@/configstore";
 import { writeAttachmentDescriptors } from "@/msgstore";
 import { generateId, hashToken } from "@/platform";
-import { handleInboundFrame, ingestHttpFrame } from "@/protocol/inbound";
+import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
 import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
@@ -346,7 +346,7 @@ export function agentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Post agent output (pre-WS fallback) — routed through M2 inbound",
-      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401) },
+      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401, 500) },
     }),
     async (c) => {
       const agentId = c.req.param("agentId");
@@ -356,12 +356,19 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       const raw = await c.req.text();
+      // HOST-M1M2-09: only an undecodable frame is 400 (permanently bad — the
+      // agent must drop it); a storage failure propagates to the error handler
+      // as a 5xx so the agent retries the frame.
       try {
-        return c.json(ingestHttpFrame(c.get("db"), agentId, raw));
+        return c.json(ingestHttpFrame({ db: c.get("db"), agentId, logger: c.get("logger") }, raw));
       }
       catch (err) {
-        c.get("logger").warn({ err, agentId }, "agent output fallback: frame rejected");
-        return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed or unprocessable frame" } }, 400);
+        if (err instanceof MalformedFrameError) {
+          c.get("logger").warn({ err, agentId }, "agent output fallback: malformed frame rejected");
+          return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed frame" } }, 400);
+        }
+        c.get("logger").error({ err, agentId }, "agent output fallback: storage failure (agent should retry)");
+        throw err;
       }
     },
   );

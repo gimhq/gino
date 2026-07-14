@@ -114,6 +114,13 @@ export function listTasks(db: AppDatabase, filter: ListTasksFilter = {}): Task[]
  * placement records `agent_id` + `assigned_at`; re-pinning the SAME agent is an
  * idempotent no-op; re-pinning a DIFFERENT agent is rejected (409) because a
  * task lives on exactly one agent for life. "Moving agents" is a brand-new task.
+ *
+ * The pin also RESETS the placement-scoped state — `seeded_at` and
+ * `current_thread_id` — so an orphaned task (agent removed → `agent_id` nulled)
+ * re-placed on a NEW agent is re-seeded (`task_upsert`) and opens a fresh
+ * thread instead of dragging the removed agent's dead thread along. Both
+ * columns are always NULL on a first placement, so the reset only bites on
+ * re-placement.
  */
 export function setPlacement(db: AppDatabase, taskId: string, agentId: string): Task {
   const task = requireTask(db, taskId);
@@ -129,7 +136,7 @@ export function setPlacement(db: AppDatabase, taskId: string, agentId: string): 
   }
   return db
     .update(tasks)
-    .set({ agentId, assignedAt: Date.now(), updatedAt: Date.now() })
+    .set({ agentId, assignedAt: Date.now(), seededAt: null, currentThreadId: null, updatedAt: Date.now() })
     .where(eq(tasks.id, taskId))
     .returning()
     .get();

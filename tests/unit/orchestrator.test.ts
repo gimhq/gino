@@ -2,7 +2,7 @@ import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
 import type { FrameSender } from "@/protocol/outbox";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent } from "@/agents/registry";
+import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
@@ -155,6 +155,37 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
     const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "more" });
     expect(second.taskUpsert).toBeUndefined();
     expect(sender.sent.filter(s => s.frame.type === "task_upsert")).toHaveLength(1);
+  });
+});
+
+describe("M4 orchestrator — orphaned task re-placement re-seeds (HOST-M4-05)", () => {
+  it("re-placed task gets a fresh task_upsert seed + a fresh thread on the new agent", () => {
+    const task = placedTask();
+    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    expect(first.taskUpsert).toBeDefined();
+    const oldThread = first.threadId;
+
+    removeAgent(db, agentId); // orphans the task (agent_id → NULL)
+    expect(getTask(db, task.id)?.agentId).toBeNull();
+
+    // Re-place on a NEW agent: the pin resets the seed gate + thread binding.
+    const freshAgent = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+    sender.online.add(freshAgent);
+    setPlacement(db, task.id, freshAgent);
+    expect(hasSeededTask(db, task.id)).toBe(false);
+    expect(getTask(db, task.id)?.currentThreadId).toBeNull();
+
+    // The next message re-seeds the NEW agent and opens a fresh thread —
+    // no dead current_thread_id from the removed agent is carried along.
+    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "again" });
+    expect(second.taskUpsert).toBeDefined();
+    expect(second.taskUpsert!.agentId).toBe(freshAgent);
+    expect(second.threadId).not.toBe(oldThread);
+    expect(getTask(db, task.id)?.currentThreadId).toBe(second.threadId);
+
+    // The new agent's wire history starts with its own seed, then the message.
+    const toFresh = sender.sent.filter(s => s.agentId === freshAgent).map(s => s.frame.type);
+    expect(toFresh).toEqual(["task_upsert", "message"]);
   });
 });
 

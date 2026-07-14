@@ -131,8 +131,10 @@ agent-architecture); bytes never travel in frames.
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
 
 Field semantics:
-- `kind` (`thread_message`) ∈ `{user_input, assistant_text, thinking, tool_use,
-  tool_result, status, error}`; `thinking`/`status` are config-filterable.
+- `kind` (`thread_message`) is an open string; the recognized set is
+  `{user_input, assistant_text, thinking, tool_use, tool_result, status, error}` —
+  a receiver stores an unrecognized `kind` opaquely instead of rejecting the
+  frame (additive-compatibility, §1). `thinking`/`status` are config-filterable.
 - `status` (`thread_result`) is a terminal thread state ∈ `{succeeded, failed, cancelled}`.
 - `failure_reason` follows the taxonomy in agent-architecture §6 (`runner.*` / `agent.*`);
   NULL on success. A resume-unsafe failure (e.g. `agent.invalid_request`) omits
@@ -340,16 +342,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "maximum": 9007199254740991
                 },
                 "kind": {
-                  "type": "string",
-                  "enum": [
-                    "user_input",
-                    "assistant_text",
-                    "thinking",
-                    "tool_use",
-                    "tool_result",
-                    "status",
-                    "error"
-                  ]
+                  "type": "string"
                 },
                 "role": {
                   "type": "string"
@@ -1013,16 +1006,7 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "maximum": 9007199254740991
                 },
                 "kind": {
-                  "type": "string",
-                  "enum": [
-                    "user_input",
-                    "assistant_text",
-                    "thinking",
-                    "tool_use",
-                    "tool_result",
-                    "status",
-                    "error"
-                  ]
+                  "type": "string"
                 },
                 "role": {
                   "type": "string"
