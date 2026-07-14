@@ -24,6 +24,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { sessions } from "@/agents/sessions";
 import { getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, TRANSCRIPT_READ_LIMIT } from "@/msgstore";
+import { AttachmentDescriptor } from "@/protocol/frames";
 import { ok } from "@/shared/lib/api-response";
 import { AppError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
@@ -97,7 +98,9 @@ const assignBody = z.object({ agent_id: z.string().min(1).optional() });
 
 const messageBody = z.object({
   text: z.string().min(1),
-  attachments: z.array(z.unknown()).optional(),
+  // HOST-M1M2-12: descriptors are validated against the wire schema
+  // (protocol §5) BEFORE they are forwarded into `message.data.attachments`.
+  attachments: z.array(AttachmentDescriptor).optional(),
   new_thread: z.boolean().optional(),
 });
 

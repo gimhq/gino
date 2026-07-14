@@ -23,6 +23,7 @@ import {
   setEntries,
 } from "@/configstore";
 import { ok } from "@/shared/lib/api-response";
+import { readBodyCapped } from "@/shared/lib/body-limit";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 import { broadcastGlobalConfig, getTask } from "@/tasks";
 
@@ -47,7 +48,7 @@ export function adminConfigRoutes() {
     describeRoute({
       tags: [TAGS.Config],
       summary: "Upload/version a config artifact (raw bytes; ?name & ?kind)",
-      responses: { ...jsonCreated(z.any(), "Stored"), ...errors(400, 401) },
+      responses: { ...jsonCreated(z.any(), "Stored"), ...errors(400, 401, 413) },
     }),
     async (c) => {
       const name = c.req.query("name");
@@ -59,7 +60,9 @@ export function adminConfigRoutes() {
         return c.json({ success: false, error: { code: "BAD_REQUEST", message: "kind must be 'file' or 'dir'" } }, 400);
       }
       const contentType = c.req.query("content_type") ?? c.req.header("content-type");
-      const bytes = new Uint8Array(await c.req.arrayBuffer());
+      // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
+      // streamed size are capped (413 via PayloadTooLargeError) before hashing.
+      const bytes = await readBodyCapped(c.req.raw, c.get("config").MAX_UPLOAD_BYTES);
 
       const store = createStore(c.get("config"));
       try {

@@ -22,13 +22,14 @@ import {
   ShaMismatchError,
 } from "@/configstore";
 import { writeAttachmentDescriptors } from "@/msgstore";
-import { generateId, hashToken } from "@/platform";
+import { generateId, hashToken, safeEqual } from "@/platform";
 import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
 import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
+import { readBodyCapped } from "@/shared/lib/body-limit";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
-import { connectTokenAuth, registerTokenAuth } from "@/shared/middleware/auth";
+import { bearerToken, connectTokenAuth } from "@/shared/middleware/auth";
 import { rateLimit } from "@/shared/middleware/rate-limit";
 import { getTask } from "@/tasks";
 
@@ -198,17 +199,41 @@ export function agentRoutes() {
       limits: config => ({ windowMs: config.RATE_LIMIT_REGISTER_WINDOW_MS, max: config.RATE_LIMIT_REGISTER_MAX }),
       onLimit: c => c.json(registerError("rate_limited"), 429),
     }),
-    registerTokenAuth,
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Enroll an agent (returns agentId + connect token + config)",
-      responses: { 200: { description: "Enrolled" }, ...errors(400, 401), 429: { description: "Rate limited (`register_error{rate_limited}`, protocol §3)" } },
+      responses: {
+        200: { description: "Enrolled" },
+        400: { description: "`register_error{invalid_body|unsupported_protocol}` (protocol §3)" },
+        401: { description: "`register_error{invalid_register_token}` (protocol §3)" },
+        403: { description: "`register_error{registration_disabled}` (protocol §3)" },
+        429: { description: "Rate limited (`register_error{rate_limited}`, protocol §3)" },
+      },
     }),
     async (c) => {
+      // HOST-M1M2-14: EVERY register failure renders the protocol §3
+      // `register_error` envelope (an agent parses `reason` to decide between
+      // "exit permanently" and "retry") — token validation lives here, in the
+      // handler, so a bad token never falls through to the scaffold's generic
+      // 401 envelope. The shared register token rides in the body
+      // (`{ registerToken }`) with an `Authorization: Bearer` fallback; the
+      // comparison is constant-time and fails CLOSED on an unconfigured secret.
       const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
+      const expected = c.get("config").REGISTER_TOKEN;
+      const bodyToken = body && typeof body.registerToken === "string" ? body.registerToken : null;
+      const provided = bearerToken(c) ?? bodyToken;
+      if (!expected || !provided || !safeEqual(provided, expected)) {
+        return c.json(registerError("invalid_register_token"), 401);
+      }
+      if (!c.get("config").REGISTER_ENABLED) {
+        return c.json(registerError("registration_disabled"), 403);
+      }
+      if (body == null || typeof body !== "object" || Array.isArray(body)) {
+        return c.json(registerError("invalid_body"), 400);
+      }
 
       // Version gate (protocol §1): reject anything but the current major.
-      if (!body || !isSupportedProtocol(body.protocolVersion)) {
+      if (!isSupportedProtocol(body.protocolVersion)) {
         return c.json(registerError("unsupported_protocol"), 400);
       }
 
@@ -431,7 +456,7 @@ export function agentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Ingest attachment bytes → store + descriptor",
-      responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401) },
+      responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401, 413) },
     }),
     async (c) => {
       const requesterId = c.get("agentId");
@@ -451,7 +476,9 @@ export function agentRoutes() {
       const direction: "inbound" | "outbound" = directionRaw === "inbound" ? "inbound" : "outbound";
       const declaredSha = c.req.query("sha256");
 
-      const bytes = new Uint8Array(await c.req.arrayBuffer());
+      // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
+      // streamed size are capped (413 via PayloadTooLargeError) before hashing.
+      const bytes = await readBodyCapped(c.req.raw, c.get("config").MAX_UPLOAD_BYTES);
       const sha256 = sha256Hex(bytes);
       if (declaredSha && declaredSha !== sha256) {
         return c.json({ success: false, error: { code: "SHA_MISMATCH", message: `computed ${sha256} != declared ${declaredSha}` } }, 400);

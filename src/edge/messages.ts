@@ -16,6 +16,7 @@ import { z } from "zod";
 import { sessions } from "@/agents/sessions";
 import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@/channels";
 import { hashToken, safeEqual } from "@/platform";
+import { AttachmentDescriptor } from "@/protocol/frames";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 import { bearerToken, channelTokenAuth } from "@/shared/middleware/auth";
@@ -28,7 +29,10 @@ const LONG_POLL_INTERVAL_MS = 250;
 const sendBody = z.object({
   conversation_ref: z.string().min(1),
   text: z.string().min(1),
-  attachments: z.array(z.unknown()).optional(),
+  // HOST-M1M2-12: descriptors are validated against the wire schema
+  // (protocol §5) BEFORE they are forwarded into `message.data.attachments` —
+  // the host never emits a frame violating its own published contract.
+  attachments: z.array(AttachmentDescriptor).optional(),
   engine: z.string().optional(),
   model: z.string().optional(),
   workdir: z.string().optional(),
@@ -42,6 +46,18 @@ const pollBody = z.object({
   limit: z.number().int().positive().max(MAX_POLL_LIMIT).optional(),
   ack: z.number().int().nonnegative().optional(),
   wait: z.number().int().nonnegative().optional(),
+});
+
+// HOST-M1M2-17: the GET variant enforces the SAME numeric contract as the POST
+// body (coerced from query strings) — garbage like `?after=latest` is a 422,
+// never a silently degraded poll (`after: NaN` / a collapsed long-poll wait).
+const pollQuery = z.object({
+  conversation_ref: z.string().optional(),
+  task: z.string().optional(),
+  after: z.coerce.number().int().nonnegative().optional(),
+  limit: z.coerce.number().int().positive().max(MAX_POLL_LIMIT).optional(),
+  ack: z.coerce.number().int().nonnegative().optional(),
+  wait: z.coerce.number().int().nonnegative().optional(),
 });
 
 interface PollParams {
@@ -171,22 +187,18 @@ export function messagesRoutes() {
     describeRoute({
       tags: [TAGS.Messages],
       summary: "Poll a channel for new messages (egress: at-least-once; confirm receipt via ack)",
-      responses: { ...jsonOk(z.any(), "Messages"), ...errors(401, 404) },
+      responses: { ...jsonOk(z.any(), "Messages"), ...errors(401, 404, 422) },
     }),
+    validator("query", pollQuery),
     async (c) => {
-      const conversationRef = c.req.query("conversation_ref");
-      const taskId = c.req.query("task");
-      const after = c.req.query("after");
-      const limit = c.req.query("limit");
-      const ack = c.req.query("ack");
-      const wait = c.req.query("wait");
+      const q = c.req.valid("query");
       const result = await runPoll(c.get("db"), c.req.param("channel"), {
-        ...(conversationRef != null ? { conversationRef } : {}),
-        ...(taskId != null ? { taskId } : {}),
-        ...(after != null ? { after: Number(after) } : {}),
-        ...(limit != null ? { limit: Math.min(Number(limit), MAX_POLL_LIMIT) } : {}),
-        ...(ack != null ? { ack: Number(ack) } : {}),
-        waitMs: wait != null ? Number(wait) : 0,
+        ...(q.conversation_ref != null ? { conversationRef: q.conversation_ref } : {}),
+        ...(q.task != null ? { taskId: q.task } : {}),
+        ...(q.after != null ? { after: q.after } : {}),
+        ...(q.limit != null ? { limit: q.limit } : {}),
+        ...(q.ack != null ? { ack: q.ack } : {}),
+        waitMs: q.wait ?? 0,
       });
       return c.json(ok(result));
     },
