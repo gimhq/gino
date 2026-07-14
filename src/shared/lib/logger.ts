@@ -77,6 +77,19 @@ const REDACT_KEYS = new Set([
   "bootstrap_token",
 ]);
 
+// Pattern companion to the exact set: catches the host's own secret
+// vocabulary without enumerating every spelling — `registerToken` /
+// `connectToken` (protocol §3/§4), `x-internal-token` (connect header),
+// `apiKey` / `api_key`, and the `PROXY_*_API_KEY` / `PROXY_*_OAUTH_TOKEN` /
+// `PROXY_STATIC_KEY` config keys. Matched against the lowercased key: any
+// key containing "token", "secret", "passw", "credential", "authorization"
+// or "cookie", or ending in "key", is redacted.
+const RE_REDACT_KEY = /token|secret|passw|credential|authorization|cookie|key$/;
+
+function isRedactedKey(lowerKey: string): boolean {
+  return REDACT_KEYS.has(lowerKey) || RE_REDACT_KEY.test(lowerKey);
+}
+
 const REDACT_MAX_DEPTH = 8;
 
 function deepRedact(value: unknown, depth: number, seen: WeakSet<object>): unknown {
@@ -105,7 +118,7 @@ function deepRedact(value: unknown, depth: number, seen: WeakSet<object>): unkno
   }
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (REDACT_KEYS.has(k.toLowerCase()))
+    if (isRedactedKey(k.toLowerCase()))
       out[k] = "[REDACTED]";
     else
       out[k] = deepRedact(v, depth + 1, seen);
@@ -113,7 +126,8 @@ function deepRedact(value: unknown, depth: number, seen: WeakSet<object>): unkno
   return out;
 }
 
-function sanitizeLogPayload(value: unknown): unknown {
+/** Exported for tests — redaction is a security guarantee (see REDACT_KEYS). */
+export function sanitizeLogPayload(value: unknown): unknown {
   return deepRedact(value, 0, new WeakSet<object>());
 }
 

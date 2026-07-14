@@ -14,7 +14,10 @@ import { edgeRoutes } from "./edge";
 import { docsCspRelax, mountDocs } from "./modules/docs";
 import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
+import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
+import { renderPrometheus } from "./shared/lib/metrics";
+import { channelTokenAuth } from "./shared/middleware/auth";
 import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
@@ -70,6 +73,15 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
 export function createApp({ config, db, logger }: AppDeps) {
+  // HOST-M9-08 — surface the spoofable proxy configuration at composition
+  // time: TRUST_PROXY without an allow-list means any direct client can
+  // forge X-Forwarded-For and evade every IP-keyed control.
+  if (isSpoofableProxyConfig(config)) {
+    logger.warn(
+      "TRUST_PROXY is enabled without TRUSTED_PROXY_IPS — forwarding headers are accepted from ANY peer, so client IPs are forgeable; set GINO_TRUSTED_PROXY_IPS to the proxy addresses",
+    );
+  }
+
   const api = new Hono<AppEnv>();
 
   // Hono's `requestId()` accepts a well-formed inbound `X-Request-Id` and
@@ -91,6 +103,12 @@ export function createApp({ config, db, logger }: AppDeps) {
   // `openAPIRouteHandler` still walks the full route table lazily at request
   // time, so routes registered below are included in the spec.
   mountDocs(api, config);
+
+  // HOST-M9-09 — Prometheus scrape endpoint for the in-process registry.
+  // Guarded by the admin channel bearer (same credential as /admin/*); an
+  // unconfigured token fails closed, so this is never an open surface. The
+  // logging middleware's SKIP_METRICS_RE keeps scrapes out of the metrics.
+  api.get("/metrics", channelTokenAuth, c => c.text(renderPrometheus()));
 
   api.route("/", publicRoutes());
 

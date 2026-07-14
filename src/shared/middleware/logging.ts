@@ -26,6 +26,31 @@ export function coarsenPath(path: string): string {
     .replace(RE_MIXED_TOKEN, "/:id");
 }
 
+// Bound metrics label cardinality (HOST-M9-04). Unmatched requests (404s —
+// arbitrary attacker-chosen paths) collapse into a single "other" label, and
+// a defensive cap on distinct route labels stops any residual growth: the
+// registry has no eviction, so each surviving label is a permanent
+// counter + histogram entry. 256 comfortably covers the real route table.
+const MAX_ROUTE_LABELS = 256;
+const seenRoutes = new Set<string>();
+
+export function routeLabel(path: string, matched: boolean): string {
+  if (!matched)
+    return "other";
+  const route = coarsenPath(path);
+  if (seenRoutes.has(route))
+    return route;
+  if (seenRoutes.size >= MAX_ROUTE_LABELS)
+    return "other";
+  seenRoutes.add(route);
+  return route;
+}
+
+/** Test-only: drop the seen-route set between specs. */
+export function __resetRouteLabelsForTests(): void {
+  seenRoutes.clear();
+}
+
 export function loggingMiddleware() {
   return createMiddleware<AppEnv>(async (c, next) => {
     if (c.req.method === "OPTIONS" || SKIP_LOGGING_RE.test(c.req.path)) {
@@ -38,7 +63,7 @@ export function loggingMiddleware() {
     finally {
       const durationMs = performance.now() - start;
       const status = c.res.status;
-      const route = coarsenPath(c.req.path);
+      const route = routeLabel(c.req.path, status !== 404);
       c.get("logger").info({
         method: c.req.method,
         path: c.req.path,
