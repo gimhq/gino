@@ -11,13 +11,15 @@
 
 const BASE = process.env.BASE ?? "http://host:3000/api";
 const REG = process.env.REGISTER_TOKEN ?? "e2e-register-secret";
-const CHAN = process.env.CHANNEL_TOKEN ?? "e2e-channel-secret";
+const ADMIN = process.env.ADMIN_TOKEN ?? "e2e-admin-secret";
 const AGENT_NAME = process.env.AGENT_NAME ?? "e2e-real-runner";
 const MODEL = process.env.REAL_MODEL ?? "claude-haiku";
 const TOKEN = "PONG-7Q2";
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
-const bearer = { Authorization: `Bearer ${CHAN}`, "content-type": "application/json" };
+// Every call this driver makes is control-plane (/admin/*), so it authenticates
+// with the ADMIN bearer (HOST-XC-02: the channel token no longer reaches /admin).
+const bearer = { Authorization: `Bearer ${ADMIN}`, "content-type": "application/json" };
 
 async function http(method: string, path: string, body?: unknown): Promise<{ status: number; json: any; text: string }> {
   const res = await fetch(`${BASE}${path}`, { method, headers: bearer, body: body == null ? undefined : JSON.stringify(body) });
@@ -87,7 +89,10 @@ async function main(): Promise<void> {
   }
 
   const status = view.run?.status;
-  const transcript: string[] = (view.messages ?? []).map((m: any) => m.content).filter((c: any) => typeof c === "string");
+  // The task view carries thread SUMMARIES only; the transcript is paged per
+  // thread via `?thread=` (HOST-M1M2-16).
+  const page = await http("GET", `/admin/tasks/${taskId}?thread=${view.threadId}`);
+  const transcript: string[] = (page.json?.data?.messages ?? []).map((m: any) => m.content).filter((c: any) => typeof c === "string");
   const blob = `${JSON.stringify(view.run)} ${transcript.join(" ")}`;
   const rateLimited = /429|rate.?limit|overloaded|provider_/i.test(blob);
   const assistant = transcript.join("\n").trim();
