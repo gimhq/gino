@@ -10,6 +10,10 @@
 //   writeCronState            cron_state     → crons      (read-only mirror; UPSERT on cron id)
 //   writeAttachmentDescriptors attachments              (idempotent on id)
 //
+// One dispatch-side exception (called by M4, not inbound): `writeCronPrompt`
+// persists the `cron_upsert` command's `prompt` into the `crons` mirror —
+// `cron_state` never carries it (HOST-M5M6-09).
+//
 // Read helpers (for M6 egress / admin, later stages):
 //   getTranscript · getThreadRun · getTaskThreads · getCron
 export const MODULE = "msgstore" as const;
@@ -17,8 +21,8 @@ export const MODULE = "msgstore" as const;
 export type { AttachmentWrite } from "./attachments";
 export { writeAttachmentDescriptors } from "./attachments";
 
-export type { CronStateWrite } from "./crons";
-export { getCron, writeCronState } from "./crons";
+export type { CronPromptWrite, CronStateWrite } from "./crons";
+export { getCron, writeCronPrompt, writeCronState } from "./crons";
 
 export type { ThreadMessageWrite } from "./messages";
 export { getTranscript, writeThreadMessage } from "./messages";

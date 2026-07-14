@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
+import { getCron } from "@/msgstore";
 import {
   broadcastGlobalConfig,
   emitClose,
@@ -151,6 +152,22 @@ describe("M4 orchestrator — cron commands + control", () => {
     const del = emitCronDelete(db, sender, task, cronId);
     expect(del.type).toBe("cron_delete");
     expect(del.cronId).toBe(cronId);
+  });
+
+  it("emitCronUpsert persists the prompt into the crons mirror (HOST-M5M6-09)", () => {
+    const task = placedTask();
+    const { cronId } = emitCronUpsert(db, sender, task, {
+      data: { kind: "schedule", continuity: "isolated", schedule_type: "cron", schedule_value: "0 9 * * *", prompt: "daily digest" },
+    });
+    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+
+    // A later upsert with a new prompt overwrites it …
+    emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated", prompt: "weekly digest" } });
+    expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
+
+    // … and one without a prompt leaves it untouched.
+    emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated" } });
+    expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
   });
 
   it("interrupt + close are task-scoped control frames", () => {
