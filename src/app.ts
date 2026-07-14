@@ -8,6 +8,7 @@ import { cors } from "hono/cors";
 import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
 import { startLivenessSweep } from "./agents/liveness";
+import { sessions } from "./agents/sessions";
 import { loadConfig } from "./config";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
@@ -166,7 +167,7 @@ export function bootstrap(): BootstrapResult {
   // it never holds the process open; `stop()` is folded into `closeDb` so clean
   // shutdown halts it before the DB closes. Started here (not in `createApp`)
   // so tests that build the app directly never spin a background timer.
-  const liveness = startLivenessSweep({ db, logger });
+  const liveness = startLivenessSweep({ db, logger, sessions });
 
   // M2 outbox retention — periodic GC of acked rows past the retention window
   // (unacked rows are never touched). Same lifecycle as the liveness sweep.
