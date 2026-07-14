@@ -61,7 +61,7 @@ export function createProxyHandler(deps: ProxyHandlerDeps): ProxyHandler {
     // Claude Messages → OpenAI Responses bridge.
     if (pathname === "/v1/messages" && req.method === "POST" && hasBody && mapping?.provider === "openai") {
       logger?.debug({ targetModel, upstreamModel: mapping.model }, "proxy: bridging /v1/messages → OpenAI");
-      const bridgeDeps: Parameters<typeof bridgeClaudeToOpenAI>[2] = { store: credentials };
+      const bridgeDeps: Parameters<typeof bridgeClaudeToOpenAI>[2] = { store: credentials, signal: req.signal };
       if (deps.wsFactory)
         Object.assign(bridgeDeps, { wsFactory: deps.wsFactory });
       if (logger)
