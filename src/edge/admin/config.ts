@@ -12,9 +12,11 @@
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
+import { sessions } from "@/agents/sessions";
 import {
   createStore,
   DEFAULT_ENGINE,
+  getGlobalConfigVersion,
   GLOBAL_SCOPE,
   ingestArtifact,
   resolveEntries,
@@ -22,7 +24,7 @@ import {
 } from "@/configstore";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import { getTask } from "@/tasks";
+import { broadcastGlobalConfig, getTask } from "@/tasks";
 
 const entriesBody = z.object({
   scope: z.string().min(1),
@@ -99,6 +101,15 @@ export function adminConfigRoutes() {
       }));
       const resolved = resolveEntries(engine, inputs);
       const persisted = setEntries(db, b.scope, resolved);
+      if (b.scope === GLOBAL_SCOPE) {
+        // M8 delivery: a global change bumps the monotonic version (inside
+        // setEntries) and is re-pushed live to every online agent; offline
+        // agents converge on their next versioned config pull.
+        const version = getGlobalConfigVersion(db);
+        const pushed = broadcastGlobalConfig(db, sessions);
+        c.get("logger").info({ scope: b.scope, engine, count: persisted.length, version, pushed: pushed.length }, "config entries set");
+        return c.json(ok({ scope: b.scope, engine, entries: persisted, version }));
+      }
       c.get("logger").info({ scope: b.scope, engine, count: persisted.length }, "config entries set");
       return c.json(ok({ scope: b.scope, engine, entries: persisted }));
     },

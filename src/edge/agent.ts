@@ -13,6 +13,7 @@ import {
   DEFAULT_ENGINE,
   getArtifactBySha,
   getAttachmentById,
+  getGlobalConfigVersion,
   GLOBAL_SCOPE,
   isShaInAgentDesiredSet,
   resolveBlobRef,
@@ -59,13 +60,17 @@ function primaryEngine(agent: Agent): string {
 }
 
 /**
- * M8 — the resolved GLOBAL desired set for the agent's engine, delivered as
- * `config.entries` on register / `GET /agent/config` (additive; the agent
- * reconciles it against its installed manifest). Empty when nothing is declared,
+ * M8 — the resolved GLOBAL desired set for the agent's engine plus the
+ * host-assigned monotonic `version`, delivered on register / `GET
+ * /agent/config` (additive; the agent reconciles only when the version
+ * advances — agent-architecture §9b). Empty entries when nothing is declared,
  * so the response stays backward-compatible.
  */
-function globalConfigEntries(db: AppDatabase, agent: Agent) {
-  return resolveEntriesForEngine(db, GLOBAL_SCOPE, primaryEngine(agent));
+function globalConfig(db: AppDatabase, agent: Agent) {
+  return {
+    entries: resolveEntriesForEngine(db, GLOBAL_SCOPE, primaryEngine(agent)),
+    version: getGlobalConfigVersion(db),
+  };
 }
 
 /**
@@ -217,8 +222,8 @@ export function agentRoutes() {
       }
 
       c.get("logger").info({ agentId: agent.id, source: agent.source }, "agent enrolled");
-      // M8 (B6): seed the resolved GLOBAL desired set on register (additive).
-      const config = { ...agentConfig(agent.id), entries: globalConfigEntries(db, agent) };
+      // M8 (B6): seed the resolved GLOBAL desired set + version on register (additive).
+      const config = { ...agentConfig(agent.id), ...globalConfig(db, agent) };
       return c.json({ agentId: agent.id, connectToken, config });
     },
   );
@@ -291,8 +296,8 @@ export function agentRoutes() {
       if (!agent || !agentId) {
         throw new UnauthorizedError();
       }
-      // M8 (B6): mirror the resolved GLOBAL desired set alongside the config.
-      return c.json({ ...agentConfig(agentId), entries: globalConfigEntries(c.get("db"), agent) });
+      // M8 (B6): mirror the resolved GLOBAL desired set + version alongside the config.
+      return c.json({ ...agentConfig(agentId), ...globalConfig(c.get("db"), agent) });
     },
   );
 
