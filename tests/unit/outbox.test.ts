@@ -75,7 +75,7 @@ describe("M2 outbox — ack stops replay", () => {
     const sender = fakeSender(true);
     const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
 
-    ackOutbox(db, row.id);
+    ackOutbox(db, agentId, row.id);
     sender.sent.length = 0;
     expect(replayUnacked(db, sender, agentId)).toBe(0);
   });
@@ -84,9 +84,38 @@ describe("M2 outbox — ack stops replay", () => {
     const sender = fakeSender(true);
     const row = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
 
-    ackMessage(db, row.msgId!);
+    ackMessage(db, agentId, row.msgId!);
     sender.sent.length = 0;
     expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("another agent's ack{id} does NOT ack this agent's frame", () => {
+    const sender = fakeSender(false);
+    const otherId = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
+    const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
+
+    ackOutbox(db, otherId, row.id);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+  });
+
+  it("another agent's msg_ack{msgId} does NOT mark this agent's message delivered", () => {
+    const sender = fakeSender(false);
+    const otherId = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
+    const row = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
+
+    ackMessage(db, otherId, row.msgId!);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
+  });
+
+  it("a plain ack{id} does NOT mark a message delivered — only msg_ack can", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
+
+    ackOutbox(db, agentId, row.id);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(1);
   });
 
   it("replays multiple unacked frames in id order", () => {

@@ -154,14 +154,14 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
 
     case "msg_ack": {
       if (decoded.msgId != null) {
-        ackMessage(db, decoded.msgId);
+        ackMessage(db, agentId, decoded.msgId);
       }
       return null;
     }
 
     case "ack": {
       if (decoded.id != null) {
-        ackOutbox(db, decoded.id);
+        ackOutbox(db, agentId, decoded.id);
       }
       return null;
     }
