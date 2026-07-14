@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
-import { outbox } from "@/db/schema";
+import { configArtifacts, outbox } from "@/db/schema";
 import { getCron } from "@/msgstore";
 import { gcOutbox, OUTBOX_RETENTION_MS, replayUnacked } from "@/protocol/outbox";
 import {
@@ -47,6 +47,11 @@ beforeEach(() => {
   sender = new FakeSender();
   agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
   sender.online.add(agentId);
+  // Register the shas the config-entry tests declare (write-time validation, HOST-M8-07).
+  db
+    .insert(configArtifacts)
+    .values({ name: "seed", sha256: "a".repeat(64), kind: "file", size: 1, storeRef: `seed/${"a".repeat(12)}` })
+    .run();
 });
 
 afterEach(() => {
@@ -330,6 +335,22 @@ describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", 
 
     // Both frames went out live (the sender reported the agents online).
     expect(sender.sent.filter(s => s.frame.type === "config_update")).toHaveLength(2);
+  });
+
+  it("a multi-engine agent receives the UNION of its engines' targets (HOST-M8-03)", () => {
+    const multiId = enrollAgent(db, { capabilities: { engines: ["claude", "codex"] } }).agent.id;
+    sender.online.add(multiId);
+    setEntries(db, GLOBAL_SCOPE, [
+      ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
+      ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
+    ]);
+
+    const rows = broadcastGlobalConfig(db, sender);
+    const byAgent = new Map(rows.map(r => [r.agentId, r.dataJson as { entries: { target: string }[] }]));
+    // NOT just engines[0] — both declared engines' rows are delivered.
+    expect(byAgent.get(multiId)!.entries.map(e => e.target).sort()).toEqual(["AGENTS.md", "CLAUDE.md"]);
+    // A single-engine agent still receives only its own engine's rows.
+    expect(byAgent.get(agentId)!.entries.map(e => e.target)).toEqual(["CLAUDE.md"]);
   });
 
   it("skips offline agents (they converge on the next versioned config pull)", () => {

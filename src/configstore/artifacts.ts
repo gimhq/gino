@@ -24,9 +24,12 @@ export interface IngestArtifactInput {
 
 /**
  * Ingest an artifact: store its bytes content-addressed (dedup by sha256) and
- * upsert the immutable `config_artifacts` row. `onConflictDoNothing` makes a
- * repeat ingest of identical `(name, sha256)` a no-op (the registry is
- * append-only — a new version is a new `sha256`, hence a new row).
+ * upsert the `config_artifacts` row. The CONTENT ADDRESS is immutable (a new
+ * version is a new `sha256`, hence a new row) but the metadata OUTSIDE it —
+ * `kind` / `content_type` — is last-write-wins: a repeat ingest of identical
+ * `(name, sha256)` updates them to the caller's values instead of silently
+ * discarding the request (HOST-M8-13 — e.g. re-uploading a bundle wrongly
+ * ingested as `kind:file` with `kind:dir` corrects the row).
  */
 export function ingestArtifact(db: AppDatabase, store: BlobStore, input: IngestArtifactInput): ConfigArtifact {
   const blob = store.put(input.name, input.bytes);
@@ -40,7 +43,10 @@ export function ingestArtifact(db: AppDatabase, store: BlobStore, input: IngestA
       contentType: input.contentType ?? null,
       storeRef: blob.ref,
     })
-    .onConflictDoNothing()
+    .onConflictDoUpdate({
+      target: [configArtifacts.name, configArtifacts.sha256],
+      set: { kind: input.kind, contentType: input.contentType ?? null },
+    })
     .run();
   return getArtifact(db, blob.name, blob.sha256)!;
 }

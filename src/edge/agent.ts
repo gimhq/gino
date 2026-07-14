@@ -10,14 +10,13 @@ import { sessions } from "@/agents/sessions";
 import {
   attachmentsBySha,
   createStore,
-  DEFAULT_ENGINE,
   getArtifactBySha,
   getAttachmentById,
   getGlobalConfigVersion,
   GLOBAL_SCOPE,
   isShaInAgentDesiredSet,
   resolveBlobRef,
-  resolveEntriesForEngine,
+  resolveEntriesForEngines,
   sha256Hex,
   ShaMismatchError,
 } from "@/configstore";
@@ -56,21 +55,17 @@ function agentConfig(agentId: string) {
   };
 }
 
-/** An agent's primary engine (the first declared capability), defaulting to claude. */
-function primaryEngine(agent: Agent): string {
-  return agent.capabilities.engines[0] ?? DEFAULT_ENGINE;
-}
-
 /**
- * M8 — the resolved GLOBAL desired set for the agent's engine plus the
- * host-assigned monotonic `version`, delivered on register / `GET
- * /agent/config` (additive; the agent reconciles only when the version
- * advances — agent-architecture §9b). Empty entries when nothing is declared,
- * so the response stays backward-compatible.
+ * M8 — the resolved GLOBAL desired set covering ALL the agent's declared
+ * engines (HOST-M8-03 — a multi-engine agent lands every engine's targets, not
+ * just its first capability's) plus the host-assigned monotonic `version`,
+ * delivered on register / `GET /agent/config` (additive; the agent reconciles
+ * only when the version advances — agent-architecture §9b). Empty entries when
+ * nothing is declared, so the response stays backward-compatible.
  */
 function globalConfig(db: AppDatabase, agent: Agent) {
   return {
-    entries: resolveEntriesForEngine(db, GLOBAL_SCOPE, primaryEngine(agent)),
+    entries: resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines),
     version: getGlobalConfigVersion(db),
   };
 }
