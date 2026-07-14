@@ -34,8 +34,8 @@ export function getLauncher(kind?: string | null): Launcher {
 
 // The docker launcher (B2b) — the first real launcher; constructor exposed so
 // deployments/tests can build a variant (custom binary/image/mock spawn).
-export { createDockerLauncher, DOCKER_LAUNCHER_KIND, dockerLauncher } from "./docker";
-export type { DockerLauncherOptions, SpawnFn, SpawnResult } from "./docker";
+export { createDockerLauncher, DEFAULT_DOCKER_OP_TIMEOUT_MS, DOCKER_LAUNCHER_KIND, dockerLauncher, DockerOpTimeoutError } from "./docker";
+export type { DockerLauncherOptions, SpawnFn, SpawnOptions, SpawnResult } from "./docker";
 /** The default launcher (`manual`). Exposed for the registry default + tests. */
 export { manualLauncher } from "./manual";
 export type { InspectState, Launcher, LauncherCapabilities, LaunchRequest, LaunchResult } from "./types";
