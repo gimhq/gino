@@ -22,6 +22,7 @@ export {
 } from "./lifecycle";
 
 export {
+  broadcastGlobalConfig,
   emitClose,
   emitConfigUpdate,
   emitCronDelete,

@@ -38,6 +38,7 @@ export {
   ENGINE_TARGETS,
   type EntryInput,
   getEntries,
+  getGlobalConfigVersion,
   GLOBAL_SCOPE,
   isShaInAgentDesiredSet,
   resolveEntries,

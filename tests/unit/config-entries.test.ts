@@ -1,7 +1,9 @@
 import type { AppDatabase } from "@/db";
+import type { ConfigEntry } from "@/protocol/frames";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   getEntries,
+  getGlobalConfigVersion,
   GLOBAL_SCOPE,
   resolveEntries,
   resolveEntriesForEngine,
@@ -94,6 +96,38 @@ describe("desired set — set/get/replace + UNIQUE(scope, target)", () => {
     expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(1);
     expect(getEntries(db, "task-123")).toHaveLength(1);
     expect(getEntries(db, "task-123")[0]!.target).toBe(".claude/skills/reviewer");
+  });
+});
+
+describe("global config version — monotonic, bumped only by GLOBAL writes (HOST-M8-01)", () => {
+  it("starts at 0 and advances on every global setEntries (including a clear)", () => {
+    expect(getGlobalConfigVersion(db)).toBe(0);
+
+    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
+    expect(getGlobalConfigVersion(db)).toBe(1);
+
+    setEntries(db, GLOBAL_SCOPE, []);
+    expect(getGlobalConfigVersion(db)).toBe(2);
+  });
+
+  it("a task-scope write never touches the global version", () => {
+    setEntries(db, "task-123", resolveEntries("claude", [{ name: "reviewer", sha256: "b".repeat(64), kind: "dir" }]));
+    expect(getGlobalConfigVersion(db)).toBe(0);
+  });
+});
+
+describe("setEntries is transactional — delete+insert is all-or-nothing (HOST-M8-02)", () => {
+  it("a failing insert leaves the previous set intact and the version unmoved", () => {
+    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
+    expect(getGlobalConfigVersion(db)).toBe(1);
+
+    // A NULL sha256 violates NOT NULL at insert time — AFTER the delete ran.
+    const bad = [{ name: "reviewer", sha256: null, target: ".claude/skills/reviewer", kind: "dir" }] as unknown as ConfigEntry[];
+    expect(() => setEntries(db, GLOBAL_SCOPE, bad)).toThrow();
+
+    // Rolled back: the old desired set survives, the version did not advance.
+    expect(getEntries(db, GLOBAL_SCOPE).map(r => r.target)).toEqual(["CLAUDE.md"]);
+    expect(getGlobalConfigVersion(db)).toBe(1);
   });
 });
 

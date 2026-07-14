@@ -114,17 +114,36 @@ describe("global delivery — register / GET /agent/config carry config.entries"
       { name: "reviewer", sha256: skHash, kind: "dir" },
     ]);
     expect(put.status).toBe(200);
+    // A GLOBAL write mints a monotonic version (HOST-M8-01) and reports it.
+    const putBody = await put.json() as { data: { version: number } };
+    expect(putBody.data.version).toBeGreaterThan(0);
 
     const reg = await register(["claude"]);
     expect(reg.status).toBe(200);
-    const body = await reg.json() as { agentId: string; connectToken: string; config: { entries: { target: string }[] } };
+    const body = await reg.json() as { agentId: string; connectToken: string; config: { entries: { target: string }[]; version: number } };
     expect(body.config.entries.map(e => e.target).sort()).toEqual([".claude/skills/reviewer", "CLAUDE.md"]);
+    expect(body.config.version).toBe(putBody.data.version);
 
     // The same set is mirrored on GET /agent/config (additive; agent reconciles).
     const cfg = await app.fetch(new Request(`http://local/api/agent/config/${body.agentId}`, { headers: { "x-internal-token": body.connectToken } }));
     expect(cfg.status).toBe(200);
-    const cfgBody = await cfg.json() as { entries: { target: string }[] };
+    const cfgBody = await cfg.json() as { entries: { target: string }[]; version: number };
     expect(cfgBody.entries.map(e => e.target).sort()).toEqual([".claude/skills/reviewer", "CLAUDE.md"]);
+    expect(cfgBody.version).toBe(putBody.data.version);
+  });
+
+  it("every global PUT advances the version; a task-scope PUT does not", async () => {
+    const v1 = (await (await putEntries("global", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }])).json() as { data: { version: number } }).data.version;
+    const v2 = (await (await putEntries("global", [{ name: "CLAUDE.md", sha256: "c".repeat(64), kind: "file" }])).json() as { data: { version: number } }).data.version;
+    expect(v2).toBe(v1 + 1);
+
+    // Task scope: no version minted (the response carries none).
+    const reg = await register(["claude"]);
+    const { agentId } = await reg.json() as { agentId: string };
+    const task = createTask(db, { ownerId: "owner-v", engine: "claude", model: "sonnet" });
+    setPlacement(db, task.id, agentId);
+    const taskPut = await (await putEntries(task.id, [{ name: "reviewer", sha256: "b".repeat(64), kind: "dir" }])).json() as { data: { version?: number } };
+    expect(taskPut.data.version).toBeUndefined();
   });
 
   it("a codex agent receives codex-resolved targets, never another engine's", async () => {

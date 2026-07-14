@@ -3,8 +3,10 @@ import type { Task } from "@/db/schema";
 import type { FrameSender } from "@/protocol/outbox";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
+import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
 import {
+  broadcastGlobalConfig,
   emitClose,
   emitCronDelete,
   emitCronUpsert,
@@ -157,5 +159,36 @@ describe("M4 orchestrator — cron commands + control", () => {
     const close = emitClose(db, sender, task);
     expect(close.type).toBe("close");
     expect(close.taskId).toBe(task.id);
+  });
+});
+
+describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", () => {
+  it("pushes config_update{entries, version} to online agents, per their engine", () => {
+    const codexId = enrollAgent(db, { capabilities: { engines: ["codex"] } }).agent.id;
+    sender.online.add(codexId);
+    setEntries(db, GLOBAL_SCOPE, [
+      ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
+      ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
+    ]);
+
+    const rows = broadcastGlobalConfig(db, sender);
+    expect(rows).toHaveLength(2);
+    expect(rows.every(r => r.type === "config_update" && r.taskId === null)).toBe(true);
+
+    const byAgent = new Map(rows.map(r => [r.agentId, r.dataJson as { entries: { target: string }[]; version: number }]));
+    expect(byAgent.get(agentId)!.version).toBe(1);
+    expect(byAgent.get(agentId)!.entries.map(e => e.target)).toEqual(["CLAUDE.md"]);
+    expect(byAgent.get(codexId)!.entries.map(e => e.target)).toEqual(["AGENTS.md"]);
+
+    // Both frames went out live (the sender reported the agents online).
+    expect(sender.sent.filter(s => s.frame.type === "config_update")).toHaveLength(2);
+  });
+
+  it("skips offline agents (they converge on the next versioned config pull)", () => {
+    enrollAgent(db, { capabilities: { engines: ["claude"] } }); // never marked online
+    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
+
+    const rows = broadcastGlobalConfig(db, sender);
+    expect(rows.map(r => r.agentId)).toEqual([agentId]);
   });
 });

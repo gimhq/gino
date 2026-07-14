@@ -21,7 +21,8 @@ import type { Outbox, Task } from "@/db/schema";
 import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
 import type { FrameSender } from "@/protocol/outbox";
 import { and, eq } from "drizzle-orm";
-import { resolveEntriesForEngine } from "@/configstore";
+import { listAgents } from "@/agents/registry";
+import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
 import { outbox } from "@/db/schema";
 import { ulid } from "@/platform";
 import { enqueue } from "@/protocol/outbox";
@@ -213,4 +214,26 @@ export function emitClose(db: AppDatabase, sender: FrameSender, task: Task): Out
 export function emitConfigUpdate(db: AppDatabase, sender: FrameSender, task: Task, data: Record<string, unknown> = {}): Outbox {
   const agentId = requirePlacement(task);
   return enqueue(db, sender, { agentId, type: "config_update", taskId: task.id, data });
+}
+
+/**
+ * Re-push the GLOBAL desired set live after a global config change (M8
+ * delivery): a `config_update` carrying the resolved `entries` (per the agent's
+ * primary engine) + the new monotonic `version` to every ONLINE agent — the
+ * agent's §9b version gate makes the apply idempotent. Offline agents converge
+ * on their next `GET /agent/config` pull (which carries the same version), so
+ * no frame is queued for them. Returns the enqueued rows.
+ */
+export function broadcastGlobalConfig(db: AppDatabase, sender: FrameSender): Outbox[] {
+  const version = getGlobalConfigVersion(db);
+  const rows: Outbox[] = [];
+  for (const agent of listAgents(db)) {
+    if (agent.status === "removed" || !sender.isOnline(agent.id)) {
+      continue;
+    }
+    const engine = agent.capabilities.engines[0] ?? DEFAULT_ENGINE;
+    const entries = resolveEntriesForEngine(db, GLOBAL_SCOPE, engine);
+    rows.push(enqueue(db, sender, { agentId: agent.id, type: "config_update", data: { entries, version } }));
+  }
+  return rows;
 }
