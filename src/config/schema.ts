@@ -31,17 +31,21 @@ export const configSchema = z.object({
   // `data/` dir (gitignored) so existing token-less config still constructs.
   STORE_DIR: z.string().default("data/store"),
 
-  // Three-token auth secrets (M1 / OD12). REGISTER_TOKEN — the shared,
+  // Token auth secrets (M1 / OD12 / HOST-XC-02). REGISTER_TOKEN — the shared,
   // long-lived bootstrap secret for POST /agent/register. HTTP_CHANNEL_TOKEN —
-  // the admin/user bearer for /admin/*. Both are REQUIRED in real deployments
-  // (set them via GINO_REGISTER_TOKEN / GINO_HTTP_CHANNEL_TOKEN — see
-  // .env.example). The default "" means "unconfigured": the auth middleware
-  // treats an empty expected secret as fail-closed and rejects every request,
-  // so a missing token never silently opens the surface. (Kept default-able,
-  // not hard-required, so the scaffold's token-less config loads — e.g.
-  // health probes — still construct.)
+  // the user I/O bearer for /messages/*. HTTP_ADMIN_TOKEN — the control-plane
+  // bearer for /admin/*, /system/lode/*, and GET /metrics; a DISTINCT secret
+  // so a channel credential cannot reach destructive admin surfaces. All are
+  // REQUIRED in real deployments (set them via GINO_REGISTER_TOKEN /
+  // GINO_HTTP_CHANNEL_TOKEN / GINO_HTTP_ADMIN_TOKEN — see .env.example). The
+  // default "" means "unconfigured": the auth middleware treats an empty
+  // expected secret as fail-closed and rejects every request, so a missing
+  // token never silently opens the surface — and the admin token NEVER falls
+  // back to the channel token. (Kept default-able, not hard-required, so the
+  // scaffold's token-less config loads — e.g. health probes — still construct.)
   REGISTER_TOKEN: z.string().default(""),
   HTTP_CHANNEL_TOKEN: z.string().default(""),
+  HTTP_ADMIN_TOKEN: z.string().default(""),
   // Operator kill-switch for enrollment (HOST-M1M2-14). When false, POST
   // /agent/register rejects every attempt with the protocol §3
   // `register_error{registration_disabled}` envelope.

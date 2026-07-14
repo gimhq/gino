@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
-import { channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
+import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
 import { errorHandler } from "@/shared/middleware/error-handler";
 
 // ─── platform crypto ───
@@ -52,6 +52,7 @@ describe("generateId", () => {
 const TEST_CONFIG = {
   REGISTER_TOKEN: "reg-secret",
   HTTP_CHANNEL_TOKEN: "chan-secret",
+  HTTP_ADMIN_TOKEN: "admin-secret",
 } as unknown as Config;
 
 // Minimal app: inject config into context (as app.ts does), apply the
@@ -140,5 +141,50 @@ describe("channelTokenAuth", () => {
     const app = appWith(channelTokenAuth);
     const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer chan-secret" } });
     expect(res.status).toBe(200);
+  });
+
+  it("401 on the ADMIN token (no cross-grant, HOST-XC-02)", async () => {
+    const app = appWith(channelTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("adminTokenAuth (HOST-XC-02)", () => {
+  it("401 without an Authorization bearer", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET" });
+    expect(res.status).toBe(401);
+  });
+
+  it("401 on a wrong bearer token", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer nope" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("401 on the CHANNEL token — a channel credential never grants admin", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer chan-secret" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("passes with the correct admin bearer", async () => {
+    const app = appWith(adminTokenAuth);
+    const res = await app.request("/", { method: "GET", headers: { authorization: "Bearer admin-secret" } });
+    expect(res.status).toBe(200);
+  });
+
+  it("fails CLOSED when unconfigured — no fallback to the channel token", async () => {
+    const noAdmin = { ...TEST_CONFIG, HTTP_ADMIN_TOKEN: "" } as Config;
+    const app = appWith(adminTokenAuth, noAdmin);
+    for (const headers of [
+      undefined,
+      { authorization: "Bearer chan-secret" },
+      { authorization: "Bearer " },
+    ]) {
+      const res = await app.request("/", { method: "GET", ...(headers ? { headers } : {}) });
+      expect(res.status).toBe(401);
+    }
   });
 });

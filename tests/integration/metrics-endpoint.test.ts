@@ -1,6 +1,7 @@
 // HOST-M9-09 — /metrics serves the in-process registry, gated by the admin
-// channel bearer. HOST-M9-08 — createApp warns at composition time when the
-// proxy config is spoofable (TRUST_PROXY without TRUSTED_PROXY_IPS).
+// bearer (HOST-XC-02: NOT the channel token). HOST-M9-08 — createApp warns at
+// composition time when the proxy config is spoofable (TRUST_PROXY without
+// TRUSTED_PROXY_IPS).
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -12,6 +13,7 @@ import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
 
 const CHANNEL_TOKEN = "test-channel-token";
+const ADMIN_TOKEN = "test-admin-token";
 const dbPath = resolve(tmpdir(), `gino-metrics-${process.pid}-${Date.now()}.db`);
 const config = loadConfigStrict({
   NODE_ENV: "test",
@@ -19,6 +21,7 @@ const config = loadConfigStrict({
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
+  GINO_HTTP_ADMIN_TOKEN: ADMIN_TOKEN,
 });
 
 let db: ReturnType<typeof createDb>;
@@ -52,11 +55,18 @@ describe("GET /api/metrics (HOST-M9-09)", () => {
     expect(res.status).toBe(401);
   });
 
-  it("serves prometheus exposition to the channel bearer", async () => {
+  it("rejects the CHANNEL bearer with 401 (HOST-XC-02 — /metrics is admin-only)", async () => {
+    const res = await app.fetch(new Request("http://local/api/metrics", {
+      headers: { authorization: `Bearer ${CHANNEL_TOKEN}` },
+    }));
+    expect(res.status).toBe(401);
+  });
+
+  it("serves prometheus exposition to the admin bearer", async () => {
     // Prime the registry: any metered request creates http_requests_total.
     await app.fetch(new Request("http://local/api/system/version"));
     const res = await app.fetch(new Request("http://local/api/metrics", {
-      headers: { authorization: `Bearer ${CHANNEL_TOKEN}` },
+      headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
     }));
     expect(res.status).toBe(200);
     const body = await res.text();
@@ -65,7 +75,7 @@ describe("GET /api/metrics (HOST-M9-09)", () => {
     expect(body).not.toContain("route=\"/api/metrics\"");
   });
 
-  it("fails closed when no channel token is configured", async () => {
+  it("fails closed when no admin token is configured", async () => {
     const bare = loadConfigStrict({
       NODE_ENV: "test",
       GINO_DB_PATH: dbPath,
