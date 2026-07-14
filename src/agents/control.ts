@@ -23,7 +23,7 @@ import { randomBytes } from "node:crypto";
 import { enqueue, purgeAgentOutbox } from "@/protocol/outbox";
 import { AppError, NotFoundError } from "@/shared/lib/errors";
 import { getLauncher } from "./launchers";
-import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner } from "./registry";
+import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess } from "./registry";
 
 export type ControlOp = "stop" | "restart" | "remove";
 
@@ -240,6 +240,17 @@ export function revokeAgentOwner(deps: ControlDeps, agentId: string, ownerId: st
   revokeOwner(deps.db, agentId, ownerId);
 }
 
+/**
+ * Set an agent's access policy (OD13) — the ADMIN-ONLY mutation that makes an
+ * agent `public` (HOST-M3-09; enrollment never honours a client-supplied
+ * `access`). 404 if unknown; 410 if `removed` (like grant).
+ */
+export function setAgentAccessControl(deps: ControlDeps, agentId: string, access: "dedicated" | "public"): void {
+  requireActiveAgent(deps.db, agentId);
+  setAgentAccess(deps.db, agentId, access);
+  deps.logger?.info({ agentId, access }, "agent access policy set (admin)");
+}
+
 /** A config-driven launch request (B2b). `hostUrl` + `registerToken` are host-supplied (the agent never picks them). */
 export interface LaunchInput {
   /** Which launcher runs it (`docker` | …) — selected from the registry. */
@@ -256,6 +267,12 @@ export interface LaunchInput {
   readonly env?: Record<string, string>;
   /** Launcher-specific resource hints (cpu/mem/image/…). */
   readonly resources?: Record<string, unknown>;
+  /**
+   * Access policy the launched agent enrolls with (HOST-M3-09): the launch is
+   * an ADMIN request, so `public` may be allowlisted here — applied at
+   * correlate time, never taken from the agent's register body.
+   */
+  readonly access?: "dedicated" | "public";
 }
 
 export interface LaunchAgentResult {
@@ -302,7 +319,9 @@ export async function launchAgent(deps: ControlDeps, input: LaunchInput): Promis
   });
 
   // Record the pending launch so the matching registration correlates (OD17).
-  recordPendingLaunch(nonce, { launcherKind: launcher.kind, launchRef: ref });
+  // Persisted (HOST-M3-05): survives a host restart and is TTL-reaped when the
+  // agent never registers (see launch-reaper.ts).
+  recordPendingLaunch(deps.db, nonce, { launcherKind: launcher.kind, launchRef: ref, ...(input.access ? { access: input.access } : {}) });
   deps.logger?.info({ launcher: launcher.kind, ref, taskId: input.workload?.taskId }, "agent launch (awaiting registration)");
   return { launcherKind: launcher.kind, nonce, ref };
 }

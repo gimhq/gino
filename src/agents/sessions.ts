@@ -1,9 +1,8 @@
 // M3 — SESSIONS (live connection registry; the host→agent push surface).
 //
 // An agent always DIALS OUT (protocol §2): the host never connects in. This
-// registry maps `agentId → { ws, connectTokenHash }` for the currently-attached
-// sockets and is the one place that turns a host→agent frame into bytes on the
-// wire. Durability is NOT here — the durable host→agent queue is the M2 `outbox`
+// registry maps `agentId → { ws }` for the currently-attached sockets and is
+// the one place that turns a host→agent frame into bytes on the wire. Durability is NOT here — the durable host→agent queue is the M2 `outbox`
 // (it persists before send and replays on reconnect). Sessions only knows
 // "is this agent online, and how do I push a frame to it right now".
 //
@@ -36,7 +35,6 @@ function sameSocket(a: WsLike, b: WsLike): boolean {
 interface Session {
   agentId: string;
   ws: WsLike;
-  connectTokenHash: string;
 }
 
 const WS_OPEN = 1;
@@ -55,7 +53,7 @@ export class SessionRegistry {
    * live host→agent pipes. The caller flips the agent `online` in the registry
    * and then replays the unacked outbox.
    */
-  attach(agentId: string, ws: WsLike, connectTokenHash: string): void {
+  attach(agentId: string, ws: WsLike): void {
     const existing = this.sessions.get(agentId);
     if (existing && !sameSocket(existing.ws, ws)) {
       try {
@@ -65,7 +63,7 @@ export class SessionRegistry {
         // The stale socket may already be gone — detaching is best-effort.
       }
     }
-    this.sessions.set(agentId, { agentId, ws, connectTokenHash });
+    this.sessions.set(agentId, { agentId, ws });
   }
 
   /**

@@ -23,11 +23,14 @@ import {
 } from "@/db/schema";
 import { ulid } from "@/shared/lib/id";
 
-// The 14 §6 tables (docs/host-v2-design.md). The schema is "clean v2": no v1
-// legacy tables (scheduled_tasks / task_run_logs / sessions / registered_groups).
+// The 14 §6 tables (docs/host-v2-design.md) plus `pending_launches`
+// (HOST-M3-05: the persisted launch↔register correlation set). The schema is
+// "clean v2": no v1 legacy tables (scheduled_tasks / task_run_logs / sessions
+// / registered_groups).
 const EXPECTED_TABLES = [
   "agents",
   "agent_grants",
+  "pending_launches",
   "tasks",
   "crons",
   "thread_runs",
@@ -70,7 +73,7 @@ function tableNames(): Set<string> {
 }
 
 describe("v2 host schema (§6)", () => {
-  it("migrates a fresh db and creates all 14 §6 tables", () => {
+  it("migrates a fresh db and creates all §6 tables (+ pending_launches)", () => {
     const names = tableNames();
     for (const t of EXPECTED_TABLES) {
       expect(names.has(t)).toBe(true);

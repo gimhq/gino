@@ -249,7 +249,7 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     registry.attach(agentId, {
       send: () => {},
       close: (code?: number, reason?: string) => { closed.push({ code, reason }); },
-    }, "hash");
+    });
     expect(registry.isOnline(agentId)).toBe(true);
 
     await removeAgentControl({ db, sender: registry, sessions: registry }, agentId);

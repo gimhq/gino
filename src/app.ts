@@ -7,6 +7,7 @@ import { websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
+import { startLaunchReaper } from "./agents/launch-reaper";
 import { startLivenessSweep } from "./agents/liveness";
 import { sessions } from "./agents/sessions";
 import { loadConfig } from "./config";
@@ -191,6 +192,11 @@ export function bootstrap(): BootstrapResult {
   // (unacked rows are never touched). Same lifecycle as the liveness sweep.
   const outboxGc = startOutboxGc({ db, logger });
 
+  // M3 pending-launch reaper (HOST-M3-05) — tears down runtimes whose agent
+  // never registered inside the TTL. The `pending_launches` table is persisted,
+  // so this also reaps orphans left by a host restart.
+  const launchReaper = startLaunchReaper({ db, logger });
+
   return {
     fetch: (req, env) => app.fetch(req, env),
     websocket,
@@ -200,6 +206,7 @@ export function bootstrap(): BootstrapResult {
     closeDb: () => {
       liveness.stop();
       outboxGc.stop();
+      launchReaper.stop();
       db.close();
     },
   };

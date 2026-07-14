@@ -21,7 +21,7 @@ describe("M3 sessions — detach eviction contract", () => {
   it("detach of the current socket evicts and returns true", () => {
     const registry = new SessionRegistry();
     const ws = fakeWs();
-    registry.attach("a1", ws, "hash");
+    registry.attach("a1", ws);
 
     expect(registry.detach("a1", ws)).toBe(true);
     expect(registry.isOnline("a1")).toBe(false);
@@ -31,9 +31,9 @@ describe("M3 sessions — detach eviction contract", () => {
     const registry = new SessionRegistry();
     const stale = fakeWs();
     const fresh = fakeWs();
-    registry.attach("a1", stale, "hash");
+    registry.attach("a1", stale);
     // Dirty reconnect: the new socket supersedes (closes) the stale one.
-    registry.attach("a1", fresh, "hash");
+    registry.attach("a1", fresh);
     expect(stale.closed).toHaveLength(1);
 
     // The stale socket's late close must NOT evict the fresh session.
@@ -54,7 +54,7 @@ describe("M3 sessions — detach eviction contract", () => {
     // event — onOpen's and onClose's handles differ by identity but not by raw.
     const openHandle = { ...fakeWs(), raw: rawSocket };
     const closeHandle = { ...fakeWs(), raw: rawSocket };
-    registry.attach("a1", openHandle, "hash");
+    registry.attach("a1", openHandle);
 
     expect(registry.detach("a1", closeHandle)).toBe(true);
     expect(registry.isOnline("a1")).toBe(false);
@@ -62,7 +62,7 @@ describe("M3 sessions — detach eviction contract", () => {
 
   it("detach without a socket evicts unconditionally", () => {
     const registry = new SessionRegistry();
-    registry.attach("a1", fakeWs(), "hash");
+    registry.attach("a1", fakeWs());
     expect(registry.detach("a1")).toBe(true);
     expect(registry.isOnline("a1")).toBe(false);
   });
