@@ -16,7 +16,7 @@
 // M2 `encodeOutbox` codec — it never hand-rolls the envelope.
 import type { AppDatabase } from "@/db";
 import type { Outbox } from "@/db/schema";
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, ne } from "drizzle-orm";
 import { outbox } from "@/db/schema";
 import { encodeOutbox } from "./envelope";
 
@@ -70,21 +70,31 @@ export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInpu
   return row;
 }
 
-/** Agent acked a generic host→agent frame (`ack{id}`) → stop replaying it. */
-export function ackOutbox(db: AppDatabase, id: number): void {
-  db.update(outbox).set({ ackedAt: Date.now() }).where(eq(outbox.id, id)).run();
+/**
+ * Agent acked a generic host→agent frame (`ack{id}`) → stop replaying it.
+ * Scoped to the authenticated agent's own rows (outbox ids are a global
+ * autoincrement, so a foreign id is trivially guessable), and to non-`message`
+ * rows: a `message` is delivered only by the durable-storage `msg_ack` (§4.2).
+ */
+export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
+  db
+    .update(outbox)
+    .set({ ackedAt: Date.now() })
+    .where(and(eq(outbox.id, id), eq(outbox.agentId, agentId), ne(outbox.type, "message")))
+    .run();
 }
 
 /**
  * Agent durably stored a `message` (`msg_ack{msgId}`) → mark it delivered.
+ * Scoped to the authenticated agent's own rows.
  * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
  * row acked is enough to stop replay.
  */
-export function ackMessage(db: AppDatabase, msgId: number): void {
+export function ackMessage(db: AppDatabase, agentId: string, msgId: number): void {
   db
     .update(outbox)
     .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.msgId, msgId), eq(outbox.type, "message")))
+    .where(and(eq(outbox.msgId, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
     .run();
 }
 

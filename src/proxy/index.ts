@@ -25,6 +25,7 @@ export {
   detectProvider,
   extractProxyCredential,
   isAllowedUpstreamPath,
+  isAnthropicPassthroughPath,
   isAnthropicTempKey,
   isPrivateUpstreamHost,
 } from "./provider";

@@ -11,10 +11,13 @@ import type { AppDatabase } from "@/db";
 import type { ConfigEntry as ConfigEntryRow } from "@/db/schema";
 import type { ConfigEntry } from "@/protocol/frames";
 import { and, eq } from "drizzle-orm";
-import { configEntries, tasks } from "@/db/schema";
+import { configEntries, routerState, tasks } from "@/db/schema";
 
 /** The per-agent (non-task) scope name. */
 export const GLOBAL_SCOPE = "global" as const;
+
+/** `router_state` key holding the monotonic GLOBAL config version. */
+const GLOBAL_CONFIG_VERSION_KEY = "global_config_version" as const;
 
 /** Default engine when none is supplied (the common single-engine deployment). */
 export const DEFAULT_ENGINE = "claude" as const;
@@ -106,19 +109,46 @@ function dedupeByTarget(entries: ConfigEntry[]): ConfigEntry[] {
 }
 
 /**
+ * The host-assigned monotonic GLOBAL config version (restart-durable, kept in
+ * `router_state`). The agent reconciles the global scope only when this
+ * advances (agent-architecture §9b); `0` means the global set was never written.
+ */
+export function getGlobalConfigVersion(db: AppDatabase): number {
+  const row = db.select().from(routerState).where(eq(routerState.key, GLOBAL_CONFIG_VERSION_KEY)).get();
+  const parsed = row ? Number.parseInt(row.value, 10) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
  * REPLACE the desired set for a scope (delete-then-insert): the new list IS the
  * scope's complete desired state (an empty list clears it). Entries are deduped
- * by `target` to honor UNIQUE(scope, target). Returns the persisted set.
+ * by `target` to honor UNIQUE(scope, target). The delete+insert pair runs in
+ * ONE transaction — a crash or insert error can never leave the scope wiped
+ * (all-or-nothing). A GLOBAL write also bumps the monotonic config version in
+ * the same transaction, so the version advances iff the set actually changed
+ * durably. Returns the persisted set.
  */
 export function setEntries(db: AppDatabase, scope: string, entries: ConfigEntry[]): ConfigEntry[] {
   const next = dedupeByTarget(entries);
-  db.delete(configEntries).where(eq(configEntries.scope, scope)).run();
-  if (next.length > 0) {
-    db
-      .insert(configEntries)
-      .values(next.map(e => ({ scope, name: e.name, sha256: e.sha256, target: e.target, kind: e.kind })))
-      .run();
-  }
+  db.transaction((tx) => {
+    tx.delete(configEntries).where(eq(configEntries.scope, scope)).run();
+    if (next.length > 0) {
+      tx
+        .insert(configEntries)
+        .values(next.map(e => ({ scope, name: e.name, sha256: e.sha256, target: e.target, kind: e.kind })))
+        .run();
+    }
+    if (scope === GLOBAL_SCOPE) {
+      const row = tx.select().from(routerState).where(eq(routerState.key, GLOBAL_CONFIG_VERSION_KEY)).get();
+      const current = row ? Number.parseInt(row.value, 10) : 0;
+      const value = String((Number.isFinite(current) ? current : 0) + 1);
+      tx
+        .insert(routerState)
+        .values({ key: GLOBAL_CONFIG_VERSION_KEY, value })
+        .onConflictDoUpdate({ target: routerState.key, set: { value } })
+        .run();
+    }
+  });
   return next;
 }
 

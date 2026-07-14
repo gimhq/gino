@@ -3,6 +3,7 @@ import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+  assertSafeWebhookUrl,
   assertSafeWebhookUrlResolved,
   bindConversation,
   deliverWebhook,
@@ -220,5 +221,37 @@ describe("M6 security — FINDING 2b: assertSafeWebhookUrlResolved (DNS-rebind d
     expect(url.hostname).toBe(PUBLIC_IP);
     expect(consulted).toBe(false); // literal IP → no DNS lookup
     await expect(assertSafeWebhookUrlResolved("http://127.0.0.1/x", spy)).rejects.toThrow();
+  });
+});
+
+describe("M6 security — HOST-M5M6-02: SSRF guard normalizes IP-literal encodings", () => {
+  it("rejects IPv4-mapped IPv6, unspecified, and alternate-encoded private literals at registration", () => {
+    const blocked = [
+      "http://[::ffff:127.0.0.1]/", // IPv4-mapped loopback
+      "http://[::ffff:169.254.169.254]/", // IPv4-mapped cloud metadata
+      "http://[::]/", // IPv6 unspecified
+      "http://0.0.0.0:8080/", // IPv4 unspecified
+      "http://100.64.0.1/", // CGNAT
+      "http://2130706433/", // decimal 127.0.0.1 (canonicalized by the URL parser)
+      "http://0x7f000001/", // hex 127.0.0.1
+      "http://017700000001/", // octal 127.0.0.1
+      "http://[64:ff9b::a9fe:a9fe]/", // NAT64 wrapping the metadata IP
+    ];
+    for (const url of blocked)
+      expect(() => assertSafeWebhookUrl(url)).toThrow(AppError);
+  });
+
+  it("literal IPv6 skips DNS at delivery time — but only because the static check now classifies it", async () => {
+    const spy: DnsResolver = async () => {
+      throw new Error("must not resolve a literal IP");
+    };
+    await expect(assertSafeWebhookUrlResolved("http://[::ffff:10.0.0.1]/x", spy)).rejects.toThrow(AppError);
+    const url = await assertSafeWebhookUrlResolved("http://[2001:4860:4860::8888]/x", spy);
+    expect(url.hostname).toBe("[2001:4860:4860::8888]");
+  });
+
+  it("still allows a public mapped-IPv4 literal (no over-blocking)", () => {
+    const url = assertSafeWebhookUrl("http://[::ffff:8.8.8.8]/hook");
+    expect(url.protocol).toBe("http:");
   });
 });

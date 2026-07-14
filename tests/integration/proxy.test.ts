@@ -83,6 +83,32 @@ describe("M7 /llm/* — mount + auth", () => {
     expect(res.status).toBe(401);
   });
 
+  it("401: a forged sk-ant- key does not authenticate host-credential paths (HOST-M7-01)", async () => {
+    const forged = { "x-api-key": "sk-ant-forged-anything", "content-type": "application/json" };
+    for (const [path, init] of [
+      ["/v1/chat/completions", { method: "POST", headers: forged, body: JSON.stringify({ model: "gpt-5" }) }],
+      ["/v1/responses", { headers: forged }],
+      ["/api/oauth/token", { method: "POST", headers: forged, body: "{}" }],
+    ] as const) {
+      const res = await app.fetch(proxyUrl(path, init));
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("a temp key on /v1/messages stays on the anthropic pass-through even when the model maps to openai", async () => {
+    const up = mockUpstream();
+    const res = await app.fetch(proxyUrl("/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": "sk-ant-forged-anything", "content-type": "application/json" },
+      body: JSON.stringify({ model: "gpt-5", messages: [] }),
+    }));
+    expect(res.status).toBe(200); // mocked upstream; real Anthropic would reject the key
+    expect(up.calls).toHaveLength(1);
+    expect(up.calls[0]!.url).toBe("https://api.anthropic.com/v1/messages"); // NOT bridged to OpenAI
+    expect(up.calls[0]!.headers.get("x-api-key")).toBe("sk-ant-forged-anything"); // no host credential injected
+    expect(up.calls[0]!.headers.get("authorization")).toBeNull();
+  });
+
   it("unknown /llm subpath → 404 (no catch-all), even with a valid credential", async () => {
     const res = await app.fetch(proxyUrl("/v1/embeddings", { method: "POST", headers: { "x-internal-token": CONNECT_TOKEN }, body: "{}" }));
     expect(res.status).toBe(404);
