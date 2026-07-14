@@ -12,14 +12,15 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   };
 }
 
-function fakeWs(): { sent: string[]; factory: WsFactory; socket: () => BridgeSocket } {
+function fakeWs(): { sent: string[]; closed: () => number; factory: WsFactory; socket: () => BridgeSocket } {
   const sent: string[] = [];
+  let closes = 0;
   let sock: BridgeSocket | null = null;
   const factory: WsFactory = () => {
-    sock = { onopen: null, onmessage: null, onerror: null, onclose: null, send: d => sent.push(d), close: () => {} };
+    sock = { onopen: null, onmessage: null, onerror: null, onclose: null, send: d => sent.push(d), close: () => closes++ };
     return sock;
   };
-  return { sent, factory, socket: () => sock! };
+  return { sent, closed: () => closes, factory, socket: () => sock! };
 }
 
 describe("M7 proxy/bridge — Claude→OpenAI Messages→Responses", () => {
@@ -61,6 +62,42 @@ describe("M7 proxy/bridge — Claude→OpenAI Messages→Responses", () => {
     const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory });
     expect(res.status).toBe(401);
     expect(await res.json()).toMatchObject({ error: { type: "authentication_error" } });
+  });
+
+  it("closes the upstream WS when the client aborts mid-stream", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const ctl = new AbortController();
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory, signal: ctl.signal });
+    ws.socket().onopen?.(null);
+    expect(ws.closed()).toBe(0);
+
+    ctl.abort();
+    expect(ws.closed()).toBe(1);
+    // The SSE stream is finalized, not left hanging.
+    await res.text();
+  });
+
+  it("closes the upstream WS immediately when the signal is already aborted", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const ctl = new AbortController();
+    ctl.abort();
+    await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory, signal: ctl.signal });
+    expect(ws.closed()).toBe(1);
+  });
+
+  it("closes the upstream WS when the response stream is canceled", async () => {
+    const ws = fakeWs();
+    const store = new CredentialStore(makeConfig());
+    const res = await bridgeClaudeToOpenAI(JSON.stringify({ messages: [] }), "gpt-5", { store, wsFactory: ws.factory });
+    ws.socket().onopen?.(null);
+    await res.body!.cancel();
+
+    // The next upstream event hits a rejected write → the bridge tears down the WS.
+    ws.socket().onmessage?.({ data: JSON.stringify({ type: "response.created", response: { id: "resp_1", model: "gpt-5" } }) });
+    await Bun.sleep(0);
+    expect(ws.closed()).toBe(1);
   });
 
   it("returns 400 on an invalid JSON body", async () => {

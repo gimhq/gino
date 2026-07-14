@@ -39,6 +39,8 @@ export interface BridgeDeps {
   readonly logger?: Logger;
   /** Override the upstream WS URL (tests / alternate gateways). */
   readonly wsUrl?: string;
+  /** Request abort signal — tears down the upstream WS when the client goes away. */
+  readonly signal?: AbortSignal;
 }
 
 function errorResponse(status: number, errType: string, message: string): Response {
@@ -79,12 +81,6 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const state = createTranslatorState();
-  const writeLine = (line: string) => {
-    void writer.write(encoder.encode(`${line}\n`)).catch(() => {});
-  };
-  const closeWriter = () => {
-    void writer.close().catch(() => {});
-  };
 
   const headers: Record<string, string> = {
     "authorization": `Bearer ${token}`,
@@ -95,6 +91,15 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
 
   let opened = false;
   const ws = wsFactory(wsUrl, { headers });
+
+  const writeLine = (line: string) => {
+    // A rejected write means the client canceled the response stream — tear
+    // down the upstream WS instead of letting it generate into the void.
+    void writer.write(encoder.encode(`${line}\n`)).catch(() => ws.close());
+  };
+  const closeWriter = () => {
+    void writer.close().catch(() => {});
+  };
 
   ws.onopen = () => {
     opened = true;
@@ -135,6 +140,19 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
     logger?.debug("proxy bridge: WS closed");
     closeWriter();
   };
+
+  // Client abort (cancel, timeout, disconnect): close the upstream WS so it
+  // stops generating, and finalize the SSE stream. Closing a still-connecting
+  // socket aborts the dial.
+  const onAbort = () => {
+    logger?.debug({ targetModel }, "proxy bridge: client aborted, closing upstream WS");
+    ws.close();
+    closeWriter();
+  };
+  if (deps.signal?.aborted)
+    onAbort();
+  else
+    deps.signal?.addEventListener("abort", onAbort, { once: true });
 
   return new Response(readable, {
     status: 200,
