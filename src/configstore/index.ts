@@ -34,6 +34,7 @@ export {
   listArtifacts,
 } from "./artifacts";
 export {
+  clearEntries,
   DEFAULT_ENGINE,
   ENGINE_TARGETS,
   type EntryInput,
@@ -43,6 +44,7 @@ export {
   isShaInAgentDesiredSet,
   resolveEntries,
   resolveEntriesForEngine,
+  resolveEntriesForEngines,
   resolveTarget,
   setEntries,
   targetEngine,

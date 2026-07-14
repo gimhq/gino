@@ -107,6 +107,23 @@ describe("config_artifacts registry — ingest/get/list", () => {
     expect(listArtifacts(db).filter(a => a.name === "CLAUDE.md")).toHaveLength(2);
   });
 
+  it("re-ingesting identical (name, bytes) with different metadata UPDATES kind/content_type (HOST-M8-13)", () => {
+    const bytes = enc.encode("bundle-bytes");
+    const first = ingestArtifact(db, store, { name: "bundle", kind: "file", bytes, contentType: "text/plain" });
+    expect(first.kind).toBe("file");
+    expect(first.contentType).toBe("text/plain");
+
+    // The corrective re-ingest is NOT silently ignored: metadata last-write-wins.
+    const second = ingestArtifact(db, store, { name: "bundle", kind: "dir", bytes, contentType: "application/gzip" });
+    expect(second.sha256).toBe(first.sha256);
+    expect(second.kind).toBe("dir");
+    expect(second.contentType).toBe("application/gzip");
+
+    // Still one content-addressed row + one physical blob (the bytes dedup).
+    expect(listArtifacts(db).filter(a => a.name === "bundle")).toHaveLength(1);
+    expect(readdirSync(resolve(storeDir, "bundle"))).toHaveLength(1);
+  });
+
   it("a file artifact carries kind:file (a skill is just kind:dir — one abstraction)", () => {
     const file = ingestArtifact(db, store, { name: "design.md", kind: "file", bytes: enc.encode("doc") });
     const dir = ingestArtifact(db, store, { name: "reviewer", kind: "dir", bytes: enc.encode("bundle") });

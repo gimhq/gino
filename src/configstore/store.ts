@@ -38,13 +38,18 @@ export function sha256Hex(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/** True iff `name` is a single safe path segment (no separators, no traversal). */
+export function isSafeName(name: string): boolean {
+  return !!name && name.length <= 255 && name !== "." && name !== ".." && RE_SAFE_NAME.test(name);
+}
+
 /**
  * Reject a name that is not a single safe path segment (defends the store dir
  * against `..`/separator traversal). Artifact + attachment names land as a
  * store sub-directory, so they MUST be a plain segment.
  */
 export function assertSafeName(name: string): void {
-  if (!name || name.length > 255 || name === "." || name === ".." || !RE_SAFE_NAME.test(name)) {
+  if (!isSafeName(name)) {
     throw new ConfigStoreError(`unsafe store name: ${JSON.stringify(name)}`);
   }
 }

@@ -22,7 +22,7 @@ import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
 import type { EnqueuedOutbox, FrameSender } from "@/protocol/outbox";
 import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
-import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
+import { getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine, resolveEntriesForEngines } from "@/configstore";
 import { tasks } from "@/db/schema";
 import { writeCronPrompt } from "@/msgstore";
 import { ulid } from "@/platform";
@@ -254,11 +254,12 @@ export function emitConfigUpdate(db: AppDatabase, sender: FrameSender, task: Tas
 
 /**
  * Re-push the GLOBAL desired set live after a global config change (M8
- * delivery): a `config_update` carrying the resolved `entries` (per the agent's
- * primary engine) + the new monotonic `version` to every ONLINE agent — the
- * agent's §9b version gate makes the apply idempotent. Offline agents converge
- * on their next `GET /agent/config` pull (which carries the same version), so
- * no frame is queued for them. Returns the enqueued rows.
+ * delivery): a `config_update` carrying the resolved `entries` (covering ALL
+ * the agent's declared engines, HOST-M8-03) + the new monotonic `version` to
+ * every ONLINE agent — the agent's §9b version gate makes the apply
+ * idempotent. Offline agents converge on their next `GET /agent/config` pull
+ * (which carries the same version), so no frame is queued for them. Returns
+ * the enqueued rows.
  */
 export function broadcastGlobalConfig(db: AppDatabase, sender: FrameSender): Outbox[] {
   const version = getGlobalConfigVersion(db);
@@ -267,8 +268,7 @@ export function broadcastGlobalConfig(db: AppDatabase, sender: FrameSender): Out
     if (agent.status === "removed" || !sender.isOnline(agent.id)) {
       continue;
     }
-    const engine = agent.capabilities.engines[0] ?? DEFAULT_ENGINE;
-    const entries = resolveEntriesForEngine(db, GLOBAL_SCOPE, engine);
+    const entries = resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines);
     rows.push(enqueue(db, sender, { agentId: agent.id, type: "config_update", data: { entries, version } }));
   }
   return rows;
