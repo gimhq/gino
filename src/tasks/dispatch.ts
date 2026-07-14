@@ -24,6 +24,26 @@ import { requireTask, setPlacement, setStatus } from "./store";
 export const STATUS_ACTIVE = "active" as const;
 export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
 
+/**
+ * Statuses from which placement may flip a task `active`. Anything else
+ * (`closed`, `failed`, …) is user/agent-marked lifecycle state that a
+ * placement or a retried assign must never resurrect (the host never
+ * auto-terminals and never auto-revives, DP4).
+ */
+const ASSIGNABLE_STATUSES: readonly string[] = [STATUS_PENDING_ASSIGNMENT, STATUS_ACTIVE];
+
+/**
+ * Status half of a placement: flip to `active` ONLY from a status where
+ * assignment is legal; a closed/terminal task keeps its status even when the
+ * pin itself is (re-)recorded. Returns the resulting status.
+ */
+function activateForPlacement(db: AppDatabase, task: Task): string {
+  if (!ASSIGNABLE_STATUSES.includes(task.status)) {
+    return task.status;
+  }
+  return setStatus(db, task.id, STATUS_ACTIVE).status;
+}
+
 /** A placement precondition failure (admin `/assign`) → HTTP 422. */
 export class DispatchError extends AppError {
   constructor(message: string, code: string) {
@@ -114,18 +134,25 @@ export function placeTask(db: AppDatabase, taskId: string): DispatchResult {
   }
 
   setPlacement(db, taskId, chosen.agent.id); // SET ONCE
-  const placed = setStatus(db, taskId, STATUS_ACTIVE);
-  return { taskId, placed: true, agentId: chosen.agent.id, status: placed.status, reason: "placed" };
+  const status = activateForPlacement(db, task);
+  return { taskId, placed: true, agentId: chosen.agent.id, status, reason: "placed" };
 }
 
 /**
  * Manual placement (admin `/assign {agent_id}`): pin a SPECIFIC permitted agent.
  * Validates the agent exists, is not `removed`, holds the task's `engine`, and
- * the owner is permitted on it — then pins it once + marks `active`. Set-once is
- * enforced by `setPlacement` (a second, different agent → 409).
+ * the owner is permitted on it — then pins it once + marks `active` (only from
+ * an assignable status — a closed task is never resurrected). Re-assigning the
+ * SAME agent is a full no-op (`already-placed`); set-once is enforced by
+ * `setPlacement` (a second, different agent → 409).
  */
 export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: string): DispatchResult {
   const task = requireTask(db, taskId);
+  if (task.agentId === agentId) {
+    // Idempotent replay of the same assign: report the existing pin and touch
+    // NOTHING — a retried assign must not flip a closed task back to `active`.
+    return { taskId, placed: true, agentId, status: task.status, reason: "already-placed" };
+  }
   const agent = listAgents(db).find(a => a.id === agentId);
   if (!agent || agent.status === "removed") {
     throw new DispatchError(`agent ${agentId} is not available for placement`, "AGENT_UNAVAILABLE");
@@ -137,7 +164,7 @@ export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: stri
     throw new DispatchError(`owner ${task.ownerId} is not permitted on agent ${agentId}`, "NOT_PERMITTED");
   }
 
-  setPlacement(db, taskId, agentId); // SET ONCE (idempotent on same agent; 409 on a different one)
-  const placed = setStatus(db, taskId, STATUS_ACTIVE);
-  return { taskId, placed: true, agentId, status: placed.status, reason: "placed" };
+  setPlacement(db, taskId, agentId); // SET ONCE (409 on a different agent while placed)
+  const status = activateForPlacement(db, task);
+  return { taskId, placed: true, agentId, status, reason: "placed" };
 }

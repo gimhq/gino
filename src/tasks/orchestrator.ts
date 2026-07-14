@@ -43,9 +43,11 @@ function requirePlacement(task: Task): string {
 }
 
 /**
- * True once a `task_upsert` has been emitted for this task (so we seed only
- * once). Reads the durable `tasks.seeded_at` flag — NOT outbox history, which
- * the retention GC deletes once acked.
+ * True once a `task_upsert` has been emitted for this task's CURRENT placement
+ * (so we seed once per placement, not once per task): `setPlacement` clears
+ * `seeded_at` when an orphaned task is re-placed, so the new agent gets a
+ * fresh seed. Reads the durable `tasks.seeded_at` flag — NOT outbox history,
+ * which the retention GC deletes once acked.
  */
 export function hasSeededTask(db: AppDatabase, taskId: string): boolean {
   const row = db
@@ -119,8 +121,11 @@ export interface MessageResult {
  * Deliver input to a task (`message`). Resolves the target thread per OD7+OD9:
  * continue the task's `current_thread_id`, or open a fresh thread (first message
  * on the task, or an explicit `newThread`) and record it as current. The
- * `message` frame carries a `msgId` (set by the outbox) so the host advances its
- * delivery cursor only once the agent `msg_ack`s durable storage.
+ * `message` frame carries a `msgId` (the outbox row id); the agent replies
+ * `msg_ack{msgId}` once it has durably stored the input, which marks THAT row
+ * delivered. Delivery is tracked PER ROW — there is no per-task delivery
+ * cursor; unacked rows are simply replayed on reconnect (at-least-once, the
+ * agent dedupes by `msgId`).
  */
 export function emitMessage(db: AppDatabase, sender: FrameSender, task: Task, input: MessageInput): MessageResult {
   const agentId = requirePlacement(task);
