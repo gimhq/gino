@@ -24,6 +24,7 @@ import { and, eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
 import { outbox } from "@/db/schema";
+import { writeCronPrompt } from "@/msgstore";
 import { ulid } from "@/platform";
 import { enqueue } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
@@ -169,7 +170,9 @@ export interface CronUpsertResult {
  * agent owns, fires, and persists it; the host schedules nothing and keeps only
  * the `cron_state` mirror. `data` carries the schedule + `continuity` (+ the
  * `prompt` work command, additive on the wire). The host mints the `cronId` on
- * create so it can address later upsert/delete commands.
+ * create so it can address later upsert/delete commands. When the command
+ * carries a `prompt` it is persisted into the `crons` mirror here — the
+ * `cron_state` frame never echoes it (HOST-M5M6-09).
  */
 export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task, input: CronUpsertInput): CronUpsertResult {
   const agentId = requirePlacement(task);
@@ -181,6 +184,9 @@ export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task,
     cronId,
     data: input.data,
   });
+  if (input.data.prompt !== undefined) {
+    writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
+  }
   return { cron, cronId };
 }
 
