@@ -19,14 +19,14 @@
 import type { AppDatabase } from "@/db";
 import type { Outbox, Task } from "@/db/schema";
 import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
-import type { FrameSender } from "@/protocol/outbox";
+import type { EnqueuedOutbox, FrameSender } from "@/protocol/outbox";
 import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { DEFAULT_ENGINE, getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine } from "@/configstore";
 import { tasks } from "@/db/schema";
 import { writeCronPrompt } from "@/msgstore";
 import { ulid } from "@/platform";
-import { enqueue } from "@/protocol/outbox";
+import { enqueue, enqueueLiveOnly } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
 import { markSeeded, setCurrentThread } from "./store";
 
@@ -43,9 +43,11 @@ function requirePlacement(task: Task): string {
 }
 
 /**
- * True once a `task_upsert` has been emitted for this task (so we seed only
- * once). Reads the durable `tasks.seeded_at` flag — NOT outbox history, which
- * the retention GC deletes once acked.
+ * True once a `task_upsert` has been emitted for this task's CURRENT placement
+ * (so we seed once per placement, not once per task): `setPlacement` clears
+ * `seeded_at` when an orphaned task is re-placed, so the new agent gets a
+ * fresh seed. Reads the durable `tasks.seeded_at` flag — NOT outbox history,
+ * which the retention GC deletes once acked.
  */
 export function hasSeededTask(db: AppDatabase, taskId: string): boolean {
   const row = db
@@ -109,8 +111,8 @@ export interface MessageInput {
 }
 
 export interface MessageResult {
-  /** The `message` outbox row (carries `msgId`, acked by `msg_ack`). */
-  message: Outbox;
+  /** The `message` outbox row (carries the derived `msgId`, acked by `msg_ack`). */
+  message: EnqueuedOutbox;
   /** The thread the message was delivered on (the task's ongoing thread). */
   threadId: string;
 }
@@ -119,8 +121,11 @@ export interface MessageResult {
  * Deliver input to a task (`message`). Resolves the target thread per OD7+OD9:
  * continue the task's `current_thread_id`, or open a fresh thread (first message
  * on the task, or an explicit `newThread`) and record it as current. The
- * `message` frame carries a `msgId` (set by the outbox) so the host advances its
- * delivery cursor only once the agent `msg_ack`s durable storage.
+ * `message` frame carries a `msgId` (the outbox row id); the agent replies
+ * `msg_ack{msgId}` once it has durably stored the input, which marks THAT row
+ * delivered. Delivery is tracked PER ROW — there is no per-task delivery
+ * cursor; unacked rows are simply replayed on reconnect (at-least-once, the
+ * agent dedupes by `msgId`).
  */
 export function emitMessage(db: AppDatabase, sender: FrameSender, task: Task, input: MessageInput): MessageResult {
   const agentId = requirePlacement(task);
@@ -166,7 +171,7 @@ export function sendTaskMessage(
 export interface CronUpsertInput {
   /** Reuse an existing cron id (update) or omit to mint a new one (create). */
   cronId?: string;
-  data: CronUpsertData & { prompt?: string };
+  data: CronUpsertData;
 }
 
 export interface CronUpsertResult {
@@ -178,13 +183,18 @@ export interface CronUpsertResult {
  * Emit a `cron_upsert` COMMAND. The cron then LIVES ON THE AGENT (OD14): the
  * agent owns, fires, and persists it; the host schedules nothing and keeps only
  * the `cron_state` mirror. `data` carries the schedule + `continuity` (+ the
- * `prompt` work command, additive on the wire). The host mints the `cronId` on
- * create so it can address later upsert/delete commands. When the command
- * carries a `prompt` it is persisted into the `crons` mirror here — the
- * `cron_state` frame never echoes it (HOST-M5M6-09).
+ * `prompt` work command — required, the agent rejects a promptless command).
+ * The host mints the `cronId` on create so it can address later upsert/delete
+ * commands. The `prompt` is persisted into the `crons` mirror here — the
+ * `cron_state` frame never echoes it (HOST-M5M6-09). Like the first message,
+ * the first cron SEEDS a never-seeded task (`task_upsert` before the command)
+ * so the agent has the task row the cron FK-references (HOST-M4-02).
  */
 export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task, input: CronUpsertInput): CronUpsertResult {
   const agentId = requirePlacement(task);
+  if (!hasSeededTask(db, task.id)) {
+    emitTaskUpsert(db, sender, task);
+  }
   const cronId = input.cronId ?? ulid();
   const cron = enqueue(db, sender, {
     agentId,
@@ -193,9 +203,7 @@ export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task,
     cronId,
     data: input.data,
   });
-  if (input.data.prompt !== undefined) {
-    writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
-  }
+  writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
   return { cron, cronId };
 }
 
@@ -207,12 +215,22 @@ export function emitCronDelete(db: AppDatabase, sender: FrameSender, task: Task,
 
 /**
  * Emit an `interrupt` — graceful cancel of the task's current turn (the engine
- * stays alive). Carried with `taskId` so it is scoped to this task (additive on
- * the wire; the agent ignores ids it does not need).
+ * stays alive). Carries `taskId`, which §5 makes NORMATIVE: the agent cancels
+ * only if this task owns the in-flight turn, so another task's work is never
+ * killed (HOST-M1M2-03). The signal is LIVE-ONLY: it requires the agent online
+ * (409 otherwise) and is never replayed on reconnect — a stale cancel must not
+ * fire against an arbitrary future turn (HOST-M4-03).
  */
 export function emitInterrupt(db: AppDatabase, sender: FrameSender, task: Task): Outbox {
   const agentId = requirePlacement(task);
-  return enqueue(db, sender, { agentId, type: "interrupt", taskId: task.id });
+  if (!sender.isOnline(agentId)) {
+    throw new AppError(
+      `agent ${agentId} is offline — interrupt is a live-only signal and cannot be queued`,
+      409,
+      "AGENT_OFFLINE",
+    );
+  }
+  return enqueueLiveOnly(db, sender, { agentId, type: "interrupt", taskId: task.id });
 }
 
 /**

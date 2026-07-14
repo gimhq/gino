@@ -12,7 +12,18 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
     process.exit(subcommandExit);
   }
 
-  const { fetch, websocket, config, logger, db, closeDb } = bootstrap();
+  // Bootstrap failures (config, DB open, the HOST-M9-14 migration lock held by
+  // a concurrent starter) surface as a clean one-line fatal, not an unhandled
+  // rejection — the logger does not exist yet at this point.
+  let boot: ReturnType<typeof bootstrap>;
+  try {
+    boot = bootstrap();
+  }
+  catch (err) {
+    console.error("[gino] bootstrap failed:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  }
+  const { fetch, websocket, config, logger, db, closeDb } = boot;
   logger.info({ ...BUILD_INFO }, "build info");
 
   const server = Bun.serve({

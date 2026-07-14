@@ -157,16 +157,15 @@ export const outbox = sqliteTable("outbox", {
   taskId: text("task_id"),
   threadId: text("thread_id"),
   cronId: text("cron_id"),
-  msgId: integer("msg_id"),
   dataJson: text("data_json", { mode: "json" }).$type<Record<string, unknown>>().notNull(), // at-least-once host→agent
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   ackedAt: integer("acked_at"),
 }, t => [
   // Reconnect replay scan (`agent_id = ? AND acked_at IS NULL`) — partial, so
   // only in-flight rows are indexed and acked history costs nothing.
+  // (`msg_ack{msgId}` keys on the integer PK directly — a message's delivery
+  // id IS its row id — so no dedicated msg_ack index is needed.)
   index("outbox_agent_unacked_idx").on(t.agentId).where(sql`acked_at IS NULL`),
-  // `msg_ack{msgId}` lookup (`msg_id = ? AND agent_id = ?`).
-  index("outbox_msg_ack_idx").on(t.agentId, t.msgId).where(sql`msg_id IS NOT NULL`),
 ]);
 
 export const channels = sqliteTable("channels", {

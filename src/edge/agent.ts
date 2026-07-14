@@ -23,7 +23,7 @@ import {
 } from "@/configstore";
 import { writeAttachmentDescriptors } from "@/msgstore";
 import { generateId } from "@/platform";
-import { handleInboundFrame, ingestHttpFrame } from "@/protocol/inbound";
+import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
 import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
@@ -272,7 +272,7 @@ export function agentRoutes() {
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
           touchLiveness(db, agentId);
-          const replayed = replayUnacked(db, sessions, agentId);
+          const replayed = replayUnacked(db, sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
@@ -327,7 +327,7 @@ export function agentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Post agent output (pre-WS fallback) — routed through M2 inbound",
-      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401) },
+      responses: { 200: { description: "Stored (returns the ack)" }, ...errors(400, 401, 500) },
     }),
     async (c) => {
       const agentId = c.req.param("agentId");
@@ -337,13 +337,24 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       const raw = await c.req.text();
+      // HOST-M1M2-09: only an undecodable frame is 400 (permanently bad — the
+      // agent must drop it); a storage failure propagates to the error handler
+      // as a 5xx so the agent retries the frame.
       try {
         // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
-        return c.json(ingestHttpFrame(c.get("db"), agentId, raw, c.get("webhookPump")?.notifyTask));
+        const pump = c.get("webhookPump");
+        return c.json(ingestHttpFrame(
+          { db: c.get("db"), agentId, logger: c.get("logger"), ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
+          raw,
+        ));
       }
       catch (err) {
-        c.get("logger").warn({ err, agentId }, "agent output fallback: frame rejected");
-        return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed or unprocessable frame" } }, 400);
+        if (err instanceof MalformedFrameError) {
+          c.get("logger").warn({ err, agentId }, "agent output fallback: malformed frame rejected");
+          return c.json({ success: false, error: { code: "BAD_FRAME", message: "malformed frame" } }, 400);
+        }
+        c.get("logger").error({ err, agentId }, "agent output fallback: storage failure (agent should retry)");
+        throw err;
       }
     },
   );

@@ -148,6 +148,7 @@ const ERROR_DESCRIPTIONS: Partial<Record<number, string>> = {
   403: "Forbidden",
   404: "Not found",
   409: "Conflict",
+  410: "Gone",
   413: "Payload too large",
   422: "Validation failed",
   429: "Too many requests",

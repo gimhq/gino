@@ -69,7 +69,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     });
 
     // The production inbound path: store the frame, notify the pump.
-    const ack = ingestHttpFrame(db, agentId, threadMessageFrame(taskId, 1, "hello"), pump.notifyTask);
+    const ack = ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "hello"));
     expect(ack).toEqual({ type: "ack", id: 1 });
     await pump.flush();
 
@@ -106,7 +106,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     });
 
     // A failing receiver → the cursor must NOT move (nothing lost).
-    ingestHttpFrame(db, agentId, threadMessageFrame(taskId, 1, "first"), pump.notifyTask);
+    ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "first"));
     await pump.flush();
     expect(bodies).toHaveLength(1);
     expect(readCursor(db, channelId, taskId)).toBe(0);
@@ -133,7 +133,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     };
     const pump = startWebhookPump({ db, fetchImpl, intervalMs: 60_000 });
 
-    ingestHttpFrame(db, agentId, threadMessageFrame(taskId, 1, "unbound"), pump.notifyTask);
+    ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "unbound"));
     await pump.flush();
     expect(called).toBe(0);
 

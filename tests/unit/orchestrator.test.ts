@@ -2,12 +2,12 @@ import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
 import type { FrameSender } from "@/protocol/outbox";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent } from "@/agents/registry";
+import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
 import { getCron } from "@/msgstore";
-import { gcOutbox, OUTBOX_RETENTION_MS } from "@/protocol/outbox";
+import { gcOutbox, OUTBOX_RETENTION_MS, replayUnacked } from "@/protocol/outbox";
 import {
   broadcastGlobalConfig,
   emitClose,
@@ -158,6 +158,37 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
   });
 });
 
+describe("M4 orchestrator — orphaned task re-placement re-seeds (HOST-M4-05)", () => {
+  it("re-placed task gets a fresh task_upsert seed + a fresh thread on the new agent", () => {
+    const task = placedTask();
+    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    expect(first.taskUpsert).toBeDefined();
+    const oldThread = first.threadId;
+
+    removeAgent(db, agentId); // orphans the task (agent_id → NULL)
+    expect(getTask(db, task.id)?.agentId).toBeNull();
+
+    // Re-place on a NEW agent: the pin resets the seed gate + thread binding.
+    const freshAgent = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+    sender.online.add(freshAgent);
+    setPlacement(db, task.id, freshAgent);
+    expect(hasSeededTask(db, task.id)).toBe(false);
+    expect(getTask(db, task.id)?.currentThreadId).toBeNull();
+
+    // The next message re-seeds the NEW agent and opens a fresh thread —
+    // no dead current_thread_id from the removed agent is carried along.
+    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "again" });
+    expect(second.taskUpsert).toBeDefined();
+    expect(second.taskUpsert!.agentId).toBe(freshAgent);
+    expect(second.threadId).not.toBe(oldThread);
+    expect(getTask(db, task.id)?.currentThreadId).toBe(second.threadId);
+
+    // The new agent's wire history starts with its own seed, then the message.
+    const toFresh = sender.sent.filter(s => s.agentId === freshAgent).map(s => s.frame.type);
+    expect(toFresh).toEqual(["task_upsert", "message"]);
+  });
+});
+
 describe("M4 orchestrator — cron commands + control", () => {
   it("emitCronUpsert mints a cronId + emits the command; cron_delete addresses it", () => {
     const task = placedTask();
@@ -181,13 +212,30 @@ describe("M4 orchestrator — cron commands + control", () => {
     });
     expect(getCron(db, cronId)?.prompt).toBe("daily digest");
 
-    // A later upsert with a new prompt overwrites it …
+    // A later upsert with a new prompt overwrites it.
     emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated", prompt: "weekly digest" } });
     expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
+  });
 
-    // … and one without a prompt leaves it untouched.
-    emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated" } });
-    expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
+  it("first cron on a never-seeded task seeds task_upsert before the command (HOST-M4-02)", () => {
+    const task = placedTask();
+    expect(hasSeededTask(db, task.id)).toBe(false);
+
+    const { cron } = emitCronUpsert(db, sender, task, {
+      data: { kind: "schedule", continuity: "isolated", schedule_value: "0 9 * * *", prompt: "daily" },
+    });
+
+    // The seed frame exists, and it rides the outbox BEFORE the cron command.
+    const rows = db.select().from(outbox).all();
+    const seed = rows.find(r => r.type === "task_upsert");
+    expect(seed).toBeDefined();
+    expect(seed!.taskId).toBe(task.id);
+    expect(seed!.id).toBeLessThan(cron.id);
+    expect(hasSeededTask(db, task.id)).toBe(true);
+
+    // A second cron does not re-seed.
+    emitCronUpsert(db, sender, task, { data: { kind: "schedule", continuity: "isolated", prompt: "weekly" } });
+    expect(db.select().from(outbox).all().filter(r => r.type === "task_upsert")).toHaveLength(1);
   });
 
   it("interrupt + close are task-scoped control frames", () => {
@@ -196,6 +244,33 @@ describe("M4 orchestrator — cron commands + control", () => {
     const close = emitClose(db, sender, task);
     expect(close.type).toBe("close");
     expect(close.taskId).toBe(task.id);
+  });
+
+  it("interrupt is live-only: refused while the agent is offline (HOST-M4-03)", () => {
+    const task = placedTask();
+    sender.online.delete(agentId);
+    let code: string | undefined;
+    try {
+      emitInterrupt(db, sender, task);
+    }
+    catch (err) {
+      code = (err as { code?: string }).code;
+    }
+    expect(code).toBe("AGENT_OFFLINE");
+    expect(db.select().from(outbox).all().filter(r => r.type === "interrupt")).toHaveLength(0);
+  });
+
+  it("interrupt is never replayed on reconnect — no stale cancel (HOST-M4-03)", () => {
+    const task = placedTask();
+    const row = emitInterrupt(db, sender, task);
+    expect(row.ackedAt).not.toBeNull(); // expired at enqueue: at-most-once
+    expect(sender.sent.filter(s => s.frame.type === "interrupt")).toHaveLength(1); // live push happened
+
+    // Reconnect replay pushes nothing for the interrupt.
+    const replaySender = new FakeSender();
+    replaySender.online.add(agentId);
+    replayUnacked(db, replaySender, agentId);
+    expect(replaySender.sent.filter(s => s.frame.type === "interrupt")).toHaveLength(0);
   });
 });
 

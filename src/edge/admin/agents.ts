@@ -147,7 +147,7 @@ export function adminAgentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Stop an agent (OOB — launcher or WS close)",
-      responses: { ...jsonOk(z.any(), "Stopped"), ...errors(401, 404) },
+      responses: { ...jsonOk(z.any(), "Stopped"), ...errors(401, 404, 410) },
     }),
     async (c) => {
       const deps = { db: c.get("db"), sender: sessions, logger: c.get("logger") };
@@ -160,7 +160,7 @@ export function adminAgentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Restart an agent (OOB — launcher or WS close)",
-      responses: { ...jsonOk(z.any(), "Restarted"), ...errors(401, 404) },
+      responses: { ...jsonOk(z.any(), "Restarted"), ...errors(401, 404, 410) },
     }),
     async (c) => {
       const deps = { db: c.get("db"), sender: sessions, logger: c.get("logger") };
@@ -176,7 +176,7 @@ export function adminAgentRoutes() {
       responses: { ...jsonOk(z.any(), "Removed"), ...errors(401, 404) },
     }),
     async (c) => {
-      const deps = { db: c.get("db"), sender: sessions, logger: c.get("logger") };
+      const deps = { db: c.get("db"), sender: sessions, sessions, logger: c.get("logger") };
       return c.json(ok(await removeAgentControl(deps, c.req.param("id"))));
     },
   );
@@ -187,7 +187,7 @@ export function adminAgentRoutes() {
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Grant an owner access to an agent (OD13)",
-      responses: { ...jsonOk(z.any(), "Granted"), ...errors(401, 404, 422) },
+      responses: { ...jsonOk(z.any(), "Granted"), ...errors(401, 404, 410, 422) },
     }),
     validator("json", ownerBody),
     (c) => {

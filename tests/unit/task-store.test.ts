@@ -1,12 +1,13 @@
 import type { AppDatabase } from "@/db";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent } from "@/agents/registry";
+import { enrollAgent, removeAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import {
   createTask,
   getTask,
   listTaskCrons,
   listTasks,
+  markSeeded,
   requireTask,
   setCurrentThread,
   setPlacement,
@@ -102,6 +103,34 @@ describe("M4 store — setPlacement (set-once)", () => {
     }
     expect(code).toBe(409);
     expect(getTask(db, task.id)?.agentId).toBe(a); // unchanged
+  });
+
+  it("re-placing an orphaned task resets seeded_at + current_thread_id (HOST-M4-05)", () => {
+    const a = agentId();
+    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    setPlacement(db, task.id, a);
+    markSeeded(db, task.id);
+    setCurrentThread(db, task.id, "thread-old");
+
+    removeAgent(db, a); // orphans the task: agent_id → NULL
+    expect(getTask(db, task.id)?.agentId).toBeNull();
+
+    // The new pin must not drag the removed agent's seed/thread state along.
+    const repinned = setPlacement(db, task.id, agentId());
+    expect(repinned.seededAt).toBeNull();
+    expect(repinned.currentThreadId).toBeNull();
+  });
+
+  it("re-pinning the SAME agent keeps the seed + thread state (no reset)", () => {
+    const a = agentId();
+    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    setPlacement(db, task.id, a);
+    markSeeded(db, task.id);
+    setCurrentThread(db, task.id, "thread-1");
+
+    const again = setPlacement(db, task.id, a);
+    expect(again.seededAt).not.toBeNull();
+    expect(again.currentThreadId).toBe("thread-1");
   });
 });
 
