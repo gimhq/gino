@@ -14,6 +14,7 @@
 // `spawn` seam — tests mock it, so NO real docker is required (and the binary is
 // never touched at import time; only on an actual op).
 import type { InspectState, Launcher, LaunchRequest, LaunchResult } from "./types";
+import process from "node:process";
 
 /** Result of a shelled-out command — the surface the `spawn` seam returns. */
 export interface SpawnResult {
@@ -22,8 +23,35 @@ export interface SpawnResult {
   readonly stderr: string;
 }
 
+/**
+ * Options handed through the `spawn` seam. `signal` aborts (kills) the child —
+ * the launcher fires it on the per-op deadline (HOST-M3-10). `env` is EXTRA
+ * child environment, merged over the host process env — secrets ride here
+ * instead of the argv (HOST-M3-11).
+ */
+export interface SpawnOptions {
+  readonly signal?: AbortSignal;
+  readonly env?: Record<string, string>;
+}
+
 /** The single shell-out seam. Production uses `Bun.spawn`; tests inject a fake. */
-export type SpawnFn = (cmd: readonly string[]) => Promise<SpawnResult>;
+export type SpawnFn = (cmd: readonly string[], opts?: SpawnOptions) => Promise<SpawnResult>;
+
+/**
+ * Thrown when a docker CLI call exceeds the per-op deadline (HOST-M3-10). The
+ * child is killed; callers (the M3 control layer) can catch this DISTINCT
+ * error and degrade — e.g. fall back to a WS `close` — instead of hanging on
+ * a wedged docker daemon.
+ */
+export class DockerOpTimeoutError extends Error {
+  constructor(op: string, timeoutMs: number) {
+    super(`docker ${op} timed out after ${timeoutMs}ms`);
+    this.name = "DockerOpTimeoutError";
+  }
+}
+
+/** Default per-op deadline. Overridable via `DockerLauncherOptions.opTimeoutMs`. */
+export const DEFAULT_DOCKER_OP_TIMEOUT_MS = 30_000;
 
 /**
  * Construction options. The docker binary, default image, extra `docker run`
@@ -40,6 +68,8 @@ export interface DockerLauncherOptions {
   readonly runArgs?: readonly string[];
   /** Shell-out seam (defaults to `Bun.spawn`). Tests inject a fake. */
   readonly spawn?: SpawnFn;
+  /** Per-op deadline in ms (HOST-M3-10). Default `DEFAULT_DOCKER_OP_TIMEOUT_MS`. */
+  readonly opTimeoutMs?: number;
 }
 
 /** The launcher `kind` selected by `agents.launcher_kind = "docker"`. */
@@ -51,14 +81,28 @@ const RE_TRAILING_SLASH = /\/+$/;
  * Default shell-out via `Bun.spawn`. Only reached when an op actually runs
  * (never at import), so the docker binary is not required to load the module.
  */
-async function bunSpawn(cmd: readonly string[]): Promise<SpawnResult> {
-  const proc = Bun.spawn([...cmd], { stdout: "pipe", stderr: "pipe", stdin: "ignore" });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
-  return { exitCode, stdout, stderr };
+async function bunSpawn(cmd: readonly string[], opts?: SpawnOptions): Promise<SpawnResult> {
+  const proc = Bun.spawn([...cmd], {
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+    // Extra env (secrets, HOST-M3-11) merged over the host env so the docker
+    // CLI keeps PATH/DOCKER_HOST while the values stay off its argv.
+    ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
+  });
+  const onAbort = () => proc.kill();
+  opts?.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    return { exitCode, stdout, stderr };
+  }
+  finally {
+    opts?.signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 /**
@@ -72,10 +116,37 @@ export function createDockerLauncher(opts: DockerLauncherOptions = {}): Launcher
   const spawn = opts.spawn ?? bunSpawn;
   const runArgs = opts.runArgs ?? [];
   const defaultImage = opts.image;
+  const opTimeoutMs = opts.opTimeoutMs ?? DEFAULT_DOCKER_OP_TIMEOUT_MS;
+
+  /**
+   * Shell out with the per-op deadline (HOST-M3-10): the abort signal kills
+   * the child, and the op rejects with the distinct `DockerOpTimeoutError` —
+   * even if the injected `spawn` ignores the signal — so a wedged docker
+   * daemon can never hang an admin control op forever.
+   */
+  async function spawnWithDeadline(args: readonly string[], env?: Record<string, string>): Promise<SpawnResult> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), opTimeoutMs);
+    try {
+      return await Promise.race([
+        spawn([docker, ...args], { signal: controller.signal, ...(env ? { env } : {}) }),
+        new Promise<never>((_, reject) => {
+          controller.signal.addEventListener(
+            "abort",
+            () => reject(new DockerOpTimeoutError(args[0] ?? "op", opTimeoutMs)),
+            { once: true },
+          );
+        }),
+      ]);
+    }
+    finally {
+      clearTimeout(timer);
+    }
+  }
 
   /** Run a docker subcommand, throwing on a non-zero exit (caller handles inspect's soft path). */
-  async function run(args: readonly string[]): Promise<SpawnResult> {
-    const res = await spawn([docker, ...args]);
+  async function run(args: readonly string[], env?: Record<string, string>): Promise<SpawnResult> {
+    const res = await spawnWithDeadline(args, env);
     if (res.exitCode !== 0) {
       const detail = res.stderr.trim() || res.stdout.trim();
       throw new Error(`docker ${args[0]} failed (exit ${res.exitCode})${detail ? `: ${detail}` : ""}`);
@@ -108,9 +179,13 @@ export function createDockerLauncher(opts: DockerLauncherOptions = {}): Launcher
         ANTHROPIC_BASE_URL: llmBase,
         OPENAI_BASE_URL: llmBase,
       };
-      const envArgs = Object.entries(env).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+      // HOST-M3-11: value-less `-e KEY` — docker inherits each value from the
+      // CLI process env (supplied via the spawn seam's `env`), so no secret
+      // (the register token above all) ever appears on the docker argv, where
+      // it would be world-readable via /proc/<pid>/cmdline.
+      const envArgs = Object.keys(env).flatMap(k => ["-e", k]);
 
-      const res = await run(["run", "-d", ...envArgs, ...runArgs, image]);
+      const res = await run(["run", "-d", ...envArgs, ...runArgs, image], env);
       const ref = res.stdout.trim();
       if (!ref) {
         throw new Error("docker run -d returned no container id");
@@ -133,10 +208,16 @@ export function createDockerLauncher(opts: DockerLauncherOptions = {}): Launcher
     },
 
     // Coarse runtime state from `docker inspect`. A docker error (e.g. the
-    // container is gone) maps to `unknown` rather than throwing — the control
-    // layer treats `inspect` as best-effort observation.
+    // container is gone) — or a per-op timeout — maps to `unknown` rather than
+    // throwing — the control layer treats `inspect` as best-effort observation.
     async inspect(ref: string): Promise<InspectState> {
-      const res = await spawn([docker, "inspect", "-f", "{{.State.Status}}", ref]);
+      let res: SpawnResult;
+      try {
+        res = await spawnWithDeadline(["inspect", "-f", "{{.State.Status}}", ref]);
+      }
+      catch {
+        return "unknown";
+      }
       if (res.exitCode !== 0) {
         return "unknown";
       }

@@ -33,11 +33,11 @@ const config = loadConfigStrict({
 let db: AppDatabase;
 let app: ReturnType<typeof createApp>;
 
-/** Captured docker argv across the suite (the recording `spawn` pushes here). */
-let spawnCalls: string[][] = [];
+/** Captured docker argv + spawn env across the suite (the recording `spawn` pushes here). */
+let spawnCalls: { cmd: string[]; env: Record<string, string> | undefined }[] = [];
 
-const recordingSpawn: SpawnFn = async (cmd) => {
-  spawnCalls.push([...cmd]);
+const recordingSpawn: SpawnFn = async (cmd, opts) => {
+  spawnCalls.push({ cmd: [...cmd], env: opts?.env });
   // `docker run -d` (the only command the launch path issues) prints the id.
   return { exitCode: 0, stdout: "ctr-launch-1\n", stderr: "" };
 };
@@ -107,14 +107,22 @@ describe("D-B2b /admin/agents/launch — auth + wiring", () => {
     expect(body.data.nonce).toMatch(/^[0-9a-f]{48}$/); // 24 bytes hex
 
     // The launcher shelled out `docker run -d` with the host-generated nonce
-    // and the host-authoritative bootstrap env (NEVER the client's register token).
+    // and the host-authoritative bootstrap env (NEVER the client's register
+    // token). Values ride the spawn env, not the argv (HOST-M3-11): the argv
+    // only names the keys via value-less `-e`.
     expect(spawnCalls).toHaveLength(1);
-    const cmd = spawnCalls[0]!;
+    const { cmd, env } = spawnCalls[0]!;
     expect(cmd.slice(0, 3)).toEqual(["docker", "run", "-d"]);
-    expect(cmd).toContain("GINO_HOST_URL=https://host.example");
-    expect(cmd).toContain(`GINO_REGISTER_TOKEN=${REGISTER_TOKEN}`);
-    expect(cmd).toContain(`GINO_LAUNCH_NONCE=${body.data.nonce}`);
-    expect(cmd).toContain("ANTHROPIC_BASE_URL=https://host.example/llm");
+    for (const key of ["GINO_HOST_URL", "GINO_REGISTER_TOKEN", "GINO_LAUNCH_NONCE", "ANTHROPIC_BASE_URL"]) {
+      expect(cmd).toContain(key);
+    }
+    expect(cmd.some(arg => arg.includes(REGISTER_TOKEN))).toBe(false);
+    expect(env).toMatchObject({
+      GINO_HOST_URL: "https://host.example",
+      GINO_REGISTER_TOKEN: REGISTER_TOKEN,
+      GINO_LAUNCH_NONCE: body.data.nonce,
+      ANTHROPIC_BASE_URL: "https://host.example/llm",
+    });
   });
 
   it("422 when hostUrl is missing (route is validated)", async () => {
