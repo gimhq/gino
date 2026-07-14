@@ -27,6 +27,18 @@ export function isAllowedUpstreamPath(pathname: string): boolean {
   return ALL_ALLOWED_PREFIXES.some(p => pathname.startsWith(p));
 }
 
+// Paths on which a client-presented Anthropic temp key is forwarded AS-IS to
+// Anthropic (which validates it). Everywhere else — the OAuth exchange, the
+// OpenAI endpoints, the Codex WS relay — the host injects its OWN credential,
+// so a bare `sk-ant-` prefix must never count as authentication there
+// (HOST-M7-01: a forged key would spend the host's credentials).
+const ANTHROPIC_PASSTHROUGH_PREFIXES = ["/v1/messages", "/v1/models"];
+
+/** True if `pathname` forwards a client Anthropic temp key as-is (never injects host credentials). */
+export function isAnthropicPassthroughPath(pathname: string): boolean {
+  return ANTHROPIC_PASSTHROUGH_PREFIXES.some(p => pathname.startsWith(p));
+}
+
 /**
  * Detect which upstream a request targets, given the `/llm`-stripped path and
  * the request headers:
@@ -73,8 +85,10 @@ export function extractProxyCredential(headers: Headers): string | undefined {
 
 /**
  * True for a real Anthropic key that is NOT the proxy placeholder — i.e. a temp
- * `sk-ant-...` API key the engine obtained from the OAuth exchange step. These
- * pass through proxy auth (they authenticate directly against Anthropic).
+ * `sk-ant-...` API key the engine obtained from the OAuth exchange step. Such a
+ * key is only accepted on Anthropic pass-through paths (where Anthropic itself
+ * validates it) and never authorizes host-credential injection — see
+ * `verifyProxyCredential` and the bridge guard in `handler.ts`.
  */
 export function isAnthropicTempKey(headers: Headers): boolean {
   const apiKey = headers.get("x-api-key");

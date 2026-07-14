@@ -5,6 +5,7 @@ import {
   detectProvider,
   extractProxyCredential,
   isAllowedUpstreamPath,
+  isAnthropicPassthroughPath,
   isAnthropicTempKey,
   isPrivateUpstreamHost,
 } from "@/proxy";
@@ -20,6 +21,15 @@ describe("M7 proxy/provider — path allow-list", () => {
   it("rejects unknown subpaths", () => {
     for (const p of ["/", "/v1/embeddings", "/admin", "/v2/messages", "/api/other"])
       expect(isAllowedUpstreamPath(p)).toBe(false);
+  });
+
+  it("pass-through paths are the anthropic-direct ones only (temp-key auth scope)", () => {
+    expect(isAnthropicPassthroughPath("/v1/messages")).toBe(true);
+    expect(isAnthropicPassthroughPath("/v1/models")).toBe(true);
+    // Host-credential-injecting paths must never be temp-key-authenticated.
+    expect(isAnthropicPassthroughPath("/api/oauth/token")).toBe(false);
+    expect(isAnthropicPassthroughPath("/v1/chat/completions")).toBe(false);
+    expect(isAnthropicPassthroughPath("/v1/responses")).toBe(false);
   });
 });
 

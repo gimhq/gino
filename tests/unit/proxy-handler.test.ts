@@ -147,6 +147,24 @@ describe("M7 proxy/handler — bridge + errors", () => {
     expect(calls).toHaveLength(0); // bridged via WS, not the HTTP forward
   });
 
+  it("never bridges for a temp-key caller — the key passes through to anthropic instead (HOST-M7-01)", async () => {
+    const config = makeConfig({ modelMap: { "gpt-mini": { provider: "openai", model: "gpt-5-codex-mini" } } });
+    const { calls, fetchImpl } = recordingFetch();
+    const handler = createProxyHandler({ config, credentials: new CredentialStore(config), fetchImpl, wsFactory: noopWs });
+    const req = new Request("http://host/api/llm/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": "sk-ant-api03-temp" },
+      body: JSON.stringify({ model: "gpt-mini", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const res = await handler.handle(req, "/v1/messages", "");
+    expect(res.headers.get("x-bridge-provider")).toBeNull();
+    expect(calls).toHaveLength(1); // direct forward, not the bridge
+    expect(calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
+    const h = reqHeaders(calls[0]!.init);
+    expect(h.get("x-api-key")).toBe("sk-ant-api03-temp"); // client key as-is — no host credential injected
+    expect(h.get("authorization")).toBeNull();
+  });
+
   it("returns 404 for a path outside the allow-list", async () => {
     const config = makeConfig();
     const { fetchImpl } = recordingFetch();
