@@ -125,6 +125,42 @@ describe("M4 orchestrator — message threading (OD7+OD9)", () => {
   });
 });
 
+describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOST-M4-04)", () => {
+  it("every message frame carries a host-minted threadId — the absent-threadId wire path is never used", () => {
+    const task = placedTask();
+    emitMessage(db, sender, task, { text: "first" });
+    emitMessage(db, sender, getTask(db, task.id)!, { text: "continue" });
+    emitMessage(db, sender, getTask(db, task.id)!, { text: "fresh", newThread: true });
+
+    const wires = sender.sent.filter(s => s.frame.type === "message").map(s => s.frame);
+    expect(wires).toHaveLength(3);
+    for (const wire of wires) {
+      expect(wire.threadId).toMatch(/^[0-9a-z]{26}$/); // present on EVERY message, host-minted ULID (§5)
+    }
+  });
+
+  it("records the minted id as current_thread_id BEFORE the frame is pushed to the wire", () => {
+    // §5: the binding must be durable before emission — the agent creates the
+    // thread on first sight, so a crash after the record but before the send
+    // re-sends under the SAME id instead of forking the conversation.
+    const task = placedTask();
+    const currentAtSend: Array<string | null> = [];
+    const observingSender: FrameSender = {
+      isOnline: () => true,
+      send: (_agent, frame) => {
+        if (frame.type === "message") {
+          currentAtSend.push(getTask(db, task.id)?.currentThreadId ?? null);
+        }
+        return true;
+      },
+    };
+
+    const first = emitMessage(db, observingSender, task, { text: "hello" });
+    const fresh = emitMessage(db, observingSender, getTask(db, task.id)!, { text: "restart", newThread: true });
+    expect(currentAtSend).toEqual([first.threadId, fresh.threadId]);
+  });
+});
+
 describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
   it("first message seeds task_upsert + message; subsequent messages do not re-seed", () => {
     const task = placedTask();

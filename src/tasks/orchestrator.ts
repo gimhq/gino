@@ -132,7 +132,10 @@ export function emitMessage(db: AppDatabase, sender: FrameSender, task: Task, in
 
   let threadId = task.currentThreadId ?? null;
   if (threadId == null || input.newThread) {
-    threadId = ulid(); // host opens the conversation's thread (globally unique, §6)
+    // The HOST mints conversation thread ids (§5, HOST-M1M2-02/HOST-M4-04): the
+    // agent creates-on-first-sight, so the binding is recorded durable BEFORE
+    // the frame is emitted — a crash between the two re-sends under the same id.
+    threadId = ulid();
     setCurrentThread(db, task.id, threadId);
   }
 
