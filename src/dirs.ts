@@ -11,21 +11,29 @@ import { fileURLToPath } from "node:url";
  * This is a single-root project (no monorepo): `src/` sits at the repo
  * root, so `drizzle/` and `data/` resolve relative to `../`.
  */
+// import.meta.url is always available (works in Bun, Node, Vite).
+const THIS_DIR = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * True when running inside a compiled binary (`bun build --compile`), where
+ * modules live in Bun's virtual filesystem. Consumers must not trust
+ * cwd-relative code assets (e.g. a `drizzle/` tree) in this mode — see
+ * HOST-M9-13.
+ */
+export const IS_COMPILED = THIS_DIR.startsWith("/$bunfs");
+
 function detectRootDir(): string {
   if (process.env.ROOT_DIR) {
     return resolve(process.env.ROOT_DIR);
   }
 
-  // import.meta.url is always available (works in Bun, Node, Vite).
-  const thisDir = dirname(fileURLToPath(import.meta.url));
-
   // Compiled binary: Bun virtual filesystem.
-  if (thisDir.startsWith("/$bunfs")) {
+  if (IS_COMPILED) {
     return process.cwd();
   }
 
   // Dev / test: this file is at <root>/src/dirs.ts → go up one level.
-  return resolve(thisDir, "..");
+  return resolve(THIS_DIR, "..");
 }
 
 export const ROOT_DIR = detectRootDir();

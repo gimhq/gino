@@ -1,12 +1,12 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { Database } from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { BUILD_INFO } from "../build-info";
-import { ROOT_DIR } from "../dirs";
+import { IS_COMPILED, ROOT_DIR } from "../dirs";
 import { embeddedMigrations } from "./embedded-migrations";
 import * as schema from "./schema";
 
@@ -19,7 +19,7 @@ import * as schema from "./schema";
  *
  * `:memory:` is passed through untouched for ephemeral test databases.
  */
-export function createDb(path: string): AppDatabase {
+export function createDb(path: string, opts: { migrationLockTimeoutMs?: number } = {}): AppDatabase {
   if (path !== ":memory:") {
     const dir = dirname(path);
     if (!existsSync(dir)) {
@@ -55,10 +55,26 @@ export function createDb(path: string): AppDatabase {
   // Pre-migration snapshot (host-upgrade-design.md §7): on a version change, back
   // up the existing DB BEFORE the new code migrates it, so a rollback to the
   // previous version still finds a compatible schema. Then migrate, then record
-  // the version that owns the on-disk schema.
-  snapshotOnVersionChange(sqlite, path, BUILD_INFO.version);
-  runMigrations(db);
-  recordDbVersion(path, BUILD_INFO.version);
+  // the version that owns the on-disk schema. The whole window is serialized
+  // across processes (HOST-M9-14): a concurrent start waits for the holder to
+  // finish migrating, then proceeds against the already-migrated file.
+  try {
+    const releaseLock = path === ":memory:"
+      ? null
+      : acquireMigrationLock(path, opts.migrationLockTimeoutMs);
+    try {
+      snapshotOnVersionChange(sqlite, path, BUILD_INFO.version);
+      runMigrations(db);
+      recordDbVersion(path, BUILD_INFO.version);
+    }
+    finally {
+      releaseLock?.();
+    }
+  }
+  catch (err) {
+    sqlite.close();
+    throw err;
+  }
 
   return Object.assign(db, {
     close: () => sqlite.close(),
@@ -121,13 +137,120 @@ export function recordDbVersion(dbPath: string, version: string): void {
 
 type DrizzleDb = ReturnType<typeof drizzle<typeof schema>>;
 
-function runMigrations(db: DrizzleDb): void {
-  const fsMigrationsFolder = resolve(ROOT_DIR, "drizzle");
-  const journalPath = resolve(fsMigrationsFolder, "meta/_journal.json");
+/**
+ * Cross-process guard around the snapshot + migrate window (HOST-M9-14): an
+ * exclusively-created (`O_EXCL`) pidfile beside the DB. A SQLite
+ * `BEGIN EXCLUSIVE` on a sidecar file would be the natural choice, but
+ * bun:sqlite's VFS does not place OS file locks, so its transactions are
+ * invisible to other processes — verified empirically (a concurrent `sqlite3`
+ * CLI writes straight through a held `BEGIN EXCLUSIVE`).
+ *
+ * A concurrent starter polls up to `busyTimeoutMs` for the holder to finish,
+ * then fails with a clear error. A lock left behind by a crashed holder is
+ * detected via pid liveness and reclaimed immediately.
+ */
+export function acquireMigrationLock(dbPath: string, busyTimeoutMs = 30_000): () => void {
+  const lockPath = `${dbPath}.lock`;
+  const deadline = Date.now() + busyTimeoutMs;
+  while (true) {
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      writeSync(fd, `${process.pid}\n`);
+      closeSync(fd);
+      return () => {
+        try {
+          unlinkSync(lockPath);
+        }
+        catch {}
+      };
+    }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST")
+        throw err;
+    }
+    // Lock exists. Reclaim it right away when the holder is dead; otherwise
+    // wait for it to finish, up to the deadline.
+    const holderPid = readLockPid(lockPath);
+    if (holderPid !== null && !isProcessAlive(holderPid)) {
+      try {
+        unlinkSync(lockPath);
+      }
+      catch {}
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `another gino process holds the migration lock (${lockPath}`
+        + `${holderPid ? `, pid ${holderPid}` : ""}); wait for it to finish `
+        + `starting up, then retry — or delete the file if that process is gone`,
+      );
+    }
+    Bun.sleepSync(Math.min(100, deadline - Date.now()));
+  }
+}
 
-  if (existsSync(journalPath)) {
-    migrate(db, { migrationsFolder: fsMigrationsFolder });
-    return;
+function readLockPid(lockPath: string): number | null {
+  try {
+    const pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  }
+  catch {
+    return null;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  }
+  catch (err) {
+    // EPERM: the pid exists but belongs to another user — still alive.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Materialize an embedded-migrations map into a fresh private temp directory
+ * so drizzle's folder-based migrator can read it. `mkdtemp` yields an
+ * unpredictable, owner-only (0700) directory, so a local attacker cannot
+ * pre-create it or swap contents between write and migrate (HOST-M9-06).
+ * The caller removes the directory when done.
+ */
+export function materializeEmbeddedMigrations(migrations: ReadonlyMap<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), "gino-migrations-"));
+  for (const [name, content] of migrations) {
+    const filePath = resolve(dir, name);
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, content);
+  }
+  return dir;
+}
+
+/**
+ * Apply migrations from the right source. Packaged builds — the compiled
+ * binary (`/$bunfs`) or the `bun run package` bundle, both of which carry a
+ * populated `embeddedMigrations` map — use the embedded set exclusively, so a
+ * stale, foreign, or attacker-planted `drizzle/` tree in the working
+ * directory can never reach the database (HOST-M9-13). Only a dev/test run
+ * (empty stub map) reads `<ROOT_DIR>/drizzle` from disk.
+ *
+ * Exported for tests; runtime callers use the defaults.
+ */
+export function runMigrations(
+  db: DrizzleDb,
+  opts: { compiled?: boolean; embedded?: ReadonlyMap<string, string>; rootDir?: string } = {},
+): void {
+  const compiled = opts.compiled ?? IS_COMPILED;
+  const embedded = opts.embedded ?? embeddedMigrations;
+  const rootDir = opts.rootDir ?? ROOT_DIR;
+
+  if (!compiled && embedded.size === 0) {
+    const fsMigrationsFolder = resolve(rootDir, "drizzle");
+    if (existsSync(resolve(fsMigrationsFolder, "meta/_journal.json"))) {
+      migrate(db, { migrationsFolder: fsMigrationsFolder });
+      return;
+    }
   }
 
   // Package path: `scripts/package.ts` writes the migration files into
@@ -136,13 +259,14 @@ function runMigrations(db: DrizzleDb): void {
   // worktree where the stub was restored but `drizzle/` was excluded — would
   // otherwise boot with an empty map and crash later on its first DB write.
   // Fail fast with a concrete fix.
-  if (embeddedMigrations.size === 0) {
+  if (embedded.size === 0) {
     throw new Error(
       "No migrations available: filesystem drizzle/ folder is missing and the "
       + "compiled binary has no embedded migrations. This binary was built "
       + "outside `bun run package` (which populates embedded-migrations.ts at "
       + "build time) or against a worktree without `drizzle/`. Run "
-      + "`bun run package` to rebuild, or mount the project's drizzle/ folder.",
+      + "`bun run package` to rebuild, or restore the repo's drizzle/ folder "
+      + "for dev runs.",
     );
   }
 
@@ -150,21 +274,15 @@ function runMigrations(db: DrizzleDb): void {
   // the compile step finished writing the full set, not just a truncated
   // prefix. Drizzle's migrator reads it first, so a missing journal here
   // would silently no-op.
-  if (!embeddedMigrations.has("meta/_journal.json")) {
+  if (!embedded.has("meta/_journal.json")) {
     throw new Error(
       "Embedded migrations are corrupt: meta/_journal.json missing. "
       + "Rebuild the bundle with `bun run package`.",
     );
   }
 
-  const tmpMigrations = resolve(tmpdir(), `gino-migrations-${process.pid}`);
+  const tmpMigrations = materializeEmbeddedMigrations(embedded);
   try {
-    mkdirSync(resolve(tmpMigrations, "meta"), { recursive: true });
-    for (const [name, content] of embeddedMigrations) {
-      const filePath = resolve(tmpMigrations, name);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, content);
-    }
     migrate(db, { migrationsFolder: tmpMigrations });
   }
   finally {
