@@ -22,7 +22,8 @@ import { ForbiddenError, UnauthorizedError } from "@/shared/lib/errors";
 
 const BEARER_PREFIX = "bearer ";
 
-function bearerToken(c: Context<AppEnv>): string | null {
+/** Extract the `Authorization: Bearer` token, or null. Shared with the rate-limit keyers. */
+export function bearerToken(c: Context<AppEnv>): string | null {
   const header = c.req.header("authorization")?.trim();
   if (!header || !header.toLowerCase().startsWith(BEARER_PREFIX))
     return null;

@@ -60,6 +60,18 @@ export const configSchema = z.object({
   // means "any peer is trusted".
   TRUSTED_PROXY_IPS: z.string().default(""),
 
+  // ─── Edge rate limits (HOST-M1M2-10 / HOST-M9-02 / HOST-M7-03) ───
+  // Fixed-window budgets enforced by `src/shared/middleware/rate-limit.ts`.
+  // Keyed per verified principal where one exists (connect/channel token),
+  // otherwise per client IP. Defaults are deliberately generous — they bound
+  // brute force and runaway retry loops without throttling normal traffic.
+  RATE_LIMIT_REGISTER_MAX: z.coerce.number().int().min(1).default(30),
+  RATE_LIMIT_REGISTER_WINDOW_MS: z.coerce.number().int().min(1).default(60_000),
+  RATE_LIMIT_LLM_MAX: z.coerce.number().int().min(1).default(300),
+  RATE_LIMIT_LLM_WINDOW_MS: z.coerce.number().int().min(1).default(60_000),
+  RATE_LIMIT_MESSAGES_MAX: z.coerce.number().int().min(1).default(300),
+  RATE_LIMIT_MESSAGES_WINDOW_MS: z.coerce.number().int().min(1).default(60_000),
+
   // ─── M7 — credential proxy (`/llm/*`) ───
   // The host holds the real upstream LLM credentials; the engine reaches the
   // proxy via ANTHROPIC_BASE_URL/OPENAI_BASE_URL = `<hostUrl>/llm` and never
