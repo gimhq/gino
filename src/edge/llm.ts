@@ -8,12 +8,18 @@ import { buildProxyConfig, createCodexRelay, createProxyHandler, CredentialStore
 import { UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, raw, TAGS } from "@/shared/lib/openapi";
 
-/** Validate the engine's proxy credential; 401 (UnauthorizedError) on failure. */
+/**
+ * Validate the engine's proxy credential; 401 (UnauthorizedError) on failure.
+ * Auth is path-aware: an Anthropic temp key only clears the pass-through
+ * paths, never the host-credential-injecting ones (HOST-M7-01).
+ */
 const proxyAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const config = c.get("config");
+  const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
   const ok = verifyProxyCredential(c.req.raw.headers, {
     db: c.get("db"),
-    staticKey: c.get("config").PROXY_STATIC_KEY || undefined,
-  });
+    staticKey: config.PROXY_STATIC_KEY || undefined,
+  }, pathname);
   if (!ok)
     throw new UnauthorizedError();
   await next();

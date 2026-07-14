@@ -4,7 +4,10 @@ import type { AppDatabase } from "@/db";
 // or `x-api-key: sk-ant-proxy-<token>`, or `Authorization: Bearer <token>`),
 // validated against `agents.connect_token_hash`; OR with a configured static
 // proxy key. A real Anthropic temp key (`sk-ant-...`, from a prior OAuth
-// exchange) is also accepted and forwarded as-is.
+// exchange) is accepted ONLY on Anthropic pass-through paths, where it is
+// forwarded as-is and Anthropic itself validates it (HOST-M7-01: the host
+// cannot verify a temp key, so it must never gate a path that injects the
+// host's own credentials).
 //
 // Self-contained: a DIRECT read-only query on the `agents` table (no dependency
 // on the M3 registry, which isn't built yet). Constant-time comparison for the
@@ -12,7 +15,7 @@ import type { AppDatabase } from "@/db";
 import { and, eq, ne } from "drizzle-orm";
 import { agents } from "@/db/schema";
 import { hashToken, safeEqual } from "@/platform";
-import { extractProxyCredential, isAnthropicTempKey } from "./provider";
+import { extractProxyCredential, isAnthropicPassthroughPath, isAnthropicTempKey } from "./provider";
 
 export interface ProxyAuthOpts {
   readonly db: AppDatabase;
@@ -20,15 +23,19 @@ export interface ProxyAuthOpts {
 }
 
 /**
- * True if the request carries a valid proxy credential. Resolution order:
- *   1. A real Anthropic temp key (`sk-ant-...`, not the proxy placeholder) →
- *      accepted (it authenticates directly against Anthropic; forwarded as-is).
+ * True if the request carries a valid proxy credential. `pathname` is the
+ * `/llm`-stripped upstream subpath. Resolution order:
+ *   1. A real Anthropic temp key (`sk-ant-...`, not the proxy placeholder),
+ *      ONLY on an Anthropic pass-through path → accepted (it is forwarded
+ *      as-is and authenticates directly against Anthropic). On any other path
+ *      the host injects its own credentials, so the unverifiable prefix grants
+ *      nothing.
  *   2. The configured static proxy key (constant-time compare).
  *   3. A per-agent connect token whose sha-256 matches a non-removed agent's
  *      `connect_token_hash`.
  */
-export function verifyProxyCredential(headers: Headers, opts: ProxyAuthOpts): boolean {
-  if (isAnthropicTempKey(headers))
+export function verifyProxyCredential(headers: Headers, opts: ProxyAuthOpts, pathname: string): boolean {
+  if (isAnthropicTempKey(headers) && isAnthropicPassthroughPath(pathname))
     return true;
 
   const cred = extractProxyCredential(headers);
