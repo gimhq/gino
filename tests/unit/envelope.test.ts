@@ -74,6 +74,15 @@ describe("M2 envelope — encode", () => {
     expect(frame.outboxId).toBeUndefined();
   });
 
+  // HOST-M1M2-07 / HOST-M4-07: the delivery id is derived from the row id, so
+  // even a row whose msg_id column was never back-filled (the pre-fix crash
+  // window) encodes to an ackable frame instead of an id-less one.
+  it("a message row with msg_id NULL still carries msgId = row id on the wire", () => {
+    const frame = encodeOutbox(outboxRow({ id: 12, type: "message", msgId: null, taskId: "t-1", dataJson: { text: "hi" } }));
+    expect(frame.msgId).toBe(12);
+    expect(frame.outboxId).toBeUndefined();
+  });
+
   it("a delete frame (no data) is envelope-only", () => {
     const frame = encodeOutbox(outboxRow({ id: 9, type: "task_delete", taskId: "t-1", dataJson: {} }));
     expect(frame).toEqual({ type: "task_delete", outboxId: 9, taskId: "t-1" });

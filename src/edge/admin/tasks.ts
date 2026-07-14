@@ -23,7 +23,7 @@ import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
 import { sessions } from "@/agents/sessions";
-import { getCron, getTaskThreads, getThreadRun, getTranscriptPage, getTranscriptStats } from "@/msgstore";
+import { getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, TRANSCRIPT_READ_LIMIT } from "@/msgstore";
 import { ok } from "@/shared/lib/api-response";
 import { AppError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
@@ -137,14 +137,13 @@ function requireCron(db: AppDatabase, taskId: string, cronId: string): Cron {
   return cron;
 }
 
-/** Transcript paging bounds for the task detail view (HOST-M1M2-16). */
+/** Default page size for the task detail transcript read (HOST-M1M2-16); the hard cap is `TRANSCRIPT_READ_LIMIT`. */
 const TRANSCRIPT_PAGE_LIMIT = 200;
-const TRANSCRIPT_PAGE_MAX = 1000;
 
 const detailQuery = z.object({
   thread: z.string().min(1).optional(),
   after: z.coerce.number().int().nonnegative().optional(),
-  limit: z.coerce.number().int().positive().max(TRANSCRIPT_PAGE_MAX).optional(),
+  limit: z.coerce.number().int().positive().max(TRANSCRIPT_READ_LIMIT).optional(),
 });
 
 export function adminTaskRoutes() {
@@ -222,8 +221,8 @@ export function adminTaskRoutes() {
         if (!threadIds.includes(q.thread)) {
           throw new AppError(`thread ${q.thread} not found on task ${id}`, 404, "THREAD_NOT_FOUND");
         }
-        const page = getTranscriptPage(db, q.thread, {
-          ...(q.after != null ? { after: q.after } : {}),
+        const page = getTranscript(db, q.thread, {
+          ...(q.after != null ? { afterSeq: q.after } : {}),
           limit: q.limit ?? TRANSCRIPT_PAGE_LIMIT,
         });
         return c.json(ok({

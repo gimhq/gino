@@ -8,7 +8,12 @@ const NANOID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
 
 const randomChars = customAlphabet(ENCODING, RANDOM_LEN);
 
-export const nanoid = customAlphabet(NANOID_ALPHABET, 8);
+// 16 chars over a 36-char alphabet ≈ 82.7 bits — birthday collisions stay
+// negligible (<1e-13 at 100 M ids). The previous 8-char form (~41 bits)
+// reached 50 % collision odds around 1.7 M ids, too low for row-volume
+// tables like attachments (HOST-M9-11). No external contract pins the
+// length: ids are opaque strings in the DB and API.
+export const nanoid = customAlphabet(NANOID_ALPHABET, 16);
 
 function encodeTime(now: number): string {
   let time = now;

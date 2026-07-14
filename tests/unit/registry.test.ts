@@ -75,4 +75,31 @@ describe("M3 registry — lifecycle + liveness", () => {
     expect(got?.lastSeen).toBeGreaterThan(0);
     expect(got?.activeThreads).toBe(4);
   });
+
+  it("touchLiveness restores online for an offline agent (HOST-M3-03)", () => {
+    const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+    setAgentStatus(db, agent.id, "online");
+    setAgentStatus(db, agent.id, "offline");
+
+    // A heartbeat lands on the still-live socket → the one-way flip heals.
+    touchLiveness(db, agent.id, 1);
+    expect(getAgent(db, agent.id)?.status).toBe("online");
+  });
+
+  it("touchLiveness never resurrects a removed agent (HOST-M3-03 guard)", () => {
+    const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+    setAgentStatus(db, agent.id, "online");
+    setAgentStatus(db, agent.id, "removed");
+
+    touchLiveness(db, agent.id, 1);
+    const got = getAgent(db, agent.id);
+    expect(got?.status).toBe("removed");
+    expect(got?.lastSeen).toBeGreaterThan(0); // liveness still recorded
+  });
+
+  it("touchLiveness leaves an enrolled agent enrolled (restore is offline-only)", () => {
+    const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+    touchLiveness(db, agent.id);
+    expect(getAgent(db, agent.id)?.status).toBe("enrolled");
+  });
 });

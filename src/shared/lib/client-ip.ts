@@ -40,8 +40,15 @@ export function getClientIp(c: Context, config?: ClientIpConfig): string {
   // (e.g. exposed to the open internet without a proxy in front of it)
   // from letting any caller forge a client IP.
   const proxyAllowList = parseProxyAllowList(config.TRUSTED_PROXY_IPS);
-  if (proxyAllowList.length > 0 && peerIp && !isAllowedPeer(peerIp, proxyAllowList)) {
-    return peerIp;
+  if (proxyAllowList.length > 0) {
+    // Fail CLOSED (HOST-M9-05): when the peer address cannot be resolved we
+    // cannot verify it against the allow-list, so forwarding headers must
+    // not be trusted — otherwise any request path that doesn't thread the
+    // peer IP lets a direct client forge X-Forwarded-For.
+    if (!peerIp)
+      return "unknown";
+    if (!isAllowedPeer(peerIp, proxyAllowList))
+      return peerIp;
   }
 
   const headers = c.req.header();
@@ -74,7 +81,7 @@ export function getClientIp(c: Context, config?: ClientIpConfig): string {
  * headers are trusted (`TRUST_PROXY=true`) but no proxy-peer allow-list
  * narrows *which* peers may set them. In this state any client that can
  * reach the process directly can forge its IP and defeat every IP-keyed
- * rate limiter. The app should log a startup warning when this is true
+ * rate limiter. `createApp` logs a startup warning when this is true
  * (it does not change request behaviour — kept for backward compat).
  */
 export function isSpoofableProxyConfig(config?: ClientIpConfig): boolean {

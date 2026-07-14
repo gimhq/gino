@@ -9,8 +9,10 @@
 // DP4 invariant: `offline` is an AGENT state, NOT a task state. The sweep NEVER
 // reaps, terminates, or migrates a task or cron — the agent owns its work
 // durably and resumes it on reconnect (the WS `onOpen` flips it back `online`
-// and replays the unacked outbox). The grace window is the only thing tuned
-// here; everything else is left untouched.
+// and replays the unacked outbox; a resumed heartbeat on a still-live socket
+// also restores `online` via `touchLiveness`). The grace window is the only
+// thing tuned here; everything else is left untouched.
+import type { SessionRegistry } from "@/agents/sessions";
 import type { AppDatabase } from "@/db";
 import type { Logger } from "@/shared/lib/logger";
 import { and, eq, isNotNull, lt } from "drizzle-orm";
@@ -26,6 +28,12 @@ export const OFFLINE_GRACE_MS = OFFLINE_GRACE_MULTIPLIER * HEARTBEAT_INTERVAL_MS
 export interface LivenessDeps {
   readonly db: AppDatabase;
   readonly logger?: Logger;
+  /**
+   * Live-session registry (HOST-M3-14): when provided, the sweep also closes +
+   * detaches a swept agent's zombie socket so `sessions.isOnline` converges
+   * with `agents.status` instead of answering `true` for a dead pipe.
+   */
+  readonly sessions?: Pick<SessionRegistry, "get" | "detach">;
   /** Grace window in ms. Defaults to `OFFLINE_GRACE_MS`. */
   readonly graceMs?: number;
   /** Sweep cadence in ms. Defaults to `HEARTBEAT_INTERVAL_MS`. */
@@ -63,6 +71,25 @@ export function sweepLiveness(deps: LivenessDeps): number {
     ))
     .returning({ id: agents.id })
     .all();
+
+  // HOST-M3-14: evict the half-open zombie socket for every swept agent. The
+  // detach runs first so the close's own `onClose` (detach + offline write) is
+  // a guarded no-op; unacked outbox rows stay put and replay on reconnect.
+  if (deps.sessions) {
+    for (const { id } of transitioned) {
+      const session = deps.sessions.get(id);
+      if (!session) {
+        continue;
+      }
+      deps.sessions.detach(id);
+      try {
+        session.ws.close(1001, "liveness sweep: silent past offline grace");
+      }
+      catch {
+        // The zombie socket may already be gone — eviction is best-effort.
+      }
+    }
+  }
 
   if (transitioned.length > 0) {
     deps.logger?.info(

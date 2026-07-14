@@ -8,8 +8,8 @@
 // Conventions:
 //   - snake_case column names; camelCase TS keys.
 //   - Host-generated string PKs (`id`) are text ULIDs (see shared/lib/id.ts).
-//     The two exceptions are `outbox.id` (integer autoincrement) and
-//     `messages.seq` (per-thread integer serial, part of a composite PK).
+//     The exceptions are `outbox.id` and `messages.id` (integer autoincrement)
+//     and `messages.seq` (per-thread integer serial, unique with `thread_id`).
 //   - Timestamps are integer epoch-milliseconds. `created_at` / `updated_at`
 //     default to `Date.now()` at insert time (host = sole writer); optional
 //     timestamps are nullable integers.
@@ -111,6 +111,11 @@ export const threadRuns = sqliteTable("thread_runs", {
 export const messages = sqliteTable(
   "messages",
   {
+    // Stable store position (the M6 egress cursor key, HOST-M5M6-03). An
+    // explicit INTEGER PRIMARY KEY is a rowid alias, so VACUUM never renumbers
+    // it; AUTOINCREMENT additionally forbids value reuse after deletes, so a
+    // persisted cursor can never silently point at a different row.
+    id: integer("id").primaryKey({ autoIncrement: true }),
     taskId: text("task_id").notNull(),
     threadId: text("thread_id").notNull(),
     seq: integer("seq").notNull(), // per-thread serial
@@ -123,7 +128,7 @@ export const messages = sqliteTable(
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [
-    primaryKey({ columns: [t.threadId, t.seq] }),
+    unique("messages_thread_seq_unq").on(t.threadId, t.seq), // idempotent-write key (protocol §6)
     index("messages_task_thread_seq_idx").on(t.taskId, t.threadId, t.seq),
   ],
 );

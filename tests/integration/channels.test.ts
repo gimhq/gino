@@ -143,18 +143,23 @@ describe("D-B4 channels — ingress routing", () => {
 
     const poll1 = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1" }) });
     expect(poll1.status).toBe(200);
-    const d1 = (await poll1.json() as { data: { deliveries: Array<{ taskId: string; messages: Array<{ seq: number; kind: string }> }> } }).data;
+    const d1 = (await poll1.json() as { data: { deliveries: Array<{ taskId: string; cursor: number; messages: Array<{ seq: number; kind: string }> }> } }).data;
     expect(d1.deliveries).toHaveLength(1);
     expect(d1.deliveries[0]!.taskId).toBe(r1.taskId);
     expect(d1.deliveries[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3]); // all kinds, seq order
 
-    // Second poll → cursor advanced, nothing new.
+    // Unacked → at-least-once: a second poll re-delivers the same batch (HOST-M5M6-01).
     const poll2 = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1" }) });
-    const d2 = (await poll2.json() as { data: { deliveries: unknown[] } }).data;
-    expect(d2.deliveries).toHaveLength(0);
+    const d2 = (await poll2.json() as { data: { deliveries: Array<{ messages: unknown[] }> } }).data;
+    expect(d2.deliveries[0]!.messages).toHaveLength(3);
 
-    // Re-poll from a stale cursor (after:0, peek) → re-reads idempotently.
-    const replay = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1", after: 0, peek: true }) });
+    // Acking the delivered cursor advances it — nothing new afterwards.
+    const acked = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1", ack: d1.deliveries[0]!.cursor }) });
+    const dAcked = (await acked.json() as { data: { deliveries: unknown[] } }).data;
+    expect(dAcked.deliveries).toHaveLength(0);
+
+    // Re-poll from a stale cursor (after:0) → re-reads idempotently, cursor untouched.
+    const replay = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1", after: 0 }) });
     const d3 = (await replay.json() as { data: { deliveries: Array<{ messages: Array<{ seq: number }> }> } }).data;
     expect(d3.deliveries[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3]);
 

@@ -139,6 +139,11 @@ export function setAgentStatus(db: AppDatabase, agentId: string, status: AgentSt
  * Liveness touch from a `heartbeat` (or any inbound frame): bump `last_seen`
  * and, when reported, `active_threads`. The full offline-grace sweep that flips
  * a silent agent to `offline` is B2 — this is the light update it builds on.
+ *
+ * HOST-M3-03: a frame from an `offline` agent proves the socket is alive
+ * (sweep-marked offline during heartbeat starvation, socket never dropped), so
+ * restore `online`. The transition is a guarded CAS out of `offline` ONLY —
+ * `removed` stays terminal and `enrolled` is untouched.
  */
 export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: number): void {
   db
@@ -148,6 +153,11 @@ export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: 
       ...(activeThreads != null ? { activeThreads } : {}),
     })
     .where(eq(agents.id, agentId))
+    .run();
+  db
+    .update(agents)
+    .set({ status: "online" })
+    .where(and(eq(agents.id, agentId), eq(agents.status, "offline")))
     .run();
 }
 

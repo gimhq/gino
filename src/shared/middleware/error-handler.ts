@@ -16,15 +16,16 @@ export function errorHandler(err: Error, c: Context<AppEnv>) {
     }, 422);
   }
 
-  // bun:sqlite constraint violations are the DB-level backstop for
+  // bun:sqlite uniqueness violations are the DB-level backstop for
   // check-then-write races (unique names, relation tuples). Surface them as
-  // an actionable 409 instead of an opaque 500. The raw message can name
-  // columns, so keep the response generic.
+  // an actionable 409 instead of an opaque 500. Classify by the structured
+  // error code only (HOST-M9-12) — message-text matching would also fire on
+  // non-database errors that merely quote constraint text, and FK / NOT NULL
+  // / CHECK violations are host data bugs, not duplicates: they fall through
+  // to the logged 500. The raw message can name columns, so keep the
+  // response generic.
   const code = (err as { code?: unknown }).code;
-  if (
-    (typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT"))
-    || /\b(?:UNIQUE|CHECK|FOREIGN KEY|NOT NULL) constraint failed\b/i.test(err.message)
-  ) {
+  if (code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT_PRIMARYKEY") {
     return c.json({
       success: false,
       error: { code: "CONFLICT", message: "Resource already exists or violates a constraint" },

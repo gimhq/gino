@@ -79,7 +79,9 @@ export function decodeFrame(raw: string | ArrayBuffer | Uint8Array): DecodedFram
  * Encode a durable `outbox` row into the host→agent wire frame, rebuilding the
  * envelope from the row's columns (protocol §4.2 — the outbox is the sole
  * host→agent path). The `message` frame's delivery id is `msgId` (acked by
- * `msg_ack`); every other host→agent frame uses `outboxId` (acked by
+ * `msg_ack`) and is DERIVED from the row id, so every durable `message` row —
+ * including one written by a host that crashed mid-enqueue — carries an
+ * ackable id; every other host→agent frame uses `outboxId` (acked by
  * `ack{id}`). Correlation ids and `data` are emitted only when present, so a
  * delete/control frame (which carries no `data`) stays envelope-only.
  */
@@ -87,9 +89,7 @@ export function encodeOutbox(row: Outbox): Record<string, unknown> {
   const frame: Record<string, unknown> = { type: row.type };
 
   if (row.type === "message") {
-    if (row.msgId != null) {
-      frame.msgId = row.msgId;
-    }
+    frame.msgId = row.id;
   }
   else {
     frame.outboxId = row.id;
