@@ -5,7 +5,7 @@ import type { Agent } from "@/db/schema";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { correlateLaunch, enrollAgent, setAgentStatus, verifyConnectToken } from "@/agents/registry";
+import { correlateLaunch, enrollAgent, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
 import { sessions } from "@/agents/sessions";
 import {
   attachmentsBySha,
@@ -266,6 +266,10 @@ export function agentRoutes() {
           // Attach BEFORE replay so the replayed frames find the live socket.
           sessions.attach(agentId, ws, agent.connectTokenHash);
           setAgentStatus(db, agentId, "online");
+          // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
+          // connection starts inside the sweep's grace window (never insta-swept
+          // on a stale or NULL `last_seen` before its first heartbeat).
+          touchLiveness(db, agentId);
           const replayed = replayUnacked(db, sessions, agentId);
           logger.info({ agentId, replayed }, "agent ws attached");
         },
@@ -280,11 +284,14 @@ export function agentRoutes() {
           // Blob payloads are not produced by the bun adapter — ignored.
         },
         onClose(_evt, ws) {
-          sessions.detach(agentId, ws);
-          setAgentStatus(db, agentId, "offline");
-          logger.info({ agentId }, "agent ws detached");
-          // TODO(B2): offline-grace sweep flips silent agents; here we just mark
-          // the socket gone — tasks/crons survive on the agent (DP4).
+          // HOST-M1M2-05 / HOST-M3-02: only the CURRENT socket's close marks the
+          // agent offline — a superseded socket's late close (dirty reconnect)
+          // must not clobber the live session's `online` status.
+          const evicted = sessions.detach(agentId, ws);
+          if (evicted) {
+            setAgentStatus(db, agentId, "offline");
+          }
+          logger.info({ agentId, evicted }, "agent ws detached");
         },
       };
     }),
