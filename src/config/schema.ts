@@ -42,6 +42,16 @@ export const configSchema = z.object({
   // health probes — still construct.)
   REGISTER_TOKEN: z.string().default(""),
   HTTP_CHANNEL_TOKEN: z.string().default(""),
+  // Operator kill-switch for enrollment (HOST-M1M2-14). When false, POST
+  // /agent/register rejects every attempt with the protocol §3
+  // `register_error{registration_disabled}` envelope.
+  REGISTER_ENABLED: z.enum(["true", "false"]).default("true").transform(v => v === "true"),
+
+  // Max accepted request-body size for the byte-ingest endpoints (POST
+  // /agent/attachments, POST /admin/config/artifacts) — HOST-M1M2-11. Both the
+  // declared Content-Length and the actual streamed bytes are checked; over
+  // the cap → 413 and nothing is hashed or stored.
+  MAX_UPLOAD_BYTES: z.coerce.number().int().min(1).default(64 * 1024 * 1024),
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   LOG_FILE: z.string().default("data/logs/gino.log"),

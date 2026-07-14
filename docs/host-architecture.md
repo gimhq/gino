@@ -128,7 +128,9 @@ puts an owner's task on an agent the owner is **permitted** to use.
 - **Registry** (`agents` table, PK `id` = the wire `agentId`): enroll on `POST /agent/register` (auth: the
   **shared, long-lived register token**) — version-gate, generate `agentId`, mint the **per-agent connect
   token** (store hash; **revoked on remove**), persist `capabilities` (engines + `max_threads`; host may
-  override `max_threads`) + `source` + `access`, correlate to a launch via nonce. Lifecycle:
+  override `max_threads`) + `source` (a client-supplied `access` is IGNORED — enrollment always lands
+  `dedicated`; flipping an agent `public` is an admin-only mutation, HOST-M3-09), correlate to a launch
+  via nonce. Lifecycle:
   `enrolled → online ⇄ offline → removed`.
 - **Sessions**: `agentId → { ws, connectTokenHash, outboxCursor, inboxDedup }`. An agent **dials out**; the
   host never connects in. On (re)connect: auth by hash, attach WS, **replay unacked outbox**, resume.

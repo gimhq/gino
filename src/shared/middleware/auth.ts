@@ -7,7 +7,10 @@ import { ForbiddenError, UnauthorizedError } from "@/shared/lib/errors";
 // ─── Three-token auth (M1 / OD12) ───
 //
 // register token  — shared, long-lived bootstrap secret on POST /agent/register
-//                   (carried in the request body per protocol §3).
+//                   (carried in the request body per protocol §3). Validated IN
+//                   the register handler (src/edge/agent.ts), not here, so every
+//                   failure renders the protocol §3 `register_error` envelope
+//                   (HOST-M1M2-14).
 // connect token   — per-agent secret on the WS + HTTP data plane, header
 //                   `x-internal-token`. B0 is a PLACEHOLDER: presence/non-empty
 //                   only. The per-agent `agents.connect_token_hash` lookup
@@ -36,25 +39,6 @@ function requireSecret(expected: string, provided: string | null | undefined): v
   if (!expected || !provided || !safeEqual(provided, expected))
     throw new UnauthorizedError();
 }
-
-/**
- * POST /agent/register — validate the shared `GINO_REGISTER_TOKEN`. The token
- * is read from the JSON body (`{ registerToken }`, protocol §3); an
- * `Authorization: Bearer` header is accepted as a fallback. A malformed/empty
- * body is treated as "no token" → 401.
- */
-export const registerTokenAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
-  const expected = c.get("config").REGISTER_TOKEN;
-  let provided = bearerToken(c);
-  if (!provided) {
-    // Hono caches the parsed body, so re-reading it in the stub handler is safe.
-    const body = await c.req.json().catch(() => null) as { registerToken?: unknown } | null;
-    if (body && typeof body.registerToken === "string")
-      provided = body.registerToken;
-  }
-  requireSecret(expected, provided);
-  await next();
-};
 
 /**
  * WS + HTTP data plane (`/agent/ws|config|output|attachments`) — authenticate AND
