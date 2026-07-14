@@ -124,6 +124,33 @@ function authorizeWrite(
 }
 
 /**
+ * Derive the dispatch context of a thread from its id (HOST-M1M2-06 /
+ * HOST-M5M6-06). The `thread_result` frame does not carry `source`/`cronId`
+ * (protocol §4.1), but the agent mints cron-fired thread ids deterministically
+ * (agent scheduler, agent-architecture §4): `<cronId>@<scheduled_epoch_millis>`
+ * for isolated fires and `<cronId>@shared` for shared continuity. When the
+ * prefix names a known cron of the SAME task, the run is cron-originated;
+ * anything else — no `@`, a non-cron suffix, an unknown prefix, or a cron
+ * belonging to another task — stays `chat` with no cron link.
+ */
+function deriveDispatchContext(db: AppDatabase, taskId: string, threadId: string): { source: string; cronId?: string } {
+  const at = threadId.lastIndexOf("@");
+  if (at <= 0) {
+    return { source: "chat" };
+  }
+  const suffix = threadId.slice(at + 1);
+  if (suffix !== "shared" && !/^\d+$/.test(suffix)) {
+    return { source: "chat" };
+  }
+  const cronId = threadId.slice(0, at);
+  const cron = getCron(db, cronId);
+  if (cron == null || cron.taskId !== taskId) {
+    return { source: "chat" };
+  }
+  return { source: "cron", cronId };
+}
+
+/**
  * Dispatch one decoded frame: write it to M5 (or apply the plumbing effect) and
  * return the ack frame the agent expects, or `null` for control frames that are
  * not acked. THROWS only if a storage write fails (TRANSIENT) — the caller must
@@ -170,9 +197,11 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         return poisonDrop(deps, decoded, "schema_invalid", parsed.error.issues);
       }
       const data = parsed.data;
-      // `source` is dispatch context the frame does not carry (protocol §4.1).
-      // B1b default = 'chat'; M4/B3 supplies real source/cronId from dispatch.
-      writeThreadResult(db, { taskId: decoded.taskId, threadId: decoded.threadId, data, source: "chat" });
+      // `source`/`cronId` are dispatch context the frame does not carry
+      // (protocol §4.1) — derived here from the cron-minted thread-id shape
+      // (HOST-M1M2-06 / HOST-M5M6-06).
+      const dispatch = deriveDispatchContext(db, decoded.taskId, decoded.threadId);
+      writeThreadResult(db, { taskId: decoded.taskId, threadId: decoded.threadId, data, ...dispatch });
       // HOST-M1M2-13: verify the transcript is exactly `1..=final_seq`
       // (protocol §6). Diagnostic only — a gap is flagged, never blocks the ack.
       const completeness = checkTranscriptCompleteness(db, decoded.threadId, data.final_seq);
