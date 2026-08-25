@@ -345,6 +345,9 @@ pub(crate) mod v2 {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub(crate) struct ProvisioningEntry {
         /// Logical name (= store `<name>`); groups an artifact's versions.
+        /// The host wire field is `name` (protocol.md §8 `ConfigEntry`); `id`
+        /// is the historical agent-side spelling, kept for stored task rows.
+        #[serde(alias = "name")]
         pub(crate) id: String,
         /// Full hash — the version identifier and the download-integrity check.
         pub(crate) sha256: String,
@@ -960,6 +963,17 @@ pub(crate) mod v2 {
         fn provisioning_entry_rejects_unknown_kind() {
             let raw = r#"{ "id": "x", "sha256": "aa", "target": "x", "kind": "symlink" }"#;
             assert!(serde_json::from_str::<ProvisioningEntry>(raw).is_err());
+        }
+
+        #[test]
+        fn provisioning_entry_accepts_host_name_spelling() {
+            // The host wire field is `name` (protocol.md §8 `ConfigEntry`);
+            // the agent's `id` is an accepted alias, so a real host
+            // `config_update` / `task_upsert.entries` payload parses.
+            let raw =
+                r#"{ "name": "clauderc", "sha256": "aa", "target": "CLAUDE.md", "kind": "file" }"#;
+            let entry: ProvisioningEntry = serde_json::from_str(raw).unwrap();
+            assert_eq!(entry.id, "clauderc");
         }
 
         #[test]

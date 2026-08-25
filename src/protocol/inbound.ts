@@ -31,6 +31,7 @@ import {
   checkTranscriptCompleteness,
   getCron,
   getThreadTaskId,
+  writeAttachmentDescriptors,
   writeCronState,
   writeThreadMessage,
   writeThreadResult,
@@ -210,6 +211,13 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       // (HOST-M1M2-06 / HOST-M5M6-06).
       const dispatch = deriveDispatchContext(db, decoded.taskId, decoded.threadId);
       writeThreadResult(db, { taskId: decoded.taskId, threadId: decoded.threadId, data, ...dispatch });
+      // Register the run's outbound attachment descriptors (protocol §5 /
+      // agent-architecture §9: "descriptors returned on thread_result"). The
+      // agent's byte upload carries no task/thread context, so THIS is where
+      // the descriptor gains its task/thread binding (idempotent on `id`).
+      if (data.attachments != null && data.attachments.length > 0) {
+        writeAttachmentDescriptors(db, { taskId: decoded.taskId, threadId: decoded.threadId, descriptors: data.attachments });
+      }
       // HOST-M1M2-13: verify the transcript is exactly `1..=final_seq`
       // (protocol §6). Diagnostic only — a gap is flagged, never blocks the ack.
       const completeness = checkTranscriptCompleteness(db, decoded.threadId, data.final_seq);

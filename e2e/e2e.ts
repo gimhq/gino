@@ -394,9 +394,11 @@ async function testAttachments(): Promise<void> {
       body: payload,
     });
     assert(r.status === 201, `status ${r.status} body ${r.text.slice(0, 200)}`);
-    attId = r.json?.data?.id;
-    attSha = r.json?.data?.sha256;
-    check("size matches", r.json?.data?.size === payload.length, JSON.stringify(r.json?.data));
+    // Flat descriptor body (the runner parses top-level {id, ref}).
+    attId = r.json?.id;
+    attSha = r.json?.sha256;
+    check("size matches", r.json?.size === payload.length, JSON.stringify(r.json));
+    check("resolvable wire ref", r.json?.ref === `/agent/attachments/${attId}`, JSON.stringify(r.json?.ref));
   });
   await step("A downloads by id → verified bytes", async () => {
     assert(a && attId, "missing");
@@ -440,6 +442,35 @@ async function testLlmProxy(): Promise<void> {
 
 // ── 9. config / skill provisioning (artifacts → entries → register) ──────────
 
+/**
+ * A minimal VALID uncompressed tar holding one file — the runner really
+ * unpacks a `dir` entry's bundle, so the staged bytes must be a real archive
+ * (a text placeholder makes the agent-side reconcile fail `tar unpack`).
+ */
+function miniTar(name: string, content: string): Uint8Array {
+  const enc = new TextEncoder();
+  const data = enc.encode(content);
+  const header = new Uint8Array(512);
+  header.set(enc.encode(name), 0); // name
+  header.set(enc.encode("0000644\0"), 100); // mode
+  header.set(enc.encode("0000000\0"), 108); // uid
+  header.set(enc.encode("0000000\0"), 116); // gid
+  header.set(enc.encode(`${data.length.toString(8).padStart(11, "0")}\0`), 124); // size
+  header.set(enc.encode("00000000000\0"), 136); // mtime
+  header.set(enc.encode("        "), 148); // checksum placeholder (spaces)
+  header[156] = 0x30; // typeflag '0' (regular file)
+  header.set(enc.encode("ustar\0"), 257); // magic
+  header.set(enc.encode("00"), 263); // version
+  const checksum = header.reduce((a, b) => a + b, 0);
+  header.set(enc.encode(`${checksum.toString(8).padStart(6, "0")}\0 `), 148);
+  const padded = new Uint8Array(Math.ceil(data.length / 512) * 512);
+  padded.set(data);
+  const out = new Uint8Array(512 + padded.length + 1024); // header + data + 2 zero blocks
+  out.set(header, 0);
+  out.set(padded, 512);
+  return out;
+}
+
 async function testProvisioning(): Promise<void> {
   group("config provisioning (global desired set)");
   let fileSha = "";
@@ -449,7 +480,7 @@ async function testProvisioning(): Promise<void> {
     const f = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...adminBearer }, body: "# e2e global instructions" });
     assert(f.status === 201, `file status ${f.status} body ${f.text.slice(0, 160)}`);
     fileSha = f.json?.data?.sha256;
-    const d = await http("POST", "/admin/config/artifacts?name=e2e-skill&kind=dir&content_type=application/gzip", { headers: { ...adminBearer }, body: "skill-bundle-bytes" });
+    const d = await http("POST", "/admin/config/artifacts?name=e2e-skill&kind=dir&content_type=application/x-tar", { headers: { ...adminBearer }, body: miniTar("SKILL.md", "# e2e skill\n") });
     assert(d.status === 201, `dir status ${d.status}`);
     dirSha = d.json?.data?.sha256;
     const again = await http("POST", "/admin/config/artifacts?name=CLAUDE.md&kind=file&content_type=text/markdown", { headers: { ...adminBearer }, body: "# e2e global instructions" });

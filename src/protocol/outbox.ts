@@ -106,9 +106,12 @@ export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
 }
 
 /**
- * Agent durably stored a `message` (`msg_ack{msgId}`) → mark it delivered.
- * A message's `msgId` is its row id, so the match keys on `id` +
- * `type = 'message'`, scoped to the authenticated agent's own rows.
+ * Agent durably stored a host→agent frame (`msg_ack{msgId}`) → mark it
+ * delivered. A frame's `msgId` is its row id, so the match keys on `id`
+ * alone, scoped to the authenticated agent's own rows. Not limited to
+ * `message` rows: the runner acknowledges EVERY durable host→agent frame via
+ * `msg_ack` (it never sends `ack{id}`), so this is the ack that stops replay
+ * for `task_upsert`/`cron_upsert`/`close`/`config_update`/… as well.
  * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
  * row acked is enough to stop replay.
  */
@@ -116,7 +119,7 @@ export function ackMessage(db: AppDatabase, agentId: string, msgId: number): voi
   db
     .update(outbox)
     .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.id, msgId), eq(outbox.agentId, agentId), eq(outbox.type, "message")))
+    .where(and(eq(outbox.id, msgId), eq(outbox.agentId, agentId)))
     .run();
 }
 

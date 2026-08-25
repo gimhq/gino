@@ -170,11 +170,20 @@ describe("M2 outbox — atomic message delivery id", () => {
     expect(replayUnacked(db, sender, agentId)).toBe(0);
   });
 
-  it("msg_ack{id} of a NON-message frame does NOT ack it (match is id + type='message')", () => {
+  it("msg_ack{id} of a NON-message frame DOES ack it (the runner acks every durable frame via msg_ack)", () => {
     const sender = fakeSender(false);
     const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
 
     ackMessage(db, agentId, row.id);
+    sender.online = true;
+    expect(replayUnacked(db, sender, agentId)).toBe(0);
+  });
+
+  it("msg_ack{id} scoped to another agent's row is a no-op", () => {
+    const sender = fakeSender(false);
+    const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
+
+    ackMessage(db, "someone-else", row.id);
     sender.online = true;
     expect(replayUnacked(db, sender, agentId)).toBe(1);
   });

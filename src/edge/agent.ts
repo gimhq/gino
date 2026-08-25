@@ -18,10 +18,11 @@ import {
   MissingBlobError,
   resolveBlobRef,
   resolveEntriesForEngines,
+  sanitizeAttachmentName,
   sha256Hex,
   ShaMismatchError,
 } from "@/configstore";
-import { writeAttachmentDescriptors } from "@/msgstore";
+import { wireAttachmentRef, writeAttachmentDescriptors } from "@/msgstore";
 import { generateId, hashToken, safeEqual } from "@/platform";
 import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
@@ -487,21 +488,30 @@ export function agentRoutes() {
     }),
     async (c) => {
       const requesterId = c.get("agentId");
-      const name = c.req.query("name");
+      // Metadata rides query params (host-native form) OR headers (the runner's
+      // form — agent-architecture §14 A1: `x-attachment-name` +
+      // `x-attachment-sha256`, bytes as the raw body).
+      const name = c.req.query("name") ?? c.req.header("x-attachment-name");
       const taskId = c.req.query("task_id");
       const threadId = c.req.query("thread_id");
-      if (!name || !taskId || !threadId) {
-        return c.json({ success: false, error: { code: "BAD_REQUEST", message: "name, task_id, thread_id query params are required" } }, 400);
+      if (!name) {
+        return c.json({ success: false, error: { code: "BAD_REQUEST", message: "name query param or x-attachment-name header is required" } }, 400);
       }
-      // An agent may write attachments ONLY for its OWN placed tasks — authorize
-      // BEFORE reading/storing any bytes (a foreign task_id never touches the store).
-      if (!isAgentPlacedOnTask(c.get("db"), requesterId, taskId)) {
+      // The runner's upload carries NO task/thread context — the binding
+      // arrives later on `thread_result.data.attachments` (protocol §5). When
+      // a caller DOES bind at upload time it must name both ids, and an agent
+      // may write attachments ONLY for its OWN placed tasks — authorize BEFORE
+      // reading/storing any bytes (a foreign task_id never touches the store).
+      if ((taskId == null) !== (threadId == null)) {
+        return c.json({ success: false, error: { code: "BAD_REQUEST", message: "task_id and thread_id must be provided together" } }, 400);
+      }
+      if (taskId != null && !isAgentPlacedOnTask(c.get("db"), requesterId, taskId)) {
         throw new ForbiddenError("cannot write an attachment for a task placed on another agent");
       }
       const contentType = c.req.query("content_type") ?? c.req.header("content-type") ?? "application/octet-stream";
       const directionRaw = c.req.query("direction");
       const direction: "inbound" | "outbound" = directionRaw === "inbound" ? "inbound" : "outbound";
-      const declaredSha = c.req.query("sha256");
+      const declaredSha = c.req.query("sha256") ?? c.req.header("x-attachment-sha256");
 
       // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
@@ -514,24 +524,35 @@ export function agentRoutes() {
       const store = createStore(c.get("config"));
       let blob;
       try {
-        blob = store.put(name, bytes);
+        // The runner names an outbound file by its `output/`-relative path
+        // (separators included) — flatten to a store segment with the same
+        // function the descriptor registry uses, so the later
+        // `thread_result` registration derives this exact store ref.
+        blob = store.put(sanitizeAttachmentName(name), bytes);
       }
       catch (err) {
         return c.json({ success: false, error: { code: "BAD_REQUEST", message: err instanceof Error ? err.message : "store rejected the blob" } }, 400);
       }
 
+      // The wire descriptor carries the RESOLVABLE byte-channel ref (the
+      // runner parses the flat `{id, ref, …}` body and later fetches `ref`
+      // joined to its host base — agent-architecture §14 A1); the store ref
+      // stays host-private (derived again at registry-write time).
+      const id = generateId("att");
       const descriptor = {
-        id: generateId("att"),
+        id,
         name: blob.name,
         content_type: contentType,
         size: blob.size,
         sha256: blob.sha256,
-        ref: blob.ref,
+        ref: wireAttachmentRef(id),
         direction,
       };
-      writeAttachmentDescriptors(c.get("db"), { taskId, threadId, descriptors: [descriptor] });
+      if (taskId != null && threadId != null) {
+        writeAttachmentDescriptors(c.get("db"), { taskId, threadId, descriptors: [descriptor] });
+      }
       c.get("logger").info({ id: descriptor.id, taskId, threadId, sha256: blob.sha256, size: blob.size }, "attachment ingested");
-      return c.json({ success: true, data: descriptor }, 201);
+      return c.json(descriptor, 201);
     },
   );
 

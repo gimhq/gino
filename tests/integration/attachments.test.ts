@@ -121,9 +121,11 @@ describe("POST /agent/attachments — a placed agent ingests for its own task", 
     const payload = "the quick brown fox";
     const res = await ingest(a.connectToken, `name=report.txt&task_id=${taskId}&thread_id=th1&content_type=text/plain`, payload);
     expect(res.status).toBe(201);
-    const { data } = await res.json() as { data: { id: string; sha256: string; ref: string; size: number; direction: string } };
+    const data = await res.json() as { id: string; sha256: string; ref: string; size: number; direction: string };
     expect(data.size).toBe(payload.length);
     expect(data.direction).toBe("outbound");
+    // The wire ref is the RESOLVABLE byte-channel URL, never the store path.
+    expect(data.ref).toBe(`/agent/attachments/${data.id}`);
 
     // Download by id (own task) → 200 + verified bytes.
     const byId = await downloadById(a.connectToken, data.id);
@@ -137,10 +139,39 @@ describe("POST /agent/attachments — a placed agent ingests for its own task", 
     expect(await bySha.text()).toBe(payload);
   });
 
-  it("requires name + task_id + thread_id (400)", async () => {
+  it("requires a name (query or x-attachment-name header) and paired task/thread ids (400)", async () => {
     const a = await register();
-    const res = await ingest(a.connectToken, "name=a.txt", "x");
-    expect(res.status).toBe(400);
+    // No name anywhere → 400.
+    expect((await ingest(a.connectToken, "content_type=text/plain", "x")).status).toBe(400);
+    // task_id without thread_id (or vice versa) → 400.
+    expect((await ingest(a.connectToken, "name=a.txt&task_id=t1", "x")).status).toBe(400);
+    expect((await ingest(a.connectToken, "name=a.txt&thread_id=th1", "x")).status).toBe(400);
+  });
+
+  it("accepts the runner's shape: metadata via headers, no task binding, flat response", async () => {
+    const a = await register();
+    const payload = "runner output bytes";
+    const sha = new Bun.CryptoHasher("sha256").update(payload).digest("hex");
+    const res = await app.fetch(new Request("http://local/api/agent/attachments", {
+      method: "POST",
+      headers: {
+        ...tok(a.connectToken),
+        "x-attachment-name": "out/report.txt",
+        "x-attachment-sha256": sha,
+        "content-type": "text/plain",
+      },
+      body: payload,
+    }));
+    expect(res.status).toBe(201);
+    // Flat body (the runner parses top-level {id, ref}), resolvable ref,
+    // path-shaped name flattened to a store segment.
+    const data = await res.json() as { id: string; name: string; ref: string; sha256: string };
+    expect(data.sha256).toBe(sha);
+    expect(data.ref).toBe(`/agent/attachments/${data.id}`);
+    expect(data.name).toBe("out__report.txt");
+    // No task binding at upload time → no descriptor row yet (that arrives on
+    // thread_result), so a by-id download is a 404 until then.
+    expect((await downloadById(a.connectToken, data.id)).status).toBe(404);
   });
 
   it("rejects a declared sha256 that does not match the bytes (400) — stores nothing", async () => {
@@ -168,9 +199,10 @@ describe("GET /agent/attachments — a placed agent downloads", () => {
     const a = await register();
     const taskId = placeTaskOn(a.agentId);
     const res = await ingest(a.connectToken, `name=corrupt.txt&task_id=${taskId}&thread_id=th1`, "original");
-    const { data } = await res.json() as { data: { id: string; ref: string } };
-    // Corrupt the stored blob underneath the descriptor (ref is relative to storeDir).
-    writeFileSync(resolve(storeDir, data.ref), "TAMPERED");
+    const data = await res.json() as { id: string; sha256: string; ref: string };
+    // Corrupt the stored blob underneath the descriptor. The wire `ref` is the
+    // byte-channel URL; the blob lives at the store ref `<name>/<sha256[:12]>`.
+    writeFileSync(resolve(storeDir, `corrupt.txt/${data.sha256.slice(0, 12)}`), "TAMPERED");
 
     const got = await downloadById(a.connectToken, data.id);
     expect(got.status).toBe(409);
@@ -181,9 +213,9 @@ describe("GET /agent/attachments — a placed agent downloads", () => {
     const a = await register();
     const taskId = placeTaskOn(a.agentId);
     const res = await ingest(a.connectToken, `name=dangling.txt&task_id=${taskId}&thread_id=th1`, "soon to vanish");
-    const { data } = await res.json() as { data: { id: string; ref: string } };
+    const data = await res.json() as { id: string; sha256: string; ref: string };
     // Simulate a crash between a GC row delete and blob delete (or manual FS surgery).
-    rmSync(resolve(storeDir, data.ref), { force: true });
+    rmSync(resolve(storeDir, `dangling.txt/${data.sha256.slice(0, 12)}`), { force: true });
 
     const got = await downloadById(a.connectToken, data.id);
     expect(got.status).toBe(404);
@@ -194,7 +226,7 @@ describe("GET /agent/attachments — a placed agent downloads", () => {
     const taskId = placeTaskOn(a.agentId);
     const payload = "cache me by content address";
     const res = await ingest(a.connectToken, `name=cached.txt&task_id=${taskId}&thread_id=th1`, payload);
-    const { data } = await res.json() as { data: { id: string; sha256: string } };
+    const data = await res.json() as { id: string; sha256: string };
 
     const full = await downloadById(a.connectToken, data.id);
     expect(full.status).toBe(200);
@@ -232,7 +264,7 @@ describe("IDOR regression — an agent cannot reach another agent's bytes", () =
     placeTaskOn(b.agentId); // B is a real placed agent, just not on A's task
 
     const res = await ingest(a.connectToken, `name=secret.txt&task_id=${taskA}&thread_id=th1`, "A's private bytes");
-    const { data } = await res.json() as { data: { id: string; sha256: string } };
+    const data = await res.json() as { id: string; sha256: string };
 
     // A (placed on the task) reads fine.
     expect((await downloadById(a.connectToken, data.id)).status).toBe(200);

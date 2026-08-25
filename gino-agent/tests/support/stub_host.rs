@@ -851,6 +851,26 @@ async fn route_http(req: &HttpRequest, ctx: &ConnCtx) -> Vec<u8> {
             let body = json!({ "id": id, "ref": format!("/agent/attachments/{id}") });
             json_response("200 OK", &body)
         }
+        // Content-addressed blob fetch (provisioning): the runner asks
+        // `GET /agent/attachments?sha256=<hex>`; serve whichever staged blob
+        // hashes to it (counted under the STAGED id, so cache-hit assertions
+        // keep working).
+        ("GET", _) if path.starts_with("/agent/attachments?sha256=") => {
+            let sha = path.trim_start_matches("/agent/attachments?sha256=").to_owned();
+            let mut model = ctx.model.lock().await;
+            let hit = model
+                .inbound_blobs
+                .iter()
+                .find(|(_, blob)| sha256_hex(&blob.bytes) == sha)
+                .map(|(id, blob)| (id.clone(), blob.content_type.clone(), blob.bytes.clone()));
+            match hit {
+                Some((id, content_type, bytes)) => {
+                    *model.get_counts.entry(id).or_insert(0) += 1;
+                    bytes_response("200 OK", &content_type, &bytes)
+                }
+                None => text_response("404 Not Found", "no blob with that sha256"),
+            }
+        }
         ("GET", _) if path.starts_with("/agent/attachments/") => {
             let id = path.trim_start_matches("/agent/attachments/").to_owned();
             let mut model = ctx.model.lock().await;
