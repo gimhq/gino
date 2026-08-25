@@ -71,10 +71,13 @@ export {
 export {
   BlobStore,
   ConfigStoreError,
+  isSafeName,
   MissingBlobError,
+  sanitizeAttachmentName,
   sha256Hex,
   SHA_PREFIX_LEN,
   ShaMismatchError,
   type StoredBlob,
   type StoreLeaf,
+  storeRefFor,
 } from "./store";

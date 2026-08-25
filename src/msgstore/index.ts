@@ -19,7 +19,7 @@
 export const MODULE = "msgstore" as const;
 
 export type { AttachmentWrite } from "./attachments";
-export { writeAttachmentDescriptors } from "./attachments";
+export { wireAttachmentRef, writeAttachmentDescriptors } from "./attachments";
 
 export type { CronPromptWrite, CronStateWrite } from "./crons";
 export { getCron, writeCronPrompt, writeCronState } from "./crons";

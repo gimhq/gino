@@ -75,6 +75,33 @@ export interface StoredBlob {
 }
 
 /**
+ * Store-relative ref for a `(name, sha256)` pair — the deterministic location
+ * `put()` writes to. Exposed as a free function so registry writers can derive
+ * the store ref for a descriptor WITHOUT trusting the wire `ref` (the wire
+ * carries a byte-channel URL, never a store path). Rejects unsafe names.
+ */
+export function storeRefFor(name: string, sha256: string): string {
+  assertSafeName(name);
+  return `${name}/${sha256.slice(0, SHA_PREFIX_LEN)}`;
+}
+
+/**
+ * Map an arbitrary wire attachment name to a safe single store segment. The
+ * runner names an outbound attachment by its path RELATIVE to `output/`
+ * (agent-architecture §9), so separators are expected on the wire — they are
+ * flattened deterministically so the byte-upload path and the later
+ * `thread_result` descriptor registration derive the SAME store ref for the
+ * same wire name.
+ */
+export function sanitizeAttachmentName(raw: string): string {
+  const flattened = raw
+    .replace(/[/\\]+/g, "__")
+    .replace(/[^\w.@+-]/g, "_")
+    .slice(0, 255);
+  return isSafeName(flattened) ? flattened : "attachment";
+}
+
+/**
  * The content-addressed blob store rooted at a single directory (`GINO_STORE_DIR`).
  * Cheap to construct (it only holds the root path) — build one per request.
  */
@@ -83,7 +110,7 @@ export class BlobStore {
 
   /** Store-relative ref for a `(name, sha256)` pair. */
   refFor(name: string, sha256: string): string {
-    return `${name}/${sha256.slice(0, SHA_PREFIX_LEN)}`;
+    return storeRefFor(name, sha256);
   }
 
   /**

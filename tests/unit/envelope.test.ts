@@ -61,10 +61,9 @@ describe("M2 envelope — decode", () => {
 });
 
 describe("M2 envelope — encode", () => {
-  it("a generic host→agent frame carries outboxId (acked by ack{id})", () => {
+  it("a generic host→agent frame carries msgId (acked by msg_ack) + outboxId (compat)", () => {
     const frame = encodeOutbox(outboxRow({ id: 5, type: "task_upsert", taskId: "t-1", dataJson: { name: "job" } }));
-    expect(frame).toEqual({ type: "task_upsert", outboxId: 5, taskId: "t-1", data: { name: "job" } });
-    expect(frame.msgId).toBeUndefined();
+    expect(frame).toEqual({ type: "task_upsert", msgId: 5, outboxId: 5, taskId: "t-1", data: { name: "job" } });
   });
 
   // HOST-M1M2-07 / HOST-M4-07: the delivery id is DERIVED from the row id at
@@ -78,7 +77,7 @@ describe("M2 envelope — encode", () => {
 
   it("a delete frame (no data) is envelope-only", () => {
     const frame = encodeOutbox(outboxRow({ id: 9, type: "task_delete", taskId: "t-1", dataJson: {} }));
-    expect(frame).toEqual({ type: "task_delete", outboxId: 9, taskId: "t-1" });
+    expect(frame).toEqual({ type: "task_delete", msgId: 9, outboxId: 9, taskId: "t-1" });
     expect("data" in frame).toBe(false);
   });
 });

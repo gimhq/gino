@@ -31,8 +31,15 @@ the host spec [`docs/host-architecture.md`](host-architecture.md). The runner ty
 - **WebSocket is the primary, bidirectional channel** for all work and results.
 - **HTTP** is used only for enrollment + bootstrap + a pre-WS output fallback + the
   attachment byte channel: `POST /agent/register`, `GET /agent/config/:agentId`,
-  `POST /agent/output/:agentId`, and (host-proxy backend) `GET /agent/attachments/:id` +
-  `POST /agent/attachments`.
+  `POST /agent/output/:agentId`, and (host-proxy backend) `GET /agent/attachments/:id`
+  (an attachment by descriptor id), `GET /agent/attachments?sha256=<hex>` (a
+  config/skill artifact in the agent's desired set, content-addressed — the
+  provisioning fetch), and `POST /agent/attachments` (upload: bytes ride the raw
+  body; metadata rides the `x-attachment-name` / `x-attachment-sha256` headers or
+  equivalent query params; the response is the flat descriptor JSON `{id, name,
+  content_type, size, sha256, ref, direction}`). A descriptor's `ref` is a
+  byte-channel path the agent resolves against its host base URL
+  (`/agent/attachments/<id>`) — never a host-internal storage path.
 - The agent always **dials out** to the host (NAT/firewall friendly). The host never
   connects into the agent; out-of-band control is the launcher's job (see
   [`docs/host-architecture.md`](host-architecture.md)), not part of this protocol.
@@ -44,15 +51,25 @@ Unauthenticated by connect token; carries the bootstrap **register token** inste
 Request:
 ```json
 { "registerToken": "<secret>", "protocolVersion": 2,
-  "name": "<human label?>", "capabilities": ["claude", ...], "source": "docker|vm|bare" }
+  "name": "<human label?>", "capabilities": ["claude", ...],
+  "version": "<agent build version?>", "platform": "<arch-os?>", "source": "docker|vm|bare?" }
 ```
 Response (success):
 ```json
 { "agentId": "<host-generated>", "connectToken": "<per-agent secret>",
   "config": { "agentId": "...", "wsUrl": "/agent/ws/<agentId>",
               "configUrl": "/agent/config/<agentId>", "outputUrl": "/agent/output/<agentId>",
-              "heartbeatIntervalMs": 30000, "protocolVersion": 2 } }
+              "heartbeatIntervalMs": 30000, "protocolVersion": 2,
+              "entries": [ { "name": "...", "sha256": "...", "target": "...", "kind": "file|dir" } ],
+              "version": 0 } }
 ```
+
+`config.entries` is the GLOBAL-scope desired provisioning set and `config.version`
+the host-assigned monotonic global config version (agent-architecture §9b): the
+agent reconciles the global scope only when `version` advances past its applied
+version. The same two fields are delivered on `GET /agent/config/:agentId`
+(which returns the config object FLAT, not nested under `config`) and on
+`config_update`.
 Response (failure): `{ "register_error": { "reason": "invalid_register_token | rate_limited | invalid_body | registration_disabled | unsupported_protocol" } }`.
 
 Rules:
@@ -90,10 +107,16 @@ level; `data` carries the type-specific business payload only.**
 
 ### 4.2 Delivery — at-least-once both ways
 
-- Sender persists each outbound frame (outbox) before sending; receiver replies
-  `{ "type": "ack", "id": <outboxId> }`; unacked frames replay on reconnect.
-- Host→agent message delivery uses `msgId` + `{ "type": "msg_ack", "msgId": <int> }` so
-  the host advances its cursor only after the agent has durably stored the message.
+- Sender persists each outbound frame (outbox) before sending; unacked frames replay on
+  reconnect.
+- **Agent→host**: the host replies `{ "type": "ack", "id": <outboxId> }` after the durable
+  mirror write; the agent clears the outbox row on that ack.
+- **Host→agent**: EVERY durable host→agent frame carries `msgId` (the host outbox row id);
+  the agent dedups inbound frames on `msgId` and replies
+  `{ "type": "msg_ack", "msgId": <int> }` once it has durably stored the frame — that
+  `msg_ack` (not `ack{id}`) is what stops host replay, for `message` and for every other
+  durable type alike. Non-`message` frames also carry `outboxId` (same row id) for
+  compatibility; the agent does not acknowledge `outboxId`.
 - Receivers MUST be idempotent (dedupe by id; see §6) and MUST ignore unknown `type`s and
   unknown fields.
 
@@ -126,9 +149,13 @@ agent-architecture); bytes never travel in frames.
 | `cron_delete` | `taskId`, `cronId` | — | remove a trigger |
 | `message` | `taskId`, `threadId?` | `{text, attachments?}` | user/system input for a task (optionally a live thread) |
 | `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn. Delivery is LIVE-ONLY (at-most-once): the host sends it to an online agent and never replays it on reconnect — a stale cancel must not fire against a future turn |
-| `close` | — | — | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
-| `config_update` | — | `{<config fields>}` | live config change (opaque overlay) |
+| `close` | — | `{reason?}` (`stop\|restart\|remove`) | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
+| `config_update` | — | `{entries, version, <config fields>}` | live config change (the §3 global overlay; `data` is required — `entries` + `version` drive the version-gated reconcile) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
+
+Every durable host→agent frame additionally carries the top-level delivery id `msgId`
+(§4.2); it is omitted from the "envelope ids" column above, which lists the correlation
+ids only.
 
 Field semantics:
 - `kind` (`thread_message`) is an open string; the recognized set is
@@ -534,6 +561,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
             },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
             "data": {
               "type": "object",
               "properties": {
@@ -612,6 +644,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -634,6 +671,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
@@ -693,6 +735,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
@@ -801,6 +848,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -819,6 +871,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -834,6 +891,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "config_update"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
@@ -1199,6 +1261,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
             },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
             "data": {
               "type": "object",
               "properties": {
@@ -1277,6 +1344,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -1299,6 +1371,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
@@ -1358,6 +1435,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
@@ -1466,6 +1548,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -1484,6 +1571,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991
+            },
+            "msgId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -1499,6 +1591,11 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "config_update"
             },
             "outboxId": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "msgId": {
               "type": "integer",
               "minimum": -9007199254740991,
               "maximum": 9007199254740991

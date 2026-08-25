@@ -11,6 +11,7 @@
 // message. The old "group" delivery role is dissolved into this routing.
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
+import type { AttachmentDescriptor } from "@/protocol/frames";
 import type { FrameSender } from "@/protocol/outbox";
 import type { DispatchResult } from "@/tasks";
 import { and, eq } from "drizzle-orm";
@@ -22,7 +23,7 @@ export interface InboundMessage {
   /** Conversation identity within the channel (`channel_bindings.conversation_ref`). */
   conversationRef: string;
   text: string;
-  attachments?: unknown[];
+  attachments?: AttachmentDescriptor[];
   /** Per-conversation overrides for a NEW task; else fall back to the channel's `config` defaults. */
   engine?: string;
   model?: string;

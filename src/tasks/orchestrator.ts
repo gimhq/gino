@@ -18,13 +18,13 @@
 // agent-side (the host does not generate those ids).
 import type { AppDatabase } from "@/db";
 import type { Outbox, Task } from "@/db/schema";
-import type { ConfigEntry, CronUpsertData } from "@/protocol/frames";
+import type { AttachmentDescriptor, ConfigEntry, CronUpsertData } from "@/protocol/frames";
 import type { EnqueuedOutbox, FrameSender } from "@/protocol/outbox";
 import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine, resolveEntriesForEngines } from "@/configstore";
 import { tasks } from "@/db/schema";
-import { writeCronPrompt } from "@/msgstore";
+import { wireAttachmentRef, writeAttachmentDescriptors, writeCronPrompt } from "@/msgstore";
 import { ulid } from "@/platform";
 import { enqueue, enqueueLiveOnly } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
@@ -105,7 +105,7 @@ export function emitTaskUpsert(
 
 export interface MessageInput {
   text: string;
-  attachments?: unknown[];
+  attachments?: AttachmentDescriptor[];
   /** Open a NEW thread within the task instead of continuing the current one. */
   newThread?: boolean;
 }
@@ -141,7 +141,16 @@ export function emitMessage(db: AppDatabase, sender: FrameSender, task: Task, in
 
   const data: Record<string, unknown> = { text: input.text };
   if (input.attachments && input.attachments.length > 0) {
-    data.attachments = input.attachments;
+    // Register the descriptors under this task/thread (idempotent on `id`),
+    // then put the RESOLVABLE byte-channel ref on the wire: the agent joins
+    // `ref` to its host base URL and fetches (agent-architecture §9), so the
+    // store-internal ref must never leave the host.
+    writeAttachmentDescriptors(db, {
+      taskId: task.id,
+      threadId,
+      descriptors: input.attachments.map(d => ({ ...d, direction: d.direction ?? "inbound" })),
+    });
+    data.attachments = input.attachments.map(d => ({ ...d, ref: wireAttachmentRef(d.id) }));
   }
   const message = enqueue(db, sender, { agentId, type: "message", taskId: task.id, threadId, data });
   return { message, threadId };

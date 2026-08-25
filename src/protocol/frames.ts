@@ -236,10 +236,15 @@ export const AckFrame = z.looseObject({
 
 // ── Frames — host → agent ───────────────────────────────────────────────────
 
+// Every durable host→agent frame carries `msgId` (its outbox row id): the
+// runner dedups inbound frames and acknowledges durable storage by `msgId` +
+// `msg_ack` alone (§4.2) — `outboxId` rides along for compatibility but is
+// never acked by the runner.
 export const TaskUpsertFrame = z.looseObject({
   type: z.literal("task_upsert"),
   taskId: CorrelationId,
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
   data: TaskUpsertData,
 });
 
@@ -247,6 +252,7 @@ export const TaskDeleteFrame = z.looseObject({
   type: z.literal("task_delete"),
   taskId: CorrelationId,
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
 });
 
 export const CronUpsertFrame = z.looseObject({
@@ -254,6 +260,7 @@ export const CronUpsertFrame = z.looseObject({
   taskId: CorrelationId,
   cronId: CorrelationId,
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
   data: CronUpsertData,
 });
 
@@ -262,6 +269,7 @@ export const CronDeleteFrame = z.looseObject({
   taskId: CorrelationId,
   cronId: CorrelationId,
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
 });
 
 export const MessageFrame = z.looseObject({
@@ -282,16 +290,19 @@ export const InterruptFrame = z.looseObject({
    */
   taskId: CorrelationId.optional(),
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
 });
 
 export const CloseFrame = z.looseObject({
   type: z.literal("close"),
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
 });
 
 export const ConfigUpdateFrame = z.looseObject({
   type: z.literal("config_update"),
   outboxId: DeliveryId.optional(),
+  msgId: DeliveryId.optional(),
   data: ConfigUpdateData.optional(),
 });
 
