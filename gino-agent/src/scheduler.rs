@@ -1158,6 +1158,10 @@ mod tests {
                 name: None,
                 kind: None,
                 status: "active".to_owned(),
+                engine: None,
+                model: None,
+                workdir: None,
+                meta: None,
                 created_at: "2026-06-22T09:00:00.000Z".to_owned(),
                 updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
             })
