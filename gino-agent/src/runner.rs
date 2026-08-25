@@ -998,9 +998,20 @@ fn handle_cron_upsert(
 /// Apply a host `task_upsert` to the v2 `tasks` entity: insert when new, patch the
 /// supplied fields in place when known. Returns `false` on a DB failure so the
 /// router leaves the inbox row unprocessed for replay.
+///
+/// Every field follows the OMISSION-PRESERVES rule the `entries` column already
+/// had: an absent field leaves the stored value alone, so a partial `task_upsert`
+/// never wipes a definition the host pushed earlier. The task DEFINITION fields
+/// (`engine`/`model`/`workdir`/`meta`, OD15) ride the same rule; only `model`
+/// reaches execution today (at the next engine spawn, see
+/// [`crate::executor`]) — `workdir` and `meta` are persisted and nothing more.
 fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool {
     let guard = lock_db(db);
     let now_iso = to_iso(now());
+    warn_unsupported_engine(task_id, data.engine.as_deref());
+    let Ok(meta) = task_meta_json(task_id, data) else {
+        return false;
+    };
     match guard.get_task_row(task_id) {
         Ok(Some(mut row)) => {
             if let Some(name) = &data.name {
@@ -1011,6 +1022,18 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool 
             }
             if let Some(status) = &data.status {
                 row.status.clone_from(status);
+            }
+            if let Some(engine) = &data.engine {
+                row.engine = Some(engine.clone());
+            }
+            if let Some(model) = &data.model {
+                row.model = Some(model.clone());
+            }
+            if let Some(workdir) = &data.workdir {
+                row.workdir = Some(workdir.clone());
+            }
+            if meta.is_some() {
+                row.meta = meta;
             }
             row.updated_at = now_iso;
             if let Err(err) = guard.update_task_row(&row) {
@@ -1025,6 +1048,10 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool 
                 name: data.name.clone(),
                 kind: data.kind.clone(),
                 status: data.status.clone().unwrap_or_else(|| "active".to_owned()),
+                engine: data.engine.clone(),
+                model: data.model.clone(),
+                workdir: data.workdir.clone(),
+                meta,
                 created_at: now_iso.clone(),
                 updated_at: now_iso,
             };
@@ -1039,6 +1066,40 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool 
             false
         }
     }
+}
+
+/// The only engine backend this runner implements (`Engine::name`).
+const SUPPORTED_ENGINE: &str = "claude";
+
+/// Warn once per applied `task_upsert` when the host names an engine this build
+/// cannot run. DECISION: NON-FATAL — an unsupported engine is a forward-compat
+/// signal from a newer host, not a bad request, so the value is still persisted
+/// and the task's threads keep running on [`SUPPORTED_ENGINE`]. Failing them
+/// would strand a whole task on a field the runner is free to ignore.
+fn warn_unsupported_engine(task_id: &str, engine: Option<&str>) {
+    if let Some(engine) = engine
+        && engine != SUPPORTED_ENGINE
+    {
+        warn!(
+            task = %task_id,
+            requested = %engine,
+            fallback = %SUPPORTED_ENGINE,
+            "task_upsert named an unsupported engine; running on the supported one"
+        );
+    }
+}
+
+/// Serialize a `task_upsert`'s free-form `meta` object for the `tasks.meta` text
+/// column. `Ok(None)` means the host omitted it (omission preserves the stored
+/// value); `Err(())` is a serialize failure, which fails the apply so the inbox
+/// row replays rather than silently dropping half a definition.
+fn task_meta_json(task_id: &str, data: &TaskUpsertData) -> Result<Option<String>, ()> {
+    let Some(meta) = &data.meta else {
+        return Ok(None);
+    };
+    serde_json::to_string(meta).map(Some).map_err(|err| {
+        warn!(task = %task_id, error = %err, "failed to serialize task meta");
+    })
 }
 
 /// Persist a `task_upsert`'s provisioning entries onto the `tasks` row (PLAN-007

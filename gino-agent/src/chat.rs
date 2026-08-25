@@ -186,6 +186,10 @@ pub(crate) fn seed_task_if_missing(db: &Db, task_id: &str) -> bool {
                 name: None,
                 kind: None,
                 status: "active".to_owned(),
+                engine: None,
+                model: None,
+                workdir: None,
+                meta: None,
                 created_at: now_iso.clone(),
                 updated_at: now_iso,
             };
@@ -378,6 +382,10 @@ mod tests {
                     name: None,
                     kind: None,
                     status: "active".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T00:00:00Z".to_owned(),
                     updated_at: "2026-06-22T00:00:00Z".to_owned(),
                 })
@@ -494,6 +502,10 @@ mod tests {
                     name: None,
                     kind: None,
                     status: "closed".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T00:00:00Z".to_owned(),
                     updated_at: "2026-06-22T00:00:00Z".to_owned(),
                 })
@@ -575,6 +587,10 @@ mod tests {
                     name: None,
                     kind: None,
                     status: "active".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T00:00:00Z".to_owned(),
                     updated_at: "2026-06-22T00:00:00Z".to_owned(),
                 })

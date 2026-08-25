@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use serde_json::json;
+
 use crate::chat::InboxPromptSource;
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::protocol::v2::{EntryKind, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
@@ -50,6 +52,10 @@ fn task_owns_active_run_matches_only_in_flight_threads() {
                     name: None,
                     kind: None,
                     status: "active".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T09:00:00.000Z".to_owned(),
                     updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
                 })
@@ -243,6 +249,10 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
             name: None,
             kind: None,
             status: "active".to_owned(),
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             created_at: "2026-06-22T09:00:00.000Z".to_owned(),
             updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
         })
@@ -276,6 +286,10 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
             name: None,
             kind: None,
             status: Some("active".to_owned()),
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             entries: None,
         },
         msg_id: Some(32),
@@ -324,6 +338,10 @@ fn task_upsert_persists_entries_and_omission_preserves_them() {
             name: Some("build".to_owned()),
             kind: None,
             status: None,
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             entries: Some(vec![entry.clone()]),
         },
     );
@@ -344,6 +362,10 @@ fn task_upsert_persists_entries_and_omission_preserves_them() {
             name: Some("build-2".to_owned()),
             kind: None,
             status: None,
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             entries: None,
         },
     );
@@ -361,6 +383,10 @@ fn task_upsert_persists_entries_and_omission_preserves_them() {
             name: None,
             kind: None,
             status: None,
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             entries: Some(Vec::new()),
         },
     );
@@ -368,6 +394,140 @@ fn task_upsert_persists_entries_and_omission_preserves_them() {
         lock_db(&db).get_task_entries("t-1").unwrap().as_deref(),
         Some("[]"),
         "an explicit empty entries set replaces the prior one"
+    );
+}
+
+/// D2: the host ALWAYS sends the task definition (`engine`/`model`/`workdir`/
+/// `meta`) on `task_upsert`; the runner used to discard all four. They must land
+/// on the `tasks` row, and — like `entries` — a later upsert that OMITS them must
+/// not wipe what is already stored.
+#[test]
+fn task_upsert_persists_definition_and_omission_preserves_it() {
+    let db = Mutex::new(Db::open_in_memory().unwrap());
+
+    // Insert-new carrying the full definition.
+    assert!(apply_task_def(
+        &db,
+        "t-1",
+        &TaskUpsertData {
+            name: Some("build".to_owned()),
+            kind: Some("agent".to_owned()),
+            status: Some("active".to_owned()),
+            engine: Some("claude".to_owned()),
+            model: Some("claude-opus-4-8".to_owned()),
+            workdir: Some("/srv/project".to_owned()),
+            meta: Some(json!({ "team": "infra" })),
+            entries: None,
+        },
+    ));
+    let row = lock_db(&db).get_task_row("t-1").unwrap().unwrap();
+    assert_eq!(row.engine.as_deref(), Some("claude"));
+    assert_eq!(row.model.as_deref(), Some("claude-opus-4-8"));
+    assert_eq!(row.workdir.as_deref(), Some("/srv/project"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.meta.as_deref().unwrap()).unwrap(),
+        json!({ "team": "infra" }),
+        "meta is persisted verbatim as JSON text"
+    );
+
+    // Patch-existing that omits all four → the stored definition is untouched.
+    assert!(apply_task_def(
+        &db,
+        "t-1",
+        &TaskUpsertData {
+            name: Some("build-2".to_owned()),
+            kind: None,
+            status: None,
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
+            entries: None,
+        },
+    ));
+    let after = lock_db(&db).get_task_row("t-1").unwrap().unwrap();
+    assert_eq!(
+        after.name.as_deref(),
+        Some("build-2"),
+        "the sent field applies"
+    );
+    assert_eq!(
+        (after.engine, after.model, after.workdir, after.meta),
+        (row.engine, row.model, row.workdir, row.meta),
+        "an upsert omitting the definition must not wipe it"
+    );
+
+    // A sent field still overwrites.
+    assert!(apply_task_def(
+        &db,
+        "t-1",
+        &TaskUpsertData {
+            name: None,
+            kind: None,
+            status: None,
+            engine: None,
+            model: Some("claude-sonnet-4-6".to_owned()),
+            workdir: None,
+            meta: None,
+            entries: None,
+        },
+    ));
+    assert_eq!(
+        lock_db(&db)
+            .get_task_row("t-1")
+            .unwrap()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("claude-sonnet-4-6")
+    );
+}
+
+/// D2: an engine this build cannot run is FORWARD-COMPAT NOISE, not a bad
+/// request — the value is stored as sent, the apply still succeeds (so the inbox
+/// row is marked processed rather than replayed forever), and the task's threads
+/// stay runnable on the claude fallback.
+#[tokio::test]
+async fn unsupported_engine_is_stored_but_never_fails_the_task() {
+    let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+    assert!(
+        apply_task_def(
+            &db,
+            "t-1",
+            &TaskUpsertData {
+                name: None,
+                kind: None,
+                status: Some("active".to_owned()),
+                engine: Some("codex".to_owned()),
+                model: None,
+                workdir: None,
+                meta: None,
+                entries: None,
+            },
+        ),
+        "an unsupported engine must not fail the apply"
+    );
+    assert_eq!(
+        lock_db(&db)
+            .get_task_row("t-1")
+            .unwrap()
+            .unwrap()
+            .engine
+            .as_deref(),
+        Some("codex"),
+        "the value is persisted as sent"
+    );
+
+    // The task's thread is still runnable: nothing parked or failed it.
+    lock_db(&db)
+        .insert_thread(&chat_thread("th-1", "t-1"))
+        .unwrap();
+    assert!(!crate::executor::task_parked(&db, "t-1"));
+    assert_eq!(
+        lock_db(&db).list_pending_threads().unwrap().len(),
+        1,
+        "the thread stays pending and drainable despite the unknown engine"
     );
 }
 
@@ -473,6 +633,10 @@ fn cron_upsert_before_task_upsert_is_not_dropped() {
             name: Some("rounds".to_owned()),
             kind: None,
             status: None,
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             entries: None,
         },
     ));
@@ -561,6 +725,10 @@ async fn local_planes_run_and_shut_down_cleanly_while_host_unreachable() {
             name: None,
             kind: None,
             status: "active".to_owned(),
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             created_at: "2026-06-22T09:00:00.000Z".to_owned(),
             updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
         })
@@ -747,6 +915,10 @@ async fn shutdown_cancels_the_active_run_within_the_drain_window() {
             name: None,
             kind: None,
             status: "active".to_owned(),
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             created_at: "2026-06-22T09:00:00.000Z".to_owned(),
             updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
         })

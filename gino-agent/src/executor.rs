@@ -91,6 +91,21 @@ pub(crate) fn task_parked(db: &Mutex<Db>, task_id: &str) -> bool {
     }
 }
 
+/// The per-task model override (OD15) for `task_id`, or `None` when the task
+/// has none — then the engine keeps the globally configured `config.engine.model`.
+/// A missing row (task rows are seeded lazily) and a lookup failure both answer
+/// `None`: an unreadable definition must degrade to the global model, never fail
+/// the run.
+fn task_model(db: &Mutex<Db>, task_id: &str) -> Option<String> {
+    match lock_db(db).get_task_row(task_id) {
+        Ok(row) => row.and_then(|row| row.model),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task model lookup failed; using the configured model");
+            None
+        }
+    }
+}
+
 // -- thread.status string values (the engine lifecycle axis) ------------
 const PENDING: &str = "pending";
 const DISPATCHED: &str = "dispatched";
@@ -459,6 +474,10 @@ impl ThreadExecutor {
             initial_prompt: Some(prompt),
             task_id: Some(thread.task_id.clone()),
             thread_id: Some(thread.id.clone()),
+            // Per-task model (OD15): read HERE, at spawn time, so a `task_upsert`
+            // that changes the model reaches the next run without disturbing the
+            // one in flight — the same apply-on-next-run policy as `config_update`.
+            model: task_model(&self.db, &thread.task_id),
             ..SessionCfg::default()
         };
         let session: Arc<dyn Session> = match self.engine.start_session(cfg).await {

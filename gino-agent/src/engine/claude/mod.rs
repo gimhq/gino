@@ -20,6 +20,7 @@
 mod control;
 mod events;
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -269,6 +270,30 @@ fn precompact_settings_json(settings: &ClaudeSettings) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
+/// Layer the per-session [`SessionCfg::model`] (the task's `model`, OD15) onto
+/// the configured settings for ONE spawn: present → it wins over
+/// `config.engine.model`, absent → the configured model stands untouched
+/// (borrowed, so the common case copies nothing).
+///
+/// DECISION: APPLY-ON-NEXT-SPAWN. The override is read here, at spawn, and never
+/// pushed into a session already running — a live turn keeps the model it was
+/// launched with. This is the same policy the `config_update` route applies to
+/// engine settings (see `runner::apply_engine_config`), so a task's model change
+/// takes effect on its next run rather than mid-turn.
+fn effective_settings<'a>(
+    settings: &'a ClaudeSettings,
+    cfg: &SessionCfg,
+) -> Cow<'a, ClaudeSettings> {
+    match &cfg.model {
+        Some(model) => {
+            let mut overridden = settings.clone();
+            overridden.model = Some(model.clone());
+            Cow::Owned(overridden)
+        }
+        None => Cow::Borrowed(settings),
+    }
+}
+
 /// The Claude backend. Holds the resolved [`ClaudeSettings`]; cheap to clone-free
 /// share behind a `Box<dyn Engine>`.
 #[derive(Clone, Debug)]
@@ -291,8 +316,9 @@ impl Engine for ClaudeEngine {
 
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         let session_args = SessionArgs::for_session(&cfg);
+        let settings = effective_settings(&self.settings, &cfg);
         let session = spawn_session(
-            &self.settings,
+            &settings,
             &session_args,
             cfg.initial_prompt.as_deref(),
             cfg.task_id.as_deref(),
@@ -631,7 +657,9 @@ impl Stream for EventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeSettings, SessionArgs, SessionId, build_args, config_dir_env};
+    use super::{
+        ClaudeSettings, SessionArgs, SessionId, build_args, config_dir_env, effective_settings,
+    };
     use crate::engine::SessionCfg;
 
     fn args_with(session: SessionId) -> SessionArgs {
@@ -747,6 +775,37 @@ mod tests {
         // `--allowed-tools` is last, with the tools trailing it.
         let tools = argv.iter().position(|a| a == "--allowed-tools").unwrap();
         assert_eq!(&argv[tools + 1..], ["Bash", "Read"]);
+    }
+
+    /// D2/OD15: the per-task `model` on the session config wins over the
+    /// configured `config.engine.model` for that spawn's `--model`, and a
+    /// session without one leaves the configured model in place.
+    #[test]
+    fn session_model_overrides_the_configured_model_in_argv() {
+        let settings = ClaudeSettings {
+            model: Some("claude-sonnet-4-6".to_owned()),
+            ..ClaudeSettings::default()
+        };
+        let model_flag = |cfg: &SessionCfg| {
+            let effective = effective_settings(&settings, cfg);
+            let argv = build_args(&effective, &args_with(SessionId::New("s".to_owned())));
+            let at = argv.iter().position(|a| a == "--model").unwrap();
+            argv[at + 1].clone()
+        };
+
+        assert_eq!(
+            model_flag(&SessionCfg::default()),
+            "claude-sonnet-4-6",
+            "no per-task model → the configured one stands"
+        );
+        assert_eq!(
+            model_flag(&SessionCfg {
+                model: Some("claude-opus-4-8".to_owned()),
+                ..SessionCfg::default()
+            }),
+            "claude-opus-4-8",
+            "a per-task model overrides the configured one"
+        );
     }
 
     #[test]
