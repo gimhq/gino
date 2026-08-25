@@ -13,6 +13,15 @@
 //! the `.reconnect-token` file hack the TS runner needed. Otherwise it registers,
 //! persists the identity *before* returning, and folds the host-assigned config
 //! overlay onto the running [`Config`].
+//!
+//! Enrollment failures are split in two (audit D3). A *transient* failure — the
+//! host is rate-limiting us, is throwing 5xx, or is simply not reachable yet —
+//! retries forever on the same capped backoff the reconnect loop uses, because a
+//! runner that exits on a network blip is a runner an operator has to babysit. A
+//! *terminal* failure — a bad register token, enrollment switched off, a body the
+//! host cannot parse, a protocol version it will not speak — still aborts
+//! startup, and so does any reason this build does not recognise
+//! ([`register_failure_action`] fails closed).
 
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
@@ -23,6 +32,7 @@ use crate::config::{Config, ConfigError, ConfigOverlay};
 use crate::db::{Db, DbError};
 use crate::protocol::{PROTOCOL_VERSION, Redacted, RegisterRequest, RegisterResponse};
 use crate::transport::http::{HttpClient, HttpError};
+use crate::transport::{Backoff, BackoffConfig};
 
 /// Engine capabilities advertised at registration. The only engine in the plan
 /// (PLAN-001) is the Claude CLI engine; later engine L3s extend this list.
@@ -31,6 +41,14 @@ const CAPABILITIES: &[&str] = &["claude"];
 /// The `register_error` reason the host returns when it cannot speak the
 /// agent's `protocolVersion` (docs/protocol.md §1). Triggers a clean exit.
 const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
+
+/// The `register_error` reason meaning "you are enrolling too fast" — the one
+/// rejection the host can send that is worth waiting out rather than exiting on.
+const RATE_LIMITED: &str = "rate_limited";
+
+/// The status-layer twin of [`RATE_LIMITED`], for a host that answers 429 with a
+/// body that is not a `register_error` envelope.
+const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 
 /// Errors raised by the enrollment flow.
 #[derive(Debug, Error)]
@@ -95,7 +113,105 @@ pub(crate) async fn load_or_register(
             connect_token: identity.connect_token,
         });
     }
-    register(config, db, http).await
+    register_with_backoff(config, db, http, BackoffConfig::default()).await
+}
+
+/// Drive [`register`] until it succeeds or fails terminally, backing off between
+/// transient attempts on the shared reconnect schedule (1 s base, 10 s ceiling).
+///
+/// Attempts are unbounded, matching the reconnect loop (P0-2): only the delay is
+/// capped, never the number of tries. Enrollment runs before the daemon's shared
+/// cancellation token exists — and before the signal handlers that would set it
+/// are installed — so there is deliberately no cancellation branch here: a
+/// SIGINT/SIGTERM during startup still terminates the process by default, and
+/// inventing a second shutdown path for this window would buy nothing.
+///
+/// `backoff` is a parameter purely so tests can use the fast schedule.
+async fn register_with_backoff(
+    config: &mut Config,
+    db: &Db,
+    http: &HttpClient,
+    backoff: BackoffConfig,
+) -> Result<ResolvedIdentity, RegisterError> {
+    let mut backoff = Backoff::new(backoff);
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
+        let error = match register(config, db, http).await {
+            Ok(identity) => return Ok(identity),
+            Err(error) => error,
+        };
+        if register_failure_action(&error) == FailureAction::Fatal {
+            return Err(error);
+        }
+        // `next_delay` is infallible today; honouring a `None` keeps enrollment
+        // tied to the reconnect schedule's contract rather than assuming it.
+        let Some(delay) = backoff.next_delay() else {
+            return Err(error);
+        };
+        warn!(
+            attempt,
+            delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            %error,
+            "registration attempt failed transiently — retrying"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// What [`register_with_backoff`] does with a failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureAction {
+    /// Transient: wait out the backoff and re-POST.
+    Retry,
+    /// Terminal: propagate, and the daemon exits without connecting.
+    Fatal,
+}
+
+/// Classify an enrollment failure. Split out from the loop so the policy is
+/// unit-testable without a network or a sleep.
+///
+/// Fails CLOSED: only the failures listed here retry, so a rejection reason this
+/// build has never heard of aborts startup instead of hammering the host with a
+/// request it has already refused.
+fn register_failure_action(error: &RegisterError) -> FailureAction {
+    match error {
+        // The only rejection worth waiting out. `invalid_register_token`,
+        // `registration_disabled`, `invalid_body` — and anything unrecognised —
+        // fall through to `Fatal`: re-POSTing cannot change the answer.
+        RegisterError::Rejected(reason) if reason == RATE_LIMITED => FailureAction::Retry,
+        RegisterError::Http(error) => http_failure_action(error),
+        _ => FailureAction::Fatal,
+    }
+}
+
+/// The HTTP half of [`register_failure_action`].
+fn http_failure_action(error: &HttpError) -> FailureAction {
+    match error {
+        // 5xx is the host failing rather than refusing us; 429 is `rate_limited`
+        // surfaced at the status layer. `Retry-After` is deliberately not read —
+        // the capped schedule is the whole back-off policy.
+        HttpError::Status { status, .. } => {
+            if *status >= 500 || *status == HTTP_TOO_MANY_REQUESTS {
+                FailureAction::Retry
+            } else {
+                FailureAction::Fatal
+            }
+        }
+        // `Request` is DNS / TLS / connect / idle-read timeout: the host may just
+        // not be up yet, which is the ordinary case when both sides boot
+        // together. `Decode` on `/agent/register` can only be a 2xx whose body is
+        // not a `RegisterResponse` — [`HttpClient::register`] maps an unparseable
+        // NON-2xx body to `Status` instead — so it is a truncated or
+        // proxy-mangled *success*: a broken response rather than a considered
+        // rejection, and worth re-asking for.
+        HttpError::Request { .. } | HttpError::Decode { .. } => FailureAction::Retry,
+        // Enrollment neither builds a client nor streams a body, so these cannot
+        // originate here; treat the impossible as terminal rather than looping.
+        HttpError::Build(_) | HttpError::TooLarge { .. } | HttpError::Sink { .. } => {
+            FailureAction::Fatal
+        }
+    }
 }
 
 /// Perform a fresh `POST /agent/register` and persist the result.
@@ -288,10 +404,15 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{RegisterError, load_or_register};
+    use super::{
+        FailureAction, RegisterError, load_or_register, register_failure_action,
+        register_with_backoff,
+    };
     use crate::config::{Config, ConfigOverlay};
     use crate::db::Db;
-    use crate::transport::http::HttpClient;
+    use crate::protocol::{PROTOCOL_VERSION, Redacted, RegisterRequest};
+    use crate::transport::BackoffConfig;
+    use crate::transport::http::{HttpClient, HttpError};
 
     fn bootstrap_config(host: &str, register_token: Option<&str>) -> Config {
         let mut config = Config::default();
@@ -530,6 +651,183 @@ mod tests {
         // protocolVersion stripped ⇒ the overlay parsed and applied.
         assert_eq!(config.engine.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(config.agent_id.as_deref(), Some("agent-9"));
+    }
+
+    /// Build a well-formed register body for the HTTP-layer probes below.
+    fn probe_request() -> RegisterRequest {
+        RegisterRequest {
+            register_token: Redacted::new("reg-tok"),
+            protocol_version: PROTOCOL_VERSION,
+            name: None,
+            capabilities: vec!["claude".to_owned()],
+            version: "0.0.0".to_owned(),
+            platform: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn failure_classification_retries_only_transient_failures() {
+        let status = |status: u16| {
+            RegisterError::Http(HttpError::Status {
+                endpoint: "register",
+                status,
+            })
+        };
+        // Transient: the host is busy, broken, or not up yet.
+        for error in [
+            RegisterError::Rejected("rate_limited".to_owned()),
+            status(429),
+            status(500),
+            status(502),
+            status(503),
+            status(504),
+        ] {
+            assert_eq!(
+                register_failure_action(&error),
+                FailureAction::Retry,
+                "expected retry: {error:?}"
+            );
+        }
+        // Terminal: re-POSTing cannot change any of these answers. The made-up
+        // reason is the fail-closed case — unknown ⇒ fatal, never a hot loop.
+        for error in [
+            RegisterError::Rejected("invalid_register_token".to_owned()),
+            RegisterError::Rejected("registration_disabled".to_owned()),
+            RegisterError::Rejected("invalid_body".to_owned()),
+            RegisterError::Rejected("unsupported_protocol".to_owned()),
+            RegisterError::Rejected("some_future_reason".to_owned()),
+            RegisterError::UnsupportedProtocol("v1".to_owned()),
+            RegisterError::MissingRegisterToken,
+            RegisterError::InvalidConfig(serde_json::from_str::<u8>("{}").unwrap_err()),
+            status(400),
+            status(401),
+            status(403),
+            status(404),
+            status(426),
+            RegisterError::Http(HttpError::TooLarge {
+                endpoint: "register",
+                size: 2,
+                limit: 1,
+            }),
+        ] {
+            assert_eq!(
+                register_failure_action(&error),
+                FailureAction::Fatal,
+                "expected fatal: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_and_decode_failures_are_transient() {
+        // `reqwest::Error` has no public constructor, so both variants are
+        // produced by the real client — against loopback, so neither costs a
+        // second of wall-clock.
+        let http = HttpClient::new().unwrap();
+        // Connection refused on a dead port ⇒ `Request`.
+        let err = http
+            .register("http://127.0.0.1:1/agent/register", &probe_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Request { .. }), "got {err:?}");
+        assert_eq!(
+            register_failure_action(&RegisterError::Http(err)),
+            FailureAction::Retry
+        );
+
+        // A 2xx body that is not a RegisterResponse ⇒ `Decode` (a mangled
+        // success, not a rejection).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>gateway</html>"))
+            .mount(&server)
+            .await;
+        let err = http
+            .register(
+                &format!("{}/agent/register", server.uri()),
+                &probe_request(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HttpError::Decode { .. }), "got {err:?}");
+        assert_eq!(
+            register_failure_action(&RegisterError::Http(err)),
+            FailureAction::Retry
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failures_retry_until_registration_succeeds() {
+        let server = MockServer::start().await;
+        // Mocks are matched in mount order, and each falls out of the running once
+        // it is exhausted: 503 → rate_limited → success, all on one endpoint.
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "register_error": { "reason": "rate_limited" }
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "agentId": "agent-9",
+                "connectToken": "connect-xyz",
+                "config": { "engine": { "model": "claude-opus-4-8" } },
+            })))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().unwrap();
+        let http = HttpClient::new().unwrap();
+        let mut config = bootstrap_config(&server.uri(), Some("reg-tok"));
+
+        let identity = register_with_backoff(&mut config, &db, &http, BackoffConfig::for_tests())
+            .await
+            .unwrap();
+
+        // The daemon survived both failures and enrolled on the third attempt.
+        assert_eq!(identity.agent_id, "agent-9");
+        assert_eq!(identity.connect_token.expose_secret(), "connect-xyz");
+        assert_eq!(config.engine.model.as_deref(), Some("claude-opus-4-8"));
+        let persisted = db.get_identity().unwrap().unwrap();
+        assert_eq!(persisted.agent_id, "agent-9");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_fatal_rejection_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agent/register"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "register_error": { "reason": "invalid_register_token" }
+            })))
+            .mount(&server)
+            .await;
+
+        let db = Db::open_in_memory().unwrap();
+        let http = HttpClient::new().unwrap();
+        let mut config = bootstrap_config(&server.uri(), Some("bad-tok"));
+
+        let err = register_with_backoff(&mut config, &db, &http, BackoffConfig::for_tests())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, RegisterError::Rejected(reason) if reason == "invalid_register_token"),
+            "unexpected error: {err:?}"
+        );
+        // Exactly one POST: a bad token must not be re-offered on a loop.
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(db.get_identity().unwrap().is_none());
     }
 
     #[test]

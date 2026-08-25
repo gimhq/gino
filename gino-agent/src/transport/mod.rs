@@ -93,8 +93,8 @@ impl Default for BackoffConfig {
 
 #[cfg(test)]
 impl BackoffConfig {
-    /// Fast schedule for reconnect tests (no second-scale sleeps).
-    fn for_tests() -> Self {
+    /// Fast schedule for reconnect/enrollment tests (no second-scale sleeps).
+    pub(super) fn for_tests() -> Self {
         Self {
             base: Duration::from_millis(10),
             max: Duration::from_millis(40),
@@ -363,7 +363,7 @@ pub(super) struct Backoff {
 }
 
 impl Backoff {
-    fn new(config: BackoffConfig) -> Self {
+    pub(super) fn new(config: BackoffConfig) -> Self {
         Self { config, attempt: 0 }
     }
 
