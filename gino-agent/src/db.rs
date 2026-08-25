@@ -984,6 +984,22 @@ impl Db {
         Ok(())
     }
 
+    /// Whether `task_id`'s status parks execution (D1): a `closed`/`cancelled`
+    /// task neither fires its crons nor dispatches its pending threads / queued
+    /// inbox messages. Every other status — including an unknown one — keeps
+    /// running, and so does a MISSING row: the runner seeds task rows lazily
+    /// ([`crate::chat::seed_task_if_missing`]), so absence means not-yet-seeded,
+    /// never closed.
+    pub(crate) fn task_execution_blocked(&self, task_id: &str) -> DbResult<bool> {
+        let blocked = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM tasks WHERE id = ?1 AND status IN ('closed', 'cancelled')",
+            )?
+            .exists(params![task_id])?;
+        Ok(blocked)
+    }
+
     fn map_task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
         Ok(TaskRow {
             id: r.get(0)?,
@@ -2178,6 +2194,29 @@ mod tests {
         assert_eq!(reloaded.updated_at, "2026-06-22T13:00:00Z");
         // created_at is immutable across an update.
         assert_eq!(reloaded.created_at, "2026-06-22T11:00:00Z");
+    }
+
+    /// D1: the task-status gate every execution plane consults. Only `closed`
+    /// and `cancelled` park work; any other status — including one this runner
+    /// does not know — and a MISSING row (task rows are seeded lazily) do not.
+    #[test]
+    fn task_execution_blocked_only_for_closed_and_cancelled() {
+        let db = Db::open_in_memory().unwrap();
+        for status in ["active", "closed", "cancelled", "paused-by-a-future-host"] {
+            db.insert_task_row(&task_row(status, status)).unwrap();
+        }
+
+        assert!(db.task_execution_blocked("closed").unwrap());
+        assert!(db.task_execution_blocked("cancelled").unwrap());
+        assert!(!db.task_execution_blocked("active").unwrap());
+        assert!(
+            !db.task_execution_blocked("paused-by-a-future-host")
+                .unwrap()
+        );
+        assert!(
+            !db.task_execution_blocked("never-seeded").unwrap(),
+            "a missing task row must not silently park work"
+        );
     }
 
     // -- v2: crons ---------------------------------------------------------

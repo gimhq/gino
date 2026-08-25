@@ -65,6 +65,7 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::db::{CronLogRow, CronRow, Db, DbError, ThreadRow};
+use crate::executor::task_parked;
 use crate::protocol::v2::{CronStateData, CronUpsertData};
 
 /// Upper bound on how long the loop sleeps before re-scanning the DB even with no
@@ -473,6 +474,10 @@ pub(crate) struct CronTally {
     skipped: i64,
     /// The most recent fire's scheduling status.
     last_status: Option<String>,
+    /// Whether the last tick found this cron parked by its task's status (D1).
+    /// Process-local only (never emitted in `cron_state`) — it exists so the
+    /// park is logged on transition instead of on every poll.
+    parked: bool,
 }
 
 /// Build the local scheduling-ledger summary frame payload for a cron. `pub(crate)`
@@ -715,6 +720,12 @@ impl Scheduler {
         let now = now();
         let mut earliest: Option<DateTime<Utc>> = None;
         for cron in &crons {
+            // A parked cron (D1) must not pull the sleep down: its `next_run`
+            // stays in the past for as long as the task is closed, which would
+            // otherwise pin this wait at zero and spin the loop.
+            if task_parked(&self.db, &cron.task_id) {
+                continue;
+            }
             if let Some(next) = cron.next_run.as_deref().and_then(parse_iso) {
                 earliest = Some(earliest.map_or(next, |cur| cur.min(next)));
             }
@@ -729,7 +740,8 @@ impl Scheduler {
         }
     }
 
-    /// Fire every active cron whose `next_run` is due (`<= now`).
+    /// Fire every active cron whose `next_run` is due (`<= now`) and whose task
+    /// is not closed/cancelled (D1).
     fn tick(&self, now: DateTime<Utc>, tally: &mut HashMap<String, CronTally>) {
         let crons = match lock_db(&self.db).list_active_crons() {
             Ok(crons) => crons,
@@ -743,6 +755,20 @@ impl Scheduler {
                 continue;
             };
             if next > now {
+                continue;
+            }
+            // Task-status gate (D1), applied HERE rather than in the load-set
+            // query so the skip stays visible in this module's logs; logged on
+            // transition only because the tick runs every poll interval. The
+            // cron is left untouched — no ledger line, no thread, no advance —
+            // so re-activating the task resumes it on the same slot.
+            let parked = task_parked(&self.db, &cron.task_id);
+            let entry = tally.entry(cron.id.clone()).or_default();
+            if parked && !entry.parked {
+                debug!(cron = %cron.id, task = %cron.task_id, "task closed/cancelled; cron parked");
+            }
+            entry.parked = parked;
+            if parked {
                 continue;
             }
             self.fire_cron(&cron, now, tally);
@@ -1138,6 +1164,13 @@ mod tests {
             .unwrap();
     }
 
+    fn set_task_status(db: &Mutex<Db>, status: &str) {
+        let guard = lock_db(db);
+        let mut row = guard.get_task_row("task-1").unwrap().unwrap();
+        status.clone_into(&mut row.status);
+        guard.update_task_row(&row).unwrap();
+    }
+
     fn make_scheduler(db: Arc<Mutex<Db>>) -> Scheduler {
         // The retry budget cron threads are stamped with comes from
         // `config.executor.max_attempts`; tests use the shipped defaults
@@ -1361,6 +1394,94 @@ mod tests {
         assert_eq!(advanced.run_count, 1);
         assert!(parse_iso(advanced.next_run.as_deref().unwrap()).unwrap() > now);
         assert!(advanced.last_fired_at.is_some());
+    }
+
+    /// D1: a due cron whose task is `closed` does not fire — no ledger line, no
+    /// thread, and the slot is left untouched — and firing resumes on the same
+    /// slot the moment a `task_upsert{status:"active"}` re-activates the task.
+    #[test]
+    fn closed_task_parks_its_due_cron_until_reactivation() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        set_task_status(&db, "closed");
+
+        let sched = make_scheduler(Arc::clone(&db));
+        let now = at("2026-06-22T12:00:05Z");
+        let tid = isolated_thread_id("c-1", at(scheduled));
+        sched.tick(now, &mut HashMap::new());
+
+        assert_eq!(
+            lock_db(&db).max_round_seq("c-1").unwrap(),
+            None,
+            "a parked fire appends no cron_logs line"
+        );
+        assert!(
+            lock_db(&db).get_thread(&tid).unwrap().is_none(),
+            "a parked fire creates no thread"
+        );
+        let parked = lock_db(&db).get_cron("c-1").unwrap().unwrap();
+        assert_eq!(
+            parked.next_run.as_deref(),
+            Some(scheduled),
+            "the slot is kept for the re-activated task"
+        );
+        assert_eq!(parked.run_count, 0);
+
+        // Re-activation resumes the cron on the slot it was parked at.
+        set_task_status(&db, "active");
+        sched.tick(now, &mut HashMap::new());
+        assert_eq!(lock_db(&db).max_round_seq("c-1").unwrap(), Some(1));
+        assert!(
+            lock_db(&db).get_thread(&tid).unwrap().is_some(),
+            "re-activation fires the parked cron"
+        );
+    }
+
+    /// D1: `cancelled` — the status a host `task_delete` writes
+    /// ([`crate::runner`]) — parks its crons exactly like `closed`, while any
+    /// other status (including one this runner does not know) keeps firing.
+    #[test]
+    fn cancelled_task_parks_its_cron_but_an_unknown_status_does_not() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        seed_task(&db);
+        let scheduled = "2026-06-22T12:00:00.000Z";
+        lock_db(&db)
+            .insert_cron(&cron(
+                "c-1",
+                "interval",
+                "60000",
+                "isolated",
+                Some(scheduled),
+            ))
+            .unwrap();
+        set_task_status(&db, "cancelled");
+
+        let sched = make_scheduler(Arc::clone(&db));
+        let now = at("2026-06-22T12:00:05Z");
+        sched.tick(now, &mut HashMap::new());
+        assert_eq!(
+            lock_db(&db).max_round_seq("c-1").unwrap(),
+            None,
+            "a cancelled task parks its cron"
+        );
+
+        set_task_status(&db, "archived-by-some-future-host");
+        sched.tick(now, &mut HashMap::new());
+        assert_eq!(
+            lock_db(&db).max_round_seq("c-1").unwrap(),
+            Some(1),
+            "only closed/cancelled block; every other status keeps today's behavior"
+        );
     }
 
     #[test]
@@ -2086,6 +2207,7 @@ mod tests {
         let tally = CronTally {
             skipped: 2,
             last_status: Some("dispatched".to_owned()),
+            ..CronTally::default()
         };
         let data = cron_state_data(&c, 5, &tally);
         assert_eq!(data.round_count, 5);
@@ -2114,6 +2236,7 @@ mod tests {
             &CronTally {
                 skipped: 0,
                 last_status: Some("dispatched".to_owned()),
+                ..CronTally::default()
             },
         )
         .unwrap();

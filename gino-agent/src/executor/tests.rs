@@ -127,6 +127,13 @@ fn test_db() -> Arc<Mutex<Db>> {
     Arc::new(Mutex::new(db))
 }
 
+fn set_task_status(db: &Arc<Mutex<Db>>, status: &str) {
+    let guard = lock(db);
+    let mut row = guard.get_task_row("task-1").unwrap().unwrap();
+    status.clone_into(&mut row.status);
+    guard.update_task_row(&row).unwrap();
+}
+
 fn pending_thread(id: &str, max_attempts: i64) -> ThreadRow {
     ThreadRow {
         id: id.to_owned(),
@@ -636,6 +643,39 @@ async fn drain_pending_runs_every_pending_thread() {
         "succeeded"
     );
     assert!(lock(&db).list_pending_threads().unwrap().is_empty());
+}
+
+/// D1: a `pending` thread under a closed/cancelled task is NOT drained — it is
+/// left `pending` (never failed, never deleted), its inbox message unconsumed —
+/// and it drains as soon as the task is `active` again.
+#[tokio::test]
+async fn closed_task_parks_its_pending_thread_until_reactivation() {
+    let db = test_db();
+    let exec = build(
+        &db,
+        vec![started("s"), ok_result("ok", "s")],
+        false,
+        no_inactivity(),
+    );
+    lock(&db).insert_thread(&pending_thread("th-a", 1)).unwrap();
+    set_task_status(&db, "closed");
+
+    assert_eq!(exec.drain_pending(&StaticPrompt("go")).await, 0);
+    let parked = lock(&db).get_thread("th-a").unwrap().unwrap();
+    assert_eq!(parked.status, "pending", "a parked thread stays pending");
+    assert!(parked.failure_reason.is_none());
+    assert_eq!(parked.attempt, 0);
+    assert!(
+        parked.prompt.is_empty(),
+        "a parked thread never resolves (or consumes) its prompt"
+    );
+
+    set_task_status(&db, "active");
+    assert_eq!(exec.drain_pending(&StaticPrompt("go")).await, 1);
+    assert_eq!(
+        lock(&db).get_thread("th-a").unwrap().unwrap().status,
+        "succeeded"
+    );
 }
 
 #[tokio::test]

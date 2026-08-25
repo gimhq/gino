@@ -227,6 +227,81 @@ async fn malformed_config_update_overlay_is_dropped_and_settled() {
     );
 }
 
+/// D1: `task_delete` maps to `cancelled`, so the task's work inherits the
+/// task-status gate for free — its crons stop firing and its pending threads /
+/// queued messages stop draining. The paired `task_upsert{status:"active"}`
+/// clears the gate AND wakes both loops (scheduler nudge + executor drain), so
+/// the parked work resumes without an external nudge.
+#[tokio::test]
+async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
+    let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+    let dir = tempfile::tempdir().unwrap();
+    let context = serve_context(Arc::clone(&db), dir.path()).await;
+    lock_db(&db)
+        .insert_task_row(&TaskRow {
+            id: "t-1".to_owned(),
+            name: None,
+            kind: None,
+            status: "active".to_owned(),
+            created_at: "2026-06-22T09:00:00.000Z".to_owned(),
+            updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
+        })
+        .unwrap();
+
+    let frame = InboundFrameV2::TaskDelete {
+        task_id: "t-1".to_owned(),
+        msg_id: Some(31),
+    };
+    let inbox_id = lock_db(&db)
+        .record_inbound_correlated("task_delete", &frame, Some("t-1"), None, Some(31))
+        .unwrap()
+        .expect("a fresh msg_id stores a row");
+    assert!(
+        route(Inbound { inbox_id, frame }, &context)
+            .await
+            .is_continue()
+    );
+    assert_eq!(
+        lock_db(&db).get_task_row("t-1").unwrap().unwrap().status,
+        "cancelled"
+    );
+    assert!(
+        lock_db(&db).task_execution_blocked("t-1").unwrap(),
+        "a deleted task parks its crons/threads/messages"
+    );
+
+    let frame = InboundFrameV2::TaskUpsert {
+        task_id: "t-1".to_owned(),
+        data: TaskUpsertData {
+            name: None,
+            kind: None,
+            status: Some("active".to_owned()),
+            entries: None,
+        },
+        msg_id: Some(32),
+    };
+    let inbox_id = lock_db(&db)
+        .record_inbound_correlated("task_upsert", &frame, Some("t-1"), None, Some(32))
+        .unwrap()
+        .expect("a fresh msg_id stores a row");
+    assert!(
+        route(Inbound { inbox_id, frame }, &context)
+            .await
+            .is_continue()
+    );
+    assert!(!lock_db(&db).task_execution_blocked("t-1").unwrap());
+    // Both wake-ups are already stored as permits, so each `notified()` resolves
+    // immediately — the scheduler re-fires and the drainer re-runs the parked work.
+    for (label, signal) in [
+        ("scheduler nudge", &context.nudge),
+        ("executor drain", &context.drain),
+    ] {
+        tokio::time::timeout(std::time::Duration::from_millis(100), signal.notified())
+            .await
+            .unwrap_or_else(|_| panic!("re-activation must wake the {label}"));
+    }
+}
+
 /// A `task_upsert` carrying `entries` persists them as the `tasks.entries` JSON
 /// (insert-new and patch-existing); a later `task_upsert` that OMITS `entries`
 /// must leave the prior set intact, while an explicit (empty) set replaces it
