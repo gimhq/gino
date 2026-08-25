@@ -87,10 +87,12 @@ pub(super) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// live-work summary; a producer wanting `activeThreads` sends its own frame.
 pub(super) const HEARTBEAT_FRAME: &str = r#"{"type":"heartbeat","data":{}}"#;
 /// Inbox `type` column values whose replay policy differs from the default:
-/// `config_update` is dropped on replay (the host re-pushes config on connect) and
+/// `config_update` is dropped on replay (the host re-pushes config on connect),
+/// `interrupt` is retired on replay (live-only / at-most-once, protocol §5), and
 /// `close` is marked processed before delivery. Kept as constants so [`inbox_type`]
 /// and the replay policy can never drift apart.
 const INBOX_TYPE_CONFIG_UPDATE: &str = "config_update";
+const INBOX_TYPE_INTERRUPT: &str = "interrupt";
 const INBOX_TYPE_CLOSE: &str = "close";
 
 /// The client WS stream (TCP, optionally rustls-wrapped for `wss`).
@@ -431,8 +433,10 @@ fn ack_stalled(db: &Arc<Mutex<Db>>, watermark: i64, stalled: &mut Option<i64>) -
 /// re-recorded). Mirrors the TS `replayInbound`: drop poison rows (rows whose
 /// PROCESSING failed [`MAX_INBOX_RETRIES`] times — a replay itself never bumps
 /// the counter, so reconnect flaps cannot poison a queued message), skip
-/// `system_config` (the host re-pushes config), mark `system_close` processed
-/// before delivery, and defer the rest until the consumer acknowledges them.
+/// `system_config` (the host re-pushes config) and `interrupt` (live-only,
+/// protocol §5 — a stale cancel must not fire against a future turn), mark
+/// `system_close` processed before delivery, and defer the rest until the
+/// consumer acknowledges them.
 fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>) {
     let rows = match lock_db(db).list_unprocessed_inbox() {
         Ok(rows) => rows,
@@ -469,6 +473,13 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
         // `config_update`: the host re-pushes config on connect, so a stale row is
         // dropped rather than replayed.
         if row.msg_type == INBOX_TYPE_CONFIG_UPDATE {
+            let _ = lock_db(db).mark_inbox_processed(row.id);
+            continue;
+        }
+        // `interrupt`: protocol §5 declares delivery LIVE-ONLY (at-most-once) —
+        // a cancel expresses a NOW intent and must never fire against a future
+        // turn, so a row that survived a crash/reconnect is retired, not replayed.
+        if row.msg_type == INBOX_TYPE_INTERRUPT {
             let _ = lock_db(db).mark_inbox_processed(row.id);
             continue;
         }
@@ -672,7 +683,7 @@ fn inbox_type(frame: &InboundFrameV2) -> &'static str {
         InboundFrameV2::CronUpsert { .. } => "cron_upsert",
         InboundFrameV2::CronDelete { .. } => "cron_delete",
         InboundFrameV2::Message { .. } => "message",
-        InboundFrameV2::Interrupt { .. } => "interrupt",
+        InboundFrameV2::Interrupt { .. } => INBOX_TYPE_INTERRUPT,
         InboundFrameV2::Close { .. } => INBOX_TYPE_CLOSE,
         InboundFrameV2::ConfigUpdate { .. } => INBOX_TYPE_CONFIG_UPDATE,
         InboundFrameV2::Ack { .. } => "ack",
@@ -732,10 +743,11 @@ mod tests {
         HEARTBEAT_FRAME, INBOX_TYPE_CLOSE, INBOX_TYPE_CONFIG_UPDATE, InboundDisposition,
         MAX_HEARTBEAT, MAX_OUTBOX_RETRIES, MIN_HEARTBEAT, ack_stalled, clamp_period,
         classify_inbound, collect_outbox_replay, correlation_of, inbox_type, msg_id_of,
-        read_window,
+        read_window, replay_inbox,
     };
     use crate::db::Db;
     use crate::protocol::v2::{InboundFrameV2, MessageInData};
+    use tokio::sync::mpsc;
 
     fn message(thread_id: Option<&str>) -> InboundFrameV2 {
         InboundFrameV2::Message {
@@ -1170,6 +1182,33 @@ mod tests {
                 .list_unprocessed_inbox()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// Protocol §5: `interrupt` delivery is LIVE-ONLY (at-most-once). A row that
+    /// survived a crash/reconnect is retired on replay — never re-delivered, so
+    /// a stale cancel cannot fire against a future turn.
+    #[test]
+    fn interrupt_is_retired_not_replayed() {
+        let db = test_db();
+        let interrupt = r#"{"type":"interrupt","taskId":"t-1","msgId":11}"#;
+        assert!(matches!(
+            classify_inbound(interrupt, &db),
+            InboundDisposition::Deliver { .. }
+        ));
+
+        // Simulate the crash-before-processing window: the row is still
+        // unprocessed when the next connect replays the inbox.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        replay_inbox(&db, &tx);
+        assert!(rx.try_recv().is_err(), "interrupt must not be re-delivered");
+        assert!(
+            db.lock()
+                .unwrap()
+                .list_unprocessed_inbox()
+                .unwrap()
+                .is_empty(),
+            "the stale interrupt row is retired (marked processed)"
         );
     }
 

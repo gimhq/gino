@@ -1406,7 +1406,7 @@ fn provisioning_rig(
         .set_task_entries("task-1", Some(&serde_json::to_string(&[entry]).unwrap()))
         .unwrap();
     let blob = Arc::new(OneBlob::new(
-        "/agent/attachments/task-claude",
+        &format!("/agent/attachments?sha256={}", sha256_hex(bytes)),
         bytes.to_vec(),
     ));
     // Clone the concrete handle, then coerce to the trait object (unsizing
@@ -1443,7 +1443,7 @@ async fn provisioned_run_materializes_task_scope_in_project_dir() {
         .unwrap();
 
     let fetcher: Arc<dyn BlobFetcher> = Arc::new(OneBlob::new(
-        "/agent/attachments/task-claude",
+        &format!("/agent/attachments?sha256={}", sha256_hex(&bytes)),
         bytes.clone(),
     ));
     let provisioner = Arc::new(Provisioner::new(

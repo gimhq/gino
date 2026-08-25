@@ -101,10 +101,13 @@ impl Provisioner {
         }
     }
 
-    /// The host-proxy attachment reference for a store `<name>` (= entry id) — the
-    /// route the host serves config/skill bytes on (PLAN-007 §5).
-    fn reference_for(id: &str) -> String {
-        format!("/agent/attachments/{id}")
+    /// The host-proxy reference for a desired entry's bytes — content-addressed
+    /// by full `sha256` on the host's blob route (`GET /agent/attachments?sha256=…`,
+    /// authorized by desired-set membership). Content addressing, not the entry
+    /// name: the name is a logical label, only the sha identifies the bytes the
+    /// host actually serves (PLAN-007 §5 / host configstore serve).
+    fn reference_for(sha256: &str) -> String {
+        format!("/agent/attachments?sha256={sha256}")
     }
 
     /// Reconcile `desired` against the installed `scope` manifest: ADD / REPOINT
@@ -225,7 +228,7 @@ impl Provisioner {
         }
         let bytes = self
             .fetcher
-            .fetch(&Self::reference_for(name), sha256)
+            .fetch(&Self::reference_for(sha256), sha256)
             .await?;
         let ws = self.workspace_dir.clone();
         let name = name.to_owned();
@@ -556,6 +559,11 @@ mod tests {
         )
     }
 
+    /// The content-addressed reference the provisioner fetches for `bytes`.
+    fn blob_ref(bytes: &[u8]) -> String {
+        format!("/agent/attachments?sha256={}", sha256_hex(bytes))
+    }
+
     fn rows(db: &Arc<Mutex<Db>>, scope: &str) -> Vec<crate::db::ConfigEntryRow> {
         db.lock().unwrap().list_config_entries(scope).unwrap()
     }
@@ -571,8 +579,8 @@ mod tests {
         let tar = build_tar(&[("SKILL.md", b"# demo\n"), ("run.sh", b"#!/bin/sh\n")]);
         let file_entry = entry("claude-md", "CLAUDE.md", EntryKind::File, file_bytes);
         let dir_entry = entry("demo-skill", ".claude/skills/demo", EntryKind::Dir, &tar);
-        fake.insert("/agent/attachments/claude-md", file_bytes);
-        fake.insert("/agent/attachments/demo-skill", &tar);
+        fake.insert(&blob_ref(file_bytes), file_bytes);
+        fake.insert(&blob_ref(&tar), &tar);
         let desired = vec![file_entry.clone(), dir_entry.clone()];
 
         prov.reconcile("global", &scope_root, &desired)
@@ -622,7 +630,7 @@ mod tests {
 
         let v1 = b"VERSION-1\n";
         let e1 = entry("claude-md", "CLAUDE.md", EntryKind::File, v1);
-        fake.insert("/agent/attachments/claude-md", v1);
+        fake.insert(&blob_ref(v1), v1);
         prov.reconcile("global", &scope_root, std::slice::from_ref(&e1))
             .await
             .unwrap();
@@ -632,7 +640,7 @@ mod tests {
         // is replaced with the new version.
         let v2 = b"VERSION-2\n";
         let e2 = entry("claude-md", "CLAUDE.md", EntryKind::File, v2);
-        fake.insert("/agent/attachments/claude-md", v2);
+        fake.insert(&blob_ref(v2), v2);
         prov.reconcile("global", &scope_root, std::slice::from_ref(&e2))
             .await
             .unwrap();
@@ -665,8 +673,8 @@ mod tests {
 
         let a = entry("claude-md", "CLAUDE.md", EntryKind::File, b"A\n");
         let b = entry("agents-md", "AGENTS.md", EntryKind::File, b"B\n");
-        fake.insert("/agent/attachments/claude-md", b"A\n");
-        fake.insert("/agent/attachments/agents-md", b"B\n");
+        fake.insert(&blob_ref(b"A\n"), b"A\n");
+        fake.insert(&blob_ref(b"B\n"), b"B\n");
         prov.reconcile("global", &scope_root, &[a.clone(), b.clone()])
             .await
             .unwrap();
@@ -691,16 +699,16 @@ mod tests {
         let scope_root = ws.path().join("global");
 
         let keep = entry("keep", "KEEP.md", EntryKind::File, b"KEEP\n");
-        fake.insert("/agent/attachments/keep", b"KEEP\n");
+        fake.insert(&blob_ref(b"KEEP\n"), b"KEEP\n");
         let v1 = entry("cfg", "CFG.md", EntryKind::File, b"v1\n");
-        fake.insert("/agent/attachments/cfg", b"v1\n");
+        fake.insert(&blob_ref(b"v1\n"), b"v1\n");
         prov.reconcile("global", &scope_root, &[keep.clone(), v1.clone()])
             .await
             .unwrap();
 
         // Repoint cfg → v2: leaves the v1 store entry unreferenced.
         let v2 = entry("cfg", "CFG.md", EntryKind::File, b"v2\n");
-        fake.insert("/agent/attachments/cfg", b"v2\n");
+        fake.insert(&blob_ref(b"v2\n"), b"v2\n");
         prov.reconcile("global", &scope_root, &[keep.clone(), v2.clone()])
             .await
             .unwrap();
@@ -741,7 +749,7 @@ mod tests {
 
         let bytes = b"# CLAUDE.md\n";
         let e = entry("claude-md", "CLAUDE.md", EntryKind::File, bytes);
-        fake.insert("/agent/attachments/claude-md", bytes);
+        fake.insert(&blob_ref(bytes), bytes);
         prov.reconcile("global", &scope_root, std::slice::from_ref(&e))
             .await
             .unwrap();
@@ -767,7 +775,7 @@ mod tests {
 
         let tar = build_tar(&[("SKILL.md", b"# demo\n")]);
         let e = entry("demo-skill", ".claude/skills/demo", EntryKind::Dir, &tar);
-        fake.insert("/agent/attachments/demo-skill", &tar);
+        fake.insert(&blob_ref(&tar), &tar);
         prov.reconcile("global", &scope_root, std::slice::from_ref(&e))
             .await
             .unwrap();
@@ -800,7 +808,7 @@ mod tests {
         let scope_root = ws.path().join("t1-project");
 
         let e = entry("task-claude", "CLAUDE.md", EntryKind::File, b"X\n");
-        fake.insert("/agent/attachments/task-claude", b"X\n");
+        fake.insert(&blob_ref(b"X\n"), b"X\n");
         prov.reconcile("t1", &scope_root, std::slice::from_ref(&e))
             .await
             .unwrap();
@@ -849,7 +857,7 @@ mod tests {
 
         let bytes = b"# CLAUDE.md\n";
         let e = entry("claude-md", "CLAUDE.md", EntryKind::File, bytes);
-        fake.insert("/agent/attachments/claude-md", bytes);
+        fake.insert(&blob_ref(bytes), bytes);
         let desired = vec![e.clone()];
         prov.reconcile("global", &scope_root, &desired)
             .await
@@ -884,7 +892,7 @@ mod tests {
 
         let bytes = b"# CLAUDE.md\n";
         let e = entry("claude-md", "CLAUDE.md", EntryKind::File, bytes);
-        fake.insert("/agent/attachments/claude-md", bytes);
+        fake.insert(&blob_ref(bytes), bytes);
         prov.reconcile("global", &scope_root, std::slice::from_ref(&e))
             .await
             .unwrap();
@@ -918,8 +926,8 @@ mod tests {
         let tar = build_tar(&[("SKILL.md", b"# demo\n")]);
         let fe = entry("claude-md", "CLAUDE.md", EntryKind::File, file_bytes);
         let de = entry("demo-skill", ".claude/skills/demo", EntryKind::Dir, &tar);
-        fake.insert("/agent/attachments/claude-md", file_bytes);
-        fake.insert("/agent/attachments/demo-skill", &tar);
+        fake.insert(&blob_ref(file_bytes), file_bytes);
+        fake.insert(&blob_ref(&tar), &tar);
         prov.reconcile("global", &scope_root, &[fe.clone(), de.clone()])
             .await
             .unwrap();
@@ -953,11 +961,11 @@ mod tests {
         let prov = Arc::new(prov);
 
         let tar = build_tar(&[("SKILL.md", b"# demo\n")]);
-        fake.insert("/agent/attachments/demo-skill", &tar);
+        fake.insert(&blob_ref(&tar), &tar);
         let mut handles = Vec::new();
         for i in 0..4 {
             let file_bytes = format!("# scope {i}\n").into_bytes();
-            fake.insert(&format!("/agent/attachments/cfg-{i}"), &file_bytes);
+            fake.insert(&blob_ref(&file_bytes), &file_bytes);
             let desired = vec![
                 entry(
                     &format!("cfg-{i}"),
@@ -1006,7 +1014,7 @@ mod tests {
         let scope_root = ws.path().join("global");
 
         let evil = entry("evil", "../escape", EntryKind::File, b"PWNED\n");
-        fake.insert("/agent/attachments/evil", b"PWNED\n");
+        fake.insert(&blob_ref(b"PWNED\n"), b"PWNED\n");
         let err = prov
             .reconcile("global", &scope_root, &[evil])
             .await

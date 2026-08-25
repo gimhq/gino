@@ -1333,7 +1333,10 @@ mod provisioning_wiring_tests {
 
         let bytes = b"# global CLAUDE.md\n".to_vec();
         let mut blobs = HashMap::new();
-        blobs.insert("/agent/attachments/clauderc".to_owned(), bytes.clone());
+        blobs.insert(
+            format!("/agent/attachments?sha256={}", sha256_hex(&bytes)),
+            bytes.clone(),
+        );
         let (prov, db, _fetches) = provisioner_with(ws.path(), blobs);
 
         let entry = file_entry("clauderc", "CLAUDE.md", &bytes);
@@ -1372,7 +1375,10 @@ mod provisioning_wiring_tests {
 
         let bytes = b"# CLAUDE.md v1\n".to_vec();
         let mut blobs = HashMap::new();
-        blobs.insert("/agent/attachments/clauderc".to_owned(), bytes.clone());
+        blobs.insert(
+            format!("/agent/attachments?sha256={}", sha256_hex(&bytes)),
+            bytes.clone(),
+        );
         let (prov, db, _fetches) = provisioner_with(ws.path(), blobs);
 
         // v1 installs one global entry.
@@ -1411,7 +1417,10 @@ mod provisioning_wiring_tests {
 
         let bytes = b"# CLAUDE.md durable\n".to_vec();
         let mut blobs = HashMap::new();
-        blobs.insert("/agent/attachments/clauderc".to_owned(), bytes.clone());
+        blobs.insert(
+            format!("/agent/attachments?sha256={}", sha256_hex(&bytes)),
+            bytes.clone(),
+        );
         let (prov, db, fetches) = provisioner_with(ws.path(), blobs);
 
         // Install at v1 (one fetch).
@@ -1454,7 +1463,10 @@ mod provisioning_wiring_tests {
 
         let bytes = b"# CLAUDE.md stable\n".to_vec();
         let mut blobs = HashMap::new();
-        blobs.insert("/agent/attachments/clauderc".to_owned(), bytes.clone());
+        blobs.insert(
+            format!("/agent/attachments?sha256={}", sha256_hex(&bytes)),
+            bytes.clone(),
+        );
         let (prov, db, fetches) = provisioner_with(ws.path(), blobs);
 
         let entry = file_entry("clauderc", "CLAUDE.md", &bytes);

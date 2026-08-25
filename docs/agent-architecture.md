@@ -192,7 +192,8 @@ Code/repos → git; attachments/artifacts → out-of-band object storage (this s
 Engine config (instruction file + skills) is provisioned as **versioned, content-addressed artifacts**, named
 by **meta** (engine-agnostic), loaded by **symlink** from one store.
 
-- **Entry** `{ id, sha256, target, kind }` — `id`=logical name, `sha256`=version/integrity, `target`=
+- **Entry** `{ name, sha256, target, kind }` (wire spelling `name` — protocol.md §8 `ConfigEntry`; the
+  runner's internal field `id` accepts it as an alias) — `name`=logical name, `sha256`=version/integrity, `target`=
   meta-driven landing path (`CLAUDE.md` | `AGENTS.md` | `design.md` | `.claude/skills/<name>` …),
   `kind`=`file|dir`. A **skill** = a `kind:dir` entry; an **instruction file** = a `kind:file` entry. The
   runner is engine-agnostic; the host sets `target` per engine.
@@ -200,7 +201,8 @@ by **meta** (engine-agnostic), loaded by **symlink** from one store.
   (root `<thread.work_dir>/project/`, via `task_upsert.data.entries`).
 - **Store + symlink**: `store/<name>/<sha256[:12]>` (git-style short id; full `sha256` in the wire ref for
   integrity). `<scope-root>/<target>` is a **symlink** into the store — zero copy, update = repoint, per-name
-  version history. Bytes fetched out-of-band via `/agent/attachments`; **store unified with the §9 attachment
+  version history. Bytes fetched out-of-band, content-addressed by full hash
+  (`GET /agent/attachments?sha256=<hex>`, authorized by desired-set membership); **store unified with the §9 attachment
   cache**; refcount/LRU GC.
 - **`config_entries`** (§3) = installed manifest + store-refcount index (not a content copy; bytes in the
   store, desired set declared by the host). Drives reconcile (diff desired vs rows), GC (refcount by
