@@ -871,7 +871,15 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskUpsert { task_id, data, .. } => {
+            let reactivated = data.status.as_deref() == Some("active");
             applied = apply_task_def(&context.db, &task_id, &data);
+            // Re-activation unparks this task's work (D1): wake both loops so the
+            // crons the scheduler skipped and the threads/messages the drain left
+            // parked resume now instead of on their next poll.
+            if applied && reactivated {
+                context.nudge.notify_one();
+                context.drain.notify_one();
+            }
             ControlFlow::Continue(())
         }
         InboundFrameV2::TaskDelete { task_id, .. } => {

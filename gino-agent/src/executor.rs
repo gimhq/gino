@@ -75,6 +75,22 @@ pub(crate) fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The shared task-status gate (D1): `true` when `task_id` is `closed`/
+/// `cancelled` and its work must stay parked — the scheduler skips its crons,
+/// the drainer leaves its `pending` threads alone, and the chat re-scan leaves
+/// its queued messages in the inbox. Parked work is never failed or deleted; a
+/// `task_upsert{status:"active"}` resumes it. A lookup failure fails OPEN (the
+/// work runs): parking is a task-status decision, not an availability one.
+pub(crate) fn task_parked(db: &Mutex<Db>, task_id: &str) -> bool {
+    match lock_db(db).task_execution_blocked(task_id) {
+        Ok(blocked) => blocked,
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task status lookup failed; not parking");
+            false
+        }
+    }
+}
+
 // -- thread.status string values (the engine lifecycle axis) ------------
 const PENDING: &str = "pending";
 const DISPATCHED: &str = "dispatched";
@@ -298,7 +314,8 @@ impl ThreadExecutor {
     /// Drain every `pending` thread once, running each to a terminal (or
     /// retry-rescheduled) state. Returns the number of threads dispatched.
     /// Resolving no prompt for a pending thread fails it with
-    /// `runner.invalid_request` so it is not re-drained forever.
+    /// `runner.invalid_request` so it is not re-drained forever; a thread under a
+    /// closed/cancelled task is skipped and left `pending` ([`task_parked`], D1).
     pub(crate) async fn drain_pending(&self, prompts: &dyn PromptSource) -> usize {
         let pending = match lock_db(&self.db).list_pending_threads() {
             Ok(rows) => rows,
@@ -308,12 +325,21 @@ impl ThreadExecutor {
             }
         };
         let mut dispatched = 0;
+        let mut parked = 0;
         for thread in pending {
             // Daemon shutdown (P1-6): stop starting new runs; the still-pending
             // threads re-run on the next boot.
             if self.shutdown_requested() {
                 debug!("shutdown tripped; stopping the pending drain");
                 break;
+            }
+            // Task-status gate (D1): a closed/cancelled task's thread stays
+            // PARKED — left `pending`, never failed — and drains once the task
+            // is re-activated. Counted into the drain summary rather than logged
+            // per thread: this loop runs every poll interval.
+            if task_parked(&self.db, &thread.task_id) {
+                parked += 1;
+                continue;
             }
             let Some((thread, prompt)) = self.resolve_prompt(thread, prompts) else {
                 continue; // unrunnable: already failed `runner.invalid_request`
@@ -322,7 +348,7 @@ impl ThreadExecutor {
             self.run_thread(thread, prompt, continuity).await;
             dispatched += 1;
         }
-        debug!(dispatched, "drained pending threads");
+        debug!(dispatched, parked, "drained pending threads");
         dispatched
     }
 
