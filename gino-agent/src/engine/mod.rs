@@ -82,6 +82,11 @@ pub(crate) struct SessionCfg {
     pub(crate) resume_at: Option<String>,
     /// An optional first user message sent right after the handshake.
     pub(crate) initial_prompt: Option<String>,
+    /// Per-task model id overriding the backend's configured model for THIS
+    /// session (the host's `task_upsert.data.model`, OD15). `None` keeps the
+    /// engine's own configured model. Read at spawn only — see the
+    /// apply-on-next-run note on the Claude backend's `start_session`.
+    pub(crate) model: Option<String>,
     /// The task this session runs for, exported to the engine as `GINO_TASK_ID`
     /// so in-engine tooling (e.g. the `gino-agent cron` CLI) can self-reference.
     pub(crate) task_id: Option<String>,

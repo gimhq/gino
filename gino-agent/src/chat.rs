@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 use crate::db::{Db, TaskRow, ThreadRow};
-use crate::executor::{PromptSource, ThreadExecutor, lock_db};
+use crate::executor::{PromptSource, ThreadExecutor, lock_db, task_parked};
 use crate::protocol::v2::InboundFrameV2;
 use crate::scheduler::{now, to_iso};
 
@@ -57,8 +57,9 @@ pub(crate) async fn drain_with_queued_messages(
 /// crash lost the mint. Threads that are in flight (or already `pending`) are
 /// left alone: their message stays queued for the next pass. Cron threads are
 /// never re-pended here — their prompt source is `crons.prompt`, so a re-pend
-/// would re-run the cron without ever consuming the message. Returns how many
-/// threads were made `pending`.
+/// would re-run the cron without ever consuming the message. A message under a
+/// closed/cancelled task is left queued (D1). Returns how many threads were made
+/// `pending`.
 fn repend_queued_messages(db: &Mutex<Db>, chat_max_attempts: i64) -> usize {
     let rows = match lock_db(db).list_inbox_by_type("message") {
         Ok(rows) => rows,
@@ -72,6 +73,12 @@ fn repend_queued_messages(db: &Mutex<Db>, chat_max_attempts: i64) -> usize {
         let Some(task_id) = row.task_id.clone() else {
             continue;
         };
+        // Task-status gate (D1): a closed/cancelled task's message stays queued
+        // in the inbox — unprocessed, never failed — until the task re-activates.
+        if task_parked(db, &task_id) {
+            debug!(task = %task_id, inbox = row.id, "task closed/cancelled; leaving the message queued");
+            continue;
+        }
         let tid = row
             .thread_id
             .clone()
@@ -179,6 +186,10 @@ pub(crate) fn seed_task_if_missing(db: &Db, task_id: &str) -> bool {
                 name: None,
                 kind: None,
                 status: "active".to_owned(),
+                engine: None,
+                model: None,
+                workdir: None,
+                meta: None,
                 created_at: now_iso.clone(),
                 updated_at: now_iso,
             };
@@ -371,6 +382,10 @@ mod tests {
                     name: None,
                     kind: None,
                     status: "active".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T00:00:00Z".to_owned(),
                     updated_at: "2026-06-22T00:00:00Z".to_owned(),
                 })
@@ -462,6 +477,78 @@ mod tests {
         );
     }
 
+    /// D1: a queued `message` whose task is closed/cancelled is NOT re-pended —
+    /// it stays unprocessed in the inbox and its thread keeps resting — and the
+    /// re-scan picks it up the moment the task is `active` again.
+    #[test]
+    fn closed_task_leaves_its_queued_message_in_the_inbox() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let frame = InboundFrameV2::Message {
+            task_id: "t-1".to_owned(),
+            thread_id: Some("th-1".to_owned()),
+            data: MessageInData {
+                text: "queued while the turn ran".to_owned(),
+                attachments: None,
+            },
+            msg_id: Some(1),
+        };
+        let mut resting = chat_thread("th-1", "t-1");
+        "succeeded".clone_into(&mut resting.status);
+        {
+            let guard = lock_db(&db);
+            guard
+                .insert_task_row(&TaskRow {
+                    id: "t-1".to_owned(),
+                    name: None,
+                    kind: None,
+                    status: "closed".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
+                    created_at: "2026-06-22T00:00:00Z".to_owned(),
+                    updated_at: "2026-06-22T00:00:00Z".to_owned(),
+                })
+                .unwrap();
+            guard.insert_thread(&resting).unwrap();
+            guard
+                .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(1))
+                .unwrap();
+        }
+
+        assert_eq!(
+            repend_queued_messages(&db, 1),
+            0,
+            "a closed task's queued message is not re-pended"
+        );
+        assert_eq!(
+            lock_db(&db).get_thread("th-1").unwrap().unwrap().status,
+            "succeeded",
+            "the resting thread is left alone"
+        );
+        assert_eq!(
+            lock_db(&db).list_inbox_by_type("message").unwrap().len(),
+            1,
+            "the message stays unprocessed in the inbox"
+        );
+
+        {
+            let guard = lock_db(&db);
+            let mut task = guard.get_task_row("t-1").unwrap().unwrap();
+            "active".clone_into(&mut task.status);
+            guard.update_task_row(&task).unwrap();
+        }
+        assert_eq!(
+            repend_queued_messages(&db, 1),
+            1,
+            "re-activation re-pends the parked message's thread"
+        );
+        assert_eq!(
+            lock_db(&db).get_thread("th-1").unwrap().unwrap().status,
+            "pending"
+        );
+    }
+
     /// P0-3 regression: replaying an unprocessed absent-`threadId` message (the
     /// reconnect replay re-delivers the SAME inbox row) derives the SAME thread id
     /// and must NOT mint a second thread — N reconnects used to race N+1 threads
@@ -500,6 +587,10 @@ mod tests {
                     name: None,
                     kind: None,
                     status: "active".to_owned(),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     created_at: "2026-06-22T00:00:00Z".to_owned(),
                     updated_at: "2026-06-22T00:00:00Z".to_owned(),
                 })

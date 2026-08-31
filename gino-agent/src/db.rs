@@ -86,7 +86,7 @@ use thiserror::Error;
 // every step unconditional.
 
 /// The schema version this binary reads and writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 /// Step v0 → v1: the baseline schema (the pre-campaign CREATE-only shape).
 /// `IF NOT EXISTS` throughout, so a legacy unversioned DB — which already has
@@ -121,7 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_inbox_thread ON inbox(thread_id);
 -- The global top category (agent-architecture §3). The v2 entity columns are
 -- (id, name, kind, status, created_at, updated_at), driven by TaskRow. The legacy
 -- v1 columns and their TaskRecord CRUD are removed with the in-runner tool server
--- (PLAN-007).
+-- (PLAN-007). The task-definition columns (engine/model/workdir/meta) are NOT
+-- here: like inbox.msg_id they arrived after this baseline was frozen, so they
+-- are added by the v4 ladder step and this const stays honestly pre-campaign.
 CREATE TABLE IF NOT EXISTS tasks (
   id             TEXT PRIMARY KEY,
   name           TEXT,
@@ -289,11 +291,24 @@ CREATE TABLE IF NOT EXISTS thread_attachments (
 /// reclaims wholesale.
 const MIGRATE_V3_SCOPE_CLEANUP: &str = "DELETE FROM config_entries WHERE scope <> 'global';";
 
+/// Step v3 → v4: the task-definition columns the host has always sent on
+/// `task_upsert` (protocol.md §7 `{engine?, model?, workdir?, meta?}`, OD15) and
+/// the runner used to discard (align-2026-08 D2). All four are nullable with no
+/// default, so existing rows migrate to "unset" and the omission-preserves rule
+/// in `apply_task_def` reads NULL as "the host never told us".
+const MIGRATE_V4_TASK_DEFINITION: &str = "\
+ALTER TABLE tasks ADD COLUMN engine  TEXT;  -- backend name; only 'claude' is implemented (unknown → warn + claude)
+ALTER TABLE tasks ADD COLUMN model   TEXT;  -- per-task model id; overrides config.engine.model at the NEXT spawn
+ALTER TABLE tasks ADD COLUMN workdir TEXT;  -- PERSIST-ONLY: nothing reads this yet
+ALTER TABLE tasks ADD COLUMN meta    TEXT;  -- PERSIST-ONLY: free-form host JSON, stored as text
+";
+
 /// The ladder: `MIGRATIONS[n]` steps a database from version `n` to `n + 1`.
-const MIGRATIONS: [&str; 3] = [
+const MIGRATIONS: [&str; 4] = [
     MIGRATE_V1_BASELINE,
     MIGRATE_V2_INBOUND_DEDUP,
     MIGRATE_V3_SCOPE_CLEANUP,
+    MIGRATE_V4_TASK_DEFINITION,
 ];
 
 /// The per-connection pragma preamble. WAL for concurrent read/write; a busy
@@ -414,12 +429,30 @@ pub(crate) struct InboxRow {
 
 /// A `tasks` row — the **v2 top-category entity** (agent-architecture §3).
 /// "session" is not here; per-execution state lives on [`ThreadRow`].
+///
+/// `engine`/`model`/`workdir`/`meta` are the host-authored task DEFINITION
+/// (protocol.md §7 `task_upsert`, OD15). All four are `Option` because the host
+/// may push a partial definition and because rows predating the v4 ladder step
+/// carry NULL; `None` therefore means "never told", not "cleared".
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TaskRow {
     pub(crate) id: String,
     pub(crate) name: Option<String>,
     pub(crate) kind: Option<String>,
     pub(crate) status: String,
+    /// Backend name. Only `claude` is implemented; an unsupported value is
+    /// stored as sent but falls back to claude at execution time.
+    pub(crate) engine: Option<String>,
+    /// Per-task model id. Overrides `config.engine.model` on the NEXT engine
+    /// spawn for this task's threads.
+    pub(crate) model: Option<String>,
+    /// PERSIST-ONLY (align-2026-08 D2): stored so the definition round-trips,
+    /// but no runner path reads it — the executor still materializes its own
+    /// per-thread workspace.
+    pub(crate) workdir: Option<String>,
+    /// PERSIST-ONLY (align-2026-08 D2): the host's free-form JSON object, kept
+    /// verbatim as text. No runner path reads it.
+    pub(crate) meta: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -634,8 +667,11 @@ impl Db {
     /// Step the schema to [`SCHEMA_VERSION`] through the [`MIGRATIONS`] ladder.
     /// Idempotent: an up-to-date DB is a no-op. Each step commits its DDL/DML
     /// together with its `user_version` bump in one `BEGIN IMMEDIATE`
-    /// transaction. A fresh (table-less) DB fast-paths to the latest shape in a
-    /// single transaction — the data-migration step v3 has nothing to touch.
+    /// transaction. A fresh (table-less) DB fast-paths to the latest shape by
+    /// running the WHOLE ladder in a single transaction: every step must apply
+    /// cleanly on top of the baseline it just created (the data-migration step
+    /// v3 simply has nothing to touch), which is what keeps a fresh DB and a
+    /// migrated one at the identical shape.
     pub(crate) fn migrate(&self) -> DbResult<()> {
         let mut version = self.user_version()?;
         if version > SCHEMA_VERSION {
@@ -645,7 +681,7 @@ impl Db {
             });
         }
         if version == 0 && self.is_uninitialized()? {
-            return self.run_migration_step(SCHEMA_VERSION, &MIGRATIONS[..2].concat());
+            return self.run_migration_step(SCHEMA_VERSION, &MIGRATIONS.concat());
         }
         for (to_version, step) in (1..).zip(MIGRATIONS) {
             if version < to_version {
@@ -930,14 +966,18 @@ impl Db {
     pub(crate) fn insert_task_row(&self, task: &TaskRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
-                "INSERT INTO tasks (id, name, kind, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO tasks (id, name, kind, status, engine, model, workdir, meta, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?
             .execute(params![
                 task.id,
                 task.name,
                 task.kind,
                 task.status,
+                task.engine,
+                task.model,
+                task.workdir,
+                task.meta,
                 task.created_at,
                 task.updated_at,
             ])?;
@@ -949,7 +989,8 @@ impl Db {
         let row = self
             .conn
             .prepare_cached(
-                "SELECT id, name, kind, status, created_at, updated_at FROM tasks WHERE id = ?1",
+                "SELECT id, name, kind, status, engine, model, workdir, meta, created_at, updated_at
+                 FROM tasks WHERE id = ?1",
             )?
             .query_row(params![id], Self::map_task_row)
             .optional()?;
@@ -961,7 +1002,8 @@ impl Db {
         let rows = self
             .conn
             .prepare_cached(
-                "SELECT id, name, kind, status, created_at, updated_at FROM tasks ORDER BY created_at, id",
+                "SELECT id, name, kind, status, engine, model, workdir, meta, created_at, updated_at
+                 FROM tasks ORDER BY created_at, id",
             )?
             .query_map([], Self::map_task_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -969,19 +1011,45 @@ impl Db {
     }
 
     /// Update a v2 task entity's mutable columns by id (`created_at` is immutable).
+    /// Writes the row WHOLESALE, so the omission-preserves rule for a partial
+    /// `task_upsert` lives in the caller: it loads the row, patches only the
+    /// fields the host sent, and writes it back (`runner::apply_task_def`).
     pub(crate) fn update_task_row(&self, task: &TaskRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
-                "UPDATE tasks SET name = ?2, kind = ?3, status = ?4, updated_at = ?5 WHERE id = ?1",
+                "UPDATE tasks
+                    SET name = ?2, kind = ?3, status = ?4, engine = ?5, model = ?6,
+                        workdir = ?7, meta = ?8, updated_at = ?9
+                  WHERE id = ?1",
             )?
             .execute(params![
                 task.id,
                 task.name,
                 task.kind,
                 task.status,
+                task.engine,
+                task.model,
+                task.workdir,
+                task.meta,
                 task.updated_at,
             ])?;
         Ok(())
+    }
+
+    /// Whether `task_id`'s status parks execution (D1): a `closed`/`cancelled`
+    /// task neither fires its crons nor dispatches its pending threads / queued
+    /// inbox messages. Every other status — including an unknown one — keeps
+    /// running, and so does a MISSING row: the runner seeds task rows lazily
+    /// ([`crate::chat::seed_task_if_missing`]), so absence means not-yet-seeded,
+    /// never closed.
+    pub(crate) fn task_execution_blocked(&self, task_id: &str) -> DbResult<bool> {
+        let blocked = self
+            .conn
+            .prepare_cached(
+                "SELECT 1 FROM tasks WHERE id = ?1 AND status IN ('closed', 'cancelled')",
+            )?
+            .exists(params![task_id])?;
+        Ok(blocked)
     }
 
     fn map_task_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRow> {
@@ -990,8 +1058,12 @@ impl Db {
             name: r.get(1)?,
             kind: r.get(2)?,
             status: r.get(3)?,
-            created_at: r.get(4)?,
-            updated_at: r.get(5)?,
+            engine: r.get(4)?,
+            model: r.get(5)?,
+            workdir: r.get(6)?,
+            meta: r.get(7)?,
+            created_at: r.get(8)?,
+            updated_at: r.get(9)?,
         })
     }
 
@@ -1797,8 +1869,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConfigEntryRow, CronLogRow, CronRow, Db, DbError, InboxRow, MIGRATE_V1_BASELINE, OutboxRow,
-        SCHEMA_VERSION, TaskRow, ThreadRow,
+        ConfigEntryRow, CronLogRow, CronRow, Db, DbError, InboxRow, MIGRATE_V1_BASELINE,
+        MIGRATIONS, OutboxRow, SCHEMA_VERSION, TaskRow, ThreadRow,
     };
 
     // -- v2 row builders ---------------------------------------------------
@@ -1809,6 +1881,10 @@ mod tests {
             name: Some("nightly digest".to_owned()),
             kind: Some("agent".to_owned()),
             status: status.to_owned(),
+            engine: None,
+            model: None,
+            workdir: None,
+            meta: None,
             created_at: "2026-06-22T11:00:00Z".to_owned(),
             updated_at: "2026-06-22T11:00:00Z".to_owned(),
         }
@@ -1907,6 +1983,16 @@ mod tests {
         count > 0
     }
 
+    /// A table's columns in declaration order — the shape-convergence probe.
+    fn table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+        conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .unwrap()
+            .query_map(rusqlite::params![table], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
     fn raw_user_version(conn: &rusqlite::Connection) -> i64 {
         conn.query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
@@ -1921,6 +2007,12 @@ mod tests {
         let conn = rusqlite::Connection::open(path).unwrap();
         conn.execute_batch(MIGRATE_V1_BASELINE).unwrap();
         assert!(!column_exists(&conn, "inbox", "msg_id"));
+        for column in ["engine", "model", "workdir", "meta"] {
+            assert!(
+                !column_exists(&conn, "tasks", column),
+                "the v1 baseline predates the task-definition columns"
+            );
+        }
         assert!(
             !conn
                 .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_attachments'")
@@ -2052,6 +2144,68 @@ mod tests {
         }
     }
 
+    /// D2 regression: a database sitting at the pre-v4 schema steps up to the
+    /// task-definition columns with its task rows intact, and lands on the SAME
+    /// shape a fresh DB gets from the fast path.
+    #[test]
+    fn pre_v4_db_gains_task_definition_columns_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        {
+            // The v3 shape: the ladder up to (but not including) the new step.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(&MIGRATIONS[..3].concat()).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, name, kind, status, created_at, updated_at)
+                 VALUES ('t-old', 'legacy', 'agent', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
+
+        // The pre-existing row survived, with the new columns reading as unset.
+        let row = db.get_task_row("t-old").unwrap().expect("row survived");
+        assert_eq!(row.name.as_deref(), Some("legacy"));
+        assert_eq!(row.status, "active");
+        assert_eq!(
+            (row.engine, row.model, row.workdir, row.meta),
+            (None, None, None, None)
+        );
+
+        // …and the migrated shape matches the fresh fast-path shape exactly.
+        let fresh = Db::open_in_memory().unwrap();
+        assert_eq!(
+            table_columns(&db.conn, "tasks"),
+            table_columns(&fresh.conn, "tasks"),
+            "a migrated DB and a fresh one must converge on the same tasks shape"
+        );
+    }
+
+    /// D2: the task-definition columns round-trip through insert/get/update.
+    #[test]
+    fn task_definition_columns_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let mut row = task_row("t-1", "active");
+        row.engine = Some("claude".to_owned());
+        row.model = Some("claude-opus-4-8".to_owned());
+        row.workdir = Some("/srv/project".to_owned());
+        row.meta = Some(r#"{"team":"infra"}"#.to_owned());
+        db.insert_task_row(&row).unwrap();
+        assert_eq!(db.get_task_row("t-1").unwrap().as_ref(), Some(&row));
+
+        row.model = Some("claude-sonnet-4-6".to_owned());
+        db.update_task_row(&row).unwrap();
+        assert_eq!(
+            db.get_task_row("t-1").unwrap().unwrap().model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(db.list_tasks().unwrap(), vec![row]);
+    }
+
     /// P2-18: the daemon refuses a database written by a newer binary rather
     /// than corrupting a schema it does not understand.
     #[test]
@@ -2178,6 +2332,29 @@ mod tests {
         assert_eq!(reloaded.updated_at, "2026-06-22T13:00:00Z");
         // created_at is immutable across an update.
         assert_eq!(reloaded.created_at, "2026-06-22T11:00:00Z");
+    }
+
+    /// D1: the task-status gate every execution plane consults. Only `closed`
+    /// and `cancelled` park work; any other status — including one this runner
+    /// does not know — and a MISSING row (task rows are seeded lazily) do not.
+    #[test]
+    fn task_execution_blocked_only_for_closed_and_cancelled() {
+        let db = Db::open_in_memory().unwrap();
+        for status in ["active", "closed", "cancelled", "paused-by-a-future-host"] {
+            db.insert_task_row(&task_row(status, status)).unwrap();
+        }
+
+        assert!(db.task_execution_blocked("closed").unwrap());
+        assert!(db.task_execution_blocked("cancelled").unwrap());
+        assert!(!db.task_execution_blocked("active").unwrap());
+        assert!(
+            !db.task_execution_blocked("paused-by-a-future-host")
+                .unwrap()
+        );
+        assert!(
+            !db.task_execution_blocked("never-seeded").unwrap(),
+            "a missing task row must not silently park work"
+        );
     }
 
     // -- v2: crons ---------------------------------------------------------

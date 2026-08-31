@@ -75,6 +75,37 @@ pub(crate) fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The shared task-status gate (D1): `true` when `task_id` is `closed`/
+/// `cancelled` and its work must stay parked — the scheduler skips its crons,
+/// the drainer leaves its `pending` threads alone, and the chat re-scan leaves
+/// its queued messages in the inbox. Parked work is never failed or deleted; a
+/// `task_upsert{status:"active"}` resumes it. A lookup failure fails OPEN (the
+/// work runs): parking is a task-status decision, not an availability one.
+pub(crate) fn task_parked(db: &Mutex<Db>, task_id: &str) -> bool {
+    match lock_db(db).task_execution_blocked(task_id) {
+        Ok(blocked) => blocked,
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task status lookup failed; not parking");
+            false
+        }
+    }
+}
+
+/// The per-task model override (OD15) for `task_id`, or `None` when the task
+/// has none — then the engine keeps the globally configured `config.engine.model`.
+/// A missing row (task rows are seeded lazily) and a lookup failure both answer
+/// `None`: an unreadable definition must degrade to the global model, never fail
+/// the run.
+fn task_model(db: &Mutex<Db>, task_id: &str) -> Option<String> {
+    match lock_db(db).get_task_row(task_id) {
+        Ok(row) => row.and_then(|row| row.model),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task model lookup failed; using the configured model");
+            None
+        }
+    }
+}
+
 // -- thread.status string values (the engine lifecycle axis) ------------
 const PENDING: &str = "pending";
 const DISPATCHED: &str = "dispatched";
@@ -298,7 +329,8 @@ impl ThreadExecutor {
     /// Drain every `pending` thread once, running each to a terminal (or
     /// retry-rescheduled) state. Returns the number of threads dispatched.
     /// Resolving no prompt for a pending thread fails it with
-    /// `runner.invalid_request` so it is not re-drained forever.
+    /// `runner.invalid_request` so it is not re-drained forever; a thread under a
+    /// closed/cancelled task is skipped and left `pending` ([`task_parked`], D1).
     pub(crate) async fn drain_pending(&self, prompts: &dyn PromptSource) -> usize {
         let pending = match lock_db(&self.db).list_pending_threads() {
             Ok(rows) => rows,
@@ -308,12 +340,21 @@ impl ThreadExecutor {
             }
         };
         let mut dispatched = 0;
+        let mut parked = 0;
         for thread in pending {
             // Daemon shutdown (P1-6): stop starting new runs; the still-pending
             // threads re-run on the next boot.
             if self.shutdown_requested() {
                 debug!("shutdown tripped; stopping the pending drain");
                 break;
+            }
+            // Task-status gate (D1): a closed/cancelled task's thread stays
+            // PARKED — left `pending`, never failed — and drains once the task
+            // is re-activated. Counted into the drain summary rather than logged
+            // per thread: this loop runs every poll interval.
+            if task_parked(&self.db, &thread.task_id) {
+                parked += 1;
+                continue;
             }
             let Some((thread, prompt)) = self.resolve_prompt(thread, prompts) else {
                 continue; // unrunnable: already failed `runner.invalid_request`
@@ -322,7 +363,7 @@ impl ThreadExecutor {
             self.run_thread(thread, prompt, continuity).await;
             dispatched += 1;
         }
-        debug!(dispatched, "drained pending threads");
+        debug!(dispatched, parked, "drained pending threads");
         dispatched
     }
 
@@ -433,6 +474,10 @@ impl ThreadExecutor {
             initial_prompt: Some(prompt),
             task_id: Some(thread.task_id.clone()),
             thread_id: Some(thread.id.clone()),
+            // Per-task model (OD15): read HERE, at spawn time, so a `task_upsert`
+            // that changes the model reaches the next run without disturbing the
+            // one in flight — the same apply-on-next-run policy as `config_update`.
+            model: task_model(&self.db, &thread.task_id),
             ..SessionCfg::default()
         };
         let session: Arc<dyn Session> = match self.engine.start_session(cfg).await {

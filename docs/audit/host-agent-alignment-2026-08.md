@@ -112,12 +112,53 @@ byte channel, and provisioning entry parsing.
 
 | # | Side | Severity | Gap |
 |---|---|---|---|
-| D1 | agent | P1 | `task_upsert{status:"closed"}` / `task_delete` have no execution effect: `tasks.status` is stored but never consulted — crons under a closed/cancelled task keep firing and queued messages still run; only the scoped `interrupt` (live, best-effort) stops the in-flight turn. Runner-side scheduler/executor must gate on task status. |
-| D2 | agent | P2 | `task_upsert.data.engine/model/workdir/meta` are parsed away and ignored — per-task engine/model selection does not reach execution. |
-| D3 | agent | P2 | Register failure handling: any non-`unsupported_protocol` reason (including `rate_limited`) exits the daemon instead of backing off and retrying. |
 | D4 | agent | P3 | `heartbeat.activeThreads` never populated (fixed `{}` heartbeat); a `config_update` changing `heartbeatIntervalMs` does not re-arm the running transport. |
 | D5 | agent | P3 | Transcript kinds under-emitted: only `assistant_text`/`status`/`error`; `thinking`/`tool_use`/`tool_result`/`user_input` (and `role`/`tool`/`input`/`output`) never leave the runner. |
 | D6 | host | P3 | `thread_result.data.result`/`error` are dropped (no mirror columns); `thread_message` does not derive cron dispatch context (only `thread_result` does). |
 | D7 | host | P3 | No per-task message delivery cursor (`TODO(M4/B3)` in `src/protocol/outbox.ts`); per-row acks only. |
 | D8 | host | P3 | `task_delete` is never emitted (tasks are orphaned on agent removal); the runner implements it as a status-cancel. Documented behavior, no wire use. |
 | D9 | both | P3 | Version negotiation is exact-equality (`=== 2`) on both sides; no range negotiation. |
+
+## Fixed in follow-up (runner-side D1–D3)
+
+D1–D3 were closed after this branch landed and have been lifted out of the deferred
+table so it stays a list of open work. All three are runner-side; none changed the
+wire.
+
+### D1 (P1) · Task status now gates execution — `32cf9b6`
+
+`feat(agent): gate scheduler, executor and chat on task status`. `tasks.status` is
+consulted at execution time through the shared gate `Db::task_execution_blocked` /
+`executor::task_parked` (only `closed` and `cancelled` park; any other status — and a
+missing row, which the runner seeds lazily — keeps prior behavior). It is checked in
+the scheduler (at fire time in `tick`, and in `next_wait` so an overdue parked cron
+cannot pin the sleep at zero), in the pending-thread drainer (a parked thread stays
+`pending` — never failed, never deleted), and in the chat re-scan (a parked task's
+message stays unprocessed in the inbox). `task_upsert{status:"active"}` unparks and
+wakes both loops through the existing nudge/drain signals; `task_delete` (status
+`cancelled`) inherits the gate. No schema migration.
+
+### D2 (P2) · Task definition parsed, persisted and honored — `f1b7430`
+
+`feat(agent): persist and honor task engine/model/workdir/meta`. `TaskUpsertData` now
+models all four fields under the same omission-preserves rule that already governed
+`entries`; they are carried on `TaskRow` through a v3 → v4 schema ladder step (the
+fresh-DB fast path now runs the whole ladder instead of a hardcoded prefix, keeping a
+fresh and a migrated DB on the same shape). `apply_task_def` patches only the fields
+the host sent, so a partial upsert never wipes a stored definition. The task's `model`
+is read at spawn time and layered onto the Claude settings for that session,
+overriding `config.engine.model` — apply-on-next-spawn, never hot-swapped into a live
+turn, the same policy `config_update` uses. An unsupported `engine` is warned about
+and falls back to the one engine this build implements, rather than stranding the
+task's threads. `workdir` and `meta` are persisted only; nothing reads them yet.
+
+### D3 (P2) · Transient register failures retry instead of exiting — `ccb89cc`
+
+`fix(agent): retry transient registration failures with capped backoff`.
+`register_with_backoff` drives `POST /agent/register` on the same capped exponential
+schedule the reconnect loop uses (1 s base, 10 s ceiling, unbounded attempts), and the
+retry/fatal decision lives in `register_failure_action`, which fails closed: only
+`rate_limited`, HTTP 429, HTTP 5xx, and transport/decode failures retry;
+`invalid_register_token`, `registration_disabled`, `invalid_body`,
+`unsupported_protocol`, the protocol-version gate, and any unrecognized reason still
+abort startup, so a rejection this build has never heard of cannot become a hot loop.

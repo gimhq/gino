@@ -363,6 +363,11 @@ pub(crate) mod v2 {
     // -----------------------------------------------------------------------
 
     /// `data` of a `task_upsert` (the id is the envelope `taskId`).
+    ///
+    /// Every field is optional and carries OMISSION-PRESERVES semantics: an
+    /// absent field leaves whatever the runner already stored for the task
+    /// untouched (it is never a "clear this"), so a host may push a partial
+    /// definition without wiping the rest.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub(crate) struct TaskUpsertData {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,6 +376,25 @@ pub(crate) mod v2 {
         pub(crate) kind: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) status: Option<String>,
+        /// The backend this task's threads run on (protocol.md §7, OD15). Only
+        /// `claude` is implemented; an unknown value is warned about and falls
+        /// back to claude rather than failing the task ([`crate::runner`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) engine: Option<String>,
+        /// Per-task model id overriding `config.engine.model` at the NEXT engine
+        /// spawn (never hot-swapped into a live session).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) model: Option<String>,
+        /// Host-side working directory hint. PERSISTED ONLY — nothing in the
+        /// runner reads it yet (the executor still materializes its own
+        /// workspace under `paths.workspace_dir`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) workdir: Option<String>,
+        /// Free-form host passthrough object. PERSISTED ONLY (as JSON text) —
+        /// nothing in the runner reads it yet. Typed as a raw [`Value`] rather
+        /// than a map so a future non-object shape cannot fail the whole frame.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) meta: Option<Value>,
         /// Task-scope provisioning entries (instruction file + skills) materialized
         /// into `<thread.work_dir>/project/` (PLAN-007 §5). Absent → `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -887,6 +911,10 @@ pub(crate) mod v2 {
                     name: Some("nightly".to_owned()),
                     kind: Some("job".to_owned()),
                     status: Some("active".to_owned()),
+                    engine: None,
+                    model: None,
+                    workdir: None,
+                    meta: None,
                     entries: None,
                 },
                 msg_id: Some(1),

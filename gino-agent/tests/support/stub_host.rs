@@ -856,7 +856,9 @@ async fn route_http(req: &HttpRequest, ctx: &ConnCtx) -> Vec<u8> {
         // hashes to it (counted under the STAGED id, so cache-hit assertions
         // keep working).
         ("GET", _) if path.starts_with("/agent/attachments?sha256=") => {
-            let sha = path.trim_start_matches("/agent/attachments?sha256=").to_owned();
+            let sha = path
+                .trim_start_matches("/agent/attachments?sha256=")
+                .to_owned();
             let mut model = ctx.model.lock().await;
             let hit = model
                 .inbound_blobs

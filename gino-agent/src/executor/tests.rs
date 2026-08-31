@@ -120,11 +120,22 @@ fn test_db() -> Arc<Mutex<Db>> {
         name: None,
         kind: None,
         status: "active".to_owned(),
+        engine: None,
+        model: None,
+        workdir: None,
+        meta: None,
         created_at: to_iso(now()),
         updated_at: to_iso(now()),
     })
     .unwrap();
     Arc::new(Mutex::new(db))
+}
+
+fn set_task_status(db: &Arc<Mutex<Db>>, status: &str) {
+    let guard = lock(db);
+    let mut row = guard.get_task_row("task-1").unwrap().unwrap();
+    status.clone_into(&mut row.status);
+    guard.update_task_row(&row).unwrap();
 }
 
 fn pending_thread(id: &str, max_attempts: i64) -> ThreadRow {
@@ -636,6 +647,39 @@ async fn drain_pending_runs_every_pending_thread() {
         "succeeded"
     );
     assert!(lock(&db).list_pending_threads().unwrap().is_empty());
+}
+
+/// D1: a `pending` thread under a closed/cancelled task is NOT drained — it is
+/// left `pending` (never failed, never deleted), its inbox message unconsumed —
+/// and it drains as soon as the task is `active` again.
+#[tokio::test]
+async fn closed_task_parks_its_pending_thread_until_reactivation() {
+    let db = test_db();
+    let exec = build(
+        &db,
+        vec![started("s"), ok_result("ok", "s")],
+        false,
+        no_inactivity(),
+    );
+    lock(&db).insert_thread(&pending_thread("th-a", 1)).unwrap();
+    set_task_status(&db, "closed");
+
+    assert_eq!(exec.drain_pending(&StaticPrompt("go")).await, 0);
+    let parked = lock(&db).get_thread("th-a").unwrap().unwrap();
+    assert_eq!(parked.status, "pending", "a parked thread stays pending");
+    assert!(parked.failure_reason.is_none());
+    assert_eq!(parked.attempt, 0);
+    assert!(
+        parked.prompt.is_empty(),
+        "a parked thread never resolves (or consumes) its prompt"
+    );
+
+    set_task_status(&db, "active");
+    assert_eq!(exec.drain_pending(&StaticPrompt("go")).await, 1);
+    assert_eq!(
+        lock(&db).get_thread("th-a").unwrap().unwrap().status,
+        "succeeded"
+    );
 }
 
 #[tokio::test]
@@ -1330,6 +1374,82 @@ async fn attachments_round_trip_onto_thread_result_without_bytes_in_frames() {
             row.msg_type
         );
     }
+}
+
+// -- Per-task model override (align-2026-08 D2, OD15) ---------------
+
+/// An engine that logs the per-session model of every spawn, then replays a
+/// trivial successful run. Lets a test assert what `run_thread` hands the
+/// backend as the model for THIS spawn.
+struct ModelProbe {
+    spawns: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait]
+impl Engine for ModelProbe {
+    fn name(&self) -> &'static str {
+        "model-probe"
+    }
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        self.spawns.lock().unwrap().push(cfg.model.clone());
+        Ok(Box::new(MockSession {
+            script: vec![started("sess-model"), ok_result("done", "sess-model")],
+            stall: false,
+        }))
+    }
+}
+
+/// Run one thread under `task-1` through a [`ModelProbe`] and report the model
+/// the executor put on the session config.
+async fn model_for_run(db: &Arc<Mutex<Db>>, thread_id: &str) -> Option<String> {
+    let ws = tempfile::tempdir().unwrap();
+    let spawns = Arc::new(Mutex::new(Vec::new()));
+    let engine: Arc<dyn Engine> = Arc::new(ModelProbe {
+        spawns: Arc::clone(&spawns),
+    });
+    let exec = ThreadExecutor::new(
+        engine,
+        Arc::clone(db),
+        ws.path().to_path_buf(),
+        no_inactivity(),
+    );
+    lock(db)
+        .insert_thread(&pending_thread(thread_id, 1))
+        .unwrap();
+    let row = exec
+        .run_thread(
+            pending_thread(thread_id, 1),
+            "go".to_owned(),
+            Continuity::Isolated,
+        )
+        .await;
+    assert_eq!(row.status, "succeeded");
+    let spawns = spawns.lock().unwrap();
+    assert_eq!(spawns.len(), 1, "exactly one spawn per run");
+    spawns[0].clone()
+}
+
+/// D2: a thread whose task carries `model` spawns the engine with THAT model
+/// (overriding `config.engine.model`, which the backend holds); a task without
+/// one leaves the session config untouched so the global value stands.
+#[tokio::test]
+async fn task_model_overrides_the_configured_model_at_spawn() {
+    let db = test_db();
+
+    // No task model → nothing to override with; the engine keeps its own.
+    assert_eq!(model_for_run(&db, "th-global").await, None);
+
+    // A task model → carried onto the session for the next spawn.
+    {
+        let guard = lock(&db);
+        let mut row = guard.get_task_row("task-1").unwrap().unwrap();
+        row.model = Some("claude-opus-4-8".to_owned());
+        guard.update_task_row(&row).unwrap();
+    }
+    assert_eq!(
+        model_for_run(&db, "th-task-model").await.as_deref(),
+        Some("claude-opus-4-8")
+    );
 }
 
 // -- Per-thread task provisioning (PLAN-007 §3/§6) ------------------
