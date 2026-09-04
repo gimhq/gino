@@ -1,5 +1,6 @@
 import type { Metrics } from "@/host";
 import { describe, expect, it } from "bun:test";
+import { sql } from "drizzle-orm";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createHostContext } from "@/host";
@@ -78,5 +79,71 @@ describe("createHostContext — metrics sink", () => {
       { name: "inbound_poison_frames_total", value: 1, labels: { type: "thread_message", reason: "missing_ids" } },
     ]);
     db.close();
+  });
+});
+
+describe("createHostContext — lifecycle", () => {
+  it("start() twice then stop() twice does not throw", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    expect(() => host.start()).not.toThrow();
+    expect(() => host.start()).not.toThrow();
+    expect(() => host.stop()).not.toThrow();
+    expect(() => host.stop()).not.toThrow();
+  });
+
+  it("stop() closes attached sockets with 1001 and takes them offline", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    const closed: Array<{ code?: number | undefined; reason?: string | undefined }> = [];
+    const ws = { send: () => {}, close: (code?: number, reason?: string) => closed.push({ code, reason }) };
+    host.sessions.attach("agent-1", ws);
+    host.start();
+
+    host.stop();
+    expect(closed).toEqual([{ code: 1001, reason: "host shutting down" }]);
+    expect(host.sessions.isOnline("agent-1")).toBe(false);
+  });
+
+  it("registered services stop in reverse order, before the db closes", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    const order: string[] = [];
+    const dbClose = db.close;
+    Object.assign(db, { close: () => {
+      order.push("db.close");
+      dbClose();
+    } });
+    host.registerService({ stop: () => order.push("first") });
+    host.registerService({ stop: () => order.push("second") });
+    host.registerService({ stop: () => {
+      order.push("third");
+      throw new Error("boom");
+    } });
+    host.start();
+
+    expect(() => host.stop()).not.toThrow();
+    expect(order).toEqual(["third", "second", "first", "db.close"]);
+  });
+
+  it("after stop() the db is closed", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    host.start();
+    db.run(sql`SELECT 1`);
+
+    host.stop();
+    expect(() => db.run(sql`SELECT 1`)).toThrow();
+  });
+
+  it("stop() without start() still closes sockets and the db", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    const closed: number[] = [];
+    host.sessions.attach("agent-1", { send: () => {}, close: (code?: number) => closed.push(code ?? -1) });
+
+    host.stop();
+    expect(closed).toEqual([1001]);
+    expect(() => db.run(sql`SELECT 1`)).toThrow();
   });
 });
