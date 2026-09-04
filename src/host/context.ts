@@ -1,3 +1,4 @@
+import type { HostEvents } from "./events";
 import type { Metrics } from "./metrics";
 import type { HostOptions, HostOptionsInput } from "./options";
 // HOST — per-instance context (replaces the process-wide singletons).
@@ -15,6 +16,7 @@ import { DEFAULT_LAUNCHERS, LauncherRegistry } from "@/agents/launchers";
 import { SessionRegistry } from "@/agents/sessions";
 import { createStore } from "@/configstore";
 import { generateId, ulid } from "@/platform/ids";
+import { createHostEvents } from "./events";
 import { noopMetrics } from "./metrics";
 import { resolveHostOptions } from "./options";
 
@@ -24,6 +26,8 @@ export interface HostContext {
   readonly sessions: SessionRegistry;
   readonly launchers: LauncherRegistry;
   readonly metrics: Metrics;
+  /** Typed post-write event hints (see `events.ts`); one emitter per context. */
+  readonly events: HostEvents;
   /** Resolved per-instance options (defaults mirror the env schema). */
   readonly options: HostOptions;
   /** The unified blob store rooted at `options.storeDir`, built once per context. */
@@ -39,6 +43,8 @@ export interface CreateHostContextOptions {
   readonly launchers?: readonly Launcher[];
   /** Metrics sink; defaults to `noopMetrics`. */
   readonly metrics?: Metrics;
+  /** Event emitter to share/inject; defaults to a fresh `createHostEvents(logger)`. */
+  readonly events?: HostEvents;
   /** Per-instance options; missing keys fall back to `DEFAULT_HOST_OPTIONS`. */
   readonly options?: HostOptionsInput;
   /** Clock seam; defaults to `Date.now`. */
@@ -56,6 +62,7 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
     sessions: new SessionRegistry(),
     launchers: new LauncherRegistry(opts.launchers ?? DEFAULT_LAUNCHERS),
     metrics: opts.metrics ?? noopMetrics,
+    events: opts.events ?? createHostEvents(opts.logger),
     options,
     store: createStore(options.storeDir),
     clock: opts.clock ?? Date.now,

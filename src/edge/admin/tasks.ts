@@ -195,7 +195,7 @@ export function adminTaskRoutes() {
         ...(b.kind != null ? { kind: b.kind } : {}),
         ...(b.status != null ? { status: b.status } : {}),
       });
-      const dispatch = placeTask(db, created.id);
+      const dispatch = placeTask(db, created.id, c.get("host").events);
       const task = requireTask(db, created.id);
       return c.json(ok({ task: serializeTask(task), dispatch }), 201);
     },
@@ -261,7 +261,8 @@ export function adminTaskRoutes() {
       const id = c.req.param("id");
       requireTask(db, id); // 404 before placement
       const { agent_id } = c.req.valid("json");
-      const dispatch = agent_id ? assignTaskToAgent(db, id, agent_id) : placeTask(db, id);
+      const events = c.get("host").events;
+      const dispatch = agent_id ? assignTaskToAgent(db, id, agent_id, events) : placeTask(db, id, events);
       return c.json(ok(dispatch));
     },
   );

@@ -17,6 +17,7 @@ import type { SessionRegistry } from "./sessions";
 // Grant/revoke manage the OD13 access policy (`agent_grants`) via the registry.
 import type { AppDatabase } from "@/db";
 import type { Agent } from "@/db/schema";
+import type { HostEvents } from "@/host/events";
 import type { FrameSender } from "@/protocol/outbox";
 import type { Logger } from "@/shared/lib/logger";
 import { randomBytes } from "node:crypto";
@@ -41,6 +42,8 @@ export interface ControlDeps {
    */
   readonly sessions?: Pick<SessionRegistry, "get" | "detach">;
   readonly logger?: Logger;
+  /** Host event emitter: `remove` announces `agent.removed` after the durable bookkeeping. */
+  readonly events?: HostEvents;
   /** Launcher lookup seam — pass `host.launchers.resolve`; defaults to the manual launcher (controls nothing). */
   readonly resolveLauncher?: (kind: string | null | undefined) => Launcher;
 }
@@ -208,6 +211,7 @@ export async function removeAgentControl(deps: ControlDeps, agentId: string): Pr
   }
 
   const { orphanedTasks } = removeAgent(deps.db, agentId);
+  deps.events?.emit("agent.removed", { agentId });
   const purgedFrames = purgeAgentOutbox(deps.db, agentId);
   forceCloseSession(deps, agentId);
   deps.logger?.info({ agentId, launcher: launcher.kind, via, orphanedTasks, purgedFrames }, "agent removed (token revoked, tasks orphaned, outbox purged)");

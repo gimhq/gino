@@ -189,7 +189,7 @@ export function adminAgentRoutes() {
     }),
     async (c) => {
       const host = c.get("host");
-      const deps = { db: c.get("db"), sender: host.sessions, sessions: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") };
+      const deps = { db: c.get("db"), sender: host.sessions, sessions: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger"), events: host.events };
       return c.json(ok(await removeAgentControl(deps, c.req.param("id"))));
     },
   );

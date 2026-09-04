@@ -1,5 +1,4 @@
 import type { Launcher } from "./agents/launchers";
-import type { WebhookPump } from "./channels";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
 import type { HostContext, HostOptions } from "./host";
@@ -35,8 +34,6 @@ interface AppDeps {
   readonly config: Config;
   /** The per-instance host context (db, logger, sessions, launchers, metrics). */
   readonly host: HostContext;
-  /** M6 webhook egress pump (HOST-M5M6-04) — started by bootstrap; absent in tests that compose the app directly. */
-  readonly webhookPump?: WebhookPump;
 }
 
 export interface BootstrapResult {
@@ -115,7 +112,7 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Exported so tests can construct the app with injected deps (no env / no
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
-export function createApp({ config, host, webhookPump }: AppDeps) {
+export function createApp({ config, host }: AppDeps) {
   // HOST-M9-08 — surface the spoofable proxy configuration at composition
   // time: TRUST_PROXY without an allow-list means any direct client can
   // forge X-Forwarded-For and evade every IP-keyed control.
@@ -138,9 +135,6 @@ export function createApp({ config, host, webhookPump }: AppDeps) {
     c.set("db", host.db);
     c.set("config", config);
     c.set("logger", host.logger);
-    if (webhookPump) {
-      c.set("webhookPump", webhookPump);
-    }
     return next();
   });
   api.use("*", loggingMiddleware());
@@ -227,19 +221,20 @@ export function bootstrap(): BootstrapResult {
   const db = createDb(config.DB_PATH);
 
   // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
-  // webhook delivery: pushed on inbound transcript writes, retried on a tick.
-  // Started here (not in `createApp`) so tests that build the app directly
-  // never spin a background timer.
+  // webhook delivery: pushed on the `transcript.message` host event, retried
+  // on a tick. Started here (not in `createApp`) so tests that build the app
+  // directly never spin a background timer.
   const host = createAppHost({ config, db, logger });
-  const webhookPump = startWebhookPump({
+  const pump = startWebhookPump({
     db,
     logger,
+    events: host.events,
     timeoutMs: host.options.webhooks.timeoutMs,
     maxAttempts: host.options.webhooks.maxAttempts,
     intervalMs: host.options.webhooks.retryIntervalMs,
   });
 
-  const app = createApp({ config, host, webhookPump });
+  const app = createApp({ config, host });
 
   // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
   // it never holds the process open; `stop()` is folded into `closeDb` so clean
@@ -280,7 +275,7 @@ export function bootstrap(): BootstrapResult {
       outboxGc.stop();
       launchReaper.stop();
       configStoreGc.stop();
-      webhookPump.stop();
+      pump.stop();
       db.close();
     },
   };
