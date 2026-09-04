@@ -27,7 +27,6 @@ import {
   stopAgent,
 } from "@/agents/control";
 import { getAgent, getCapacity, listAgents, listGrants } from "@/agents/registry";
-import { sessions } from "@/agents/sessions";
 import { ok } from "@/shared/lib/api-response";
 import { NotFoundError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
@@ -85,8 +84,9 @@ export function adminAgentRoutes() {
     }),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const data = listAgents(db).map(a => ({
-        ...serializeAgent(a, sessions.isOnline(a.id)),
+        ...serializeAgent(a, host.sessions.isOnline(a.id)),
         capacity: getCapacity(db, a.id),
       }));
       return c.json(ok(data));
@@ -106,14 +106,14 @@ export function adminAgentRoutes() {
     }),
     validator("json", launchBody),
     async (c) => {
-      const config = c.get("config");
+      const host = c.get("host");
       const body = c.req.valid("json");
       const result = await launchAgent(
-        { db: c.get("db"), sender: sessions, logger: c.get("logger") },
+        { db: c.get("db"), sender: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") },
         {
           kind: body.kind,
           hostUrl: body.hostUrl,
-          registerToken: config.REGISTER_TOKEN,
+          registerToken: host.options.registerToken,
           ...(body.image ? { image: body.image } : {}),
           ...(body.taskId ? { workload: { taskId: body.taskId } } : {}),
           ...(body.env ? { env: body.env } : {}),
@@ -140,9 +140,10 @@ export function adminAgentRoutes() {
       if (!agent) {
         throw new NotFoundError("agent", id);
       }
-      const runtime = await inspectAgent({ db, sender: sessions, logger: c.get("logger") }, id);
+      const host = c.get("host");
+      const runtime = await inspectAgent({ db, sender: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") }, id);
       return c.json(ok({
-        ...serializeAgent(agent, sessions.isOnline(id)),
+        ...serializeAgent(agent, host.sessions.isOnline(id)),
         capacity: getCapacity(db, id),
         grants: listGrants(db, id).map(g => g.ownerId),
         runtime,
@@ -159,7 +160,8 @@ export function adminAgentRoutes() {
       responses: { ...jsonOk(z.any(), "Stopped"), ...errors(401, 404, 410) },
     }),
     async (c) => {
-      const deps = { db: c.get("db"), sender: sessions, logger: c.get("logger") };
+      const host = c.get("host");
+      const deps = { db: c.get("db"), sender: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") };
       return c.json(ok(await stopAgent(deps, c.req.param("id"))));
     },
   );
@@ -172,7 +174,8 @@ export function adminAgentRoutes() {
       responses: { ...jsonOk(z.any(), "Restarted"), ...errors(401, 404, 410) },
     }),
     async (c) => {
-      const deps = { db: c.get("db"), sender: sessions, logger: c.get("logger") };
+      const host = c.get("host");
+      const deps = { db: c.get("db"), sender: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") };
       return c.json(ok(await restartAgent(deps, c.req.param("id"))));
     },
   );
@@ -185,7 +188,8 @@ export function adminAgentRoutes() {
       responses: { ...jsonOk(z.any(), "Removed"), ...errors(401, 404) },
     }),
     async (c) => {
-      const deps = { db: c.get("db"), sender: sessions, sessions, logger: c.get("logger") };
+      const host = c.get("host");
+      const deps = { db: c.get("db"), sender: host.sessions, sessions: host.sessions, resolveLauncher: host.launchers.resolve, logger: c.get("logger") };
       return c.json(ok(await removeAgentControl(deps, c.req.param("id"))));
     },
   );
@@ -202,7 +206,7 @@ export function adminAgentRoutes() {
     (c) => {
       const id = c.req.param("id");
       const { owner_id } = c.req.valid("json");
-      grantAgentOwner({ db: c.get("db"), sender: sessions, logger: c.get("logger") }, id, owner_id);
+      grantAgentOwner({ db: c.get("db"), sender: c.get("host").sessions, logger: c.get("logger") }, id, owner_id);
       return c.json(ok({ agentId: id, ownerId: owner_id, granted: true }));
     },
   );
@@ -221,7 +225,7 @@ export function adminAgentRoutes() {
     (c) => {
       const id = c.req.param("id");
       const { access } = c.req.valid("json");
-      setAgentAccessControl({ db: c.get("db"), sender: sessions, logger: c.get("logger") }, id, access);
+      setAgentAccessControl({ db: c.get("db"), sender: c.get("host").sessions, logger: c.get("logger") }, id, access);
       return c.json(ok({ agentId: id, access }));
     },
   );
@@ -237,7 +241,7 @@ export function adminAgentRoutes() {
     (c) => {
       const id = c.req.param("id");
       const { owner_id } = c.req.valid("json");
-      revokeAgentOwner({ db: c.get("db"), sender: sessions, logger: c.get("logger") }, id, owner_id);
+      revokeAgentOwner({ db: c.get("db"), sender: c.get("host").sessions, logger: c.get("logger") }, id, owner_id);
       return c.json(ok({ agentId: id, ownerId: owner_id, granted: false }));
     },
   );

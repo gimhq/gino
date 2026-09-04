@@ -13,7 +13,6 @@ import type { AppDatabase } from "@/db";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
-import { sessions } from "@/agents/sessions";
 import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@/channels";
 import { hashToken, safeEqual } from "@/platform";
 import { AttachmentDescriptor } from "@/protocol/frames";
@@ -140,9 +139,10 @@ export function messagesRoutes() {
     validator("json", sendBody),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const channel = requireChannel(db, c.req.param("channel"));
       const b = c.req.valid("json");
-      const result = routeInbound(db, sessions, channel, {
+      const result = routeInbound(db, host.sessions, channel, {
         conversationRef: b.conversation_ref,
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),
@@ -166,9 +166,10 @@ export function messagesRoutes() {
     validator("json", sendBody),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const channel = requireChannel(db, c.req.param("channel"));
       const b = c.req.valid("json");
-      const result = routeInbound(db, sessions, channel, {
+      const result = routeInbound(db, host.sessions, channel, {
         conversationRef: b.conversation_ref,
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),

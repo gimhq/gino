@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getLauncher, manualLauncher, registerLauncher } from "@/agents/launchers";
+import { LauncherRegistry, manualLauncher } from "@/agents/launchers";
 import { UnsupportedLauncherOp } from "@/agents/launchers/types";
 
 // M3 launchers — the manual (default) launcher + the kind→launcher registry.
@@ -36,10 +36,16 @@ describe("M3 manual launcher — safe by default", () => {
 
 describe("M3 launcher registry — default + lookup", () => {
   it("unset/unknown kind resolves to the manual default", () => {
-    expect(getLauncher().kind).toBe("manual");
-    expect(getLauncher(null).kind).toBe("manual");
-    expect(getLauncher("manual").kind).toBe("manual");
-    expect(getLauncher("no-such-launcher").kind).toBe("manual");
+    const registry = new LauncherRegistry([manualLauncher]);
+    expect(registry.resolve().kind).toBe("manual");
+    expect(registry.resolve(null).kind).toBe("manual");
+    expect(registry.resolve("manual").kind).toBe("manual");
+    expect(registry.resolve("no-such-launcher").kind).toBe("manual");
+  });
+
+  it("an empty registry still resolves manual (the fallback is not a registration)", () => {
+    expect(new LauncherRegistry().resolve("manual").kind).toBe("manual");
+    expect(new LauncherRegistry().resolve().kind).toBe("manual");
   });
 
   it("a registered launcher is selected by its kind", () => {
@@ -52,9 +58,10 @@ describe("M3 launcher registry — default + lookup", () => {
       remove: async () => {},
       inspect: async () => "running" as const,
     };
-    registerLauncher(fake);
-    expect(getLauncher("fake-vm")).toBe(fake);
+    const registry = new LauncherRegistry([manualLauncher]);
+    registry.register(fake);
+    expect(registry.resolve("fake-vm")).toBe(fake);
     // The manual default is still intact for unknown kinds.
-    expect(getLauncher("still-unknown").kind).toBe("manual");
+    expect(registry.resolve("still-unknown").kind).toBe("manual");
   });
 });

@@ -17,7 +17,7 @@ import type { Launcher } from "./launchers/types";
 // never retries forever against a broken runtime handle.
 import type { AppDatabase } from "@/db";
 import type { Logger } from "@/shared/lib/logger";
-import { getLauncher } from "./launchers";
+import { manualLauncher } from "./launchers/manual";
 import { deletePendingLaunch, hasPendingLaunch, listExpiredPendingLaunches } from "./registry";
 
 /** Default launch→register TTL: a launched agent has 10 minutes to register. */
@@ -35,7 +35,7 @@ export interface LaunchReaperDeps {
   readonly intervalMs?: number;
   /** Clock seam (tests inject a fake clock). Defaults to `Date.now`. */
   readonly now?: () => number;
-  /** Launcher lookup seam (defaults to the global registry — tests inject). */
+  /** Launcher lookup seam — pass `host.launchers.resolve`; defaults to the manual launcher (controls nothing). */
   readonly resolveLauncher?: (kind: string | null | undefined) => Launcher;
 }
 
@@ -66,7 +66,7 @@ export async function reapPendingLaunches(deps: LaunchReaperDeps): Promise<numbe
       continue;
     }
     if (entry.launchRef) {
-      const launcher = (deps.resolveLauncher ?? getLauncher)(entry.launcherKind);
+      const launcher = (deps.resolveLauncher ?? (() => manualLauncher))(entry.launcherKind);
       try {
         await launcher.remove(entry.launchRef);
         deps.logger?.info(

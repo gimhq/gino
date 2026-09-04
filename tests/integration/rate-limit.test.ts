@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
@@ -34,7 +34,7 @@ function newApp(overrides: Record<string, string> = {}) {
     GINO_PROXY_ANTHROPIC_API_KEY: "sk-ant-host-real",
     ...overrides,
   });
-  return createApp({ config, db, logger: createLogger(config) });
+  return createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 }
 
 beforeAll(() => {

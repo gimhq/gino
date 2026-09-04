@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { getEntries, listArtifacts } from "@/configstore";
 import { createDb } from "@/db";
@@ -43,7 +43,7 @@ const sender: FrameSender = { isOnline: () => false, send: () => false };
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
 afterAll(() => {

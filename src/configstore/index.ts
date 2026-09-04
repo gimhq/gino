@@ -16,14 +16,13 @@
 //   entries.ts   `config_entries` desired set + per-engine target resolution + delivery shape
 //   serve.ts     unified byte-channel resolver (by id | sha256, across both stores)
 //   gc.ts        refcount/LRU GC backing both stores (disabled by default, OD11)
-import type { Config } from "@/config";
 import { BlobStore } from "./store";
 
 export const MODULE = "configstore" as const;
 
-/** Build the unified blob store rooted at the configured `STORE_DIR`. */
-export function createStore(config: Config): BlobStore {
-  return new BlobStore(config.STORE_DIR);
+/** Build the unified blob store rooted at `storeDir`. */
+export function createStore(storeDir: string): BlobStore {
+  return new BlobStore(storeDir);
 }
 
 export {

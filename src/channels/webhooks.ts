@@ -8,7 +8,7 @@
 //
 // SSRF posture (two layers):
 //   1. REGISTRATION (sync, assertSafeWebhookUrl): scheme + obvious-loopback
-//      hostname + literal private/loopback IP, reusing the proxy's per-IP guard.
+//      hostname + literal private/loopback IP, via the shared per-IP guard.
 //      Stays synchronous so the admin registration route stays synchronous.
 //   2. DELIVERY (async, assertSafeWebhookUrlResolved): the static checks PLUS DNS
 //      resolution — every resolved A/AAAA must be public. This defeats
@@ -27,8 +27,8 @@
 //      request is bounded by a timeout (AbortSignal, HOST-M5M6-05).
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { isPrivateUpstreamHost } from "@/proxy";
 import { AppError, ValidationError } from "@/shared/lib/errors";
+import { isPrivateUpstreamHost } from "@/shared/lib/net";
 
 /** A registered outbound webhook on a channel (stored under `channel.config.webhooks`). */
 export interface WebhookEndpoint {
@@ -79,7 +79,7 @@ function guardHost(url: URL): string {
 
 /**
  * SYNCHRONOUS SSRF guard for an outbound webhook URL. Rejects non-http(s) schemes,
- * obvious loopback hostnames, and literal private/loopback IPs (via the proxy
+ * obvious loopback hostnames, and literal private/loopback IPs (via the shared
  * guard). Used at REGISTRATION time (`addWebhook`) — it stays sync so the admin
  * registration route stays sync. It does NOT resolve DNS: a hostname that resolves
  * into private space is caught at delivery time by `assertSafeWebhookUrlResolved`.
@@ -108,7 +108,7 @@ export function assertSafeWebhookUrl(raw: string): URL {
 /**
  * DELIVERY-TIME SSRF guard: the static checks of `assertSafeWebhookUrl` PLUS DNS
  * resolution. Resolves the hostname and rejects if ANY returned A/AAAA address is
- * private / loopback / link-local / unique-local (per-IP check reuses the proxy's
+ * private / loopback / link-local / unique-local (per-IP check reuses the shared
  * `isPrivateUpstreamHost`) — defeating DNS-rebinding and CNAMEs into private space,
  * which the hostname-string check alone cannot see. A literal-IP host skips the
  * lookup (the sync guard already classified it). Fail-closed: a host that resolves

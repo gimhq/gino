@@ -1,6 +1,7 @@
 import type { WebhookPump } from "@/channels/pump";
 import type { Config } from "@/config";
 import type { AppDatabase } from "@/db";
+import type { HostContext } from "@/host";
 import type { Logger } from "@/shared/lib/logger";
 
 /**
@@ -18,6 +19,8 @@ export interface AppEnv {
     db: AppDatabase;
     config: Config;
     logger: Logger;
+    /** The per-instance host context (sessions, launchers, metrics sink, …). */
+    host: HostContext;
     /**
      * The connect-token-resolved agent identity on the `/agent/*` data plane.
      * Set by `connectTokenAuth` from the token's `connect_token_hash` (never a

@@ -8,7 +8,7 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { getTranscript } from "@/msgstore";
@@ -34,7 +34,7 @@ let taskId: string;
 
 beforeAll(async () => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 
   const res = await app.fetch(new Request("http://local/api/agent/register", {
     method: "POST",
