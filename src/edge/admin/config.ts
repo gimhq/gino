@@ -12,7 +12,6 @@
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
-import { sessions } from "@/agents/sessions";
 import {
   createStore,
   DEFAULT_ENGINE,
@@ -109,7 +108,7 @@ export function adminConfigRoutes() {
         // setEntries) and is re-pushed live to every online agent; offline
         // agents converge on their next versioned config pull.
         const version = getGlobalConfigVersion(db);
-        const pushed = broadcastGlobalConfig(db, sessions);
+        const pushed = broadcastGlobalConfig(db, c.get("host").sessions);
         c.get("logger").info({ scope: b.scope, engine, count: persisted.length, version, pushed: pushed.length }, "config entries set");
         return c.json(ok({ scope: b.scope, engine, entries: persisted, version }));
       }

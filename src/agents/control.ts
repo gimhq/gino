@@ -22,7 +22,7 @@ import type { Logger } from "@/shared/lib/logger";
 import { randomBytes } from "node:crypto";
 import { enqueue, purgeAgentOutbox } from "@/protocol/outbox";
 import { AppError, NotFoundError } from "@/shared/lib/errors";
-import { getLauncher } from "./launchers";
+import { manualLauncher } from "./launchers/manual";
 import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess } from "./registry";
 
 export type ControlOp = "stop" | "restart" | "remove";
@@ -41,7 +41,7 @@ export interface ControlDeps {
    */
   readonly sessions?: Pick<SessionRegistry, "get" | "detach">;
   readonly logger?: Logger;
-  /** Launcher lookup seam (defaults to the global registry — tests inject). */
+  /** Launcher lookup seam — pass `host.launchers.resolve`; defaults to the manual launcher (controls nothing). */
   readonly resolveLauncher?: (kind: string | null | undefined) => Launcher;
 }
 
@@ -108,7 +108,7 @@ function isRuntimeGone(err: unknown): boolean {
 }
 
 function resolve(deps: ControlDeps, agent: Agent): Launcher {
-  return (deps.resolveLauncher ?? getLauncher)(agent.launcherKind);
+  return (deps.resolveLauncher ?? (() => manualLauncher))(agent.launcherKind);
 }
 
 /** Enqueue a host→agent `close` frame (durable; the OOB fallback when a launcher can't act). */
@@ -300,7 +300,7 @@ function mintLaunchNonce(): string {
  * starts nothing it was not explicitly asked to (safe by default).
  */
 export async function launchAgent(deps: ControlDeps, input: LaunchInput): Promise<LaunchAgentResult> {
-  const launcher = (deps.resolveLauncher ?? getLauncher)(input.kind);
+  const launcher = (deps.resolveLauncher ?? (() => manualLauncher))(input.kind);
   if (!launcher.capabilities.canLaunch) {
     throw new AppError(`launcher '${input.kind}' cannot launch agents`, 422, "LAUNCH_UNSUPPORTED");
   }

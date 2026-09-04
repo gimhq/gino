@@ -25,6 +25,7 @@ import type { FrameSender } from "./outbox";
 // `data` is validated here (still M2) against the `frames.ts` schemas right
 // before it reaches a writer; the writers themselves stay transport-free.
 import type { AppDatabase } from "@/db";
+import type { Metrics } from "@/host/metrics";
 import type { Logger } from "@/shared/lib/logger";
 import { touchLiveness } from "@/agents/registry";
 import {
@@ -37,7 +38,6 @@ import {
   writeThreadResult,
 } from "@/msgstore";
 import { CronStateData, HeartbeatData, RECOGNIZED_MESSAGE_KINDS, ThreadMessageData, ThreadResultData } from "@/protocol/frames";
-import { counterAdd } from "@/shared/lib/metrics";
 import { getTask } from "@/tasks/store";
 import { decodeFrame } from "./envelope";
 import { ackMessage, ackOutbox } from "./outbox";
@@ -55,6 +55,8 @@ export interface InboundDeps {
    * the store), so a missed/failed notification loses nothing.
    */
   onTranscriptWrite?: (taskId: string) => void;
+  /** Metrics sink (the host context's); absent → counters are not recorded. */
+  metrics?: Metrics;
 }
 
 /** Build the `ack{id}` for a frame that carried its own `outboxId`, else null. */
@@ -73,7 +75,7 @@ function poisonDrop(deps: InboundDeps, decoded: DecodedFrame, reason: string, de
     { agentId: deps.agentId, type: decoded.type, taskId: decoded.taskId, threadId: decoded.threadId, cronId: decoded.cronId, outboxId: decoded.outboxId, reason, detail },
     "inbound frame PERMANENTLY unprocessable — acked and dropped (poison policy)",
   );
-  counterAdd("inbound_poison_frames_total", "Permanently unprocessable inbound frames acked and dropped", 1, { type: decoded.type, reason });
+  deps.metrics?.counterAdd("inbound_poison_frames_total", "Permanently unprocessable inbound frames acked and dropped", 1, { type: decoded.type, reason });
   return ackFor(decoded);
 }
 
@@ -187,7 +189,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       // version drift is visible to operators.
       if (!RECOGNIZED_MESSAGE_KINDS.has(data.kind)) {
         deps.logger?.warn({ agentId, taskId: decoded.taskId, threadId: decoded.threadId, kind: data.kind }, "thread_message with unrecognized kind — stored opaquely");
-        counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
+        deps.metrics?.counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
       }
       writeThreadMessage(db, { taskId: decoded.taskId, threadId: decoded.threadId, data });
       deps.onTranscriptWrite?.(decoded.taskId);
@@ -226,7 +228,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
           { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...completeness },
           "thread_result transcript gap — stored messages do not cover 1..=final_seq",
         );
-        counterAdd("inbound_transcript_gaps_total", "thread_result ingests whose stored transcript does not cover 1..=final_seq", 1);
+        deps.metrics?.counterAdd("inbound_transcript_gaps_total", "thread_result ingests whose stored transcript does not cover 1..=final_seq", 1);
       }
       return ackFor(decoded);
     }

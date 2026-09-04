@@ -5,7 +5,7 @@ import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { websocket } from "hono/bun";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { outbox, tasks } from "@/db/schema";
@@ -39,7 +39,7 @@ let wsBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger: createLogger(config) });
+  const app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
   server = Bun.serve({
     port: 0,
     fetch: (req, srv) => app.fetch(req, { IP: srv.requestIP(req), server: srv }),
