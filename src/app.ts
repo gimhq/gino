@@ -1,6 +1,7 @@
-import type { WebhookPump } from "./channels";
+import type { Launcher } from "./agents/launchers";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
+import type { HostContext, HostOptions } from "./host";
 import type { Logger } from "./shared/lib/logger";
 import type { AppEnv } from "./shared/lib/types";
 import { Hono } from "hono";
@@ -10,18 +11,18 @@ import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
 import { startLaunchReaper } from "./agents/launch-reaper";
 import { startLivenessSweep } from "./agents/liveness";
-import { sessions } from "./agents/sessions";
 import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
-import { createStore, startConfigStoreGc } from "./configstore";
+import { startConfigStoreGc } from "./configstore";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
+import { createHostContext, resolveHostOptions } from "./host";
 import { docsCspRelax, mountDocs } from "./modules/docs";
 import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
 import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
-import { renderPrometheus } from "./shared/lib/metrics";
+import { registryMetrics, renderPrometheus } from "./shared/lib/metrics";
 import { adminTokenAuth } from "./shared/middleware/auth";
 import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
@@ -31,10 +32,8 @@ import { propagateRequestId } from "./shared/middleware/request-id";
 
 interface AppDeps {
   readonly config: Config;
-  readonly db: AppDatabase;
-  readonly logger: Logger;
-  /** M6 webhook egress pump (HOST-M5M6-04) — started by bootstrap; absent in tests that compose the app directly. */
-  readonly webhookPump?: WebhookPump;
+  /** The per-instance host context (db, logger, sessions, launchers, metrics). */
+  readonly host: HostContext;
 }
 
 export interface BootstrapResult {
@@ -47,6 +46,8 @@ export interface BootstrapResult {
   readonly websocket: typeof websocket;
   readonly config: Config;
   readonly logger: Logger;
+  /** The host context the app was composed with. */
+  readonly host: HostContext;
   /**
    * The open database handle. Exposed so the boot entrypoint can ping it for the
    * lode readiness probe and checkpoint the WAL on the staged-update prepare
@@ -56,6 +57,38 @@ export interface BootstrapResult {
   readonly db: AppDatabase;
   /** Close the DB connection. Call on shutdown. */
   readonly closeDb: () => void;
+}
+
+// ─── Host composition ───
+
+export interface AppHostDeps {
+  readonly config: Config;
+  readonly db: AppDatabase;
+  readonly logger: Logger;
+  readonly launchers?: readonly Launcher[];
+}
+
+/** The single place env config becomes SDK options (docs/host-sdk-design.md §5.2). */
+export function hostOptionsFromConfig(config: Config): HostOptions {
+  return resolveHostOptions({
+    storeDir: config.STORE_DIR,
+    maxUploadBytes: config.MAX_UPLOAD_BYTES,
+    registerToken: config.REGISTER_TOKEN,
+    registrationEnabled: config.REGISTER_ENABLED,
+    configGc: { enabled: config.CONFIG_GC_ENABLED, intervalMs: config.CONFIG_GC_INTERVAL_MS, maxAgeMs: config.CONFIG_GC_MAX_AGE_MS },
+    webhooks: { timeoutMs: config.WEBHOOK_TIMEOUT_MS, maxAttempts: config.WEBHOOK_MAX_ATTEMPTS, retryIntervalMs: config.WEBHOOK_RETRY_INTERVAL_MS },
+  });
+}
+
+/** Build the host context the way the standalone app does: the global Prometheus registry is the metrics sink. */
+export function createAppHost({ config, db, logger, launchers }: AppHostDeps): HostContext {
+  return createHostContext({
+    db,
+    logger,
+    metrics: registryMetrics,
+    options: hostOptionsFromConfig(config),
+    ...(launchers ? { launchers } : {}),
+  });
 }
 
 // ─── App composer ───
@@ -79,12 +112,12 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Exported so tests can construct the app with injected deps (no env / no
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
-export function createApp({ config, db, logger, webhookPump }: AppDeps) {
+export function createApp({ config, host }: AppDeps) {
   // HOST-M9-08 — surface the spoofable proxy configuration at composition
   // time: TRUST_PROXY without an allow-list means any direct client can
   // forge X-Forwarded-For and evade every IP-keyed control.
   if (isSpoofableProxyConfig(config)) {
-    logger.warn(
+    host.logger.warn(
       "TRUST_PROXY is enabled without TRUSTED_PROXY_IPS — forwarding headers are accepted from ANY peer, so client IPs are forgeable; set GINO_TRUSTED_PROXY_IPS to the proxy addresses",
     );
   }
@@ -98,12 +131,10 @@ export function createApp({ config, db, logger, webhookPump }: AppDeps) {
   api.use("*", propagateRequestId);
   api.use("*", cors({ origin: resolveCorsOrigin(config) }));
   api.use("*", (c, next) => {
-    c.set("db", db);
+    c.set("host", host);
+    c.set("db", host.db);
     c.set("config", config);
-    c.set("logger", logger);
-    if (webhookPump) {
-      c.set("webhookPump", webhookPump);
-    }
+    c.set("logger", host.logger);
     return next();
   });
   api.use("*", loggingMiddleware());
@@ -190,24 +221,26 @@ export function bootstrap(): BootstrapResult {
   const db = createDb(config.DB_PATH);
 
   // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
-  // webhook delivery: pushed on inbound transcript writes, retried on a tick.
-  // Started here (not in `createApp`) so tests that build the app directly
-  // never spin a background timer.
-  const webhookPump = startWebhookPump({
+  // webhook delivery: pushed on the `transcript.message` host event, retried
+  // on a tick. Started here (not in `createApp`) so tests that build the app
+  // directly never spin a background timer.
+  const host = createAppHost({ config, db, logger });
+  const pump = startWebhookPump({
     db,
     logger,
-    timeoutMs: config.WEBHOOK_TIMEOUT_MS,
-    maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
-    intervalMs: config.WEBHOOK_RETRY_INTERVAL_MS,
+    events: host.events,
+    timeoutMs: host.options.webhooks.timeoutMs,
+    maxAttempts: host.options.webhooks.maxAttempts,
+    intervalMs: host.options.webhooks.retryIntervalMs,
   });
 
-  const app = createApp({ config, db, logger, webhookPump });
+  const app = createApp({ config, host });
 
   // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
   // it never holds the process open; `stop()` is folded into `closeDb` so clean
   // shutdown halts it before the DB closes. Started here (not in `createApp`)
   // so tests that build the app directly never spin a background timer.
-  const liveness = startLivenessSweep({ db, logger, sessions });
+  const liveness = startLivenessSweep({ db, logger, sessions: host.sessions });
 
   // M2 outbox retention — periodic GC of acked rows past the retention window
   // (unacked rows are never touched). Same lifecycle as the liveness sweep.
@@ -216,7 +249,7 @@ export function bootstrap(): BootstrapResult {
   // M3 pending-launch reaper (HOST-M3-05) — tears down runtimes whose agent
   // never registered inside the TTL. The `pending_launches` table is persisted,
   // so this also reaps orphans left by a host restart.
-  const launchReaper = startLaunchReaper({ db, logger });
+  const launchReaper = startLaunchReaper({ db, logger, resolveLauncher: host.launchers.resolve });
 
   // M8 store GC (HOST-M8-11) — the periodic refcount/orphan sweep over the
   // unified blob store. Dry-run (observability only) unless CONFIG_GC_ENABLED,
@@ -224,10 +257,10 @@ export function bootstrap(): BootstrapResult {
   const configStoreGc = startConfigStoreGc({
     db,
     logger,
-    store: createStore(config),
-    enabled: config.CONFIG_GC_ENABLED,
-    maxAgeMs: config.CONFIG_GC_MAX_AGE_MS,
-    intervalMs: config.CONFIG_GC_INTERVAL_MS,
+    store: host.store,
+    enabled: host.options.configGc.enabled,
+    maxAgeMs: host.options.configGc.maxAgeMs,
+    intervalMs: host.options.configGc.intervalMs,
   });
 
   return {
@@ -235,13 +268,14 @@ export function bootstrap(): BootstrapResult {
     websocket,
     config,
     logger,
+    host,
     db,
     closeDb: () => {
       liveness.stop();
       outboxGc.stop();
       launchReaper.stop();
       configStoreGc.stop();
-      webhookPump.stop();
+      pump.stop();
       db.close();
     },
   };

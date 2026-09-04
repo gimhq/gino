@@ -11,6 +11,7 @@
 // message. The old "group" delivery role is dissolved into this routing.
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
+import type { HostEvents } from "@/host/events";
 import type { AttachmentDescriptor } from "@/protocol/frames";
 import type { FrameSender } from "@/protocol/outbox";
 import type { DispatchResult } from "@/tasks";
@@ -95,7 +96,7 @@ function resolveNewTaskShape(channel: Channel, input: InboundMessage): NewTaskSh
  * the message is NOT delivered yet (`delivered: false`) — the binding persists so
  * a later send/assign continues the same conversation.
  */
-export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Channel, input: InboundMessage): RouteResult {
+export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Channel, input: InboundMessage, events?: HostEvents): RouteResult {
   if (!input.conversationRef) {
     throw new ValidationError("conversation_ref is required", { formErrors: ["conversation_ref is required"], fieldErrors: {} });
   }
@@ -136,7 +137,7 @@ export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Chan
   bindConversation(db, channel.id, input.conversationRef, task.id);
 
   // M4 dispatch (owner-pinned, §3).
-  const dispatch = placeTask(db, task.id);
+  const dispatch = placeTask(db, task.id, events);
   if (!dispatch.placed) {
     return {
       taskId: task.id,

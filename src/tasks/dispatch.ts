@@ -16,6 +16,7 @@
 //     launcher/admin grants or starts one later (deferred phase).
 import type { AppDatabase } from "@/db";
 import type { Agent, Task } from "@/db/schema";
+import type { HostEvents } from "@/host/events";
 import { getCapacity, isOwnerPermitted, listAgents } from "@/agents/registry";
 import { AppError } from "@/shared/lib/errors";
 import { requireTask, setPlacement, setStatus } from "./store";
@@ -117,8 +118,9 @@ function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
  *     `active`. Dedicated is preferred over public; capacity only orders the
  *     candidates (never spills — a busy permitted agent is still chosen).
  *   • none permitted   → leaves the task `pending-assignment`.
+ * A fresh pin is announced as `task.placed` on `events` (after the write).
  */
-export function placeTask(db: AppDatabase, taskId: string): DispatchResult {
+export function placeTask(db: AppDatabase, taskId: string, events?: HostEvents): DispatchResult {
   const task = requireTask(db, taskId);
   if (task.agentId != null) {
     return { taskId, placed: true, agentId: task.agentId, status: task.status, reason: "already-placed" };
@@ -135,6 +137,7 @@ export function placeTask(db: AppDatabase, taskId: string): DispatchResult {
 
   setPlacement(db, taskId, chosen.agent.id); // SET ONCE
   const status = activateForPlacement(db, task);
+  events?.emit("task.placed", { taskId, agentId: chosen.agent.id });
   return { taskId, placed: true, agentId: chosen.agent.id, status, reason: "placed" };
 }
 
@@ -146,7 +149,7 @@ export function placeTask(db: AppDatabase, taskId: string): DispatchResult {
  * SAME agent is a full no-op (`already-placed`); set-once is enforced by
  * `setPlacement` (a second, different agent → 409).
  */
-export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: string): DispatchResult {
+export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: string, events?: HostEvents): DispatchResult {
   const task = requireTask(db, taskId);
   if (task.agentId === agentId) {
     // Idempotent replay of the same assign: report the existing pin and touch
@@ -166,5 +169,6 @@ export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: stri
 
   setPlacement(db, taskId, agentId); // SET ONCE (409 on a different agent while placed)
   const status = activateForPlacement(db, task);
+  events?.emit("task.placed", { taskId, agentId });
   return { taskId, placed: true, agentId, status, reason: "placed" };
 }

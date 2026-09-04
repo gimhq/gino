@@ -22,7 +22,6 @@ import type { CronUpsertData } from "@/protocol/frames";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
-import { sessions } from "@/agents/sessions";
 import { getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, TRANSCRIPT_READ_LIMIT } from "@/msgstore";
 import { AttachmentDescriptor } from "@/protocol/frames";
 import { ok } from "@/shared/lib/api-response";
@@ -196,7 +195,7 @@ export function adminTaskRoutes() {
         ...(b.kind != null ? { kind: b.kind } : {}),
         ...(b.status != null ? { status: b.status } : {}),
       });
-      const dispatch = placeTask(db, created.id);
+      const dispatch = placeTask(db, created.id, c.get("host").events);
       const task = requireTask(db, created.id);
       return c.json(ok({ task: serializeTask(task), dispatch }), 201);
     },
@@ -262,7 +261,8 @@ export function adminTaskRoutes() {
       const id = c.req.param("id");
       requireTask(db, id); // 404 before placement
       const { agent_id } = c.req.valid("json");
-      const dispatch = agent_id ? assignTaskToAgent(db, id, agent_id) : placeTask(db, id);
+      const events = c.get("host").events;
+      const dispatch = agent_id ? assignTaskToAgent(db, id, agent_id, events) : placeTask(db, id, events);
       return c.json(ok(dispatch));
     },
   );
@@ -278,9 +278,10 @@ export function adminTaskRoutes() {
     validator("json", messageBody),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
       const b = c.req.valid("json");
-      const sent = sendTaskMessage(db, sessions, task, {
+      const sent = sendTaskMessage(db, host.sessions, task, {
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),
         ...(b.new_thread != null ? { newThread: b.new_thread } : {}),
@@ -303,8 +304,9 @@ export function adminTaskRoutes() {
     }),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
-      const row = emitInterrupt(db, sessions, task);
+      const row = emitInterrupt(db, host.sessions, task);
       return c.json(ok({ taskId: task.id, outboxId: row.id }));
     },
   );
@@ -319,6 +321,7 @@ export function adminTaskRoutes() {
     }),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const id = c.req.param("id");
       const task = requireTask(db, id);
       // Never-placed: no agent to command — just record the terminal status
@@ -330,9 +333,9 @@ export function adminTaskRoutes() {
       // The interrupt is a live-only signal (HOST-M4-03): best-effort while the
       // agent is online; an offline agent still learns the terminal status from
       // the durable task_upsert below.
-      const interrupt = sessions.isOnline(task.agentId) ? emitInterrupt(db, sessions, task) : null;
+      const interrupt = host.sessions.isOnline(task.agentId) ? emitInterrupt(db, host.sessions, task) : null;
       const closed = closeTask(db, id);
-      emitTaskUpsert(db, sessions, closed); // carries status "closed" to the agent
+      emitTaskUpsert(db, host.sessions, closed); // carries status "closed" to the agent
       return c.json(ok({ task: serializeTask(closed), outboxId: interrupt?.id ?? null }));
     },
   );
@@ -363,9 +366,10 @@ export function adminTaskRoutes() {
     validator("json", createCronBody),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
       const b = c.req.valid("json");
-      const { cron, cronId } = emitCronUpsert(db, sessions, task, { data: cronData(b, b.prompt) });
+      const { cron, cronId } = emitCronUpsert(db, host.sessions, task, { data: cronData(b, b.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }), 201);
     },
   );
@@ -380,6 +384,7 @@ export function adminTaskRoutes() {
     validator("json", updateCronBody),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
       const cronId = c.req.param("cronId");
       // Update addresses an EXISTING trigger only — an unknown id must 404, not
@@ -387,7 +392,7 @@ export function adminTaskRoutes() {
       // cron's current one (the wire field is required, HOST-M4-10).
       const existing = requireCron(db, task.id, cronId);
       const b = c.req.valid("json");
-      const { cron } = emitCronUpsert(db, sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
+      const { cron } = emitCronUpsert(db, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }));
     },
   );
@@ -401,10 +406,11 @@ export function adminTaskRoutes() {
     }),
     (c) => {
       const db = c.get("db");
+      const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
       const cronId = c.req.param("cronId");
       requireCron(db, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
-      const row = emitCronDelete(db, sessions, task, cronId);
+      const row = emitCronDelete(db, host.sessions, task, cronId);
       return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
     },
   );

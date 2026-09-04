@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { enrollAgent, grantOwner } from "@/agents/registry";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
@@ -44,7 +44,7 @@ function makeApp(env: Record<string, string> = {}) {
     GINO_MAX_UPLOAD_BYTES: String(MAX_UPLOAD),
     ...env,
   });
-  return createApp({ config, db, logger: createLogger(config) });
+  return createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 }
 
 beforeAll(() => {

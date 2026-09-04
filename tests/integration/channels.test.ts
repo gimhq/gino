@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { messages } from "@/db/schema";
@@ -38,7 +38,7 @@ let httpBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger: createLogger(config) });
+  const app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
   server = Bun.serve({
     port: 0,
     fetch: (req, srv) => app.fetch(req, { IP: srv.requestIP(req), server: srv }),
