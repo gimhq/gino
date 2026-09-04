@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
@@ -29,7 +29,7 @@ let app: ReturnType<typeof createApp>;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
 afterAll(() => {
@@ -82,7 +82,7 @@ describe("GET /api/metrics (HOST-M9-09)", () => {
       GINO_LOG_LEVEL: "error",
       GINO_LOG_TO_STDOUT: "true",
     });
-    const bareApp = createApp({ config: bare, db, logger: createLogger(bare) });
+    const bareApp = createApp({ config: bare, host: createAppHost({ config: bare, db, logger: createLogger(bare) }) });
     const res = await bareApp.fetch(new Request("http://local/api/metrics", {
       headers: { authorization: "Bearer " },
     }));
@@ -111,7 +111,7 @@ describe("spoofable proxy config warning (HOST-M9-08)", () => {
       GINO_TRUST_PROXY: "true",
     });
     const { logger, warnings } = warnCapturingLogger();
-    createApp({ config: spoofable, db, logger });
+    createApp({ config: spoofable, host: createAppHost({ config: spoofable, db, logger }) });
     expect(warnings).toHaveLength(1);
     expect(String(warnings[0])).toContain("TRUSTED_PROXY_IPS");
   });
@@ -125,7 +125,7 @@ describe("spoofable proxy config warning (HOST-M9-08)", () => {
       GINO_TRUSTED_PROXY_IPS: "10.0.0.5",
     });
     const { logger, warnings } = warnCapturingLogger();
-    createApp({ config: narrowed, db, logger });
+    createApp({ config: narrowed, host: createAppHost({ config: narrowed, db, logger }) });
     expect(warnings).toHaveLength(0);
   });
 });

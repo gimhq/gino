@@ -6,7 +6,6 @@ import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
 import { correlateLaunch, enrollAgent, reEnrollByLaunchNonce, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
-import { sessions } from "@/agents/sessions";
 import {
   attachmentsBySha,
   createStore,
@@ -326,6 +325,7 @@ export function agentRoutes() {
       const token = c.req.header("x-internal-token") ?? "";
       const db = c.get("db");
       const logger = c.get("logger");
+      const host = c.get("host");
 
       // Per-agent auth (M3): verify against the stored hash. Throwing here
       // rejects the upgrade with the standard 401 envelope (no socket opens).
@@ -336,17 +336,17 @@ export function agentRoutes() {
 
       // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
       const pump = c.get("webhookPump");
-      const deps = { db, sender: sessions, agentId, logger, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
+      const deps = { db, sender: host.sessions, agentId, logger, metrics: host.metrics, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
-          sessions.attach(agentId, ws);
+          host.sessions.attach(agentId, ws);
           setAgentStatus(db, agentId, "online");
           // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
           touchLiveness(db, agentId);
-          const replayed = replayUnacked(db, sessions, agentId, { logger });
+          const replayed = replayUnacked(db, host.sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
@@ -363,7 +363,7 @@ export function agentRoutes() {
           // HOST-M1M2-05 / HOST-M3-02: only the CURRENT socket's close marks the
           // agent offline — a superseded socket's late close (dirty reconnect)
           // must not clobber the live session's `online` status.
-          const evicted = sessions.detach(agentId, ws);
+          const evicted = host.sessions.detach(agentId, ws);
           if (evicted) {
             setAgentStatus(db, agentId, "offline");
           }
@@ -418,7 +418,7 @@ export function agentRoutes() {
         // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
         const pump = c.get("webhookPump");
         return c.json(ingestHttpFrame(
-          { db: c.get("db"), agentId, logger: c.get("logger"), ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
+          { db: c.get("db"), agentId, logger: c.get("logger"), metrics: c.get("host").metrics, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
           raw,
         ));
       }

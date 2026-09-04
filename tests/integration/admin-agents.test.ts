@@ -6,7 +6,7 @@ import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { verifyConnectToken } from "@/agents/registry";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { tasks } from "@/db/schema";
@@ -34,7 +34,7 @@ let app: ReturnType<typeof createApp>;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
 afterAll(() => {
