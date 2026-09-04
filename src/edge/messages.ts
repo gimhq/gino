@@ -150,7 +150,7 @@ export function messagesRoutes() {
         ...(b.model != null ? { model: b.model } : {}),
         ...(b.workdir != null ? { workdir: b.workdir } : {}),
         ...(b.meta != null ? { meta: b.meta } : {}),
-      });
+      }, host.events);
       return c.json(ok(result));
     },
   );
@@ -177,7 +177,7 @@ export function messagesRoutes() {
         ...(b.model != null ? { model: b.model } : {}),
         ...(b.workdir != null ? { workdir: b.workdir } : {}),
         ...(b.meta != null ? { meta: b.meta } : {}),
-      });
+      }, host.events);
       return c.json(ok(result));
     },
   );

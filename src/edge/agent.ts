@@ -305,6 +305,7 @@ export function agentRoutes() {
       }
 
       c.get("logger").info({ agentId: agent.id, source: agent.source }, "agent enrolled");
+      host.events.emit("agent.enrolled", { agentId: agent.id });
       // M8 (B6): seed the resolved GLOBAL desired set + version on register (additive).
       const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, agent) };
       return c.json({ agentId: agent.id, connectToken, config });
@@ -334,14 +335,14 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
 
-      // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
-      const pump = c.get("webhookPump");
-      const deps = { db, sender: host.sessions, agentId, logger, metrics: host.metrics, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) };
+      // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
+      const deps = { db, sender: host.sessions, agentId, logger, metrics: host.metrics, events: host.events };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
           host.sessions.attach(agentId, ws);
           setAgentStatus(db, agentId, "online");
+          host.events.emit("agent.online", { agentId });
           // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
@@ -366,6 +367,7 @@ export function agentRoutes() {
           const evicted = host.sessions.detach(agentId, ws);
           if (evicted) {
             setAgentStatus(db, agentId, "offline");
+            host.events.emit("agent.offline", { agentId, reason: "close" });
           }
           logger.info({ agentId, evicted }, "agent ws detached");
         },
@@ -415,10 +417,10 @@ export function agentRoutes() {
       // agent must drop it); a storage failure propagates to the error handler
       // as a 5xx so the agent retries the frame.
       try {
-        // M6 (HOST-M5M6-04): a stored thread_message triggers the webhook pump.
-        const pump = c.get("webhookPump");
+        // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
+        const host = c.get("host");
         return c.json(ingestHttpFrame(
-          { db: c.get("db"), agentId, logger: c.get("logger"), metrics: c.get("host").metrics, ...(pump ? { onTranscriptWrite: pump.notifyTask } : {}) },
+          { db: c.get("db"), agentId, logger: c.get("logger"), metrics: host.metrics, events: host.events },
           raw,
         ));
       }

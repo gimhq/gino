@@ -14,6 +14,7 @@
 // thing tuned here; everything else is left untouched.
 import type { SessionRegistry } from "@/agents/sessions";
 import type { AppDatabase } from "@/db";
+import type { HostEvents } from "@/host/events";
 import type { Logger } from "@/shared/lib/logger";
 import { and, eq, isNotNull, lt } from "drizzle-orm";
 import { agents } from "@/db/schema";
@@ -34,6 +35,8 @@ export interface LivenessDeps {
    * with `agents.status` instead of answering `true` for a dead pipe.
    */
   readonly sessions?: Pick<SessionRegistry, "get" | "detach">;
+  /** Host event emitter: each swept agent is announced as `agent.offline` (reason `sweep`). */
+  readonly events?: HostEvents;
   /** Grace window in ms. Defaults to `OFFLINE_GRACE_MS`. */
   readonly graceMs?: number;
   /** Sweep cadence in ms. Defaults to `HEARTBEAT_INTERVAL_MS`. */
@@ -89,6 +92,10 @@ export function sweepLiveness(deps: LivenessDeps): number {
         // The zombie socket may already be gone — eviction is best-effort.
       }
     }
+  }
+
+  for (const { id } of transitioned) {
+    deps.events?.emit("agent.offline", { agentId: id, reason: "sweep" });
   }
 
   if (transitioned.length > 0) {

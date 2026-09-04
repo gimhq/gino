@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
 import { addWebhook, bindConversation, readCursor, registerChannel, startWebhookPump } from "@/channels";
 import { createDb } from "@/db";
+import { createHostEvents } from "@/host";
 import { ingestHttpFrame } from "@/protocol/inbound";
 import { createTask, setPlacement } from "@/tasks";
 
@@ -61,15 +62,17 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
       received.push({ url, headers: init?.headers, body: init?.body });
       return { status: 200 };
     };
+    const events = createHostEvents();
     const pump = startWebhookPump({
       db,
+      events,
       fetchImpl,
       resolver: async () => [{ address: PUBLIC_IP, family: 4 }],
       intervalMs: 60_000, // the event path is under test — keep the tick out of the way
     });
 
-    // The production inbound path: store the frame, notify the pump.
-    const ack = ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "hello"));
+    // The production inbound path: store the frame, emit `transcript.message` → the pump.
+    const ack = ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "hello"));
     expect(ack).toEqual({ type: "ack", id: 1 });
     await pump.flush();
 
@@ -98,15 +101,17 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
       bodies.push(init?.body ?? "");
       return { status };
     };
+    const events = createHostEvents();
     const pump = startWebhookPump({
       db,
+      events,
       fetchImpl,
       resolver: async () => [{ address: PUBLIC_IP, family: 4 }],
       intervalMs: 60_000,
     });
 
     // A failing receiver → the cursor must NOT move (nothing lost).
-    ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "first"));
+    ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "first"));
     await pump.flush();
     expect(bodies).toHaveLength(1);
     expect(readCursor(db, channelId, taskId)).toBe(0);
@@ -131,9 +136,10 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
       called++;
       return { status: 200 };
     };
-    const pump = startWebhookPump({ db, fetchImpl, intervalMs: 60_000 });
+    const events = createHostEvents();
+    const pump = startWebhookPump({ db, events, fetchImpl, intervalMs: 60_000 });
 
-    ingestHttpFrame({ db, agentId, onTranscriptWrite: pump.notifyTask }, threadMessageFrame(taskId, 1, "unbound"));
+    ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "unbound"));
     await pump.flush();
     expect(called).toBe(0);
 
