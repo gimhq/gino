@@ -6,8 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
 import { sweepLiveness } from "@/agents/liveness";
 import { getAgent } from "@/agents/registry";
-import { sessions } from "@/agents/sessions";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
@@ -29,13 +28,15 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let host: ReturnType<typeof createAppHost>;
 let server: ReturnType<typeof Bun.serve>;
 let httpBase: string;
 let wsBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger: createLogger(config) });
+  host = createAppHost({ config, db, logger: createLogger(config) });
+  const app = createApp({ config, host });
   server = Bun.serve({
     port: 0,
     fetch: (req, srv) => app.fetch(req, { IP: srv.requestIP(req), server: srv }),
@@ -118,7 +119,7 @@ describe("M3 agent status lifecycle over a live WS", () => {
     const agent = getAgent(db, agentId);
     expect(agent?.status).toBe("online");
     expect(agent?.lastSeen).not.toBeNull();
-    expect(sweepLiveness({ db, sessions })).toBe(0);
+    expect(sweepLiveness({ db, sessions: host.sessions })).toBe(0);
     expect(getAgent(db, agentId)?.status).toBe("online");
 
     ws.close();
@@ -143,13 +144,13 @@ describe("M3 agent status lifecycle over a live WS", () => {
     // The regression: the superseded close used to flip the row `offline`
     // while frames flowed on the fresh socket — it must stay `online`.
     expect(getAgent(db, agentId)?.status).toBe("online");
-    expect(sessions.isOnline(agentId)).toBe(true);
+    expect(host.sessions.isOnline(agentId)).toBe(true);
 
     // The CURRENT socket's close still marks the agent offline.
     freshWs.close();
     await closedPromise(freshWs);
     await settle();
     expect(getAgent(db, agentId)?.status).toBe("offline");
-    expect(sessions.isOnline(agentId)).toBe(false);
+    expect(host.sessions.isOnline(agentId)).toBe(false);
   });
 });

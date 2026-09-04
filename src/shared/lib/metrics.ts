@@ -4,6 +4,7 @@
  * Emits prometheus exposition format on demand. Operators that outgrow
  * this can swap the implementation without changing call sites.
  */
+import type { Metrics } from "@/host/metrics";
 
 interface Counter {
   readonly type: "counter";
@@ -64,6 +65,9 @@ export function counterAdd(name: string, help: string, value = 1, labels?: Recor
   const key = labelKey(labels);
   metric.values.set(key, (metric.values.get(key) ?? 0) + value);
 }
+
+/** The domain-facing `Metrics` sink backed by this registry (the standalone app's sink). */
+export const registryMetrics: Metrics = { counterAdd };
 
 export function gaugeSet(name: string, help: string, value: number, labels?: Record<string, string | number>): void {
   let metric = registry.get(name);

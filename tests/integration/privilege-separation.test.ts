@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
@@ -36,7 +36,7 @@ beforeAll(() => {
     GINO_HTTP_ADMIN_TOKEN: ADMIN_TOKEN,
   });
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
 afterAll(() => {
@@ -113,7 +113,7 @@ describe("HOST-XC-02 — unconfigured admin token fails CLOSED (no channel fallb
       GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
       // GINO_HTTP_ADMIN_TOKEN deliberately unset.
     });
-    const bare = createApp({ config, db, logger: createLogger(config) });
+    const bare = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
     for (const [method, path] of [
       ["GET", "/admin/agents"],
       ["POST", "/system/lode/restart"],
@@ -141,7 +141,7 @@ describe("HOST-XC-02 — explicit same-secret reuse still works (operator opt-in
       GINO_HTTP_CHANNEL_TOKEN: "shared-secret",
       GINO_HTTP_ADMIN_TOKEN: "shared-secret",
     });
-    const shared = createApp({ config, db, logger: createLogger(config) });
+    const shared = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
     const admin = await shared.fetch(new Request("http://local/api/admin/agents", {
       headers: { authorization: "Bearer shared-secret" },
     }));

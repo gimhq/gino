@@ -40,8 +40,8 @@ interface Session {
 const WS_OPEN = 1;
 
 /**
- * In-memory registry of attached agent sockets. One per host process; the
- * exported `sessions` singleton is what the WS pipe + outbox share. Tests can
+ * In-memory registry of attached agent sockets. One per `HostContext` (not per
+ * process): the WS pipe + outbox share the context's instance. Tests can
  * construct an isolated `new SessionRegistry()`.
  */
 export class SessionRegistry {
@@ -115,6 +115,3 @@ export class SessionRegistry {
     }
   }
 }
-
-/** Process-wide session registry shared by the WS pipe (M3) and the outbox (M2). */
-export const sessions = new SessionRegistry();
