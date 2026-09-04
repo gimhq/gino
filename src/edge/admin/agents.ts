@@ -106,7 +106,6 @@ export function adminAgentRoutes() {
     }),
     validator("json", launchBody),
     async (c) => {
-      const config = c.get("config");
       const host = c.get("host");
       const body = c.req.valid("json");
       const result = await launchAgent(
@@ -114,7 +113,7 @@ export function adminAgentRoutes() {
         {
           kind: body.kind,
           hostUrl: body.hostUrl,
-          registerToken: config.REGISTER_TOKEN,
+          registerToken: host.options.registerToken,
           ...(body.image ? { image: body.image } : {}),
           ...(body.taskId ? { workload: { taskId: body.taskId } } : {}),
           ...(body.env ? { env: body.env } : {}),

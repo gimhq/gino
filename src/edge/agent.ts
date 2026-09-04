@@ -8,7 +8,6 @@ import { upgradeWebSocket } from "hono/bun";
 import { correlateLaunch, enrollAgent, reEnrollByLaunchNonce, setAgentStatus, touchLiveness, verifyConnectToken } from "@/agents/registry";
 import {
   attachmentsBySha,
-  createStore,
   getArtifactBySha,
   getAttachmentById,
   getGlobalConfigVersion,
@@ -25,7 +24,7 @@ import { wireAttachmentRef, writeAttachmentDescriptors } from "@/msgstore";
 import { generateId, hashToken, safeEqual } from "@/platform";
 import { handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
 import { replayUnacked } from "@/protocol/outbox";
-import { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
+import { isSupportedProtocol, PROTOCOL_VERSION, registerError } from "@/protocol/version";
 import { readBodyCapped } from "@/shared/lib/body-limit";
 import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
@@ -45,13 +44,13 @@ import { getTask } from "@/tasks";
  */
 
 /** The host-authoritative agent config object (protocol §3) — register + config mirror it. */
-function agentConfig(agentId: string) {
+function agentConfig(agentId: string, heartbeatIntervalMs: number) {
   return {
     agentId,
     wsUrl: `/agent/ws/${agentId}`,
     configUrl: `/agent/config/${agentId}`,
     outputUrl: `/agent/output/${agentId}`,
-    heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+    heartbeatIntervalMs,
     protocolVersion: PROTOCOL_VERSION,
   };
 }
@@ -163,7 +162,7 @@ function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): R
   if (ifNoneMatchHits(c.req.header("if-none-match"), etag)) {
     return new Response(null, { status: 304, headers: cacheHeaders });
   }
-  const store = createStore(c.get("config"));
+  const store = c.get("host").store;
   try {
     const bytes = store.readVerified(resolved.ref, resolved.sha256);
     // Copy out an exact ArrayBuffer (fresh-buffer slice) for the Response body.
@@ -246,13 +245,14 @@ export function agentRoutes() {
       // (`{ registerToken }`) with an `Authorization: Bearer` fallback; the
       // comparison is constant-time and fails CLOSED on an unconfigured secret.
       const body = await c.req.json().catch(() => null) as Record<string, unknown> | null;
-      const expected = c.get("config").REGISTER_TOKEN;
+      const host = c.get("host");
+      const expected = host.options.registerToken;
       const bodyToken = body && typeof body.registerToken === "string" ? body.registerToken : null;
       const provided = bearerToken(c) ?? bodyToken;
       if (!expected || !provided || !safeEqual(provided, expected)) {
         return c.json(registerError("invalid_register_token"), 401);
       }
-      if (!c.get("config").REGISTER_ENABLED) {
+      if (!host.options.registrationEnabled) {
         return c.json(registerError("registration_disabled"), 403);
       }
       if (body == null || typeof body !== "object" || Array.isArray(body)) {
@@ -275,7 +275,7 @@ export function agentRoutes() {
         const existing = reEnrollByLaunchNonce(db, launchNonce);
         if (existing) {
           c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
-          const retryConfig = { ...agentConfig(existing.agent.id), ...globalConfig(db, existing.agent) };
+          const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, existing.agent) };
           return c.json({ agentId: existing.agent.id, connectToken: existing.connectToken, config: retryConfig });
         }
       }
@@ -290,7 +290,7 @@ export function agentRoutes() {
         capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
         // HOST-M3-15 provenance: which register token enrolled it — the
         // sha-256 at-rest form (the shared plaintext is never stored).
-        registerTokenRef: hashToken(c.get("config").REGISTER_TOKEN),
+        registerTokenRef: hashToken(host.options.registerToken),
       });
 
       // OD17 launch↔register correlation (OPTIONAL, backward-compatible): when
@@ -306,7 +306,7 @@ export function agentRoutes() {
 
       c.get("logger").info({ agentId: agent.id, source: agent.source }, "agent enrolled");
       // M8 (B6): seed the resolved GLOBAL desired set + version on register (additive).
-      const config = { ...agentConfig(agent.id), ...globalConfig(db, agent) };
+      const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, agent) };
       return c.json({ agentId: agent.id, connectToken, config });
     },
   );
@@ -390,7 +390,7 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       // M8 (B6): mirror the resolved GLOBAL desired set + version alongside the config.
-      return c.json({ ...agentConfig(agentId), ...globalConfig(c.get("db"), agent) });
+      return c.json({ ...agentConfig(agentId, c.get("host").options.heartbeatIntervalMs), ...globalConfig(c.get("db"), agent) });
     },
   );
 
@@ -515,13 +515,14 @@ export function agentRoutes() {
 
       // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
-      const bytes = await readBodyCapped(c.req.raw, c.get("config").MAX_UPLOAD_BYTES);
+      const host = c.get("host");
+      const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);
       const sha256 = sha256Hex(bytes);
       if (declaredSha && declaredSha !== sha256) {
         return c.json({ success: false, error: { code: "SHA_MISMATCH", message: `computed ${sha256} != declared ${declaredSha}` } }, 400);
       }
 
-      const store = createStore(c.get("config"));
+      const store = host.store;
       let blob;
       try {
         // The runner names an outbound file by its `output/`-relative path

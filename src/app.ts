@@ -2,7 +2,7 @@ import type { Launcher } from "./agents/launchers";
 import type { WebhookPump } from "./channels";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
-import type { HostContext } from "./host";
+import type { HostContext, HostOptions } from "./host";
 import type { Logger } from "./shared/lib/logger";
 import type { AppEnv } from "./shared/lib/types";
 import { Hono } from "hono";
@@ -14,10 +14,10 @@ import { startLaunchReaper } from "./agents/launch-reaper";
 import { startLivenessSweep } from "./agents/liveness";
 import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
-import { createStore, startConfigStoreGc } from "./configstore";
+import { startConfigStoreGc } from "./configstore";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
-import { createHostContext } from "./host";
+import { createHostContext, resolveHostOptions } from "./host";
 import { docsCspRelax, mountDocs } from "./modules/docs";
 import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
@@ -71,10 +71,27 @@ export interface AppHostDeps {
   readonly launchers?: readonly Launcher[];
 }
 
+/** The single place env config becomes SDK options (docs/host-sdk-design.md §5.2). */
+export function hostOptionsFromConfig(config: Config): HostOptions {
+  return resolveHostOptions({
+    storeDir: config.STORE_DIR,
+    maxUploadBytes: config.MAX_UPLOAD_BYTES,
+    registerToken: config.REGISTER_TOKEN,
+    registrationEnabled: config.REGISTER_ENABLED,
+    configGc: { enabled: config.CONFIG_GC_ENABLED, intervalMs: config.CONFIG_GC_INTERVAL_MS, maxAgeMs: config.CONFIG_GC_MAX_AGE_MS },
+    webhooks: { timeoutMs: config.WEBHOOK_TIMEOUT_MS, maxAttempts: config.WEBHOOK_MAX_ATTEMPTS, retryIntervalMs: config.WEBHOOK_RETRY_INTERVAL_MS },
+  });
+}
+
 /** Build the host context the way the standalone app does: the global Prometheus registry is the metrics sink. */
 export function createAppHost({ config, db, logger, launchers }: AppHostDeps): HostContext {
-  void config; // mapped to HostOptions in the next step; unused today
-  return createHostContext({ db, logger, metrics: registryMetrics, ...(launchers ? { launchers } : {}) });
+  return createHostContext({
+    db,
+    logger,
+    metrics: registryMetrics,
+    options: hostOptionsFromConfig(config),
+    ...(launchers ? { launchers } : {}),
+  });
 }
 
 // ─── App composer ───
@@ -213,15 +230,15 @@ export function bootstrap(): BootstrapResult {
   // webhook delivery: pushed on inbound transcript writes, retried on a tick.
   // Started here (not in `createApp`) so tests that build the app directly
   // never spin a background timer.
+  const host = createAppHost({ config, db, logger });
   const webhookPump = startWebhookPump({
     db,
     logger,
-    timeoutMs: config.WEBHOOK_TIMEOUT_MS,
-    maxAttempts: config.WEBHOOK_MAX_ATTEMPTS,
-    intervalMs: config.WEBHOOK_RETRY_INTERVAL_MS,
+    timeoutMs: host.options.webhooks.timeoutMs,
+    maxAttempts: host.options.webhooks.maxAttempts,
+    intervalMs: host.options.webhooks.retryIntervalMs,
   });
 
-  const host = createAppHost({ config, db, logger });
   const app = createApp({ config, host, webhookPump });
 
   // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
@@ -245,10 +262,10 @@ export function bootstrap(): BootstrapResult {
   const configStoreGc = startConfigStoreGc({
     db,
     logger,
-    store: createStore(config),
-    enabled: config.CONFIG_GC_ENABLED,
-    maxAgeMs: config.CONFIG_GC_MAX_AGE_MS,
-    intervalMs: config.CONFIG_GC_INTERVAL_MS,
+    store: host.store,
+    enabled: host.options.configGc.enabled,
+    maxAgeMs: host.options.configGc.maxAgeMs,
+    intervalMs: host.options.configGc.intervalMs,
   });
 
   return {
