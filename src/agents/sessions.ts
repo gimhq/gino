@@ -94,6 +94,26 @@ export class SessionRegistry {
   }
 
   /**
+   * Detach every session and best-effort `close(code, reason)` each socket
+   * (host shutdown). A throwing socket is skipped, like `attach`. Returns the
+   * number of sessions closed.
+   */
+  closeAll(code: number, reason: string): number {
+    let closed = 0;
+    for (const [agentId, session] of this.sessions) {
+      this.sessions.delete(agentId);
+      closed += 1;
+      try {
+        session.ws.close(code, reason);
+      }
+      catch {
+        // The socket may already be gone — closing is best-effort.
+      }
+    }
+    return closed;
+  }
+
+  /**
    * Push one already-encoded frame to the agent as JSON. Returns `false` when
    * the agent is offline or the socket throws — the frame stays in the outbox
    * (unacked) and replays on the next connect, so a failed push is never lost.

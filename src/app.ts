@@ -9,16 +9,12 @@ import { websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
-import { startLaunchReaper } from "./agents/launch-reaper";
-import { startLivenessSweep } from "./agents/liveness";
 import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
-import { startConfigStoreGc } from "./configstore";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
 import { createHostContext, resolveHostOptions } from "./host";
 import { docsCspRelax, mountDocs } from "./modules/docs";
-import { startOutboxGc } from "./protocol/outbox";
 import { publicRoutes } from "./routes";
 import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
@@ -55,8 +51,6 @@ export interface BootstrapResult {
    * the hono context, not this.
    */
   readonly db: AppDatabase;
-  /** Close the DB connection. Call on shutdown. */
-  readonly closeDb: () => void;
 }
 
 // ─── Host composition ───
@@ -220,48 +214,28 @@ export function bootstrap(): BootstrapResult {
   const logger = createLogger(config);
   const db = createDb(config.DB_PATH);
 
+  const host = createAppHost({ config, db, logger });
+  const app = createApp({ config, host });
+
+  // Background loops start here (not in `createApp`) so tests that build the
+  // app directly never spin a background timer. `host.start()` owns the core
+  // loops — M3 liveness sweep (DP4), M2 outbox retention GC, M3 pending-launch
+  // reaper (HOST-M3-05), M8 store GC (HOST-M8-11) — every timer `unref`'d so
+  // none holds the process open; `host.stop()` (index.ts) halts them, closes
+  // the live sockets and then the DB.
+  host.start();
+
   // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
   // webhook delivery: pushed on the `transcript.message` host event, retried
-  // on a tick. Started here (not in `createApp`) so tests that build the app
-  // directly never spin a background timer.
-  const host = createAppHost({ config, db, logger });
-  const pump = startWebhookPump({
+  // on a tick. App-owned, so it is registered with the host and stopped first.
+  host.registerService(startWebhookPump({
     db,
     logger,
     events: host.events,
     timeoutMs: host.options.webhooks.timeoutMs,
     maxAttempts: host.options.webhooks.maxAttempts,
     intervalMs: host.options.webhooks.retryIntervalMs,
-  });
-
-  const app = createApp({ config, host });
-
-  // M3 liveness — periodic offline-grace sweep (DP4). The timer is `unref`'d so
-  // it never holds the process open; `stop()` is folded into `closeDb` so clean
-  // shutdown halts it before the DB closes. Started here (not in `createApp`)
-  // so tests that build the app directly never spin a background timer.
-  const liveness = startLivenessSweep({ db, logger, sessions: host.sessions });
-
-  // M2 outbox retention — periodic GC of acked rows past the retention window
-  // (unacked rows are never touched). Same lifecycle as the liveness sweep.
-  const outboxGc = startOutboxGc({ db, logger });
-
-  // M3 pending-launch reaper (HOST-M3-05) — tears down runtimes whose agent
-  // never registered inside the TTL. The `pending_launches` table is persisted,
-  // so this also reaps orphans left by a host restart.
-  const launchReaper = startLaunchReaper({ db, logger, resolveLauncher: host.launchers.resolve });
-
-  // M8 store GC (HOST-M8-11) — the periodic refcount/orphan sweep over the
-  // unified blob store. Dry-run (observability only) unless CONFIG_GC_ENABLED,
-  // per OD11. Same lifecycle as the other background timers.
-  const configStoreGc = startConfigStoreGc({
-    db,
-    logger,
-    store: host.store,
-    enabled: host.options.configGc.enabled,
-    maxAgeMs: host.options.configGc.maxAgeMs,
-    intervalMs: host.options.configGc.intervalMs,
-  });
+  }));
 
   return {
     fetch: (req, env) => app.fetch(req, env),
@@ -270,13 +244,5 @@ export function bootstrap(): BootstrapResult {
     logger,
     host,
     db,
-    closeDb: () => {
-      liveness.stop();
-      outboxGc.stop();
-      launchReaper.stop();
-      configStoreGc.stop();
-      pump.stop();
-      db.close();
-    },
   };
 }
