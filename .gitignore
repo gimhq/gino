@@ -25,3 +25,6 @@ coverage/
 .env.*
 !.env.example
 !.env.*.example
+
+# local scratch (agent/host test state)
+.tmp/
