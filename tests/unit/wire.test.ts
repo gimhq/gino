@@ -48,7 +48,6 @@ let events: string[];
 function makeHost(options: Record<string, unknown> = {}): HostContext {
   const db = createDb(":memory:");
   return createHostContext({
-    db,
     logger,
     storage: sqliteStorage(db, { storeDir }),
     options: { registerToken: REGISTER, ...options },

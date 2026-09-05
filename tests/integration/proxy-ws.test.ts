@@ -11,10 +11,11 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { agents } from "@/db/schema";
 import { llmRoutes } from "@/edge/llm";
-import { createHostContext } from "@/host/context";
+import { createHost } from "@/host";
 import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
+import { sqliteStorage } from "@/store/sqlite";
 
 // D-B5w — the `/llm/v1/responses` Codex WS passthrough, proven end-to-end against
 // a LIVE Bun server with a real client WebSocket. The HTTP→WS upgrade reuses the
@@ -79,14 +80,13 @@ let wsBase: string;
 beforeAll(() => {
   db = createDb(config.DB_PATH);
   const logger = createLogger(config);
-  const host = createHostContext({ db, logger });
+  const host = createHost({ storage: sqliteStorage(db), logger });
 
   // Minimal app: per-request context + the /llm router with the FAKE upstream
   // factory injected. Production wires `llmRoutes()` (real WebSocket) — only the
   // test overrides the upstream so the relay touches no network.
   const api = new Hono<AppEnv>();
   api.use("*", (c, next) => {
-    c.set("db", db);
     c.set("host", host);
     c.set("config", config);
     c.set("logger", logger);
