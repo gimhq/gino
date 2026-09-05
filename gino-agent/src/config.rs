@@ -38,6 +38,14 @@ use crate::protocol::v2::ProvisioningEntry;
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
 /// Default SQLite filename within the workspace directory.
 const DEFAULT_DB_FILE: &str = "agent.db";
+/// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root
+/// (PLAN-007 §1/§6): the runner materializes the global instruction file + skills
+/// here and launches the engine with `ENGINE_CONFIG_DIR`/`CLAUDE_CONFIG_DIR`
+/// pointed at it. Overridden by `CLAUDE_CONFIG_USE_DEFAULT` (see
+/// [`ConfigOverlay::paths_from_env`]).
+pub(crate) const ENGINE_CONFIG_SUBDIR: &str = "engine-config";
+/// Claude's own default config dir under `$HOME`.
+const CLAUDE_DEFAULT_CONFIG_SUBDIR: &str = ".claude";
 /// Default transport liveness ping cadence (ms) when the host sets none.
 const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// Default max bytes for a single attachment (agent-architecture §9, A5: 100 MB).
@@ -60,6 +68,12 @@ pub(crate) enum ConfigError {
     /// The host URL did not start with a supported scheme.
     #[error("orchestrator host URL must start with http:// or https://, got {0:?}")]
     InvalidHostScheme(String),
+    /// `CLAUDE_CONFIG_USE_DEFAULT` was set but claude's default config dir could
+    /// not be derived.
+    #[error(
+        "CLAUDE_CONFIG_USE_DEFAULT is set but neither CLAUDE_CONFIG_DIR nor HOME is set, so claude's default config dir cannot be resolved"
+    )]
+    MissingHome,
 }
 
 /// Fully-resolved runner configuration.
@@ -253,15 +267,21 @@ pub(crate) struct Paths {
     pub(crate) workspace_dir: PathBuf,
     /// SQLite database path (outbox/inbox/tasks/identity).
     pub(crate) db_path: PathBuf,
+    /// The engine config dir (`CLAUDE_CONFIG_DIR` for the claude child and the
+    /// GLOBAL provisioning scope root). `{workspace}/engine-config` by default;
+    /// claude's own default dir when `CLAUDE_CONFIG_USE_DEFAULT` is set.
+    pub(crate) engine_config_dir: PathBuf,
 }
 
 impl Default for Paths {
     fn default() -> Self {
         let workspace_dir = PathBuf::from(DEFAULT_WORKSPACE_DIR);
         let db_path = workspace_dir.join(DEFAULT_DB_FILE);
+        let engine_config_dir = workspace_dir.join(ENGINE_CONFIG_SUBDIR);
         Self {
             workspace_dir,
             db_path,
+            engine_config_dir,
         }
     }
 }
@@ -354,12 +374,16 @@ impl Config {
         let PathsOverlay {
             workspace_dir,
             db_path,
+            engine_config_dir,
         } = paths;
         if let Some(dir) = workspace_dir {
             self.paths.workspace_dir = dir;
         }
         if let Some(path) = db_path {
             self.paths.db_path = path;
+        }
+        if let Some(dir) = engine_config_dir {
+            self.paths.engine_config_dir = dir;
         }
     }
 
@@ -440,6 +464,30 @@ impl Config {
     }
 }
 
+/// Resolve the `CLAUDE_CONFIG_USE_DEFAULT` opt-in: `None` when the flag is unset
+/// or falsy (the runner keeps its private `{workspace}/engine-config`); otherwise
+/// the dir claude itself would use — an explicit `CLAUDE_CONFIG_DIR` from the
+/// daemon's environment, else `$HOME/.claude`. Pure so it is unit-testable.
+pub(crate) fn claude_default_config_dir(
+    use_default: Option<&str>,
+    claude_config_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let enabled = use_default.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    if !enabled {
+        return Ok(None);
+    }
+    claude_config_dir
+        .or_else(|| home.map(|home| home.join(CLAUDE_DEFAULT_CONFIG_SUBDIR)))
+        .map(Some)
+        .ok_or(ConfigError::MissingHome)
+}
+
 /// A partial view of [`Config`]: every field is optional. One overlay is
 /// produced per config source and merged with [`Config::apply`].
 ///
@@ -517,6 +565,10 @@ struct PathsOverlay {
     /// of silently accepted-and-dead.
     #[serde(skip)]
     db_path: Option<PathBuf>,
+    /// Env/CLI bootstrap only, like `db_path`: the engine dir is created and the
+    /// global scope reconciled at startup, before any host layer applies.
+    #[serde(skip)]
+    engine_config_dir: Option<PathBuf>,
 }
 
 impl ConfigOverlay {
@@ -535,6 +587,20 @@ impl ConfigOverlay {
         }
     }
 
+    /// Build the local engine-auth overlay from the token stored by
+    /// `gino-agent login` (`{workspace}/claude-oauth-token`). Applied right after
+    /// the env/CLI bootstrap and *before* any host layer, so a host-supplied
+    /// `claudeCodeOauthToken` still overrides it per the normal precedence.
+    pub(crate) fn local_engine_oauth_token(token: String) -> Self {
+        Self {
+            engine: EngineOverlay {
+                claude_code_oauth_token: Some(token),
+                ..EngineOverlay::default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// Build the env/CLI **paths** bootstrap overlay from `GINO_WORKSPACE_DIR` /
     /// `GINO_DB_PATH` (PLAN-003 §3 config precedence; ARCHITECTURE "Config layer").
     /// Part of the same env/CLI bootstrap layer as [`Self::bootstrap`]; kept a
@@ -549,19 +615,48 @@ impl ConfigOverlay {
     /// built-in defaults (`/var/lib/gino-agent`, `{workspace}/agent.db`) stand.
     /// Later layers (register response / HTTP refresh / WS `config_update`) may
     /// still override these per the normal precedence.
+    ///
+    /// `engine_config_dir` follows `workspace_dir` the same way (`{workspace}/
+    /// engine-config`) unless given explicitly.
     pub(crate) fn paths_bootstrap(
         workspace_dir: Option<PathBuf>,
         db_path: Option<PathBuf>,
+        engine_config_dir: Option<PathBuf>,
     ) -> Self {
         let db_path =
             db_path.or_else(|| workspace_dir.as_ref().map(|dir| dir.join(DEFAULT_DB_FILE)));
+        let engine_config_dir = engine_config_dir.or_else(|| {
+            workspace_dir
+                .as_ref()
+                .map(|dir| dir.join(ENGINE_CONFIG_SUBDIR))
+        });
         Self {
             paths: PathsOverlay {
                 workspace_dir,
                 db_path,
+                engine_config_dir,
             },
             ..Self::default()
         }
+    }
+
+    /// [`Self::paths_bootstrap`] fed from the process environment:
+    /// `GINO_WORKSPACE_DIR`, `GINO_DB_PATH`, and — when `CLAUDE_CONFIG_USE_DEFAULT`
+    /// is truthy — claude's own default config dir as the engine config dir (see
+    /// [`claude_default_config_dir`]), so an already-logged-in local claude
+    /// (credentials, settings, plugins) is reused as-is. Shared by the daemon and
+    /// the `login` subcommand so both resolve the same directories.
+    pub(crate) fn paths_from_env() -> Result<Self, ConfigError> {
+        let engine_config_dir = claude_default_config_dir(
+            std::env::var("CLAUDE_CONFIG_USE_DEFAULT").ok().as_deref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )?;
+        Ok(Self::paths_bootstrap(
+            std::env::var_os("GINO_WORKSPACE_DIR").map(PathBuf::from),
+            std::env::var_os("GINO_DB_PATH").map(PathBuf::from),
+            engine_config_dir,
+        ))
     }
 
     /// Parse a host-assigned config payload into an overlay. Production callers
@@ -937,6 +1032,7 @@ mod tests {
         config.apply(ConfigOverlay::paths_bootstrap(
             Some(std::path::PathBuf::from("/data/ws")),
             Some(std::path::PathBuf::from("/srv/state/runner.db")),
+            None,
         ));
         assert_eq!(
             config.paths.workspace_dir,
@@ -955,6 +1051,7 @@ mod tests {
         config.apply(ConfigOverlay::paths_bootstrap(
             Some(std::path::PathBuf::from("/data/ws")),
             None,
+            None,
         ));
         assert_eq!(
             config.paths.workspace_dir,
@@ -964,6 +1061,84 @@ mod tests {
             config.paths.db_path,
             std::path::PathBuf::from("/data/ws/agent.db")
         );
+        assert_eq!(
+            config.paths.engine_config_dir,
+            std::path::PathBuf::from("/data/ws/engine-config")
+        );
+    }
+
+    #[test]
+    fn paths_bootstrap_engine_config_dir_override_wins() {
+        let mut config = Config::default();
+        config.apply(ConfigOverlay::paths_bootstrap(
+            Some(std::path::PathBuf::from("/data/ws")),
+            None,
+            Some(std::path::PathBuf::from("/home/op/.claude")),
+        ));
+        assert_eq!(
+            config.paths.engine_config_dir,
+            std::path::PathBuf::from("/home/op/.claude")
+        );
+        assert_eq!(
+            config.paths.db_path,
+            std::path::PathBuf::from("/data/ws/agent.db")
+        );
+    }
+
+    #[test]
+    fn claude_config_use_default_unset_or_falsy_keeps_private_dir() {
+        let home = Some(std::path::PathBuf::from("/home/op"));
+        for flag in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+        ] {
+            assert_eq!(
+                super::claude_default_config_dir(flag, None, home.clone()).unwrap(),
+                None,
+                "flag {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_config_use_default_resolves_home_dot_claude() {
+        for flag in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(
+                super::claude_default_config_dir(
+                    Some(flag),
+                    None,
+                    Some(std::path::PathBuf::from("/home/op"))
+                )
+                .unwrap(),
+                Some(std::path::PathBuf::from("/home/op/.claude")),
+                "flag {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_config_use_default_prefers_explicit_claude_config_dir() {
+        assert_eq!(
+            super::claude_default_config_dir(
+                Some("true"),
+                Some(std::path::PathBuf::from("/opt/claude-cfg")),
+                Some(std::path::PathBuf::from("/home/op"))
+            )
+            .unwrap(),
+            Some(std::path::PathBuf::from("/opt/claude-cfg"))
+        );
+    }
+
+    #[test]
+    fn claude_config_use_default_without_home_is_an_error() {
+        assert!(matches!(
+            super::claude_default_config_dir(Some("true"), None, None),
+            Err(ConfigError::MissingHome)
+        ));
     }
 
     #[test]
@@ -973,6 +1148,7 @@ mod tests {
         config.apply(ConfigOverlay::paths_bootstrap(
             None,
             Some(std::path::PathBuf::from("/tmp/hermetic.db")),
+            None,
         ));
         assert_eq!(
             config.paths.workspace_dir,
@@ -988,7 +1164,7 @@ mod tests {
     fn paths_bootstrap_empty_keeps_documented_defaults() {
         // Neither env var set → the built-in defaults stand untouched.
         let mut config = Config::default();
-        config.apply(ConfigOverlay::paths_bootstrap(None, None));
+        config.apply(ConfigOverlay::paths_bootstrap(None, None, None));
         assert_eq!(
             config.paths.workspace_dir,
             std::path::PathBuf::from("/var/lib/gino-agent")
@@ -996,6 +1172,36 @@ mod tests {
         assert_eq!(
             config.paths.db_path,
             std::path::PathBuf::from("/var/lib/gino-agent/agent.db")
+        );
+        assert_eq!(
+            config.paths.engine_config_dir,
+            std::path::PathBuf::from("/var/lib/gino-agent/engine-config")
+        );
+    }
+
+    #[test]
+    fn local_engine_oauth_token_is_overridden_by_a_host_layer() {
+        let mut config = Config::default();
+        config.apply(ConfigOverlay::local_engine_oauth_token(
+            "local-tok".to_owned(),
+        ));
+        assert_eq!(
+            secret(config.engine.claude_code_oauth_token.as_ref()),
+            Some("local-tok")
+        );
+        // A host layer without a token leaves the local one in place.
+        config.apply(ConfigOverlay::from_json(r#"{"engine":{"model":"m"}}"#).unwrap());
+        assert_eq!(
+            secret(config.engine.claude_code_oauth_token.as_ref()),
+            Some("local-tok")
+        );
+        // A host-supplied token wins.
+        config.apply(
+            ConfigOverlay::from_json(r#"{"engine":{"claudeCodeOauthToken":"host-tok"}}"#).unwrap(),
+        );
+        assert_eq!(
+            secret(config.engine.claude_code_oauth_token.as_ref()),
+            Some("host-tok")
         );
     }
 

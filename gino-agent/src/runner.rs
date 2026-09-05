@@ -55,12 +55,6 @@ use crate::scheduler::{Cancel, Scheduler, apply_cron_delete, apply_cron_upsert, 
 use crate::transport::http::HttpClient;
 use crate::transport::{Inbound, MAX_INBOX_RETRIES, Transport, TransportConfig};
 
-/// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root
-/// (PLAN-007 §1/§6): the runner materializes the global instruction file + skills
-/// here and launches the engine with `ENGINE_CONFIG_DIR`/`CLAUDE_CONFIG_DIR`
-/// pointed at it.
-const ENGINE_CONFIG_SUBDIR: &str = "engine-config";
-
 /// Safety-net cadence for the executor worker when no drain nudge arrives — picks
 /// up freshly-pending threads and flushes any outbox rows the host has not yet
 /// acked.
@@ -138,6 +132,31 @@ fn prepare_state_dirs(paths: &crate::config::Paths) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the env/CLI bootstrap layer (PLAN-003 §2.1/§3): the host/identity
+/// inputs, then the local paths from the environment (`GINO_WORKSPACE_DIR` /
+/// `GINO_DB_PATH` / `CLAUDE_CONFIG_USE_DEFAULT`, see
+/// [`ConfigOverlay::paths_from_env`]) — resolved *before* the DB opens so ops or
+/// the e2e harness can relocate local state off the default mount — and
+/// finally the local engine credential stored by `gino-agent login`
+/// (`{workspace}/claude-oauth-token`), if any. All of this sits BELOW the host
+/// layers (register / config refresh / `config_update`), which still override per
+/// the normal precedence — a host-supplied credential wins over the local token.
+fn bootstrap_config(
+    host: Option<String>,
+    register_token: Option<String>,
+    name: Option<String>,
+) -> Result<Config> {
+    let mut config = Config::default();
+    config.apply(ConfigOverlay::bootstrap(host, register_token, name));
+    config.apply(ConfigOverlay::paths_from_env()?);
+    config.validate()?;
+    if let Some(token) = crate::login::read_token(&config.paths.workspace_dir) {
+        info!("engine auth: using the local Claude OAuth token from `gino-agent login`");
+        config.apply(ConfigOverlay::local_engine_oauth_token(token));
+    }
+    Ok(config)
+}
+
 /// Build the tokio runtime and drive the daemon to completion. Kept sync so the
 /// CLI dispatcher in [`crate`] stays sync.
 pub(crate) fn run_daemon(
@@ -158,17 +177,7 @@ async fn run_async(
     register_token: Option<String>,
     name: Option<String>,
 ) -> Result<()> {
-    let mut config = Config::default();
-    config.apply(ConfigOverlay::bootstrap(host, register_token, name));
-    // env/CLI bootstrap (PLAN-003 §3): resolve the workspace/DB paths from
-    // `GINO_WORKSPACE_DIR` / `GINO_DB_PATH` *before* opening the DB, so ops — or the
-    // e2e harness — can relocate local state off the default mount. Both unset → the
-    // documented defaults stand; later host layers may still override per precedence.
-    config.apply(ConfigOverlay::paths_bootstrap(
-        std::env::var_os("GINO_WORKSPACE_DIR").map(PathBuf::from),
-        std::env::var_os("GINO_DB_PATH").map(PathBuf::from),
-    ));
-    config.validate()?;
+    let mut config = bootstrap_config(host, register_token, name)?;
 
     prepare_state_dirs(&config.paths)?;
 
@@ -211,7 +220,8 @@ async fn run_async(
 
     // The GLOBAL provisioning scope root (PLAN-007 §1/§6). Created up front so the
     // engine always launches with a stable config dir — even with no entries.
-    let engine_config_dir = config.paths.workspace_dir.join(ENGINE_CONFIG_SUBDIR);
+    let engine_config_dir = config.paths.engine_config_dir.clone();
+    info!(dir = %engine_config_dir.display(), "engine config dir (CLAUDE_CONFIG_DIR for the engine)");
     std::fs::create_dir_all(&engine_config_dir).with_context(|| {
         format!(
             "creating engine config directory {}",
@@ -1314,7 +1324,8 @@ mod provisioning_wiring_tests {
     use crate::protocol::v2::{EntryKind, ProvisioningEntry};
     use crate::provisioning::{BlobFetcher, Provisioner, ProvisioningError};
 
-    use super::{ENGINE_CONFIG_SUBDIR, reconcile_global_startup};
+    use super::reconcile_global_startup;
+    use crate::config::ENGINE_CONFIG_SUBDIR;
 
     /// In-memory blob fetcher keyed by host-proxy `reference`. Verifies the served
     /// bytes hash to the requested `sha256` (mirroring the real fetcher's contract)

@@ -22,6 +22,7 @@ mod engine;
 mod executor;
 mod failure;
 mod gino_cli;
+mod login;
 mod paths;
 mod protocol;
 mod provisioning;
@@ -35,7 +36,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigOverlay};
 
 /// Generic WebSocket-based agent runner daemon.
 #[derive(Parser)]
@@ -85,6 +86,10 @@ enum Command {
     /// Show this agent's system info: identity, version, host, paths, live counts.
     #[command(visible_alias = "info")]
     System,
+    /// Mint a long-lived Claude OAuth token via `claude setup-token` and store it
+    /// for the daemon's engine (no host-supplied credential needed). Not needed
+    /// when `CLAUDE_CONFIG_USE_DEFAULT=true` reuses an already-logged-in `~/.claude`.
+    Login,
     /// Manage this agent's scheduled triggers (crons): create, list, pause, cancel.
     #[command(subcommand)]
     Cron(gino_cli::CronCommand),
@@ -122,6 +127,11 @@ pub fn run() -> Result<()> {
         }
         Command::Archive => archive()?,
         Command::System => gino_cli::system()?,
+        Command::Login => {
+            let mut config = Config::default();
+            config.apply(ConfigOverlay::paths_from_env()?);
+            login::run(&config.paths)?;
+        }
         Command::Cron(cmd) => gino_cli::cron(cmd)?,
         Command::Task(cmd) => gino_cli::task(cmd)?,
         Command::Thread(cmd) => gino_cli::thread(cmd)?,
