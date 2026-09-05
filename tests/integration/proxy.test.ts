@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { agents } from "@/db/schema";
@@ -30,7 +30,7 @@ const realFetch = globalThis.fetch;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
   // Seed an enrolled agent whose connect token authorizes the proxy.
   db.insert(agents).values({
     id: "agent-proxy-1",

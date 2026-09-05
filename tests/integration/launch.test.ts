@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { createDockerLauncher, dockerLauncher, registerLauncher } from "@/agents/launchers";
+import { createDockerLauncher, manualLauncher } from "@/agents/launchers";
 import { getAgent, listAgents, verifyConnectToken } from "@/agents/registry";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { hashToken } from "@/platform";
@@ -48,15 +48,18 @@ const recordingSpawn: SpawnFn = async (cmd, opts) => {
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  app = createApp({ config, db, logger: createLogger(config) });
-  // Swap the global "docker" launcher for a mocked one (recording spawn + a
-  // fixed image so a body without `image` still launches).
-  registerLauncher(createDockerLauncher({ image: "gino/agent:test", spawn: recordingSpawn }));
+  // The host's "docker" launcher is a mocked one (recording spawn + a fixed
+  // image so a body without `image` still launches).
+  const host = createAppHost({
+    config,
+    db,
+    logger: createLogger(config),
+    launchers: [manualLauncher, createDockerLauncher({ image: "gino/agent:test", spawn: recordingSpawn })],
+  });
+  app = createApp({ config, host });
 });
 
 afterAll(() => {
-  // Restore the real docker launcher so the global registry is left as found.
-  registerLauncher(dockerLauncher);
   db.close();
   for (const suffix of ["", "-wal", "-shm"]) {
     try {

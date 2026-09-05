@@ -25,6 +25,8 @@ import type { FrameSender } from "./outbox";
 // `data` is validated here (still M2) against the `frames.ts` schemas right
 // before it reaches a writer; the writers themselves stay transport-free.
 import type { AppDatabase } from "@/db";
+import type { HostEvents } from "@/host/events";
+import type { Metrics } from "@/host/metrics";
 import type { Logger } from "@/shared/lib/logger";
 import { touchLiveness } from "@/agents/registry";
 import {
@@ -37,7 +39,6 @@ import {
   writeThreadResult,
 } from "@/msgstore";
 import { CronStateData, HeartbeatData, RECOGNIZED_MESSAGE_KINDS, ThreadMessageData, ThreadResultData } from "@/protocol/frames";
-import { counterAdd } from "@/shared/lib/metrics";
 import { getTask } from "@/tasks/store";
 import { decodeFrame } from "./envelope";
 import { ackMessage, ackOutbox } from "./outbox";
@@ -49,12 +50,15 @@ export interface InboundDeps {
   agentId: string;
   logger?: Logger;
   /**
-   * M6 webhook egress trigger (HOST-M5M6-04): fired AFTER a `thread_message`
-   * is durably stored, so the webhook pump pushes the new row promptly. Purely
-   * a scheduling hint — delivery itself stays cursor-driven (egress re-reads
-   * the store), so a missed/failed notification loses nothing.
+   * Host event emitter: each durable write (and each outbox ack) is announced
+   * AFTER it lands — e.g. `transcript.message` is what the webhook pump
+   * subscribes to (HOST-M5M6-04). Purely a scheduling hint — delivery itself
+   * stays cursor-driven (consumers re-read the store), so a missed/failed
+   * notification loses nothing.
    */
-  onTranscriptWrite?: (taskId: string) => void;
+  events?: HostEvents;
+  /** Metrics sink (the host context's); absent → counters are not recorded. */
+  metrics?: Metrics;
 }
 
 /** Build the `ack{id}` for a frame that carried its own `outboxId`, else null. */
@@ -73,7 +77,7 @@ function poisonDrop(deps: InboundDeps, decoded: DecodedFrame, reason: string, de
     { agentId: deps.agentId, type: decoded.type, taskId: decoded.taskId, threadId: decoded.threadId, cronId: decoded.cronId, outboxId: decoded.outboxId, reason, detail },
     "inbound frame PERMANENTLY unprocessable — acked and dropped (poison policy)",
   );
-  counterAdd("inbound_poison_frames_total", "Permanently unprocessable inbound frames acked and dropped", 1, { type: decoded.type, reason });
+  deps.metrics?.counterAdd("inbound_poison_frames_total", "Permanently unprocessable inbound frames acked and dropped", 1, { type: decoded.type, reason });
   return ackFor(decoded);
 }
 
@@ -187,10 +191,10 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       // version drift is visible to operators.
       if (!RECOGNIZED_MESSAGE_KINDS.has(data.kind)) {
         deps.logger?.warn({ agentId, taskId: decoded.taskId, threadId: decoded.threadId, kind: data.kind }, "thread_message with unrecognized kind — stored opaquely");
-        counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
+        deps.metrics?.counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
       }
       writeThreadMessage(db, { taskId: decoded.taskId, threadId: decoded.threadId, data });
-      deps.onTranscriptWrite?.(decoded.taskId);
+      deps.events?.emit("transcript.message", { agentId, taskId: decoded.taskId, threadId: decoded.threadId, seq: data.seq, data });
       return ackFor(decoded);
     }
 
@@ -218,6 +222,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       if (data.attachments != null && data.attachments.length > 0) {
         writeAttachmentDescriptors(db, { taskId: decoded.taskId, threadId: decoded.threadId, descriptors: data.attachments });
       }
+      deps.events?.emit("thread.result", { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...dispatch, data });
       // HOST-M1M2-13: verify the transcript is exactly `1..=final_seq`
       // (protocol §6). Diagnostic only — a gap is flagged, never blocks the ack.
       const completeness = checkTranscriptCompleteness(db, decoded.threadId, data.final_seq);
@@ -226,7 +231,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
           { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...completeness },
           "thread_result transcript gap — stored messages do not cover 1..=final_seq",
         );
-        counterAdd("inbound_transcript_gaps_total", "thread_result ingests whose stored transcript does not cover 1..=final_seq", 1);
+        deps.metrics?.counterAdd("inbound_transcript_gaps_total", "thread_result ingests whose stored transcript does not cover 1..=final_seq", 1);
       }
       return ackFor(decoded);
     }
@@ -243,6 +248,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         return poisonDrop(deps, decoded, "schema_invalid", parsed.error.issues);
       }
       writeCronState(db, { taskId: decoded.taskId, cronId: decoded.cronId, data: parsed.data });
+      deps.events?.emit("cron.state", { agentId, taskId: decoded.taskId, cronId: decoded.cronId, data: parsed.data });
       return ackFor(decoded);
     }
 
@@ -256,6 +262,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
     case "msg_ack": {
       if (decoded.msgId != null) {
         ackMessage(db, agentId, decoded.msgId);
+        deps.events?.emit("outbox.acked", { agentId, id: decoded.msgId, type: "msg_ack" });
       }
       return null;
     }
@@ -263,6 +270,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
     case "ack": {
       if (decoded.id != null) {
         ackOutbox(db, agentId, decoded.id);
+        deps.events?.emit("outbox.acked", { agentId, id: decoded.id, type: "ack" });
       }
       return null;
     }
@@ -320,8 +328,8 @@ export class MalformedFrameError extends Error {
  * `MalformedFrameError` on an undecodable frame (→ 400, do not retry) and lets
  * a TRANSIENT storage failure propagate untagged (→ 5xx, the agent retries) —
  * HOST-M1M2-09. PERMANENT failures return the poison ack (2xx) like the WS path.
- * The deps carry the optional `onTranscriptWrite` webhook-pump trigger
- * (HOST-M5M6-04) exactly like the WS path.
+ * The deps carry the optional `events` emitter (the webhook pump's
+ * `transcript.message` trigger, HOST-M5M6-04) exactly like the WS path.
  */
 export function ingestHttpFrame(deps: Omit<InboundDeps, "sender">, raw: string | ArrayBuffer | Uint8Array): Record<string, unknown> {
   const decoded = decodeFrame(raw);

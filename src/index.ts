@@ -23,7 +23,7 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
     console.error("[gino] bootstrap failed:", err instanceof Error ? err.message : err);
     process.exit(1);
   }
-  const { fetch, websocket, config, logger, db, closeDb } = boot;
+  const { fetch, websocket, config, logger, db, host } = boot;
   logger.info({ ...BUILD_INFO }, "build info");
 
   const server = Bun.serve({
@@ -81,7 +81,7 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
     await safe("stopLodePrepareWatcher", () => lodePrepare?.stop(), silent);
     await safe("server.stop", stopServer, silent);
     await safe("logger.flush", () => logger.flush(), true);
-    await safe("closeDb", closeDb, silent);
+    await safe("host.stop", () => host.stop(), silent);
     await safe("logger.flush", () => logger.flush(), true);
 
     process.exit(opts.fatal ? 1 : 0);

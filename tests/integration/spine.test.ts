@@ -4,8 +4,7 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
-import { sessions } from "@/agents/sessions";
-import { createApp } from "@/app";
+import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { tasks } from "@/db/schema";
@@ -29,13 +28,15 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let host: ReturnType<typeof createAppHost>;
 let server: ReturnType<typeof Bun.serve>;
 let httpBase: string;
 let wsBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
-  const app = createApp({ config, db, logger: createLogger(config) });
+  host = createAppHost({ config, db, logger: createLogger(config) });
+  const app = createApp({ config, host });
   server = Bun.serve({
     port: 0,
     // Thread `server` into env so the hono/bun adapter can upgrade; wire `websocket`.
@@ -223,7 +224,7 @@ describe("D-B1b protocol spine — register → connect → frames → store →
     expect(run?.source).toBe("chat"); // B1b dispatch default
 
     // 4. OUTBOX (host→agent): enqueue a `message`; the live session delivers it.
-    const msgRow = enqueue(db, sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
+    const msgRow = enqueue(db, host.sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
     const delivered = await waitFor(
       conn.received,
       f => f.type === "message" && (f.data as { text?: string } | undefined)?.text === "hi from host",
