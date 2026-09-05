@@ -264,7 +264,7 @@ export function agentRoutes() {
         return c.json(registerError("unsupported_protocol"), 400);
       }
 
-      const db = c.get("db");
+      const storage = host.storage;
       const launchNonce = typeof body.launchNonce === "string" && body.launchNonce.length > 0 ? body.launchNonce : null;
 
       // HOST-M3-06: registration is IDEMPOTENT per launch. A retry carrying a
@@ -272,7 +272,7 @@ export function agentRoutes() {
       // saw its token) reuses the existing row with a ROTATED connect token
       // instead of minting a duplicate whose launch binding lands on a ghost.
       if (launchNonce) {
-        const existing = reEnrollByLaunchNonce(db, launchNonce);
+        const existing = reEnrollByLaunchNonce(storage, launchNonce);
         if (existing) {
           c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
           const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(host.storage, existing.agent) };
@@ -284,7 +284,7 @@ export function agentRoutes() {
       // never self-declares `public`. Enrollment always lands `dedicated`; a
       // host launch's admin allowlist applies at correlate, and flipping an
       // agent `public` later is the admin-only access mutation.
-      const { agent, connectToken } = enrollAgent(db, {
+      const { agent, connectToken } = enrollAgent(storage, {
         ...(typeof body.name === "string" ? { name: body.name } : {}),
         source: typeof body.source === "string" ? body.source : "manual",
         capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
@@ -298,7 +298,7 @@ export function agentRoutes() {
       // that launch (launcher_kind + launch_ref). No nonce → unchanged: a manual
       // enroll never touches the pending-launch set.
       if (launchNonce) {
-        const correlated = correlateLaunch(db, agent.id, launchNonce);
+        const correlated = correlateLaunch(storage, agent.id, launchNonce);
         if (correlated) {
           c.get("logger").info({ agentId: agent.id, launcher: correlated.launcherKind, ref: correlated.launchRef }, "agent registration correlated to launch");
         }
@@ -324,30 +324,30 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       const token = c.req.header("x-internal-token") ?? "";
-      const db = c.get("db");
       const logger = c.get("logger");
       const host = c.get("host");
+      const storage = host.storage;
 
       // Per-agent auth (M3): verify against the stored hash. Throwing here
       // rejects the upgrade with the standard 401 envelope (no socket opens).
-      const agent = verifyConnectToken(db, agentId, token);
+      const agent = verifyConnectToken(storage, agentId, token);
       if (!agent) {
         throw new UnauthorizedError();
       }
 
       // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
-      const deps = { db, sender: host.sessions, agentId, logger, metrics: host.metrics, events: host.events };
+      const deps = { storage, sender: host.sessions, agentId, logger, metrics: host.metrics, events: host.events };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
           host.sessions.attach(agentId, ws);
-          setAgentStatus(db, agentId, "online");
+          setAgentStatus(storage, agentId, "online");
           host.events.emit("agent.online", { agentId });
           // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
-          touchLiveness(db, agentId);
-          const replayed = replayUnacked(db, host.sessions, agentId, { logger });
+          touchLiveness(storage, agentId);
+          const replayed = replayUnacked(storage, host.sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
@@ -366,7 +366,7 @@ export function agentRoutes() {
           // must not clobber the live session's `online` status.
           const evicted = host.sessions.detach(agentId, ws);
           if (evicted) {
-            setAgentStatus(db, agentId, "offline");
+            setAgentStatus(storage, agentId, "offline");
             host.events.emit("agent.offline", { agentId, reason: "close" });
           }
           logger.info({ agentId, evicted }, "agent ws detached");
@@ -387,7 +387,7 @@ export function agentRoutes() {
     (c) => {
       const agentId = c.req.param("agentId");
       const token = c.req.header("x-internal-token") ?? "";
-      const agent = agentId ? verifyConnectToken(c.get("db"), agentId, token) : null;
+      const agent = agentId ? verifyConnectToken(c.get("host").storage, agentId, token) : null;
       if (!agent || !agentId) {
         throw new UnauthorizedError();
       }
@@ -408,7 +408,7 @@ export function agentRoutes() {
     async (c) => {
       const agentId = c.req.param("agentId");
       const token = c.req.header("x-internal-token") ?? "";
-      const agent = agentId ? verifyConnectToken(c.get("db"), agentId, token) : null;
+      const agent = agentId ? verifyConnectToken(c.get("host").storage, agentId, token) : null;
       if (!agent || !agentId) {
         throw new UnauthorizedError();
       }
@@ -420,7 +420,7 @@ export function agentRoutes() {
         // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
         const host = c.get("host");
         return c.json(ingestHttpFrame(
-          { db: c.get("db"), agentId, logger: c.get("logger"), metrics: host.metrics, events: host.events },
+          { storage: host.storage, agentId, logger: c.get("logger"), metrics: host.metrics, events: host.events },
           raw,
         ));
       }

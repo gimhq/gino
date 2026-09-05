@@ -16,12 +16,9 @@
 // Layering: the outbox talks to the live socket only through the abstract
 // `AgentTransport` port (sessions implements it), and rebuilds the wire frame
 // via the M2 `encodeOutbox` codec — it never hand-rolls the envelope.
-import type { AppDatabase } from "@/db";
-import type { Outbox } from "@/db/schema";
+import type { OutboxRow, Storage } from "@/host/ports/storage";
 import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
-import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
-import { outbox } from "@/db/schema";
 import { encodeOutbox } from "./envelope";
 
 export interface EnqueueInput {
@@ -38,7 +35,7 @@ export interface EnqueueInput {
  * An enqueued outbox row. `msgId` is NOT a column — for a `message` row it is
  * the derived delivery id (= row id), attached so callers can surface it.
  */
-export type EnqueuedOutbox = Outbox & { msgId?: number };
+export type EnqueuedOutbox = OutboxRow & { msgId?: number };
 
 /**
  * Persist a host→agent frame and, if the agent is online, send it. The row is
@@ -49,19 +46,15 @@ export type EnqueuedOutbox = Outbox & { msgId?: number };
  * an ackable id. The returned row carries the derived `msgId` for callers that
  * surface it.
  */
-export function enqueue(db: AppDatabase, sender: AgentTransport, input: EnqueueInput): EnqueuedOutbox {
-  const inserted = db
-    .insert(outbox)
-    .values({
-      agentId: input.agentId,
-      type: input.type,
-      taskId: input.taskId ?? null,
-      threadId: input.threadId ?? null,
-      cronId: input.cronId ?? null,
-      dataJson: input.data ?? {},
-    })
-    .returning()
-    .get();
+export function enqueue(storage: Storage, sender: AgentTransport, input: EnqueueInput): EnqueuedOutbox {
+  const inserted = storage.outbox.append({
+    agentId: input.agentId,
+    type: input.type,
+    taskId: input.taskId ?? null,
+    threadId: input.threadId ?? null,
+    cronId: input.cronId ?? null,
+    dataJson: input.data ?? {},
+  });
 
   const row = input.type === "message" ? { ...inserted, msgId: inserted.id } : inserted;
 
@@ -79,10 +72,10 @@ export function enqueue(db: AppDatabase, sender: AgentTransport, input: EnqueueI
  * one would kill an arbitrary future turn (HOST-M4-03). Delivery is the live
  * push or nothing.
  */
-export function enqueueLiveOnly(db: AppDatabase, sender: AgentTransport, input: EnqueueInput): Outbox {
-  const row = enqueue(db, sender, input);
+export function enqueueLiveOnly(storage: Storage, sender: AgentTransport, input: EnqueueInput): OutboxRow {
+  const row = enqueue(storage, sender, input);
   const ackedAt = Date.now();
-  db.update(outbox).set({ ackedAt }).where(eq(outbox.id, row.id)).run();
+  storage.outbox.markAcked(input.agentId, row.id, ackedAt);
   return { ...row, ackedAt };
 }
 
@@ -92,12 +85,8 @@ export function enqueueLiveOnly(db: AppDatabase, sender: AgentTransport, input: 
  * autoincrement, so a foreign id is trivially guessable), and to non-`message`
  * rows: a `message` is delivered only by the durable-storage `msg_ack` (§4.2).
  */
-export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
-  db
-    .update(outbox)
-    .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.id, id), eq(outbox.agentId, agentId), ne(outbox.type, "message")))
-    .run();
+export function ackOutbox(storage: Storage, agentId: string, id: number): void {
+  storage.outbox.markAcked(agentId, id, Date.now(), { excludeType: "message" });
 }
 
 /**
@@ -110,12 +99,8 @@ export function ackOutbox(db: AppDatabase, agentId: string, id: number): void {
  * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
  * row acked is enough to stop replay.
  */
-export function ackMessage(db: AppDatabase, agentId: string, msgId: number): void {
-  db
-    .update(outbox)
-    .set({ ackedAt: Date.now() })
-    .where(and(eq(outbox.id, msgId), eq(outbox.agentId, agentId)))
-    .run();
+export function ackMessage(storage: Storage, agentId: string, msgId: number): void {
+  storage.outbox.markAcked(agentId, msgId, Date.now());
 }
 
 /**
@@ -144,13 +129,8 @@ export interface ReplayOptions {
  * (marked acked so it never rescans) and logged instead of sent, so a stop
  * issued while the agent was offline cannot kill a deliberate later start.
  */
-export function replayUnacked(db: AppDatabase, sender: AgentTransport, agentId: string, opts: ReplayOptions = {}): number {
-  const rows = db
-    .select()
-    .from(outbox)
-    .where(and(eq(outbox.agentId, agentId), isNull(outbox.ackedAt)))
-    .orderBy(asc(outbox.id))
-    .all();
+export function replayUnacked(storage: Storage, sender: AgentTransport, agentId: string, opts: ReplayOptions = {}): number {
+  const rows = storage.outbox.listUnacked(agentId);
 
   const now = opts.now?.() ?? Date.now();
   const closeCutoff = now - (opts.closeTtlMs ?? CLOSE_FRAME_TTL_MS);
@@ -158,7 +138,7 @@ export function replayUnacked(db: AppDatabase, sender: AgentTransport, agentId: 
   let sent = 0;
   for (const row of rows) {
     if (row.type === "close" && row.createdAt < closeCutoff) {
-      db.update(outbox).set({ ackedAt: now }).where(eq(outbox.id, row.id)).run();
+      storage.outbox.markAcked(agentId, row.id, now);
       opts.logger?.warn(
         { agentId, outboxId: row.id, ageMs: now - row.createdAt },
         "stale close frame skipped on replay (past TTL) — retired without delivery",
@@ -178,13 +158,8 @@ export function replayUnacked(db: AppDatabase, sender: AgentTransport, agentId: 
  * — the rows are undeliverable by construction and would otherwise be immortal
  * (retention GC only touches acked rows). Returns the number of rows deleted.
  */
-export function purgeAgentOutbox(db: AppDatabase, agentId: string): number {
-  return db
-    .delete(outbox)
-    .where(and(eq(outbox.agentId, agentId), isNull(outbox.ackedAt)))
-    .returning({ id: outbox.id })
-    .all()
-    .length;
+export function purgeAgentOutbox(storage: Storage, agentId: string): number {
+  return storage.outbox.purge(agentId);
 }
 
 /** Default retention window for ACKED outbox rows (ms) — 7 days. */
@@ -207,19 +182,14 @@ export interface OutboxGcOptions {
  * inferred from outbox history (it lives on `tasks.seeded_at`), so dropping
  * acked frames is safe. Returns the number of rows deleted.
  */
-export function gcOutbox(db: AppDatabase, opts: OutboxGcOptions = {}): number {
+export function gcOutbox(storage: Storage, opts: OutboxGcOptions = {}): number {
   const now = opts.now?.() ?? Date.now();
   const cutoff = now - (opts.retentionMs ?? OUTBOX_RETENTION_MS);
-  return db
-    .delete(outbox)
-    .where(and(isNotNull(outbox.ackedAt), lt(outbox.ackedAt, cutoff)))
-    .returning({ id: outbox.id })
-    .all()
-    .length;
+  return storage.outbox.gc(cutoff);
 }
 
 export interface OutboxGcDeps extends OutboxGcOptions {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   readonly logger?: Logger;
   /** Sweep cadence in ms. Defaults to `OUTBOX_GC_INTERVAL_MS`. */
   readonly intervalMs?: number;
@@ -240,7 +210,7 @@ export interface OutboxGcHandle {
 export function startOutboxGc(deps: OutboxGcDeps): OutboxGcHandle {
   const tick = () => {
     try {
-      const deleted = gcOutbox(deps.db, deps);
+      const deleted = gcOutbox(deps.storage, deps);
       if (deleted > 0) {
         deps.logger?.info({ deleted }, "outbox gc: deleted acked rows past retention");
       }
@@ -255,6 +225,6 @@ export function startOutboxGc(deps: OutboxGcDeps): OutboxGcHandle {
 
   return {
     stop: () => clearInterval(timer),
-    gc: () => gcOutbox(deps.db, deps),
+    gc: () => gcOutbox(deps.storage, deps),
   };
 }

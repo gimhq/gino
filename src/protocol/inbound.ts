@@ -23,7 +23,6 @@ import type { DecodedFrame } from "./envelope";
 // Unknown `type`s and unknown fields are ignored (protocol §4.2). Business
 // `data` is validated here (still M2) against the `frames.ts` schemas right
 // before it reaches a writer; the writers themselves stay transport-free.
-import type { AppDatabase } from "@/db";
 import type { HostEvents } from "@/host/events";
 import type { Metrics } from "@/host/metrics";
 import type { Storage } from "@/host/ports/storage";
@@ -40,13 +39,11 @@ import {
   writeThreadResult,
 } from "@/msgstore";
 import { CronStateData, HeartbeatData, RECOGNIZED_MESSAGE_KINDS, ThreadMessageData, ThreadResultData } from "@/protocol/frames";
-import { sqliteStorage } from "@/store/sqlite";
-import { getTask } from "@/tasks/store";
 import { decodeFrame } from "./envelope";
 import { ackMessage, ackOutbox } from "./outbox";
 
 export interface InboundDeps {
-  db: AppDatabase;
+  storage: Storage;
   /** Live socket to ack back over (absent for the HTTP `/agent/output` fallback). */
   sender?: AgentTransport;
   agentId: string;
@@ -119,7 +116,7 @@ function authorizeWrite(
     return false;
   };
 
-  const task = getTask(deps.db, taskId);
+  const task = deps.storage.tasks.get(taskId);
   if (task == null || task.agentId !== deps.agentId) {
     return deny("task not placed on this agent");
   }
@@ -174,9 +171,7 @@ function deriveDispatchContext(storage: Storage, taskId: string, threadId: strin
  * acked-and-dropped inside (`poisonDrop`, HOST-M1M2-04).
  */
 export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<string, unknown> | null {
-  const { db, agentId } = deps;
-  // P1 transitional — removed when protocol/inbound moves to ports
-  const storage = sqliteStorage(db);
+  const { storage, agentId } = deps;
 
   switch (decoded.type) {
     case "thread_message": {
@@ -259,14 +254,14 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
 
     case "heartbeat": {
       const data = HeartbeatData.optional().safeParse(decoded.data);
-      touchLiveness(db, agentId, data.success ? data.data?.activeThreads : undefined);
+      touchLiveness(storage, agentId, data.success ? data.data?.activeThreads : undefined);
       // Heartbeats are liveness, not durable work; ack only if one was requested.
       return ackFor(decoded);
     }
 
     case "msg_ack": {
       if (decoded.msgId != null) {
-        ackMessage(db, agentId, decoded.msgId);
+        ackMessage(storage, agentId, decoded.msgId);
         deps.events?.emit("outbox.acked", { agentId, id: decoded.msgId, type: "msg_ack" });
       }
       return null;
@@ -274,7 +269,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
 
     case "ack": {
       if (decoded.id != null) {
-        ackOutbox(db, agentId, decoded.id);
+        ackOutbox(storage, agentId, decoded.id);
         deps.events?.emit("outbox.acked", { agentId, id: decoded.id, type: "ack" });
       }
       return null;

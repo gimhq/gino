@@ -1,3 +1,4 @@
+import type { Storage } from "@/host/ports/storage";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -10,6 +11,7 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M3 agent status lifecycle against a LIVE server (HOST-M1M2-05 / HOST-M3-02 /
 // HOST-M3-08): a dirty reconnect's superseded-socket close must not clobber the
@@ -28,6 +30,7 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let storage: Storage;
 let host: ReturnType<typeof createAppHost>;
 let server: ReturnType<typeof Bun.serve>;
 let httpBase: string;
@@ -35,6 +38,7 @@ let wsBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   host = createAppHost({ config, db, logger: createLogger(config) });
   const app = createApp({ config, host });
   server = Bun.serve({
@@ -109,18 +113,18 @@ async function registerAgent(): Promise<{ agentId: string; connectToken: string 
 describe("M3 agent status lifecycle over a live WS", () => {
   it("onOpen stamps last_seen so a fresh connection is never insta-swept (HOST-M3-08)", async () => {
     const { agentId, connectToken } = await registerAgent();
-    expect(getAgent(db, agentId)?.lastSeen).toBeNull(); // enrolled, never seen
+    expect(getAgent(storage, agentId)?.lastSeen).toBeNull(); // enrolled, never seen
 
     const ws = await openWs(agentId, connectToken);
     await settle();
 
     // No frame has been sent yet — the attach alone must stamp liveness, so
     // the sweep's `last_seen IS NOT NULL` window already covers this agent.
-    const agent = getAgent(db, agentId);
+    const agent = getAgent(storage, agentId);
     expect(agent?.status).toBe("online");
     expect(agent?.lastSeen).not.toBeNull();
-    expect(sweepLiveness({ db, sessions: host.sessions })).toBe(0);
-    expect(getAgent(db, agentId)?.status).toBe("online");
+    expect(sweepLiveness({ storage, sessions: host.sessions })).toBe(0);
+    expect(getAgent(storage, agentId)?.status).toBe("online");
 
     ws.close();
     await closedPromise(ws);
@@ -132,7 +136,7 @@ describe("M3 agent status lifecycle over a live WS", () => {
     // Old socket attaches; the host still holds it when the agent redials.
     const staleWs = await openWs(agentId, connectToken);
     await settle();
-    expect(getAgent(db, agentId)?.status).toBe("online");
+    expect(getAgent(storage, agentId)?.status).toBe("online");
 
     // Dirty reconnect: the new attach supersedes (closes) the stale socket,
     // whose late `onClose` lands AFTER the new session went online.
@@ -143,14 +147,14 @@ describe("M3 agent status lifecycle over a live WS", () => {
 
     // The regression: the superseded close used to flip the row `offline`
     // while frames flowed on the fresh socket — it must stay `online`.
-    expect(getAgent(db, agentId)?.status).toBe("online");
+    expect(getAgent(storage, agentId)?.status).toBe("online");
     expect(host.sessions.isOnline(agentId)).toBe(true);
 
     // The CURRENT socket's close still marks the agent offline.
     freshWs.close();
     await closedPromise(freshWs);
     await settle();
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
     expect(host.sessions.isOnline(agentId)).toBe(false);
   });
 });

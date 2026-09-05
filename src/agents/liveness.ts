@@ -13,11 +13,9 @@
 // also restores `online` via `touchLiveness`). The grace window is the only
 // thing tuned here; everything else is left untouched.
 import type { SessionRegistry } from "@/agents/sessions";
-import type { AppDatabase } from "@/db";
 import type { HostEvents } from "@/host/events";
+import type { Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
-import { and, eq, isNotNull, lt } from "drizzle-orm";
-import { agents } from "@/db/schema";
 import { HEARTBEAT_INTERVAL_MS } from "@/protocol/version";
 
 /** DP4 grace = N × heartbeat interval. N missed beats of silence → `offline`. */
@@ -27,7 +25,7 @@ export const OFFLINE_GRACE_MULTIPLIER = 3;
 export const OFFLINE_GRACE_MS = OFFLINE_GRACE_MULTIPLIER * HEARTBEAT_INTERVAL_MS;
 
 export interface LivenessDeps {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   readonly logger?: Logger;
   /**
    * Live-session registry (HOST-M3-14): when provided, the sweep also closes +
@@ -64,22 +62,13 @@ export function sweepLiveness(deps: LivenessDeps): number {
   const graceMs = deps.graceMs ?? OFFLINE_GRACE_MS;
   const cutoff = now - graceMs;
 
-  const transitioned = deps.db
-    .update(agents)
-    .set({ status: "offline" })
-    .where(and(
-      eq(agents.status, "online"),
-      isNotNull(agents.lastSeen),
-      lt(agents.lastSeen, cutoff),
-    ))
-    .returning({ id: agents.id })
-    .all();
+  const transitioned = deps.storage.agents.sweepSilent(cutoff);
 
   // HOST-M3-14: evict the half-open zombie socket for every swept agent. The
   // detach runs first so the close's own `onClose` (detach + offline write) is
   // a guarded no-op; unacked outbox rows stay put and replay on reconnect.
   if (deps.sessions) {
-    for (const { id } of transitioned) {
+    for (const id of transitioned) {
       const session = deps.sessions.get(id);
       if (!session) {
         continue;
@@ -94,13 +83,13 @@ export function sweepLiveness(deps: LivenessDeps): number {
     }
   }
 
-  for (const { id } of transitioned) {
+  for (const id of transitioned) {
     deps.events?.emit("agent.offline", { agentId: id, reason: "sweep" });
   }
 
   if (transitioned.length > 0) {
     deps.logger?.info(
-      { count: transitioned.length, graceMs, agentIds: transitioned.map(a => a.id) },
+      { count: transitioned.length, graceMs, agentIds: transitioned },
       "liveness: agents marked offline (tasks/crons untouched, DP4)",
     );
   }

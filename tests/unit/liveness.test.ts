@@ -1,5 +1,6 @@
 import type { WsLike } from "@/agents/sessions";
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { OFFLINE_GRACE_MS, sweepLiveness } from "@/agents/liveness";
@@ -7,14 +8,17 @@ import { enrollAgent, getAgent, setAgentStatus, touchLiveness } from "@/agents/r
 import { SessionRegistry } from "@/agents/sessions";
 import { createDb } from "@/db";
 import { tasks } from "@/db/schema";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M3 liveness — the offline-grace sweep (DP4). Marks the AGENT offline; NEVER
 // touches its tasks/crons.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -23,9 +27,9 @@ afterEach(() => {
 
 /** Enroll, bring online, and seed a placed task (the work that must survive). */
 function onlineAgentWithTask() {
-  const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
-  setAgentStatus(db, agent.id, "online");
-  touchLiveness(db, agent.id, 2);
+  const { agent } = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } });
+  setAgentStatus(storage, agent.id, "online");
+  touchLiveness(storage, agent.id, 2);
   db.insert(tasks).values({
     id: "task-1",
     ownerId: "owner-1",
@@ -44,10 +48,10 @@ describe("M3 liveness sweep", () => {
 
     // Fake clock: now is past the grace window since the last heartbeat.
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
-    const count = sweepLiveness({ db, now: () => future });
+    const count = sweepLiveness({ storage, now: () => future });
 
     expect(count).toBe(1);
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
 
     // DP4: the task survives — same placement, same status, not deleted.
     const task = db.select().from(tasks).where(eq(tasks.id, "task-1")).get();
@@ -59,25 +63,25 @@ describe("M3 liveness sweep", () => {
   it("leaves a freshly-heartbeating agent online", () => {
     const agentId = onlineAgentWithTask();
     // now is just after the heartbeat — well within the grace window.
-    const count = sweepLiveness({ db, now: () => Date.now() + 1_000 });
+    const count = sweepLiveness({ storage, now: () => Date.now() + 1_000 });
     expect(count).toBe(0);
-    expect(getAgent(db, agentId)?.status).toBe("online");
+    expect(getAgent(storage, agentId)?.status).toBe("online");
   });
 
   it("never touches an enrolled-but-never-connected agent (last_seen null)", () => {
-    const { agent } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+    const { agent } = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } });
     expect(agent.lastSeen).toBeNull();
-    const count = sweepLiveness({ db, now: () => Date.now() + OFFLINE_GRACE_MS + 1_000 });
+    const count = sweepLiveness({ storage, now: () => Date.now() + OFFLINE_GRACE_MS + 1_000 });
     expect(count).toBe(0);
-    expect(getAgent(db, agent.id)?.status).toBe("enrolled");
+    expect(getAgent(storage, agent.id)?.status).toBe("enrolled");
   });
 
   it("is idempotent — an already-offline agent is not re-counted", () => {
     const agentId = onlineAgentWithTask();
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
-    expect(sweepLiveness({ db, now: () => future })).toBe(1);
-    expect(sweepLiveness({ db, now: () => future })).toBe(0);
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(sweepLiveness({ storage, now: () => future })).toBe(1);
+    expect(sweepLiveness({ storage, now: () => future })).toBe(0);
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
   });
 
   it("closes + detaches the swept agent's zombie socket (HOST-M3-14)", () => {
@@ -93,10 +97,10 @@ describe("M3 liveness sweep", () => {
     sessions.attach(agentId, zombie);
 
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
-    expect(sweepLiveness({ db, sessions, now: () => future })).toBe(1);
+    expect(sweepLiveness({ storage, sessions, now: () => future })).toBe(1);
 
     // Both views converge: DB says offline AND the session registry is empty.
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
     expect(sessions.isOnline(agentId)).toBe(false);
     expect(closed).toHaveLength(1);
     expect(closed[0]?.code).toBe(1001);
@@ -106,23 +110,23 @@ describe("M3 liveness sweep", () => {
     const agentId = onlineAgentWithTask();
     const sessions = new SessionRegistry();
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
-    expect(sweepLiveness({ db, sessions, now: () => future })).toBe(1);
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(sweepLiveness({ storage, sessions, now: () => future })).toBe(1);
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
   });
 
   it("a heartbeat after the sweep restores online — but never out of removed (HOST-M3-03)", () => {
     const agentId = onlineAgentWithTask();
     const future = Date.now() + OFFLINE_GRACE_MS + 1_000;
-    expect(sweepLiveness({ db, now: () => future })).toBe(1);
-    expect(getAgent(db, agentId)?.status).toBe("offline");
+    expect(sweepLiveness({ storage, now: () => future })).toBe(1);
+    expect(getAgent(storage, agentId)?.status).toBe("offline");
 
     // Heartbeat starvation ends; the still-connected agent resumes beating.
-    touchLiveness(db, agentId, 2);
-    expect(getAgent(db, agentId)?.status).toBe("online");
+    touchLiveness(storage, agentId, 2);
+    expect(getAgent(storage, agentId)?.status).toBe("online");
 
     // A removed agent is terminal: liveness never resurrects it.
-    setAgentStatus(db, agentId, "removed");
-    touchLiveness(db, agentId, 2);
-    expect(getAgent(db, agentId)?.status).toBe("removed");
+    setAgentStatus(storage, agentId, "removed");
+    touchLiveness(storage, agentId, 2);
+    expect(getAgent(storage, agentId)?.status).toBe("removed");
   });
 });

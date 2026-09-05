@@ -111,9 +111,9 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
       return;
     }
     loops = [
-      startLivenessSweep({ db, logger, sessions, events, graceMs: options.offlineGraceMs, intervalMs: options.heartbeatIntervalMs }),
-      startOutboxGc({ db, logger }),
-      startLaunchReaper({ db, logger, resolveLauncher: launchers.resolve }),
+      startLivenessSweep({ storage, logger, sessions, events, graceMs: options.offlineGraceMs, intervalMs: options.heartbeatIntervalMs }),
+      startOutboxGc({ storage, logger }),
+      startLaunchReaper({ storage, logger, resolveLauncher: launchers.resolve }),
       startConfigStoreGc({ storage, logger, enabled: options.configGc.enabled, maxAgeMs: options.configGc.maxAgeMs, intervalMs: options.configGc.intervalMs }),
     ];
   };

@@ -12,7 +12,7 @@
 //     by envelope ids without parsing `data`).
 //   • encode — an `outbox` row → the wire frame, rebuilding the envelope from
 //     the row's columns (the durable host→agent path; protocol §4.2).
-import type { Outbox } from "@/db/schema";
+import type { OutboxRow } from "@/host/ports/storage";
 import { Envelope } from "@/protocol/frames";
 
 /**
@@ -88,7 +88,7 @@ export function decodeFrame(raw: string | ArrayBuffer | Uint8Array): DecodedFram
  * `data` are emitted only when present, so a delete/control frame (which
  * carries no `data`) stays envelope-only.
  */
-export function encodeOutbox(row: Outbox): Record<string, unknown> {
+export function encodeOutbox(row: OutboxRow): Record<string, unknown> {
   const frame: Record<string, unknown> = { type: row.type };
 
   frame.msgId = row.id;

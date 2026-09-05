@@ -37,7 +37,7 @@ afterEach(() => {
 
 /** Enroll a fresh agent, create a task, and place it on that agent. */
 function placedAgentTask(): { agentId: string; taskId: string } {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
   setPlacement(db, taskId, agentId);
   return { agentId, taskId };
@@ -81,7 +81,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     // `seq` must be an int — a string makes the frame permanently unprocessable.
     const poison: DecodedFrame = { type: "thread_message", outboxId: 7, taskId, threadId: "thr-1", data: { seq: "not-a-number", kind: "assistant_text" } };
 
-    const ack = applyFrame({ db, agentId, logger }, poison);
+    const ack = applyFrame({ storage, agentId, logger }, poison);
     expect(ack).toEqual({ type: "ack", id: 7 }); // acked → outbox row clears, no replay
     expect(getTranscript(storage, "thr-1")).toHaveLength(0); // dropped, never written
     expect(errors.some(args => String(args[1]).includes("acked and dropped"))).toBe(true); // logged loudly
@@ -91,7 +91,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const { agentId, taskId } = placedAgentTask();
     const poison: DecodedFrame = { type: "thread_result", outboxId: 8, taskId, threadId: "thr-2", data: { status: "exploded", duration_ms: 1, final_seq: 1 } };
 
-    expect(applyFrame({ db, agentId }, poison)).toEqual({ type: "ack", id: 8 });
+    expect(applyFrame({ storage, agentId }, poison)).toEqual({ type: "ack", id: 8 });
     expect(getThreadRun(storage, "thr-2")).toBeUndefined();
   });
 
@@ -99,14 +99,14 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const { agentId, taskId } = placedAgentTask();
     const poison: DecodedFrame = { type: "cron_state", outboxId: 9, taskId, cronId: "cron-1", data: { kind: "interval", round_count: "NaN", skipped_count: 0 } };
 
-    expect(applyFrame({ db, agentId }, poison)).toEqual({ type: "ack", id: 9 });
+    expect(applyFrame({ storage, agentId }, poison)).toEqual({ type: "ack", id: 9 });
   });
 
   it("acks-and-drops a store-write frame missing its correlation ids (permanently unroutable)", () => {
     const { agentId } = placedAgentTask();
     const poison: DecodedFrame = { type: "thread_message", outboxId: 10, data: { seq: 1, kind: "assistant_text", content: "x" } };
 
-    expect(applyFrame({ db, agentId }, poison)).toEqual({ type: "ack", id: 10 });
+    expect(applyFrame({ storage, agentId }, poison)).toEqual({ type: "ack", id: 10 });
   });
 
   it("over WS, the poison ack reaches the sender exactly like a stored ack (replay loop ends)", () => {
@@ -114,7 +114,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const { sender, sent } = spySender();
     const raw = JSON.stringify({ type: "thread_message", outboxId: 11, taskId, threadId: "thr-3", data: { seq: false } });
 
-    handleInboundFrame({ db, agentId, sender }, raw);
+    handleInboundFrame({ storage, agentId, sender }, raw);
     expect(sent).toEqual([{ type: "ack", id: 11 }]);
     expect(getTranscript(storage, "thr-3")).toHaveLength(0);
   });
@@ -126,7 +126,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     db.run(sql`DROP TABLE messages`); // deterministic stand-in for a transient write failure
     const raw = JSON.stringify({ type: "thread_message", outboxId: 12, taskId, threadId: "thr-4", data: { seq: 1, kind: "assistant_text", content: "x" } });
 
-    handleInboundFrame({ db, agentId, sender, logger }, raw); // must not throw to the socket loop
+    handleInboundFrame({ storage, agentId, sender, logger }, raw); // must not throw to the socket loop
     expect(sent).toHaveLength(0); // no ack → the agent keeps the frame and replays
     expect(warns.some(args => String(args[1]).includes("not acked"))).toBe(true);
   });
@@ -136,7 +136,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const { logger, warns } = spyLogger();
     const frame: DecodedFrame = { type: "thread_message", outboxId: 13, taskId, threadId: "thr-5", data: { seq: 1, kind: "usage", content: "tokens: 42" } };
 
-    expect(applyFrame({ db, agentId, logger }, frame)).toEqual({ type: "ack", id: 13 });
+    expect(applyFrame({ storage, agentId, logger }, frame)).toEqual({ type: "ack", id: 13 });
     expect(getTranscript(storage, "thr-5").map(m => m.kind)).toEqual(["usage"]); // written, not dropped
     expect(warns.some(args => String(args[1]).includes("unrecognized kind"))).toBe(true); // flagged
   });
@@ -145,8 +145,8 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
 describe("HOST-M1M2-09 — ingestHttpFrame tags only the malformed-frame error", () => {
   it("throws MalformedFrameError for an undecodable body (route maps this — and only this — to 400)", () => {
     const { agentId } = placedAgentTask();
-    expect(() => ingestHttpFrame({ db, agentId }, "not json at all")).toThrow(MalformedFrameError);
-    expect(() => ingestHttpFrame({ db, agentId }, JSON.stringify({ noType: true }))).toThrow(MalformedFrameError);
+    expect(() => ingestHttpFrame({ storage, agentId }, "not json at all")).toThrow(MalformedFrameError);
+    expect(() => ingestHttpFrame({ storage, agentId }, JSON.stringify({ noType: true }))).toThrow(MalformedFrameError);
   });
 
   it("lets a storage failure propagate UNTAGGED (route rethrows → 5xx, agent retries)", () => {
@@ -156,7 +156,7 @@ describe("HOST-M1M2-09 — ingestHttpFrame tags only the malformed-frame error",
 
     let thrown: unknown;
     try {
-      ingestHttpFrame({ db, agentId }, raw);
+      ingestHttpFrame({ storage, agentId }, raw);
     }
     catch (err) {
       thrown = err;
@@ -168,7 +168,7 @@ describe("HOST-M1M2-09 — ingestHttpFrame tags only the malformed-frame error",
   it("returns the poison ack (2xx) for a decodable frame with permanently bad data — same policy as WS", () => {
     const { agentId, taskId } = placedAgentTask();
     const raw = JSON.stringify({ type: "thread_result", outboxId: 2, taskId, threadId: "thr-7", data: { status: "exploded", duration_ms: 1, final_seq: 1 } });
-    expect(ingestHttpFrame({ db, agentId }, raw)).toEqual({ type: "ack", id: 2 });
+    expect(ingestHttpFrame({ storage, agentId }, raw)).toEqual({ type: "ack", id: 2 });
   });
 });
 
@@ -184,7 +184,7 @@ describe("HOST-M1M2-13 — final_seq completeness is verified on thread_result i
     msg("thr-gap", taskId, 4); // hole at seq 3
     const frame: DecodedFrame = { type: "thread_result", outboxId: 20, taskId, threadId: "thr-gap", data: { status: "succeeded", duration_ms: 5, final_seq: 4 } };
 
-    expect(applyFrame({ db, agentId, logger }, frame)).toEqual({ type: "ack", id: 20 }); // never blocks
+    expect(applyFrame({ storage, agentId, logger }, frame)).toEqual({ type: "ack", id: 20 }); // never blocks
     const gapWarn = warns.find(args => String(args[1]).includes("transcript gap"));
     expect(gapWarn).toBeDefined();
     expect(gapWarn?.[0]).toMatchObject({ threadId: "thr-gap", messageCount: 3, maxSeq: 4, finalSeq: 4 });
@@ -197,7 +197,7 @@ describe("HOST-M1M2-13 — final_seq completeness is verified on thread_result i
     msg("thr-tail", taskId, 2);
     const frame: DecodedFrame = { type: "thread_result", taskId, threadId: "thr-tail", data: { status: "succeeded", duration_ms: 5, final_seq: 4 } };
 
-    applyFrame({ db, agentId, logger }, frame);
+    applyFrame({ storage, agentId, logger }, frame);
     expect(warns.some(args => String(args[1]).includes("transcript gap"))).toBe(true);
   });
 
@@ -209,7 +209,7 @@ describe("HOST-M1M2-13 — final_seq completeness is verified on thread_result i
     msg("thr-ok", taskId, 3);
     const frame: DecodedFrame = { type: "thread_result", outboxId: 21, taskId, threadId: "thr-ok", data: { status: "succeeded", duration_ms: 5, final_seq: 3 } };
 
-    expect(applyFrame({ db, agentId, logger }, frame)).toEqual({ type: "ack", id: 21 });
+    expect(applyFrame({ storage, agentId, logger }, frame)).toEqual({ type: "ack", id: 21 });
     expect(warns.filter(args => String(args[1]).includes("transcript gap"))).toHaveLength(0);
   });
 

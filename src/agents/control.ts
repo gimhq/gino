@@ -1,5 +1,6 @@
 import type { InspectState, Launcher } from "./launchers/types";
 import type { SessionRegistry } from "./sessions";
+import type { HostEvents } from "@/host/events";
 // M3 — CONTROL (OOB agent control; the admin lever).
 //
 // The host commands agents over the protocol (M2), but reaching an agent's
@@ -15,9 +16,7 @@ import type { SessionRegistry } from "./sessions";
 // later phase (B2b) — it is a stub here.
 //
 // Grant/revoke manage the OD13 access policy (`agent_grants`) via the registry.
-import type { AppDatabase } from "@/db";
-import type { Agent } from "@/db/schema";
-import type { HostEvents } from "@/host/events";
+import type { AgentRow, Storage } from "@/host/ports/storage";
 import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
 import { randomBytes } from "node:crypto";
@@ -32,7 +31,7 @@ export type ControlOp = "stop" | "restart" | "remove";
 export type ControlVia = "launcher" | "ws-close";
 
 export interface ControlDeps {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   /** The live host→agent push surface (the M3 `SessionRegistry`). */
   readonly sender: AgentTransport;
   /**
@@ -62,8 +61,8 @@ export interface RemoveResult extends ControlResult {
   readonly orphanedTasks: number;
 }
 
-function requireAgent(db: AppDatabase, agentId: string): Agent {
-  const agent = getAgent(db, agentId);
+function requireAgent(storage: Storage, agentId: string): AgentRow {
+  const agent = getAgent(storage, agentId);
   if (!agent) {
     throw new NotFoundError("agent", agentId);
   }
@@ -76,8 +75,8 @@ function requireAgent(db: AppDatabase, agentId: string): Agent {
  * undeliverable frames (or grant access to a dead resource). Remove itself
  * stays idempotent and does NOT use this gate.
  */
-function requireActiveAgent(db: AppDatabase, agentId: string): Agent {
-  const agent = requireAgent(db, agentId);
+function requireActiveAgent(storage: Storage, agentId: string): AgentRow {
+  const agent = requireAgent(storage, agentId);
   if (agent.status === "removed") {
     throw new AppError(`agent ${agentId} is removed`, 410, "AGENT_REMOVED");
   }
@@ -110,13 +109,13 @@ function isRuntimeGone(err: unknown): boolean {
   return err instanceof Error && /no such container/i.test(err.message);
 }
 
-function resolve(deps: ControlDeps, agent: Agent): Launcher {
+function resolve(deps: ControlDeps, agent: AgentRow): Launcher {
   return (deps.resolveLauncher ?? (() => manualLauncher))(agent.launcherKind);
 }
 
 /** Enqueue a host→agent `close` frame (durable; the OOB fallback when a launcher can't act). */
 function closeViaWs(deps: ControlDeps, agentId: string, reason: ControlOp): void {
-  enqueue(deps.db, deps.sender, { agentId, type: "close", data: { reason } });
+  enqueue(deps.storage, deps.sender, { agentId, type: "close", data: { reason } });
 }
 
 /**
@@ -127,7 +126,7 @@ function closeViaWs(deps: ControlDeps, agentId: string, reason: ControlOp): void
  * reconnect.
  */
 export async function stopAgent(deps: ControlDeps, agentId: string): Promise<ControlResult> {
-  const agent = requireActiveAgent(deps.db, agentId);
+  const agent = requireActiveAgent(deps.storage, agentId);
   const launcher = resolve(deps, agent);
 
   if (launcher.capabilities.canStop && agent.launchRef) {
@@ -147,7 +146,7 @@ export async function stopAgent(deps: ControlDeps, agentId: string): Promise<Con
  * (or the operator, for `manual`) brings it back. Tasks/crons survive (DP4).
  */
 export async function restartAgent(deps: ControlDeps, agentId: string): Promise<ControlResult> {
-  const agent = requireActiveAgent(deps.db, agentId);
+  const agent = requireActiveAgent(deps.storage, agentId);
   const launcher = resolve(deps, agent);
 
   if (launcher.capabilities.canRestart && agent.launchRef) {
@@ -177,11 +176,11 @@ export async function restartAgent(deps: ControlDeps, agentId: string): Promise<
  * repeating it on a `removed` agent re-runs only the local cleanup.
  */
 export async function removeAgentControl(deps: ControlDeps, agentId: string): Promise<RemoveResult> {
-  const agent = requireAgent(deps.db, agentId);
+  const agent = requireAgent(deps.storage, agentId);
   const launcher = resolve(deps, agent);
 
   if (agent.status === "removed") {
-    purgeAgentOutbox(deps.db, agentId);
+    purgeAgentOutbox(deps.storage, agentId);
     forceCloseSession(deps, agentId);
     deps.logger?.info({ agentId }, "agent remove repeated on removed agent (no-op cleanup)");
     return { agentId, op: "remove", via: "ws-close", launcherKind: launcher.kind, ref: agent.launchRef ?? null, orphanedTasks: 0 };
@@ -210,9 +209,9 @@ export async function removeAgentControl(deps: ControlDeps, agentId: string): Pr
     via = "ws-close";
   }
 
-  const { orphanedTasks } = removeAgent(deps.db, agentId);
+  const { orphanedTasks } = removeAgent(deps.storage, agentId);
   deps.events?.emit("agent.removed", { agentId });
-  const purgedFrames = purgeAgentOutbox(deps.db, agentId);
+  const purgedFrames = purgeAgentOutbox(deps.storage, agentId);
   forceCloseSession(deps, agentId);
   deps.logger?.info({ agentId, launcher: launcher.kind, via, orphanedTasks, purgedFrames }, "agent removed (token revoked, tasks orphaned, outbox purged)");
   return { agentId, op: "remove", via, launcherKind: launcher.kind, ref: agent.launchRef ?? null, orphanedTasks };
@@ -224,7 +223,7 @@ export async function removeAgentControl(deps: ControlDeps, agentId: string): Pr
  * the agent's protocol state, surfaced separately as `agents.status`).
  */
 export async function inspectAgent(deps: ControlDeps, agentId: string): Promise<InspectState> {
-  const agent = requireAgent(deps.db, agentId);
+  const agent = requireAgent(deps.storage, agentId);
   const launcher = resolve(deps, agent);
   if (launcher.capabilities.canInspect && agent.launchRef) {
     return launcher.inspect(agent.launchRef);
@@ -234,14 +233,14 @@ export async function inspectAgent(deps: ControlDeps, agentId: string): Promise<
 
 /** Grant an owner access to an agent (OD13). 404 if unknown; 410 if `removed` (HOST-M3-12). */
 export function grantAgentOwner(deps: ControlDeps, agentId: string, ownerId: string): void {
-  requireActiveAgent(deps.db, agentId);
-  grantOwner(deps.db, agentId, ownerId);
+  requireActiveAgent(deps.storage, agentId);
+  grantOwner(deps.storage, agentId, ownerId);
 }
 
 /** Revoke an owner's access to an agent (OD13). 404 if the agent is unknown. */
 export function revokeAgentOwner(deps: ControlDeps, agentId: string, ownerId: string): void {
-  requireAgent(deps.db, agentId);
-  revokeOwner(deps.db, agentId, ownerId);
+  requireAgent(deps.storage, agentId);
+  revokeOwner(deps.storage, agentId, ownerId);
 }
 
 /**
@@ -250,8 +249,8 @@ export function revokeAgentOwner(deps: ControlDeps, agentId: string, ownerId: st
  * `access`). 404 if unknown; 410 if `removed` (like grant).
  */
 export function setAgentAccessControl(deps: ControlDeps, agentId: string, access: "dedicated" | "public"): void {
-  requireActiveAgent(deps.db, agentId);
-  setAgentAccess(deps.db, agentId, access);
+  requireActiveAgent(deps.storage, agentId);
+  setAgentAccess(deps.storage, agentId, access);
   deps.logger?.info({ agentId, access }, "agent access policy set (admin)");
 }
 
@@ -325,7 +324,7 @@ export async function launchAgent(deps: ControlDeps, input: LaunchInput): Promis
   // Record the pending launch so the matching registration correlates (OD17).
   // Persisted (HOST-M3-05): survives a host restart and is TTL-reaped when the
   // agent never registers (see launch-reaper.ts).
-  recordPendingLaunch(deps.db, nonce, { launcherKind: launcher.kind, launchRef: ref, ...(input.access ? { access: input.access } : {}) });
+  recordPendingLaunch(deps.storage, nonce, { launcherKind: launcher.kind, launchRef: ref, ...(input.access ? { access: input.access } : {}) });
   deps.logger?.info({ launcher: launcher.kind, ref, taskId: input.workload?.taskId }, "agent launch (awaiting registration)");
   return { launcherKind: launcher.kind, nonce, ref };
 }
