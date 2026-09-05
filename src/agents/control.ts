@@ -18,7 +18,7 @@ import type { SessionRegistry } from "./sessions";
 import type { AppDatabase } from "@/db";
 import type { Agent } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
-import type { FrameSender } from "@/protocol/outbox";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
 import { randomBytes } from "node:crypto";
 import { enqueue, purgeAgentOutbox } from "@/protocol/outbox";
@@ -34,7 +34,7 @@ export type ControlVia = "launcher" | "ws-close";
 export interface ControlDeps {
   readonly db: AppDatabase;
   /** The live host→agent push surface (the M3 `SessionRegistry`). */
-  readonly sender: FrameSender;
+  readonly sender: AgentTransport;
   /**
    * The session registry's force-close surface (HOST-M3-07): remove severs the
    * live socket host-side so a non-cooperating agent loses its authenticated

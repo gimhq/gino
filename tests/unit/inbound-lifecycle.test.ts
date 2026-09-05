@@ -1,6 +1,6 @@
 import type { AppDatabase } from "@/db";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { DecodedFrame } from "@/protocol/envelope";
-import type { FrameSender } from "@/protocol/outbox";
 import type { Logger } from "@/shared/lib/logger";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
@@ -56,15 +56,16 @@ function spyLogger(): { logger: Logger; warns: unknown[][]; errors: unknown[][] 
   return { logger, warns, errors };
 }
 
-/** A FrameSender fake that records every frame sent back to the agent. */
-function spySender(): { sender: FrameSender; sent: Record<string, unknown>[] } {
+/** An AgentTransport fake that records every frame sent back to the agent. */
+function spySender(): { sender: AgentTransport; sent: Record<string, unknown>[] } {
   const sent: Record<string, unknown>[] = [];
-  const sender: FrameSender = {
+  const sender: AgentTransport = {
     isOnline: () => true,
     send: (_agentId, frame) => {
       sent.push(frame);
       return true;
     },
+    closeAgent: () => false,
   };
   return { sender, sent };
 }

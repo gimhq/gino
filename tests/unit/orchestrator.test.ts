@@ -1,6 +1,6 @@
 import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
-import type { FrameSender } from "@/protocol/outbox";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
@@ -26,7 +26,7 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 let db: AppDatabase;
 
 /** Records every frame pushed; reports the agent online so enqueue delivers. */
-class FakeSender implements FrameSender {
+class FakeSender implements AgentTransport {
   readonly online = new Set<string>();
   readonly sent: Array<{ agentId: string; frame: Record<string, unknown> }> = [];
   isOnline(agentId: string): boolean {
@@ -36,6 +36,10 @@ class FakeSender implements FrameSender {
   send(agentId: string, frame: Record<string, unknown>): boolean {
     this.sent.push({ agentId, frame });
     return true;
+  }
+
+  closeAgent(agentId: string): boolean {
+    return this.online.delete(agentId);
   }
 }
 
@@ -150,7 +154,7 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
     // re-sends under the SAME id instead of forking the conversation.
     const task = placedTask();
     const currentAtSend: Array<string | null> = [];
-    const observingSender: FrameSender = {
+    const observingSender: AgentTransport = {
       isOnline: () => true,
       send: (_agent, frame) => {
         if (frame.type === "message") {
@@ -158,6 +162,7 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
         }
         return true;
       },
+      closeAgent: () => false,
     };
 
     const first = emitMessage(db, observingSender, task, { text: "hello" });
