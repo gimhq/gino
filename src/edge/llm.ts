@@ -19,7 +19,7 @@ const proxyAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const config = c.get("config");
   const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
   const ok = verifyProxyCredential(c.req.raw.headers, {
-    db: c.get("db"),
+    storage: c.get("host").storage,
     staticKey: config.PROXY_STATIC_KEY || undefined,
   }, pathname);
   if (!ok)
@@ -93,7 +93,7 @@ export function llmRoutes(opts: LlmRoutesOptions = {}) {
         return null;
       const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
       const ok = verifyProxyCredential(c.req.raw.headers, {
-        db: c.var.db,
+        storage: c.var.host.storage,
         staticKey: config.PROXY_STATIC_KEY || undefined,
       }, pathname);
       return ok ? `cred:${hashToken(cred)}` : null;

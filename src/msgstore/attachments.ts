@@ -3,12 +3,11 @@
 // Bytes never travel in frames (protocol §5) — only descriptors do. Descriptors
 // ride on `thread_result.data.attachments` (agent-produced ⇒ `outbound`) or
 // `message.data.attachments` (user-supplied ⇒ `inbound`); messages reference a
-// row by its `id`. Idempotent on `id` (ON CONFLICT DO NOTHING) so a replayed
-// carrier frame neither duplicates nor overwrites a descriptor.
-import type { AppDatabase } from "@/db";
+// row by its `id`. Idempotent on `id` (first writer wins) so a replayed carrier
+// frame neither duplicates nor overwrites a descriptor.
+import type { Storage } from "@/host/ports/storage";
 import type { AttachmentDescriptor } from "@/protocol/frames";
 import { sanitizeAttachmentName, storeRefFor } from "@/configstore";
-import { attachments } from "@/db/schema";
 
 export interface AttachmentWrite {
   taskId: string;
@@ -41,29 +40,24 @@ export function wireAttachmentRef(id: string): string {
  * keeps the registry row pointing at the blob that upload stored.
  */
 export function writeAttachmentDescriptors(
-  db: AppDatabase,
+  storage: Storage,
   { taskId, threadId, descriptors }: AttachmentWrite,
 ): void {
   if (descriptors.length === 0) {
     return;
   }
-  db.insert(attachments)
-    .values(
-      descriptors.map((d) => {
-        const name = sanitizeAttachmentName(d.name);
-        return {
-          id: d.id,
-          taskId,
-          threadId,
-          name,
-          contentType: d.content_type,
-          size: d.size,
-          sha256: d.sha256,
-          ref: storeRefFor(name, d.sha256),
-          direction: d.direction ?? "outbound",
-        };
-      }),
-    )
-    .onConflictDoNothing({ target: attachments.id })
-    .run();
+  for (const d of descriptors) {
+    const name = sanitizeAttachmentName(d.name);
+    storage.attachments.insertIfAbsent({
+      id: d.id,
+      taskId,
+      threadId,
+      name,
+      contentType: d.content_type,
+      size: d.size,
+      sha256: d.sha256,
+      ref: storeRefFor(name, d.sha256),
+      direction: d.direction ?? "outbound",
+    });
+  }
 }

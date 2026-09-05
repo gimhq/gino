@@ -1,5 +1,4 @@
 import type { AppEnv } from "@/shared/lib/types";
-import { sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import { BUILD_INFO } from "@/build-info";
@@ -65,7 +64,7 @@ export function systemRoutes() {
     }),
     (c) => {
       try {
-        c.get("db").run(sql`SELECT 1`);
+        c.get("host").storage.ping();
       }
       catch (err) {
         c.get("logger").error({ err }, "readiness probe: db ping failed");

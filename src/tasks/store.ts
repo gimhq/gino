@@ -13,11 +13,8 @@ import type { EntryInput } from "@/configstore";
 //
 // task-scope config/skill entries (`config_entries` WHERE scope = <task_id>) are
 // M8/B6 — `meta` carries an optional passthrough seam (no config storage here).
-import type { AppDatabase } from "@/db";
-import type { NewTask, Task } from "@/db/schema";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import type { CronRow, NewTaskRow, Storage, TaskRow } from "@/host/ports/storage";
 import { resolveEntries, setEntries } from "@/configstore";
-import { crons, tasks } from "@/db/schema";
 import { ulid } from "@/platform";
 import { AppError, NotFoundError } from "@/shared/lib/errors";
 
@@ -47,8 +44,8 @@ export interface CreateTaskInput {
  * task-scope `entries` are persisted to `config_entries` (scope = the new
  * `task.id`) with the host resolving the per-engine `target`.
  */
-export function createTask(db: AppDatabase, input: CreateTaskInput): Task {
-  const values: NewTask = {
+export function createTask(storage: Storage, input: CreateTaskInput): TaskRow {
+  const values: NewTaskRow = {
     id: ulid(),
     ownerId: input.ownerId,
     engine: input.engine,
@@ -59,9 +56,9 @@ export function createTask(db: AppDatabase, input: CreateTaskInput): Task {
     kind: input.kind ?? null,
     status: input.status ?? STATUS_PENDING_ASSIGNMENT,
   };
-  const task = db.insert(tasks).values(values).returning().get();
+  const task = storage.tasks.insert(values);
   if (input.entries && input.entries.length > 0) {
-    setTaskEntries(db, task.id, input.entries);
+    setTaskEntries(storage, task.id, input.entries);
   }
   return task;
 }
@@ -72,18 +69,18 @@ export function createTask(db: AppDatabase, input: CreateTaskInput): Task {
  * orchestrator re-materializes this set into `task_upsert.data.entries` on
  * (re-)dispatch; the agent reconciles it. An empty list clears the task's set.
  */
-export function setTaskEntries(db: AppDatabase, taskId: string, entries: EntryInput[]): void {
-  const task = requireTask(db, taskId);
-  setEntries(db, taskId, resolveEntries(task.engine, entries));
+export function setTaskEntries(storage: Storage, taskId: string, entries: EntryInput[]): void {
+  const task = requireTask(storage, taskId);
+  setEntries(storage, taskId, resolveEntries(task.engine, entries));
 }
 
-export function getTask(db: AppDatabase, id: string): Task | undefined {
-  return db.select().from(tasks).where(eq(tasks.id, id)).get();
+export function getTask(storage: Storage, id: string): TaskRow | undefined {
+  return storage.tasks.get(id);
 }
 
 /** Like `getTask` but throws the standard 404 for the admin surface. */
-export function requireTask(db: AppDatabase, id: string): Task {
-  const task = getTask(db, id);
+export function requireTask(storage: Storage, id: string): TaskRow {
+  const task = getTask(storage, id);
   if (!task) {
     throw new NotFoundError("task", id);
   }
@@ -97,16 +94,12 @@ export interface ListTasksFilter {
 }
 
 /** List tasks (admin observe), newest first, optionally filtered. */
-export function listTasks(db: AppDatabase, filter: ListTasksFilter = {}): Task[] {
-  const conds = [
-    filter.ownerId != null ? eq(tasks.ownerId, filter.ownerId) : undefined,
-    filter.agentId != null ? eq(tasks.agentId, filter.agentId) : undefined,
-    filter.status != null ? eq(tasks.status, filter.status) : undefined,
-  ].filter(c => c != null);
-
-  const base = db.select().from(tasks);
-  const filtered = conds.length > 0 ? base.where(and(...conds)) : base;
-  return filtered.orderBy(desc(tasks.createdAt)).all();
+export function listTasks(storage: Storage, filter: ListTasksFilter = {}): TaskRow[] {
+  return storage.tasks.list({
+    ...(filter.ownerId != null ? { ownerId: filter.ownerId } : {}),
+    ...(filter.agentId != null ? { agentId: filter.agentId } : {}),
+    ...(filter.status != null ? { status: filter.status } : {}),
+  });
 }
 
 /**
@@ -122,8 +115,8 @@ export function listTasks(db: AppDatabase, filter: ListTasksFilter = {}): Task[]
  * columns are always NULL on a first placement, so the reset only bites on
  * re-placement.
  */
-export function setPlacement(db: AppDatabase, taskId: string, agentId: string): Task {
-  const task = requireTask(db, taskId);
+export function setPlacement(storage: Storage, taskId: string, agentId: string): TaskRow {
+  const task = requireTask(storage, taskId);
   if (task.agentId != null) {
     if (task.agentId === agentId) {
       return task; // idempotent: already pinned to this agent
@@ -134,23 +127,17 @@ export function setPlacement(db: AppDatabase, taskId: string, agentId: string): 
       "TASK_ALREADY_PLACED",
     );
   }
-  return db
-    .update(tasks)
-    .set({ agentId, assignedAt: Date.now(), seededAt: null, currentThreadId: null, updatedAt: Date.now() })
-    .where(eq(tasks.id, taskId))
-    .returning()
-    .get();
+  storage.tasks.setPlacementOnce(taskId, agentId, Date.now());
+  return requireTask(storage, taskId);
 }
 
 /** Set the task's status (user/agent-marked; the host never auto-terminals, DP4). */
-export function setStatus(db: AppDatabase, taskId: string, status: string): Task {
-  requireTask(db, taskId);
-  return db
-    .update(tasks)
-    .set({ status, updatedAt: Date.now() })
-    .where(eq(tasks.id, taskId))
-    .returning()
-    .get();
+export function setStatus(storage: Storage, taskId: string, status: string): TaskRow {
+  const task = storage.tasks.setStatus(taskId, status, Date.now());
+  if (!task) {
+    throw new NotFoundError("task", taskId);
+  }
+  return task;
 }
 
 /**
@@ -159,12 +146,8 @@ export function setStatus(db: AppDatabase, taskId: string, status: string): Task
  * a task by deleting its acked history. Set once (an already-set timestamp is
  * kept); re-placement work clears it elsewhere, never here.
  */
-export function markSeeded(db: AppDatabase, taskId: string): void {
-  db
-    .update(tasks)
-    .set({ seededAt: Date.now() })
-    .where(and(eq(tasks.id, taskId), isNull(tasks.seededAt)))
-    .run();
+export function markSeeded(storage: Storage, taskId: string): void {
+  storage.tasks.markSeeded(taskId, Date.now());
 }
 
 /**
@@ -172,14 +155,12 @@ export function markSeeded(db: AppDatabase, taskId: string): void {
  * target). The orchestrator advances this when it opens a thread for a message
  * (a continue reuses it; a new conversation is a new task, OD7+OD9).
  */
-export function setCurrentThread(db: AppDatabase, taskId: string, threadId: string): Task {
-  requireTask(db, taskId);
-  return db
-    .update(tasks)
-    .set({ currentThreadId: threadId, updatedAt: Date.now() })
-    .where(eq(tasks.id, taskId))
-    .returning()
-    .get();
+export function setCurrentThread(storage: Storage, taskId: string, threadId: string): TaskRow {
+  const task = storage.tasks.setCurrentThread(taskId, threadId, Date.now());
+  if (!task) {
+    throw new NotFoundError("task", taskId);
+  }
+  return task;
 }
 
 /**
@@ -187,11 +168,6 @@ export function setCurrentThread(db: AppDatabase, taskId: string, threadId: stri
  * M5 writes this from `cron_state`). Used by the `/admin/tasks/:id/crons` list;
  * this module never writes the `crons` table.
  */
-export function listTaskCrons(db: AppDatabase, taskId: string) {
-  return db
-    .select()
-    .from(crons)
-    .where(eq(crons.taskId, taskId))
-    .orderBy(desc(crons.updatedAt))
-    .all();
+export function listTaskCrons(storage: Storage, taskId: string): CronRow[] {
+  return storage.crons.listByTask(taskId);
 }

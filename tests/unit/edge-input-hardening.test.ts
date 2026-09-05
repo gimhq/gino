@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 // Edge input hardening regressions:
@@ -29,6 +31,7 @@ const MAX_UPLOAD = 1024;
 
 let storeDir: string;
 let db: AppDatabase;
+let storage: Storage;
 let app: ReturnType<typeof createApp>;
 
 function makeApp(env: Record<string, string> = {}) {
@@ -50,6 +53,7 @@ function makeApp(env: Record<string, string> = {}) {
 beforeAll(() => {
   storeDir = mkdtempSync(join(tmpdir(), "gino-hardening-"));
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
   app = makeApp();
 });
 
@@ -75,8 +79,8 @@ async function registerAgent(): Promise<{ agentId: string; connectToken: string 
 }
 
 function placeTaskOn(agentId: string): string {
-  const task = createTask(db, { ownerId: OWNER, engine: "claude", model: "sonnet" });
-  setPlacement(db, task.id, agentId);
+  const task = createTask(storage, { ownerId: OWNER, engine: "claude", model: "sonnet" });
+  setPlacement(storage, task.id, agentId);
   return task.id;
 }
 
@@ -230,9 +234,9 @@ const VALID_DESCRIPTOR = {
 describe("HOST-M1M2-12 — attachments validated against the wire schema", () => {
   beforeAll(() => {
     // A routable channel: an owner with a permitted (granted) agent.
-    const { agent } = enrollAgent(db, { capabilities: { engines: ["claude"] } });
-    grantOwner(db, agent.id, OWNER);
-    registerChannel(db, { name: "hardening-chat", type: "http", ownerId: OWNER, config: { engine: "claude", model: "sonnet" } });
+    const { agent } = enrollAgent(storage, { capabilities: { engines: ["claude"] } });
+    grantOwner(storage, agent.id, OWNER);
+    registerChannel(storage, { name: "hardening-chat", type: "http", ownerId: OWNER, config: { engine: "claude", model: "sonnet" } });
   });
 
   function send(attachments: unknown) {

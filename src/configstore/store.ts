@@ -7,6 +7,7 @@
 // dedup). Reads are verified against the FULL `sha256` so a truncated/corrupt
 // blob never serves silently. The host NEVER touches an agent's filesystem —
 // this is purely the host-side blob index the byte channel reads from.
+import type { BlobStorePort } from "@/host/ports/storage";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
@@ -105,7 +106,7 @@ export function sanitizeAttachmentName(raw: string): string {
  * The content-addressed blob store rooted at a single directory (`GINO_STORE_DIR`).
  * Cheap to construct (it only holds the root path) — build one per request.
  */
-export class BlobStore {
+export class BlobStore implements BlobStorePort {
   constructor(readonly root: string) {}
 
   /** Store-relative ref for a `(name, sha256)` pair. */

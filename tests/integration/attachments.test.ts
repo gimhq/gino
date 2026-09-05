@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -8,6 +9,7 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 // M8/B6 — the `/agent/attachments` byte channel: ingest → store + descriptor;
@@ -37,10 +39,12 @@ const config = loadConfigStrict({
 });
 
 let db: AppDatabase;
+let storage: Storage;
 let app: ReturnType<typeof createApp>;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
@@ -69,8 +73,8 @@ async function register(capabilities: string[] = ["claude"]): Promise<{ agentId:
 
 /** Create a task and pin it to `agentId` (the placement the byte channel authorizes against). */
 function placeTaskOn(agentId: string): string {
-  const task = createTask(db, { ownerId: `owner-${agentId}`, engine: "claude", model: "sonnet" });
-  setPlacement(db, task.id, agentId);
+  const task = createTask(storage, { ownerId: `owner-${agentId}`, engine: "claude", model: "sonnet" });
+  setPlacement(storage, task.id, agentId);
   return task.id;
 }
 

@@ -1,11 +1,13 @@
 import type { AppDatabase } from "@/db";
 import type { HostEventMap } from "@/host";
+import type { Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, grantOwner } from "@/agents/registry";
 import { createDb } from "@/db";
 import { createHostEvents } from "@/host";
 import { ingestHttpFrame } from "@/protocol/inbound";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, placeTask, setPlacement } from "@/tasks";
 
 // HostEvents — the typed post-write notification seam (host-sdk-design §3.3):
@@ -17,9 +19,11 @@ import { createTask, placeTask, setPlacement } from "@/tasks";
 //   • dispatch emits `task.placed` once per fresh pin, never on the replay.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -44,9 +48,9 @@ function spyLogger(): { logger: Logger; warns: unknown[][] } {
 
 /** Enroll a fresh agent, create a task, and place it on that agent. */
 function placedAgentTask(): { agentId: string; taskId: string } {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
-  const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
+  const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
   return { agentId, taskId };
 }
 
@@ -105,7 +109,7 @@ describe("createHostEvents — emission sites", () => {
     events.on("thread.result", p => results.push(p));
     events.on("outbox.acked", p => acks.push(p));
 
-    ingestHttpFrame({ db, agentId, events }, JSON.stringify({
+    ingestHttpFrame({ storage, agentId, events }, JSON.stringify({
       type: "thread_message",
       outboxId: 1,
       taskId,
@@ -115,7 +119,7 @@ describe("createHostEvents — emission sites", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]).toMatchObject({ agentId, taskId, threadId: "thr-1", seq: 1, data: { seq: 1, kind: "assistant_text", content: "hello" } });
 
-    ingestHttpFrame({ db, agentId, events }, JSON.stringify({
+    ingestHttpFrame({ storage, agentId, events }, JSON.stringify({
       type: "thread_result",
       taskId,
       threadId: "thr-1",
@@ -124,20 +128,20 @@ describe("createHostEvents — emission sites", () => {
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ agentId, taskId, threadId: "thr-1", source: "chat", data: { status: "succeeded", final_seq: 1 } });
 
-    ingestHttpFrame({ db, agentId, events }, JSON.stringify({ type: "ack", id: 1 }));
+    ingestHttpFrame({ storage, agentId, events }, JSON.stringify({ type: "ack", id: 1 }));
     expect(acks).toEqual([{ agentId, id: 1, type: "ack" }]);
   });
 
   it("placeTask emits task.placed once — not on the already-placed replay", () => {
-    const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
-    grantOwner(db, agentId, "owner"); // a dedicated agent must be granted to the task's owner (OD13)
-    const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet" }).id;
+    const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
+    grantOwner(storage, agentId, "owner"); // a dedicated agent must be granted to the task's owner (OD13)
+    const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet" }).id;
     const events = createHostEvents();
     const placed: HostEventMap["task.placed"][] = [];
     events.on("task.placed", p => placed.push(p));
 
-    expect(placeTask(db, taskId, events).reason).toBe("placed");
-    expect(placeTask(db, taskId, events).reason).toBe("already-placed");
+    expect(placeTask(storage, taskId, events).reason).toBe("placed");
+    expect(placeTask(storage, taskId, events).reason).toBe("already-placed");
     expect(placed).toEqual([{ taskId, agentId }]);
   });
 });

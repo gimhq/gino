@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
@@ -8,10 +9,11 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
 import { adminTaskRoutes } from "@/edge/admin/tasks";
-import { createHostContext } from "@/host";
+import { createHost } from "@/host";
 import { getCron, writeThreadMessage, writeThreadResult } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, getTask, setPlacement } from "@/tasks/store";
 
 // M4 admin surface — close lifecycle (HOST-M4-01/M4-09), cron addressing
@@ -21,12 +23,14 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 const logger = createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" }));
 
 let db: AppDatabase;
-let host: ReturnType<typeof createHostContext>;
+let storage: Storage;
+let host: ReturnType<typeof createHost>;
 const attached: string[] = [];
 
 beforeEach(() => {
   db = createDb(":memory:");
-  host = createHostContext({ db, logger });
+  storage = sqliteStorage(db);
+  host = createHost({ storage, logger });
 });
 
 afterEach(() => {
@@ -36,12 +40,11 @@ afterEach(() => {
   db.close();
 });
 
-/** The admin task router with the test db injected (as app.ts does). */
+/** The admin task router with the test host injected (as app.ts does). */
 function taskApp() {
   const app = new Hono<AppEnv>();
   app.onError(errorHandler);
   app.use("*", (c, next) => {
-    c.set("db", db);
     c.set("host", host);
     return next();
   });
@@ -51,7 +54,7 @@ function taskApp() {
 
 /** Enroll an agent; optionally attach a fake socket so `sessions` reports it online. */
 function enrolledAgent(opts: { online?: boolean } = {}): string {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   if (opts.online) {
     host.sessions.attach(agentId, { send: () => {}, close: () => {} });
     attached.push(agentId);
@@ -60,9 +63,9 @@ function enrolledAgent(opts: { online?: boolean } = {}): string {
 }
 
 function placedTask(agentId: string) {
-  const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
-  setPlacement(db, task.id, agentId);
-  return getTask(db, task.id)!;
+  const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
+  setPlacement(storage, task.id, agentId);
+  return getTask(storage, task.id)!;
 }
 
 describe("POST /admin/tasks/:id/close", () => {
@@ -88,7 +91,7 @@ describe("POST /admin/tasks/:id/close", () => {
     expect(upsert).toBeDefined();
     expect((upsert!.dataJson as { status?: string }).status).toBe("closed");
 
-    expect(getTask(db, task.id)?.status).toBe("closed");
+    expect(getTask(storage, task.id)?.status).toBe("closed");
   });
 
   it("closes a task on an OFFLINE agent: no interrupt, durable task_upsert only (HOST-M4-03)", async () => {
@@ -107,7 +110,7 @@ describe("POST /admin/tasks/:id/close", () => {
   });
 
   it("closes a NEVER-PLACED task: pure status write, no 409, no frames (HOST-M4-09)", async () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     expect(task.agentId ?? null).toBeNull();
 
     const res = await taskApp().request(`/${task.id}/close`, { method: "POST" });
@@ -116,7 +119,7 @@ describe("POST /admin/tasks/:id/close", () => {
     expect(body.data.task.status).toBe("closed");
     expect(body.data.outboxId).toBeNull();
 
-    expect(getTask(db, task.id)?.status).toBe("closed");
+    expect(getTask(storage, task.id)?.status).toBe("closed");
     expect(db.select().from(outbox).all()).toHaveLength(0);
   });
 });
@@ -164,7 +167,7 @@ describe("cron routes — addressing (HOST-M4-11) + first-cron seeding (HOST-M4-
     expect(seed).toBeDefined();
     expect(cron).toBeDefined();
     expect(seed!.id).toBeLessThan(cron!.id); // task exists agent-side before the cron FK needs it
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
   });
 
   it("POST without a prompt is rejected (the agent requires it — HOST-M4-10)", async () => {
@@ -214,7 +217,7 @@ describe("cron routes — addressing (HOST-M4-11) + first-cron seeding (HOST-M4-
     const upserts = db.select().from(outbox).all().filter(r => r.type === "cron_upsert");
     expect(upserts).toHaveLength(2);
     expect((upserts[1]!.dataJson as { prompt?: string }).prompt).toBe("daily digest");
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
   });
 
   it("PUT 404s for a cron belonging to another task", async () => {
@@ -249,9 +252,9 @@ describe("GET /admin/tasks/:id — bounded detail view (HOST-M1M2-16)", () => {
   /** Store `count` transcript events on a thread of the given task. */
   function seedThread(taskId: string, threadId: string, count: number) {
     for (let seq = 1; seq <= count; seq += 1) {
-      writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `msg ${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId, data: { seq, kind: "assistant_text", content: `msg ${seq}` } });
     }
-    writeThreadResult(db, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: count } });
+    writeThreadResult(storage, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: count } });
   }
 
   it("returns thread SUMMARIES (run + counts + last seq), not transcripts", async () => {

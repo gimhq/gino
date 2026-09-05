@@ -6,10 +6,7 @@
 // `config_artifacts` registry (a skill/instruction blob). The caller then reads
 // it through `BlobStore.readVerified`, so a corrupt/mismatched blob never
 // serves. The host only RESOLVES + SERVES bytes — it never touches the agent FS.
-import type { AppDatabase } from "@/db";
-import type { Attachment } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { attachments } from "@/db/schema";
+import type { AttachmentRow, Storage } from "@/host/ports/storage";
 import { getArtifactBySha } from "./artifacts";
 
 /**
@@ -17,8 +14,8 @@ import { getArtifactBySha } from "./artifacts";
  * Carries `task_id`, so the edge can authorize the read by task placement before
  * serving bytes (the IDOR fix — see `src/edge/agent.ts`).
  */
-export function getAttachmentById(db: AppDatabase, id: string): Attachment | undefined {
-  return db.select().from(attachments).where(eq(attachments.id, id)).get();
+export function getAttachmentById(storage: Storage, id: string): AttachmentRow | undefined {
+  return storage.attachments.getById(id);
 }
 
 /**
@@ -27,8 +24,8 @@ export function getAttachmentById(db: AppDatabase, id: string): Attachment | und
  * placement across ALL of them — an agent placed on ANY referencing task may read
  * those bytes.
  */
-export function attachmentsBySha(db: AppDatabase, sha256: string): Attachment[] {
-  return db.select().from(attachments).where(eq(attachments.sha256, sha256)).all();
+export function attachmentsBySha(storage: Storage, sha256: string): AttachmentRow[] {
+  return storage.attachments.listBySha(sha256);
 }
 
 /** A located blob ready to read+verify+serve. */
@@ -52,20 +49,20 @@ export interface BlobSelector {
  * `id` resolves an `attachments` descriptor; `sha256` resolves an attachment by
  * content, else a registered artifact. Returns `null` when nothing matches.
  */
-export function resolveBlobRef(db: AppDatabase, sel: BlobSelector): ResolvedBlob | null {
+export function resolveBlobRef(storage: Storage, sel: BlobSelector): ResolvedBlob | null {
   if (sel.id) {
-    const att = db.select().from(attachments).where(eq(attachments.id, sel.id)).get();
+    const att = storage.attachments.getById(sel.id);
     if (att) {
       return { ref: att.ref, sha256: att.sha256, name: att.name, contentType: att.contentType, size: att.size };
     }
     return null;
   }
   if (sel.sha256) {
-    const att = db.select().from(attachments).where(eq(attachments.sha256, sel.sha256)).get();
+    const att = storage.attachments.listBySha(sel.sha256)[0];
     if (att) {
       return { ref: att.ref, sha256: att.sha256, name: att.name, contentType: att.contentType, size: att.size };
     }
-    const artifact = getArtifactBySha(db, sel.sha256);
+    const artifact = getArtifactBySha(storage, sel.sha256);
     if (artifact) {
       return {
         ref: artifact.storeRef,

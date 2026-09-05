@@ -13,6 +13,7 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { getTranscript } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 const REGISTER_TOKEN = "reg-secret-output";
@@ -27,6 +28,7 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let storage: ReturnType<typeof sqliteStorage>;
 let app: ReturnType<typeof createApp>;
 let agentId: string;
 let connectToken: string;
@@ -34,6 +36,7 @@ let taskId: string;
 
 beforeAll(async () => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 
   const res = await app.fetch(new Request("http://local/api/agent/register", {
@@ -44,8 +47,8 @@ beforeAll(async () => {
   expect(res.status).toBe(200);
   ({ agentId, connectToken } = await res.json() as { agentId: string; connectToken: string });
 
-  taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
+  taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
 });
 
 afterAll(() => {
@@ -71,7 +74,7 @@ describe("POST /agent/output — 400 vs 5xx vs poison-ack (HOST-M1M2-09 / HOST-M
     const res = await postOutput(JSON.stringify({ type: "thread_message", outboxId: 1, taskId, threadId: "thr-http", data: { seq: 1, kind: "assistant_text", content: "hi" } }));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ type: "ack", id: 1 });
-    expect(getTranscript(db, "thr-http")).toHaveLength(1);
+    expect(getTranscript(storage, "thr-http")).toHaveLength(1);
   });
 
   it("maps an UNDECODABLE body to 400 BAD_FRAME (do not retry)", async () => {

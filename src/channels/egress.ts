@@ -25,13 +25,10 @@
 // re-sorted before delivery (HOST-M5M6-10).
 
 import type { DnsResolver, FetchLike } from "./webhooks";
-import type { AppDatabase } from "@/db";
-import type { Channel, Message } from "@/db/schema";
+import type { ChannelRow, MessageRow, Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
-import { and, eq, gt } from "drizzle-orm";
-import { channelBindings, channelCursors, messages, tasks } from "@/db/schema";
 import { NotFoundError } from "@/shared/lib/errors";
-import { listWebhooks } from "./registry";
+import { listWebhooks, requireChannels } from "./registry";
 import { deliverWebhook } from "./webhooks";
 
 /** Batch bounds (HOST-M5M6-08): rows scanned per task per poll — default when the caller omits `limit`, hard cap otherwise. */
@@ -47,21 +44,16 @@ export const MAX_POLL_LIMIT = 1000;
  * all-bound fan-out paths trivially satisfy the binding check; this exists to stop
  * the explicit-taskId shortcut from bypassing the channel scoping.
  */
-export function isTaskOnChannel(db: AppDatabase, channel: Channel, taskId: string): boolean {
-  const binding = db
-    .select({ taskId: channelBindings.taskId })
-    .from(channelBindings)
-    .where(and(eq(channelBindings.channelId, channel.id), eq(channelBindings.taskId, taskId)))
-    .get();
-  if (binding) {
+export function isTaskOnChannel(storage: Storage, channel: ChannelRow, taskId: string): boolean {
+  if (requireChannels(storage).isTaskBound(channel.id, taskId)) {
     return true;
   }
-  const task = db.select({ ownerId: tasks.ownerId }).from(tasks).where(eq(tasks.id, taskId)).get();
+  const task = storage.tasks.get(taskId);
   return task != null && task.ownerId === channel.ownerId;
 }
 
 /** A channel's optional kind filter (`msg_filter.kinds`). Absent/empty → deliver ALL kinds (OD10). */
-function allowedKinds(channel: Channel): Set<string> | null {
+function allowedKinds(channel: ChannelRow): Set<string> | null {
   const filter = channel.msgFilter as { kinds?: unknown } | null | undefined;
   if (filter && Array.isArray(filter.kinds) && filter.kinds.length > 0) {
     return new Set(filter.kinds.filter((k): k is string => typeof k === "string"));
@@ -70,32 +62,18 @@ function allowedKinds(channel: Channel): Set<string> | null {
 }
 
 /** Read the per-(channel, task) cursor. `0` = nothing confirmed yet (`messages.id` starts at 1). */
-export function readCursor(db: AppDatabase, channelId: string, taskId: string): number {
-  const row = db
-    .select({ lastSeq: channelCursors.lastSeq })
-    .from(channelCursors)
-    .where(and(eq(channelCursors.channelId, channelId), eq(channelCursors.taskId, taskId)))
-    .get();
-  return row?.lastSeq ?? 0;
+export function readCursor(storage: Storage, channelId: string, taskId: string): number {
+  return requireChannels(storage).readCursor(channelId, taskId);
 }
 
-/** Advance the cursor to a new high-water mark (forward only; callers pass `cursor >= stored`). */
-export function advanceCursor(db: AppDatabase, channelId: string, taskId: string, lastSeq: number): void {
-  db
-    .insert(channelCursors)
-    .values({ channelId, taskId, lastSeq })
-    .onConflictDoUpdate({
-      target: [channelCursors.channelId, channelCursors.taskId],
-      set: { lastSeq, updatedAt: Date.now() },
-    })
-    .run();
+/** Advance the cursor to a new high-water mark — forward only (the port's monotonic advance; a stale position is a no-op). */
+export function advanceCursor(storage: Storage, channelId: string, taskId: string, lastSeq: number): void {
+  requireChannels(storage).advanceCursor(channelId, taskId, lastSeq, Date.now());
 }
 
 /** Confirm receipt up to `position`: advance the stored cursor, forward-only (a stale/duplicate ack is a no-op). */
-export function ackCursor(db: AppDatabase, channelId: string, taskId: string, position: number): void {
-  if (position > readCursor(db, channelId, taskId)) {
-    advanceCursor(db, channelId, taskId, position);
-  }
+export function ackCursor(storage: Storage, channelId: string, taskId: string, position: number): void {
+  advanceCursor(storage, channelId, taskId, position);
 }
 
 export interface TailOptions {
@@ -107,7 +85,7 @@ export interface TailOptions {
 
 export interface TailResult {
   /** Messages to deliver (kind-filtered), ordered by `(thread_id, seq)`. */
-  messages: Message[];
+  messages: MessageRow[];
   /** The position after this batch (high-water `messages.id` scanned) — ack this to confirm receipt. */
   cursor: number;
   /** Rows scanned before kind-filtering (the cursor advances past filtered-out rows too). */
@@ -121,26 +99,20 @@ export interface TailResult {
  * the filter — so a filtered kind is never re-scanned on the next poll. The
  * stored cursor is NOT touched here (reads are non-destructive).
  */
-export function tailTask(db: AppDatabase, channel: Channel, taskId: string, opts: TailOptions = {}): TailResult {
+export function tailTask(storage: Storage, channel: ChannelRow, taskId: string, opts: TailOptions = {}): TailResult {
   // Defense in depth (IDOR): refuse to tail a task this channel may not read,
   // regardless of caller. A not-authorized taskId surfaces as 404 (not an empty
   // delivery) so it cannot be used to probe transcript existence cross-tenant.
-  if (!isTaskOnChannel(db, channel, taskId)) {
+  if (!isTaskOnChannel(storage, channel, taskId)) {
     throw new NotFoundError("task", taskId);
   }
-  const from = opts.after ?? readCursor(db, channel.id, taskId);
+  const from = opts.after ?? readCursor(storage, channel.id, taskId);
   const limit = Math.min(Math.max(opts.limit ?? DEFAULT_POLL_LIMIT, 1), MAX_POLL_LIMIT);
 
   // The window MUST be the lowest `limit` ids past the cursor (ORDER BY id):
   // selecting it in delivery order could include a high-id row while skipping a
   // lower-id one, and acking the batch would then lose the skipped row.
-  const rows = db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.taskId, taskId), gt(messages.id, from)))
-    .orderBy(messages.id)
-    .limit(limit)
-    .all();
+  const rows = storage.transcript.readAfterId(taskId, from, limit);
 
   const filter = allowedKinds(channel);
   const out = rows.filter(row => filter == null || filter.has(row.kind));
@@ -158,12 +130,8 @@ export interface BoundTask {
 }
 
 /** Every conversation/task bound to a channel (egress fans out across all of them). */
-export function listBoundTasks(db: AppDatabase, channelId: string): BoundTask[] {
-  return db
-    .select({ taskId: channelBindings.taskId, conversationRef: channelBindings.conversationRef })
-    .from(channelBindings)
-    .where(eq(channelBindings.channelId, channelId))
-    .all();
+export function listBoundTasks(storage: Storage, channelId: string): BoundTask[] {
+  return requireChannels(storage).listBindings(channelId).map(b => ({ taskId: b.taskId, conversationRef: b.conversationRef }));
 }
 
 export interface PollOptions {
@@ -182,7 +150,7 @@ export interface PollOptions {
 export interface PollDelivery {
   taskId: string;
   conversationRef?: string;
-  messages: Message[];
+  messages: MessageRow[];
   /** The cursor after this delivery — pass it back as `ack` to confirm receipt. */
   cursor: number;
 }
@@ -199,36 +167,32 @@ export interface PollDelivery {
  * per task via scoped polls) — a larger ack could skip a truncated task's
  * still-undelivered rows. Empty deliveries are dropped from the result.
  */
-export function pollChannel(db: AppDatabase, channel: Channel, opts: PollOptions = {}): PollDelivery[] {
+export function pollChannel(storage: Storage, channel: ChannelRow, opts: PollOptions = {}): PollDelivery[] {
   let targets: BoundTask[];
   if (opts.taskId != null) {
     // Authorize the explicit taskId against this channel BEFORE tailing — the
     // caller-supplied id must be bound to the channel or share its owner, else 404
     // (prevents reading an arbitrary task's transcript via the shortcut). tailTask
     // re-checks as defense in depth.
-    if (!isTaskOnChannel(db, channel, opts.taskId)) {
+    if (!isTaskOnChannel(storage, channel, opts.taskId)) {
       throw new NotFoundError("task", opts.taskId);
     }
     targets = [{ taskId: opts.taskId, conversationRef: "" }];
   }
   else if (opts.conversationRef != null) {
-    const binding = db
-      .select({ taskId: channelBindings.taskId, conversationRef: channelBindings.conversationRef })
-      .from(channelBindings)
-      .where(and(eq(channelBindings.channelId, channel.id), eq(channelBindings.conversationRef, opts.conversationRef)))
-      .get();
-    targets = binding ? [binding] : [];
+    const binding = requireChannels(storage).getBinding(channel.id, opts.conversationRef);
+    targets = binding ? [{ taskId: binding.taskId, conversationRef: binding.conversationRef }] : [];
   }
   else {
-    targets = listBoundTasks(db, channel.id);
+    targets = listBoundTasks(storage, channel.id);
   }
 
   const deliveries: PollDelivery[] = [];
   for (const target of targets) {
     if (opts.ack != null) {
-      ackCursor(db, channel.id, target.taskId, opts.ack);
+      ackCursor(storage, channel.id, target.taskId, opts.ack);
     }
-    const tail = tailTask(db, channel, target.taskId, {
+    const tail = tailTask(storage, channel, target.taskId, {
       ...(opts.after != null ? { after: opts.after } : {}),
       ...(opts.limit != null ? { limit: opts.limit } : {}),
     });
@@ -291,15 +255,15 @@ export interface WebhookPushOptions {
  * webhooks is a no-op.
  */
 export async function pushChannelWebhooks(
-  db: AppDatabase,
-  channel: Channel,
+  storage: Storage,
+  channel: ChannelRow,
   opts: WebhookPushOptions = {},
 ): Promise<WebhookPushResult[]> {
   const webhooks = listWebhooks(channel);
   if (webhooks.length === 0) {
     return []; // no outbound endpoints → nothing to push (the cursor is untouched)
   }
-  const deliveries = pollChannel(db, channel, opts.limit != null ? { limit: opts.limit } : {});
+  const deliveries = pollChannel(storage, channel, opts.limit != null ? { limit: opts.limit } : {});
 
   const results: WebhookPushResult[] = [];
   for (const delivery of deliveries) {
@@ -326,7 +290,7 @@ export async function pushChannelWebhooks(
     const attemptKey = `${channel.id}:${delivery.taskId}`;
     if (ok) {
       // Cursor-driven: advance past this batch only once it is durably delivered.
-      ackCursor(db, channel.id, delivery.taskId, delivery.cursor);
+      ackCursor(storage, channel.id, delivery.taskId, delivery.cursor);
       opts.attempts?.delete(attemptKey);
     }
     else if (opts.attempts) {
@@ -340,7 +304,7 @@ export async function pushChannelWebhooks(
           { channelId: channel.id, taskId: delivery.taskId, cursor: delivery.cursor, failures, dropped: delivery.messages.length },
           "webhook egress: batch dead-lettered after bounded attempts — cursor advanced past it",
         );
-        ackCursor(db, channel.id, delivery.taskId, delivery.cursor);
+        ackCursor(storage, channel.id, delivery.taskId, delivery.cursor);
         opts.attempts.delete(attemptKey);
       }
       else {
