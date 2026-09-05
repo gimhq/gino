@@ -1,6 +1,7 @@
 import type { DnsResolver, FetchLike, WebhookAttemptState } from "@/channels";
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
+import type { Storage } from "@/host/ports/storage";
 import type { ThreadMessageData } from "@/protocol/frames";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
@@ -20,6 +21,7 @@ import {
 import { createDb } from "@/db";
 import { messages } from "@/db/schema";
 import { writeThreadMessage } from "@/msgstore";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask } from "@/tasks";
 
 // M6 egress (OD10) — tail the M5 store by a per-(channel, task) cursor: deliver
@@ -31,13 +33,14 @@ const OWNER = "owner-egress";
 const THREAD = "thread-egress-1";
 
 let db: AppDatabase;
+let storage: Storage;
 
 type Kind = ThreadMessageData["kind"];
 
 /** Seed N transcript events on a task's thread (seq 1..N) from a kind list. */
 function seed(taskId: string, kinds: Kind[]): void {
   kinds.forEach((kind, i) => {
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: i + 1, kind, content: `${kind}-${i + 1}` } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: i + 1, kind, content: `${kind}-${i + 1}` } });
   });
 }
 
@@ -51,6 +54,7 @@ function channel(filter?: Record<string, unknown>, type = "http"): Channel {
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -76,7 +80,7 @@ describe("M6 egress — cursor tail", () => {
     expect(cursor).toBeGreaterThan(0);
 
     // A new message → only the new one is delivered.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 5, kind: "assistant_text", content: "more" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 5, kind: "assistant_text", content: "more" } });
     const third = pollChannel(db, ch, { taskId });
     expect(third[0]!.messages.map(m => m.seq)).toEqual([5]);
 
@@ -175,7 +179,7 @@ describe("M6 egress — cursor stability (HOST-M5M6-03)", () => {
 
     // A new message gets a NEW id past the cursor — it is delivered, exactly once
     // acked, with no replay of the survivors and no silent skip.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 6, kind: "assistant_text", content: "post-vacuum" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 6, kind: "assistant_text", content: "post-vacuum" } });
     const next = pollChannel(db, ch, { taskId });
     expect(next).toHaveLength(1);
     expect(next[0]!.messages.map(m => m.seq)).toEqual([6]);
@@ -189,7 +193,7 @@ describe("M6 egress — seq-order delivery (HOST-M5M6-10)", () => {
     const ch = channel();
     // Reconnect replay: seq 3 and 1 are stored AFTER seq 5 (higher arrival ids).
     for (const seq of [2, 5, 3, 1, 4]) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
     const delivered = pollChannel(db, ch, { taskId });
     expect(delivered[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3, 4, 5]);
@@ -198,9 +202,9 @@ describe("M6 egress — seq-order delivery (HOST-M5M6-10)", () => {
   it("orders across threads by (thread, seq), not arrival", () => {
     const taskId = makeTask();
     const ch = channel();
-    writeThreadMessage(db, { taskId, threadId: "thr-b", data: { seq: 2, kind: "assistant_text", content: "b2" } });
-    writeThreadMessage(db, { taskId, threadId: "thr-a", data: { seq: 1, kind: "assistant_text", content: "a1" } });
-    writeThreadMessage(db, { taskId, threadId: "thr-b", data: { seq: 1, kind: "assistant_text", content: "b1" } });
+    writeThreadMessage(storage, { taskId, threadId: "thr-b", data: { seq: 2, kind: "assistant_text", content: "b2" } });
+    writeThreadMessage(storage, { taskId, threadId: "thr-a", data: { seq: 1, kind: "assistant_text", content: "a1" } });
+    writeThreadMessage(storage, { taskId, threadId: "thr-b", data: { seq: 1, kind: "assistant_text", content: "b1" } });
     const delivered = pollChannel(db, ch, { taskId });
     expect(delivered[0]!.messages.map(m => `${m.threadId}:${m.seq}`)).toEqual(["thr-a:1", "thr-b:1", "thr-b:2"]);
   });
@@ -210,7 +214,7 @@ describe("M6 egress — seq-order delivery (HOST-M5M6-10)", () => {
     const ch = channel();
     // seq 5 arrives first (store id 1), then seq 1..3 (store ids 2..4).
     for (const seq of [5, 1, 2, 3]) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
     // limit 2 → the window is the two OLDEST store positions (seq 5, then 1),
     // delivered sorted by seq; acking it must not skip seq 2..3.
@@ -227,7 +231,7 @@ describe("M6 egress — bounded reads (HOST-M5M6-08)", () => {
     const ch = channel();
     const total = MAX_POLL_LIMIT + 5;
     for (let seq = 1; seq <= total; seq++) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
 
     // No limit → a first-time poll (cursor 0) is still bounded, not the whole backlog.
@@ -313,7 +317,7 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
     expect(skipped).toBeGreaterThan(0);
 
     // A later message flows normally — head-of-line blocking is broken.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "after-poison" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "after-poison" } });
     const delivered = await push(async () => ({ status: 200 }));
     expect(delivered[0]!.ok).toBe(true);
     expect(delivered[0]!.delivered).toBe(1); // only the post-poison row, never the skipped one
@@ -342,7 +346,7 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
     expect(acked).toBeGreaterThan(0);
 
     // A NEW batch failing twice starts from a fresh budget (cursor moved).
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "next" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "next" } });
     await push(async () => ({ status: 500 }));
     await push(async () => ({ status: 500 }));
     expect(readCursor(db, ch.id, taskId)).toBe(acked); // not dead-lettered — 2 < maxAttempts

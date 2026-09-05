@@ -1,10 +1,12 @@
 import type { AppDatabase } from "@/db";
-import type { FrameSender } from "@/protocol/outbox";
+import type { Storage } from "@/host/ports/storage";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, grantOwner } from "@/agents/registry";
 import { getBinding, registerChannel, routeInbound } from "@/channels";
 import { createDb } from "@/db";
 import { messages } from "@/db/schema";
+import { sqliteStorage } from "@/store/sqlite";
 import { getTask } from "@/tasks";
 
 // M6 ingress (OD9/OD16) — route an inbound message: continue a known conversation
@@ -14,15 +16,16 @@ import { getTask } from "@/tasks";
 const OWNER = "owner-ingress";
 
 let db: AppDatabase;
+let storage: Storage;
 
-// Offline FrameSender — `sendTaskMessage` persists to the outbox without a live
+// Offline AgentTransport — `sendTaskMessage` persists to the outbox without a live
 // socket (delivery is replayed on connect), so ingress works with no WS.
-const sender: FrameSender = { isOnline: () => false, send: () => false };
+const sender: AgentTransport = { isOnline: () => false, send: () => false, closeAgent: () => false };
 
 /** A permitted agent for OWNER on engine `claude` (enrolled is a valid placement candidate). */
 function permittedAgent(): string {
-  const { agent } = enrollAgent(db, { capabilities: { engines: ["claude"] } });
-  grantOwner(db, agent.id, OWNER);
+  const { agent } = enrollAgent(storage, { capabilities: { engines: ["claude"] } });
+  grantOwner(storage, agent.id, OWNER);
   return agent.id;
 }
 
@@ -32,6 +35,7 @@ function chatChannel(owner = OWNER, config: Record<string, unknown> = { engine: 
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {

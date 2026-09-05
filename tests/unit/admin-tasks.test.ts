@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
@@ -12,6 +13,7 @@ import { createHostContext } from "@/host";
 import { getCron, writeThreadMessage, writeThreadResult } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, getTask, setPlacement } from "@/tasks/store";
 
 // M4 admin surface — close lifecycle (HOST-M4-01/M4-09), cron addressing
@@ -21,11 +23,13 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 const logger = createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" }));
 
 let db: AppDatabase;
+let storage: Storage;
 let host: ReturnType<typeof createHostContext>;
 const attached: string[] = [];
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
   host = createHostContext({ db, logger });
 });
 
@@ -51,7 +55,7 @@ function taskApp() {
 
 /** Enroll an agent; optionally attach a fake socket so `sessions` reports it online. */
 function enrolledAgent(opts: { online?: boolean } = {}): string {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   if (opts.online) {
     host.sessions.attach(agentId, { send: () => {}, close: () => {} });
     attached.push(agentId);
@@ -164,7 +168,7 @@ describe("cron routes — addressing (HOST-M4-11) + first-cron seeding (HOST-M4-
     expect(seed).toBeDefined();
     expect(cron).toBeDefined();
     expect(seed!.id).toBeLessThan(cron!.id); // task exists agent-side before the cron FK needs it
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
   });
 
   it("POST without a prompt is rejected (the agent requires it — HOST-M4-10)", async () => {
@@ -214,7 +218,7 @@ describe("cron routes — addressing (HOST-M4-11) + first-cron seeding (HOST-M4-
     const upserts = db.select().from(outbox).all().filter(r => r.type === "cron_upsert");
     expect(upserts).toHaveLength(2);
     expect((upserts[1]!.dataJson as { prompt?: string }).prompt).toBe("daily digest");
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
   });
 
   it("PUT 404s for a cron belonging to another task", async () => {
@@ -249,9 +253,9 @@ describe("GET /admin/tasks/:id — bounded detail view (HOST-M1M2-16)", () => {
   /** Store `count` transcript events on a thread of the given task. */
   function seedThread(taskId: string, threadId: string, count: number) {
     for (let seq = 1; seq <= count; seq += 1) {
-      writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `msg ${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId, data: { seq, kind: "assistant_text", content: `msg ${seq}` } });
     }
-    writeThreadResult(db, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: count } });
+    writeThreadResult(storage, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: count } });
   }
 
   it("returns thread SUMMARIES (run + counts + last seq), not transcripts", async () => {

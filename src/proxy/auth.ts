@@ -1,4 +1,3 @@
-import type { AppDatabase } from "@/db";
 // M7 — proxy credential authorization (H5). The engine authenticates to
 // `/llm/*` with its per-agent connect token (presented as `x-internal-token`,
 // or `x-api-key: sk-ant-proxy-<token>`, or `Authorization: Bearer <token>`),
@@ -9,16 +8,16 @@ import type { AppDatabase } from "@/db";
 // cannot verify a temp key, so it must never gate a path that injects the
 // host's own credentials).
 //
-// Self-contained: a DIRECT read-only query on the `agents` table (no dependency
-// on the M3 registry, which isn't built yet). Constant-time comparison for the
-// static key; the connect token is matched by its stored sha-256 hash.
-import { and, eq, ne } from "drizzle-orm";
-import { agents } from "@/db/schema";
+// Self-contained: a DIRECT read-only lookup through the `Storage` port
+// (`agents.getByConnectTokenHash`, no dependency on the M3 registry).
+// Constant-time comparison for the static key; the connect token is matched by
+// its stored sha-256 hash.
+import type { Storage } from "@/host/ports/storage";
 import { hashToken, safeEqual } from "@/platform";
 import { extractProxyCredential, isAnthropicPassthroughPath, isAnthropicTempKey } from "./provider";
 
 export interface ProxyAuthOpts {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   readonly staticKey?: string | undefined;
 }
 
@@ -46,12 +45,5 @@ export function verifyProxyCredential(headers: Headers, opts: ProxyAuthOpts, pat
     return true;
 
   const hash = hashToken(cred);
-  const row = opts.db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(and(eq(agents.connectTokenHash, hash), ne(agents.status, "removed")))
-    .limit(1)
-    .get();
-
-  return row !== undefined;
+  return opts.storage.agents.getByConnectTokenHash(hash) !== undefined;
 }

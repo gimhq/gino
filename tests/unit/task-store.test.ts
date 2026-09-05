@@ -1,7 +1,9 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "@/agents/registry";
 import { createDb } from "@/db";
+import { sqliteStorage } from "@/store/sqlite";
 import {
   createTask,
   getTask,
@@ -17,9 +19,11 @@ import {
 // M4 store — host-authoritative task identity + placement (set-once).
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -28,7 +32,7 @@ afterEach(() => {
 
 /** Enroll a real agent so placement satisfies the `tasks.agent_id` FK. */
 function agentId(access = "dedicated"): string {
-  return enrollAgent(db, { access, capabilities: { engines: ["claude"] } }).agent.id;
+  return enrollAgent(storage, { access, capabilities: { engines: ["claude"] } }).agent.id;
 }
 
 describe("M4 store — createTask", () => {
@@ -112,7 +116,7 @@ describe("M4 store — setPlacement (set-once)", () => {
     markSeeded(db, task.id);
     setCurrentThread(db, task.id, "thread-old");
 
-    removeAgent(db, a); // orphans the task: agent_id → NULL
+    removeAgent(storage, a); // orphans the task: agent_id → NULL
     expect(getTask(db, task.id)?.agentId).toBeNull();
 
     // The new pin must not drag the removed agent's seed/thread state along.

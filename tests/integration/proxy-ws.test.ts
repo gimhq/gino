@@ -11,6 +11,7 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { agents } from "@/db/schema";
 import { llmRoutes } from "@/edge/llm";
+import { createHostContext } from "@/host/context";
 import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
@@ -78,6 +79,7 @@ let wsBase: string;
 beforeAll(() => {
   db = createDb(config.DB_PATH);
   const logger = createLogger(config);
+  const host = createHostContext({ db, logger });
 
   // Minimal app: per-request context + the /llm router with the FAKE upstream
   // factory injected. Production wires `llmRoutes()` (real WebSocket) — only the
@@ -85,6 +87,7 @@ beforeAll(() => {
   const api = new Hono<AppEnv>();
   api.use("*", (c, next) => {
     c.set("db", db);
+    c.set("host", host);
     c.set("config", config);
     c.set("logger", logger);
     return next();

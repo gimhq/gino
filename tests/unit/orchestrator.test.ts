@@ -1,6 +1,7 @@
 import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
-import type { FrameSender } from "@/protocol/outbox";
+import type { Storage } from "@/host/ports/storage";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
@@ -8,6 +9,7 @@ import { createDb } from "@/db";
 import { configArtifacts, outbox } from "@/db/schema";
 import { getCron } from "@/msgstore";
 import { gcOutbox, OUTBOX_RETENTION_MS, replayUnacked } from "@/protocol/outbox";
+import { sqliteStorage } from "@/store/sqlite";
 import {
   broadcastGlobalConfig,
   emitClose,
@@ -24,9 +26,10 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 // M4 orchestrator — the host→agent SOURCE: every command rides the M2 outbox.
 
 let db: AppDatabase;
+let storage: Storage;
 
 /** Records every frame pushed; reports the agent online so enqueue delivers. */
-class FakeSender implements FrameSender {
+class FakeSender implements AgentTransport {
   readonly online = new Set<string>();
   readonly sent: Array<{ agentId: string; frame: Record<string, unknown> }> = [];
   isOnline(agentId: string): boolean {
@@ -37,6 +40,10 @@ class FakeSender implements FrameSender {
     this.sent.push({ agentId, frame });
     return true;
   }
+
+  closeAgent(agentId: string): boolean {
+    return this.online.delete(agentId);
+  }
 }
 
 let sender: FakeSender;
@@ -44,8 +51,9 @@ let agentId: string;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
   sender = new FakeSender();
-  agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   sender.online.add(agentId);
   // Register the shas the config-entry tests declare (write-time validation, HOST-M8-07).
   db
@@ -150,7 +158,7 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
     // re-sends under the SAME id instead of forking the conversation.
     const task = placedTask();
     const currentAtSend: Array<string | null> = [];
-    const observingSender: FrameSender = {
+    const observingSender: AgentTransport = {
       isOnline: () => true,
       send: (_agent, frame) => {
         if (frame.type === "message") {
@@ -158,6 +166,7 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
         }
         return true;
       },
+      closeAgent: () => false,
     };
 
     const first = emitMessage(db, observingSender, task, { text: "hello" });
@@ -189,7 +198,7 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
     // Ack the whole history and GC far past the retention window: the seed
     // frame's outbox row is gone, but the durable flag keeps the task seeded.
     db.update(outbox).set({ ackedAt: Date.now() }).run();
-    expect(gcOutbox(db, { now: () => Date.now() + OUTBOX_RETENTION_MS + 1000 })).toBeGreaterThan(0);
+    expect(gcOutbox(storage, { now: () => Date.now() + OUTBOX_RETENTION_MS + 1000 })).toBeGreaterThan(0);
     expect(db.select().from(outbox).all()).toHaveLength(0);
     expect(hasSeededTask(db, task.id)).toBe(true);
 
@@ -206,11 +215,11 @@ describe("M4 orchestrator — orphaned task re-placement re-seeds (HOST-M4-05)",
     expect(first.taskUpsert).toBeDefined();
     const oldThread = first.threadId;
 
-    removeAgent(db, agentId); // orphans the task (agent_id → NULL)
+    removeAgent(storage, agentId); // orphans the task (agent_id → NULL)
     expect(getTask(db, task.id)?.agentId).toBeNull();
 
     // Re-place on a NEW agent: the pin resets the seed gate + thread binding.
-    const freshAgent = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+    const freshAgent = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
     sender.online.add(freshAgent);
     setPlacement(db, task.id, freshAgent);
     expect(hasSeededTask(db, task.id)).toBe(false);
@@ -251,11 +260,11 @@ describe("M4 orchestrator — cron commands + control", () => {
     const { cronId } = emitCronUpsert(db, sender, task, {
       data: { kind: "schedule", continuity: "isolated", schedule_type: "cron", schedule_value: "0 9 * * *", prompt: "daily digest" },
     });
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
 
     // A later upsert with a new prompt overwrites it.
     emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated", prompt: "weekly digest" } });
-    expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("weekly digest");
   });
 
   it("first cron on a never-seeded task seeds task_upsert before the command (HOST-M4-02)", () => {
@@ -310,16 +319,16 @@ describe("M4 orchestrator — cron commands + control", () => {
     // Reconnect replay pushes nothing for the interrupt.
     const replaySender = new FakeSender();
     replaySender.online.add(agentId);
-    replayUnacked(db, replaySender, agentId);
+    replayUnacked(storage, replaySender, agentId);
     expect(replaySender.sent.filter(s => s.frame.type === "interrupt")).toHaveLength(0);
   });
 });
 
 describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", () => {
   it("pushes config_update{entries, version} to online agents, per their engine", () => {
-    const codexId = enrollAgent(db, { capabilities: { engines: ["codex"] } }).agent.id;
+    const codexId = enrollAgent(storage, { capabilities: { engines: ["codex"] } }).agent.id;
     sender.online.add(codexId);
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
       ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
     ]);
@@ -338,9 +347,9 @@ describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", 
   });
 
   it("a multi-engine agent receives the UNION of its engines' targets (HOST-M8-03)", () => {
-    const multiId = enrollAgent(db, { capabilities: { engines: ["claude", "codex"] } }).agent.id;
+    const multiId = enrollAgent(storage, { capabilities: { engines: ["claude", "codex"] } }).agent.id;
     sender.online.add(multiId);
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
       ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
     ]);
@@ -354,8 +363,8 @@ describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", 
   });
 
   it("skips offline agents (they converge on the next versioned config pull)", () => {
-    enrollAgent(db, { capabilities: { engines: ["claude"] } }); // never marked online
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
+    enrollAgent(storage, { capabilities: { engines: ["claude"] } }); // never marked online
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
 
     const rows = broadcastGlobalConfig(db, sender);
     expect(rows.map(r => r.agentId)).toEqual([agentId]);

@@ -15,10 +15,12 @@
 //   • None permitted → `pending-assignment` (surfaced in /admin/tasks); a
 //     launcher/admin grants or starts one later (deferred phase).
 import type { AppDatabase } from "@/db";
-import type { Agent, Task } from "@/db/schema";
+import type { Task } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
+import type { AgentRow } from "@/host/ports/storage";
 import { getCapacity, isOwnerPermitted, listAgents } from "@/agents/registry";
 import { AppError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 import { requireTask, setPlacement, setStatus } from "./store";
 
 /** A task placed by dispatch becomes `active`; pin + status flip in one step. */
@@ -63,7 +65,7 @@ export interface DispatchResult {
 
 /** A scored placement candidate (lower sort key = preferred). */
 interface Candidate {
-  agent: Agent;
+  agent: AgentRow;
   /** 0 = dedicated (the owner's own agent), 1 = public (shared). */
   tier: number;
   /** 0 = has spare capacity now, 1 = at/over capacity (back-pressure within). */
@@ -81,18 +83,20 @@ interface Candidate {
  * spare-capacity, then least-loaded, then online, then stable by `created_at`.
  */
 function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
+  // P1 transitional — removed when tasks moves to ports
+  const storage = sqliteStorage(db);
   const candidates: Candidate[] = [];
-  for (const agent of listAgents(db)) {
+  for (const agent of listAgents(storage)) {
     if (agent.status === "removed") {
       continue;
     }
     if (!agent.capabilities.engines.includes(task.engine)) {
       continue; // an agent must hold the task's engine capability (§3)
     }
-    if (!isOwnerPermitted(db, agent.id, task.ownerId)) {
+    if (!isOwnerPermitted(storage, agent.id, task.ownerId)) {
       continue;
     }
-    const capacity = getCapacity(db, agent.id);
+    const capacity = getCapacity(storage, agent.id);
     candidates.push({
       agent,
       tier: agent.access === "dedicated" ? 0 : 1,
@@ -156,14 +160,16 @@ export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: stri
     // NOTHING — a retried assign must not flip a closed task back to `active`.
     return { taskId, placed: true, agentId, status: task.status, reason: "already-placed" };
   }
-  const agent = listAgents(db).find(a => a.id === agentId);
+  // P1 transitional — removed when tasks moves to ports
+  const storage = sqliteStorage(db);
+  const agent = listAgents(storage).find(a => a.id === agentId);
   if (!agent || agent.status === "removed") {
     throw new DispatchError(`agent ${agentId} is not available for placement`, "AGENT_UNAVAILABLE");
   }
   if (!agent.capabilities.engines.includes(task.engine)) {
     throw new DispatchError(`agent ${agentId} does not support engine '${task.engine}'`, "ENGINE_MISMATCH");
   }
-  if (!isOwnerPermitted(db, agentId, task.ownerId)) {
+  if (!isOwnerPermitted(storage, agentId, task.ownerId)) {
     throw new DispatchError(`owner ${task.ownerId} is not permitted on agent ${agentId}`, "NOT_PERMITTED");
   }
 

@@ -54,6 +54,14 @@ describe("createHostContext — isolation", () => {
     expect(host.ids.ulid()).toHaveLength(26);
     db.close();
   });
+
+  it("exposes the Storage port; `store` is its blob store", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    expect(host.storage).toBeDefined();
+    expect(host.store).toBe(host.storage.blobs);
+    db.close();
+  });
 });
 
 describe("createHostContext — metrics sink", () => {
@@ -63,7 +71,7 @@ describe("createHostContext — metrics sink", () => {
     const db = createDb(":memory:");
     const host = createHostContext({ db, logger });
     expect(() => host.metrics.counterAdd("x", "y")).not.toThrow();
-    expect(() => ingestHttpFrame({ db, agentId: "a", metrics: host.metrics }, poison)).not.toThrow();
+    expect(() => ingestHttpFrame({ storage: host.storage, agentId: "a", metrics: host.metrics }, poison)).not.toThrow();
     db.close();
   });
 
@@ -74,7 +82,7 @@ describe("createHostContext — metrics sink", () => {
     const host = createHostContext({ db, logger, metrics });
     expect(host.metrics).toBe(metrics);
     // A thread_message without a threadId is the `missing_ids` poison path — no enrollment needed.
-    ingestHttpFrame({ db, agentId: "a", metrics: host.metrics }, poison);
+    ingestHttpFrame({ storage: host.storage, agentId: "a", metrics: host.metrics }, poison);
     expect(calls).toEqual([
       { name: "inbound_poison_frames_total", value: 1, labels: { type: "thread_message", reason: "missing_ids" } },
     ]);
