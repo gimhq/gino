@@ -18,8 +18,9 @@
 // agent-side (the host does not generate those ids).
 import type { AppDatabase } from "@/db";
 import type { Outbox, Task } from "@/db/schema";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { AttachmentDescriptor, ConfigEntry, CronUpsertData } from "@/protocol/frames";
-import type { EnqueuedOutbox, FrameSender } from "@/protocol/outbox";
+import type { EnqueuedOutbox } from "@/protocol/outbox";
 import { eq } from "drizzle-orm";
 import { listAgents } from "@/agents/registry";
 import { getGlobalConfigVersion, GLOBAL_SCOPE, resolveEntriesForEngine, resolveEntriesForEngines } from "@/configstore";
@@ -69,7 +70,7 @@ export function hasSeededTask(db: AppDatabase, taskId: string): boolean {
  */
 export function emitTaskUpsert(
   db: AppDatabase,
-  sender: FrameSender,
+  sender: AgentTransport,
   task: Task,
   opts: { entries?: ConfigEntry[] } = {},
 ): Outbox {
@@ -127,7 +128,7 @@ export interface MessageResult {
  * cursor; unacked rows are simply replayed on reconnect (at-least-once, the
  * agent dedupes by `msgId`).
  */
-export function emitMessage(db: AppDatabase, sender: FrameSender, task: Task, input: MessageInput): MessageResult {
+export function emitMessage(db: AppDatabase, sender: AgentTransport, task: Task, input: MessageInput): MessageResult {
   const agentId = requirePlacement(task);
 
   let threadId = task.currentThreadId ?? null;
@@ -169,7 +170,7 @@ export interface SendMessageResult extends MessageResult {
  */
 export function sendTaskMessage(
   db: AppDatabase,
-  sender: FrameSender,
+  sender: AgentTransport,
   task: Task,
   input: MessageInput,
   opts: { entries?: ConfigEntry[] } = {},
@@ -202,7 +203,7 @@ export interface CronUpsertResult {
  * the first cron SEEDS a never-seeded task (`task_upsert` before the command)
  * so the agent has the task row the cron FK-references (HOST-M4-02).
  */
-export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task, input: CronUpsertInput): CronUpsertResult {
+export function emitCronUpsert(db: AppDatabase, sender: AgentTransport, task: Task, input: CronUpsertInput): CronUpsertResult {
   const agentId = requirePlacement(task);
   if (!hasSeededTask(db, task.id)) {
     emitTaskUpsert(db, sender, task);
@@ -220,7 +221,7 @@ export function emitCronUpsert(db: AppDatabase, sender: FrameSender, task: Task,
 }
 
 /** Emit a `cron_delete` COMMAND — remove a trigger from the agent (OD14). */
-export function emitCronDelete(db: AppDatabase, sender: FrameSender, task: Task, cronId: string): Outbox {
+export function emitCronDelete(db: AppDatabase, sender: AgentTransport, task: Task, cronId: string): Outbox {
   const agentId = requirePlacement(task);
   return enqueue(db, sender, { agentId, type: "cron_delete", taskId: task.id, cronId });
 }
@@ -233,7 +234,7 @@ export function emitCronDelete(db: AppDatabase, sender: FrameSender, task: Task,
  * (409 otherwise) and is never replayed on reconnect — a stale cancel must not
  * fire against an arbitrary future turn (HOST-M4-03).
  */
-export function emitInterrupt(db: AppDatabase, sender: FrameSender, task: Task): Outbox {
+export function emitInterrupt(db: AppDatabase, sender: AgentTransport, task: Task): Outbox {
   const agentId = requirePlacement(task);
   if (!sender.isOnline(agentId)) {
     throw new AppError(
@@ -250,13 +251,13 @@ export function emitInterrupt(db: AppDatabase, sender: FrameSender, task: Task):
  * used for per-task close (that is a task-scoped `interrupt` +
  * `task_upsert{status:"closed"}`); reserve this for genuine runner shutdown.
  */
-export function emitClose(db: AppDatabase, sender: FrameSender, task: Task): Outbox {
+export function emitClose(db: AppDatabase, sender: AgentTransport, task: Task): Outbox {
   const agentId = requirePlacement(task);
   return enqueue(db, sender, { agentId, type: "close", taskId: task.id });
 }
 
 /** Emit a `config_update` — live config overlay for the task (opaque keys). */
-export function emitConfigUpdate(db: AppDatabase, sender: FrameSender, task: Task, data: Record<string, unknown> = {}): Outbox {
+export function emitConfigUpdate(db: AppDatabase, sender: AgentTransport, task: Task, data: Record<string, unknown> = {}): Outbox {
   const agentId = requirePlacement(task);
   return enqueue(db, sender, { agentId, type: "config_update", taskId: task.id, data });
 }
@@ -270,7 +271,7 @@ export function emitConfigUpdate(db: AppDatabase, sender: FrameSender, task: Tas
  * (which carries the same version), so no frame is queued for them. Returns
  * the enqueued rows.
  */
-export function broadcastGlobalConfig(db: AppDatabase, sender: FrameSender): Outbox[] {
+export function broadcastGlobalConfig(db: AppDatabase, sender: AgentTransport): Outbox[] {
   const version = getGlobalConfigVersion(db);
   const rows: Outbox[] = [];
   for (const agent of listAgents(db)) {

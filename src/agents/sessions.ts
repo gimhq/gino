@@ -6,26 +6,13 @@
 // (it persists before send and replays on reconnect). Sessions only knows
 // "is this agent online, and how do I push a frame to it right now".
 //
-// Layering: sessions implements the M2 `FrameSender` seam (`isOnline` + `send`)
-// so the outbox can deliver/replay without importing transport details, and it
-// never parses `data` — it ships an already-encoded frame object as JSON.
+// Layering: sessions implements the `AgentTransport` port (docs/host-sdk-design
+// §8.4) so the outbox can deliver/replay without importing transport details,
+// and it never parses `data` — it ships an already-encoded frame object as JSON.
 
-/**
- * The minimal socket surface sessions needs — satisfied by the hono/bun
- * `WSContext`. Kept structural so unit tests can attach a fake socket.
- */
-export interface WsLike {
-  send: (data: string) => void;
-  readyState?: number;
-  close: (code?: number, reason?: string) => void;
-  /**
-   * The underlying transport socket, when the handle is a wrapper. The hono/bun
-   * adapter constructs a FRESH `WSContext` per event around the same raw Bun
-   * socket, so current-socket checks must compare `raw` — wrapper identity
-   * differs between `onOpen` and `onClose` for the same connection.
-   */
-  raw?: unknown;
-}
+import type { AgentTransport, WsLike } from "@/host/ports/transport";
+
+export type { WsLike };
 
 /** Same connection: identical handle, or both wrap the same raw socket. */
 function sameSocket(a: WsLike, b: WsLike): boolean {
@@ -44,7 +31,7 @@ const WS_OPEN = 1;
  * process): the WS pipe + outbox share the context's instance. Tests can
  * construct an isolated `new SessionRegistry()`.
  */
-export class SessionRegistry {
+export class SessionRegistry implements AgentTransport {
   private readonly sessions = new Map<string, Session>();
 
   /**
@@ -111,6 +98,26 @@ export class SessionRegistry {
       }
     }
     return closed;
+  }
+
+  /**
+   * Detach the agent's socket and best-effort `close(code, reason)` it
+   * (supersede / remove / sweep). A throwing socket is swallowed, like
+   * `attach`. Returns whether a session existed.
+   */
+  closeAgent(agentId: string, code: number, reason: string): boolean {
+    const session = this.sessions.get(agentId);
+    if (!session) {
+      return false;
+    }
+    this.sessions.delete(agentId);
+    try {
+      session.ws.close(code, reason);
+    }
+    catch {
+      // The socket may already be gone — closing is best-effort.
+    }
+    return true;
   }
 
   /**

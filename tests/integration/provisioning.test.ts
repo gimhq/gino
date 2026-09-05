@@ -1,5 +1,5 @@
 import type { AppDatabase } from "@/db";
-import type { FrameSender } from "@/protocol/outbox";
+import type { AgentTransport } from "@/host/ports/transport";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -39,7 +39,7 @@ let db: AppDatabase;
 let app: ReturnType<typeof createApp>;
 
 /** Offline sender: enqueue persists to the outbox regardless (we read it back). */
-const sender: FrameSender = { isOnline: () => false, send: () => false };
+const sender: AgentTransport = { isOnline: () => false, send: () => false, closeAgent: () => false };
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);

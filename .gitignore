@@ -9,8 +9,9 @@ dist/
 # Runtime data (sqlite db + WAL/SHM, logs, uploads)
 data/
 # M8 content-addressed blob store (config artifacts + attachments); default
-# GINO_STORE_DIR is data/store (covered above), but honour a top-level store/ too.
-store/
+# GINO_STORE_DIR is data/store (covered above), but honour a top-level store/ too
+# (anchored: src/store/ is source).
+/store/
 *.db
 *.db-wal
 *.db-shm
