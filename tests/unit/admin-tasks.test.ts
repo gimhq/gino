@@ -4,11 +4,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { enrollAgent } from "@/agents/registry";
-import { sessions } from "@/agents/sessions";
+import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
 import { adminTaskRoutes } from "@/edge/admin/tasks";
+import { createHostContext } from "@/host";
 import { getCron, writeThreadMessage, writeThreadResult } from "@/msgstore";
+import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
 import { createTask, getTask, setPlacement } from "@/tasks/store";
 
@@ -16,16 +18,20 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 // (HOST-M4-02/M4-11), live-only interrupt (HOST-M4-03), and the bounded task
 // detail view (HOST-M1M2-16).
 
+const logger = createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" }));
+
 let db: AppDatabase;
+let host: ReturnType<typeof createHostContext>;
 const attached: string[] = [];
 
 beforeEach(() => {
   db = createDb(":memory:");
+  host = createHostContext({ db, logger });
 });
 
 afterEach(() => {
   for (const id of attached.splice(0)) {
-    sessions.detach(id);
+    host.sessions.detach(id);
   }
   db.close();
 });
@@ -36,6 +42,7 @@ function taskApp() {
   app.onError(errorHandler);
   app.use("*", (c, next) => {
     c.set("db", db);
+    c.set("host", host);
     return next();
   });
   app.route("/", adminTaskRoutes());
@@ -46,7 +53,7 @@ function taskApp() {
 function enrolledAgent(opts: { online?: boolean } = {}): string {
   const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
   if (opts.online) {
-    sessions.attach(agentId, { send: () => {}, close: () => {} });
+    host.sessions.attach(agentId, { send: () => {}, close: () => {} });
     attached.push(agentId);
   }
   return agentId;

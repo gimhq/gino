@@ -3,8 +3,9 @@
 // channels stored endpoints that were never pushed to.
 //
 // Two triggers, one serialized push lane:
-//   • EVENT — the M2 inbound path calls `notifyTask(taskId)` right after a
-//     `thread_message` lands in the store (see `protocol/inbound.ts`), so a new
+//   • EVENT — the pump subscribes to the `transcript.message` host event, which
+//     the M2 inbound path emits right after a `thread_message` lands in the
+//     store (see `protocol/inbound.ts`), and calls `notifyTask(taskId)` so a new
 //     message is pushed promptly, not on the next poll tick.
 //   • TICK — a periodic retry backstop re-pushes every webhook channel, so a
 //     batch whose delivery failed (endpoint down, timeout) is retried without
@@ -21,6 +22,7 @@
 import type { WebhookAttemptState } from "./egress";
 import type { DnsResolver, FetchLike } from "./webhooks";
 import type { AppDatabase } from "@/db";
+import type { HostEvents } from "@/host/events";
 import type { Logger } from "@/shared/lib/logger";
 import { eq } from "drizzle-orm";
 import { channelBindings } from "@/db/schema";
@@ -33,6 +35,8 @@ export const DEFAULT_WEBHOOK_RETRY_INTERVAL_MS = 15_000;
 export interface WebhookPumpDeps {
   readonly db: AppDatabase;
   readonly logger?: Logger;
+  /** Host events: when given, the pump subscribes to `transcript.message` (the EVENT trigger) until `stop()`. */
+  readonly events?: HostEvents;
   /** Injectable fetch (tests pass a fake — no real network). */
   readonly fetchImpl?: FetchLike;
   /** Injectable DNS resolver for the delivery-time SSRF check. */
@@ -46,11 +50,11 @@ export interface WebhookPumpDeps {
 }
 
 export interface WebhookPump {
-  /** Schedule a push for every webhook channel this task is bound to (called by the inbound path on a new transcript row). */
+  /** Schedule a push for every webhook channel this task is bound to (the `transcript.message` subscription calls this on a new transcript row). */
   readonly notifyTask: (taskId: string) => void;
   /** Await the pushes queued so far (tests + shutdown drain). */
   readonly flush: () => Promise<void>;
-  /** Stop the retry tick (call on shutdown). Idempotent. */
+  /** Stop the retry tick and drop the event subscription (call on shutdown). Idempotent. */
   readonly stop: () => void;
 }
 
@@ -120,10 +124,14 @@ export function startWebhookPump(deps: WebhookPumpDeps): WebhookPump {
 
   const timer = setInterval(tick, deps.intervalMs ?? DEFAULT_WEBHOOK_RETRY_INTERVAL_MS);
   timer.unref?.();
+  const unsubscribe = deps.events?.on("transcript.message", ({ taskId }) => notifyTask(taskId));
 
   return {
     notifyTask,
     flush: () => chain,
-    stop: () => clearInterval(timer),
+    stop: () => {
+      clearInterval(timer);
+      unsubscribe?.();
+    },
   };
 }

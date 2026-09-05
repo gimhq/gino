@@ -12,9 +12,7 @@
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
-import { sessions } from "@/agents/sessions";
 import {
-  createStore,
   DEFAULT_ENGINE,
   getGlobalConfigVersion,
   GLOBAL_SCOPE,
@@ -62,9 +60,10 @@ export function adminConfigRoutes() {
       const contentType = c.req.query("content_type") ?? c.req.header("content-type");
       // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
-      const bytes = await readBodyCapped(c.req.raw, c.get("config").MAX_UPLOAD_BYTES);
+      const host = c.get("host");
+      const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);
 
-      const store = createStore(c.get("config"));
+      const store = host.store;
       try {
         const artifact = ingestArtifact(c.get("db"), store, {
           name,
@@ -109,7 +108,7 @@ export function adminConfigRoutes() {
         // setEntries) and is re-pushed live to every online agent; offline
         // agents converge on their next versioned config pull.
         const version = getGlobalConfigVersion(db);
-        const pushed = broadcastGlobalConfig(db, sessions);
+        const pushed = broadcastGlobalConfig(db, c.get("host").sessions);
         c.get("logger").info({ scope: b.scope, engine, count: persisted.length, version, pushed: pushed.length }, "config entries set");
         return c.json(ok({ scope: b.scope, engine, entries: persisted, version }));
       }

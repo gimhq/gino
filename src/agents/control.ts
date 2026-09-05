@@ -17,12 +17,13 @@ import type { SessionRegistry } from "./sessions";
 // Grant/revoke manage the OD13 access policy (`agent_grants`) via the registry.
 import type { AppDatabase } from "@/db";
 import type { Agent } from "@/db/schema";
+import type { HostEvents } from "@/host/events";
 import type { FrameSender } from "@/protocol/outbox";
 import type { Logger } from "@/shared/lib/logger";
 import { randomBytes } from "node:crypto";
 import { enqueue, purgeAgentOutbox } from "@/protocol/outbox";
 import { AppError, NotFoundError } from "@/shared/lib/errors";
-import { getLauncher } from "./launchers";
+import { manualLauncher } from "./launchers/manual";
 import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess } from "./registry";
 
 export type ControlOp = "stop" | "restart" | "remove";
@@ -41,7 +42,9 @@ export interface ControlDeps {
    */
   readonly sessions?: Pick<SessionRegistry, "get" | "detach">;
   readonly logger?: Logger;
-  /** Launcher lookup seam (defaults to the global registry — tests inject). */
+  /** Host event emitter: `remove` announces `agent.removed` after the durable bookkeeping. */
+  readonly events?: HostEvents;
+  /** Launcher lookup seam — pass `host.launchers.resolve`; defaults to the manual launcher (controls nothing). */
   readonly resolveLauncher?: (kind: string | null | undefined) => Launcher;
 }
 
@@ -108,7 +111,7 @@ function isRuntimeGone(err: unknown): boolean {
 }
 
 function resolve(deps: ControlDeps, agent: Agent): Launcher {
-  return (deps.resolveLauncher ?? getLauncher)(agent.launcherKind);
+  return (deps.resolveLauncher ?? (() => manualLauncher))(agent.launcherKind);
 }
 
 /** Enqueue a host→agent `close` frame (durable; the OOB fallback when a launcher can't act). */
@@ -208,6 +211,7 @@ export async function removeAgentControl(deps: ControlDeps, agentId: string): Pr
   }
 
   const { orphanedTasks } = removeAgent(deps.db, agentId);
+  deps.events?.emit("agent.removed", { agentId });
   const purgedFrames = purgeAgentOutbox(deps.db, agentId);
   forceCloseSession(deps, agentId);
   deps.logger?.info({ agentId, launcher: launcher.kind, via, orphanedTasks, purgedFrames }, "agent removed (token revoked, tasks orphaned, outbox purged)");
@@ -300,7 +304,7 @@ function mintLaunchNonce(): string {
  * starts nothing it was not explicitly asked to (safe by default).
  */
 export async function launchAgent(deps: ControlDeps, input: LaunchInput): Promise<LaunchAgentResult> {
-  const launcher = (deps.resolveLauncher ?? getLauncher)(input.kind);
+  const launcher = (deps.resolveLauncher ?? (() => manualLauncher))(input.kind);
   if (!launcher.capabilities.canLaunch) {
     throw new AppError(`launcher '${input.kind}' cannot launch agents`, 422, "LAUNCH_UNSUPPORTED");
   }

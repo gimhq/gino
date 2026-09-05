@@ -67,3 +67,41 @@ describe("M3 sessions — detach eviction contract", () => {
     expect(registry.isOnline("a1")).toBe(false);
   });
 });
+
+describe("M3 sessions — closeAll (host shutdown)", () => {
+  it("detaches every session and closes each socket with the given code/reason", () => {
+    const registry = new SessionRegistry();
+    const a = fakeWs();
+    const b = fakeWs();
+    registry.attach("a1", a);
+    registry.attach("a2", b);
+
+    expect(registry.closeAll(1001, "host shutting down")).toBe(2);
+    expect(registry.isOnline("a1")).toBe(false);
+    expect(registry.isOnline("a2")).toBe(false);
+    expect(a.closed).toEqual([{ code: 1001, reason: "host shutting down" }]);
+    expect(b.closed).toEqual([{ code: 1001, reason: "host shutting down" }]);
+  });
+
+  it("a throwing socket does not stop the loop", () => {
+    const registry = new SessionRegistry();
+    const broken: WsLike = {
+      send: () => {},
+      close: () => {
+        throw new Error("gone");
+      },
+    };
+    const ok = fakeWs();
+    registry.attach("a1", broken);
+    registry.attach("a2", ok);
+
+    expect(registry.closeAll(1001, "host shutting down")).toBe(2);
+    expect(registry.isOnline("a1")).toBe(false);
+    expect(registry.isOnline("a2")).toBe(false);
+    expect(ok.closed).toEqual([{ code: 1001, reason: "host shutting down" }]);
+  });
+
+  it("an empty registry closes nothing", () => {
+    expect(new SessionRegistry().closeAll(1001, "host shutting down")).toBe(0);
+  });
+});
