@@ -1,5 +1,5 @@
 import type { AppDatabase } from "@/db";
-import type { FrameSender } from "@/protocol/outbox";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, grantOwner } from "@/agents/registry";
 import { getBinding, registerChannel, routeInbound } from "@/channels";
@@ -15,9 +15,9 @@ const OWNER = "owner-ingress";
 
 let db: AppDatabase;
 
-// Offline FrameSender — `sendTaskMessage` persists to the outbox without a live
+// Offline AgentTransport — `sendTaskMessage` persists to the outbox without a live
 // socket (delivery is replayed on connect), so ingress works with no WS.
-const sender: FrameSender = { isOnline: () => false, send: () => false };
+const sender: AgentTransport = { isOnline: () => false, send: () => false, closeAgent: () => false };
 
 /** A permitted agent for OWNER on engine `claude` (enrolled is a valid placement candidate). */
 function permittedAgent(): string {

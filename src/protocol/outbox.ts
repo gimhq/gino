@@ -14,20 +14,15 @@
 //     delivered (the cursor advance is a B3 seam).
 //
 // Layering: the outbox talks to the live socket only through the abstract
-// `FrameSender` (sessions implements it), and rebuilds the wire frame via the
-// M2 `encodeOutbox` codec — it never hand-rolls the envelope.
+// `AgentTransport` port (sessions implements it), and rebuilds the wire frame
+// via the M2 `encodeOutbox` codec — it never hand-rolls the envelope.
 import type { AppDatabase } from "@/db";
 import type { Outbox } from "@/db/schema";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
 import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
 import { outbox } from "@/db/schema";
 import { encodeOutbox } from "./envelope";
-
-/** The push surface the outbox needs (implemented by M3 `SessionRegistry`). */
-export interface FrameSender {
-  isOnline: (agentId: string) => boolean;
-  send: (agentId: string, frame: Record<string, unknown>) => boolean;
-}
 
 export interface EnqueueInput {
   agentId: string;
@@ -54,7 +49,7 @@ export type EnqueuedOutbox = Outbox & { msgId?: number };
  * an ackable id. The returned row carries the derived `msgId` for callers that
  * surface it.
  */
-export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInput): EnqueuedOutbox {
+export function enqueue(db: AppDatabase, sender: AgentTransport, input: EnqueueInput): EnqueuedOutbox {
   const inserted = db
     .insert(outbox)
     .values({
@@ -84,7 +79,7 @@ export function enqueue(db: AppDatabase, sender: FrameSender, input: EnqueueInpu
  * one would kill an arbitrary future turn (HOST-M4-03). Delivery is the live
  * push or nothing.
  */
-export function enqueueLiveOnly(db: AppDatabase, sender: FrameSender, input: EnqueueInput): Outbox {
+export function enqueueLiveOnly(db: AppDatabase, sender: AgentTransport, input: EnqueueInput): Outbox {
   const row = enqueue(db, sender, input);
   const ackedAt = Date.now();
   db.update(outbox).set({ ackedAt }).where(eq(outbox.id, row.id)).run();
@@ -149,7 +144,7 @@ export interface ReplayOptions {
  * (marked acked so it never rescans) and logged instead of sent, so a stop
  * issued while the agent was offline cannot kill a deliberate later start.
  */
-export function replayUnacked(db: AppDatabase, sender: FrameSender, agentId: string, opts: ReplayOptions = {}): number {
+export function replayUnacked(db: AppDatabase, sender: AgentTransport, agentId: string, opts: ReplayOptions = {}): number {
   const rows = db
     .select()
     .from(outbox)

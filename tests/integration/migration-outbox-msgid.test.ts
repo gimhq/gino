@@ -109,6 +109,7 @@ describe("migration 0003 — drop outbox.msg_id on a legacy DB", () => {
           sent.push(frame);
           return true;
         },
+        closeAgent: () => false,
       };
       expect(replayUnacked(db, sender, "agent-legacy")).toBe(2);
       expect(sent[0]).toMatchObject({ type: "message", msgId: 1 });

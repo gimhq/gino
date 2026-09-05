@@ -1,5 +1,5 @@
 import type { AppDatabase } from "@/db";
-import type { FrameSender } from "@/protocol/outbox";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { enrollAgent } from "@/agents/registry";
@@ -12,8 +12,8 @@ import { ackMessage, ackOutbox, CLOSE_FRAME_TTL_MS, enqueue, gcOutbox, OUTBOX_RE
 
 interface Sent { agentId: string; frame: Record<string, unknown> }
 
-/** A FrameSender that records every push and can be toggled online/offline. */
-function fakeSender(online: boolean): FrameSender & { sent: Sent[]; online: boolean } {
+/** An AgentTransport that records every push and can be toggled online/offline. */
+function fakeSender(online: boolean): AgentTransport & { sent: Sent[]; online: boolean } {
   const s = {
     sent: [] as Sent[],
     online,
@@ -25,6 +25,7 @@ function fakeSender(online: boolean): FrameSender & { sent: Sent[]; online: bool
       s.sent.push({ agentId, frame });
       return true;
     },
+    closeAgent: () => false,
   };
   return s;
 }
