@@ -11,6 +11,7 @@ import { tasks } from "@/db/schema";
 import { getThreadRun, getTranscript } from "@/msgstore";
 import { enqueue } from "@/protocol/outbox";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 // D-B1b — the PROTOCOL SPINE, proven end-to-end against a LIVE Bun server with a
 // real WebSocket: register → connect (connect-token auth) → frames persist + ack
@@ -28,6 +29,7 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let storage: ReturnType<typeof sqliteStorage>;
 let host: ReturnType<typeof createAppHost>;
 let server: ReturnType<typeof Bun.serve>;
 let httpBase: string;
@@ -35,6 +37,7 @@ let wsBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   host = createAppHost({ config, db, logger: createLogger(config) });
   const app = createApp({ config, host });
   server = Bun.serve({
@@ -215,16 +218,16 @@ describe("D-B1b protocol spine — register → connect → frames → store →
     await waitFor(conn.received, f => f.type === "ack" && f.id === 2, "ack id=2");
 
     // Rows landed in M5 (read via the M5 read helpers).
-    const transcript = getTranscript(db, threadId);
+    const transcript = getTranscript(storage, threadId);
     expect(transcript).toHaveLength(1);
     expect(transcript[0]!.content).toBe("hello from agent");
-    const run = getThreadRun(db, threadId);
+    const run = getThreadRun(storage, threadId);
     expect(run?.status).toBe("succeeded");
     expect(run?.finalSeq).toBe(1);
     expect(run?.source).toBe("chat"); // B1b dispatch default
 
     // 4. OUTBOX (host→agent): enqueue a `message`; the live session delivers it.
-    const msgRow = enqueue(db, host.sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
+    const msgRow = enqueue(storage, host.sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
     const delivered = await waitFor(
       conn.received,
       f => f.type === "message" && (f.data as { text?: string } | undefined)?.text === "hi from host",

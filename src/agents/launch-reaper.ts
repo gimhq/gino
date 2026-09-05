@@ -15,7 +15,7 @@ import type { Launcher } from "./launchers/types";
 // Teardown is best-effort: a launcher failure (wedged docker daemon) is logged
 // and the row is dropped anyway — the reaper bounds pending-launch state; it
 // never retries forever against a broken runtime handle.
-import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
 import { manualLauncher } from "./launchers/manual";
 import { deletePendingLaunch, hasPendingLaunch, listExpiredPendingLaunches } from "./registry";
@@ -27,7 +27,7 @@ export const PENDING_LAUNCH_TTL_MS = 10 * 60_000;
 export const LAUNCH_REAPER_INTERVAL_MS = 60_000;
 
 export interface LaunchReaperDeps {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   readonly logger?: Logger;
   /** Launch→register TTL in ms. Defaults to `PENDING_LAUNCH_TTL_MS`. */
   readonly ttlMs?: number;
@@ -55,14 +55,14 @@ export interface LaunchReaperHandle {
 export async function reapPendingLaunches(deps: LaunchReaperDeps): Promise<number> {
   const now = deps.now?.() ?? Date.now();
   const cutoff = now - (deps.ttlMs ?? PENDING_LAUNCH_TTL_MS);
-  const expired = listExpiredPendingLaunches(deps.db, cutoff);
+  const expired = listExpiredPendingLaunches(deps.storage, cutoff);
 
   let reaped = 0;
   for (const entry of expired) {
     // Re-check under the loop (`hasPendingLaunch`): a registration racing the
     // reap may have consumed the row since the list was read — never tear down
     // a runtime that just correlated.
-    if (!hasPendingLaunch(deps.db, entry.nonce)) {
+    if (!hasPendingLaunch(deps.storage, entry.nonce)) {
       continue;
     }
     if (entry.launchRef) {
@@ -81,7 +81,7 @@ export async function reapPendingLaunches(deps: LaunchReaperDeps): Promise<numbe
         );
       }
     }
-    deletePendingLaunch(deps.db, entry.nonce);
+    deletePendingLaunch(deps.storage, entry.nonce);
     reaped += 1;
   }
   return reaped;

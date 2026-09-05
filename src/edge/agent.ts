@@ -1,7 +1,6 @@
 import type { Context } from "hono";
 import type { AgentCapabilities } from "@/agents/registry";
-import type { AppDatabase } from "@/db";
-import type { Agent } from "@/db/schema";
+import type { AgentRow, Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
@@ -63,10 +62,10 @@ function agentConfig(agentId: string, heartbeatIntervalMs: number) {
  * only when the version advances — agent-architecture §9b). Empty entries when
  * nothing is declared, so the response stays backward-compatible.
  */
-function globalConfig(db: AppDatabase, agent: Agent) {
+function globalConfig(storage: Storage, agent: AgentRow) {
   return {
-    entries: resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines),
-    version: getGlobalConfigVersion(db),
+    entries: resolveEntriesForEngines(storage, GLOBAL_SCOPE, agent.capabilities.engines),
+    version: getGlobalConfigVersion(storage),
   };
 }
 
@@ -81,8 +80,8 @@ function globalConfig(db: AppDatabase, agent: Agent) {
  */
 
 /** True iff `agentId` is the agent currently PLACED on `taskId` (set-once, §3). */
-function isAgentPlacedOnTask(db: AppDatabase, agentId: string, taskId: string): boolean {
-  const task = getTask(db, taskId);
+function isAgentPlacedOnTask(storage: Storage, agentId: string, taskId: string): boolean {
+  const task = getTask(storage, taskId);
   return task != null && task.agentId === agentId;
 }
 
@@ -91,12 +90,12 @@ function isAgentPlacedOnTask(db: AppDatabase, agentId: string, taskId: string): 
  * agent placed on the attachment's `task_id`. Unknown id → 404; wrong agent → 403.
  */
 function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string): Response {
-  const db = c.get("db");
-  const att = getAttachmentById(db, id);
+  const storage = c.get("host").storage;
+  const att = getAttachmentById(storage, id);
   if (!att) {
     throw new NotFoundError("attachment", id);
   }
-  if (!isAgentPlacedOnTask(db, requesterId, att.taskId)) {
+  if (!isAgentPlacedOnTask(storage, requesterId, att.taskId)) {
     throw new ForbiddenError("attachment belongs to another agent's task");
   }
   return serveBlob(c, { id });
@@ -110,14 +109,14 @@ function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string
  * same verified content. Unknown sha → 404; known-but-unauthorized → 403.
  */
 function serveBySha(c: Context<AppEnv>, requesterId: string, sha256: string): Response {
-  const db = c.get("db");
-  const atts = attachmentsBySha(db, sha256);
-  const artifact = getArtifactBySha(db, sha256);
+  const storage = c.get("host").storage;
+  const atts = attachmentsBySha(storage, sha256);
+  const artifact = getArtifactBySha(storage, sha256);
   if (atts.length === 0 && !artifact) {
     throw new NotFoundError("attachment", sha256);
   }
-  const placed = atts.some(a => isAgentPlacedOnTask(db, requesterId, a.taskId));
-  const inDesiredSet = artifact != null && isShaInAgentDesiredSet(db, requesterId, sha256);
+  const placed = atts.some(a => isAgentPlacedOnTask(storage, requesterId, a.taskId));
+  const inDesiredSet = artifact != null && isShaInAgentDesiredSet(storage, requesterId, sha256);
   if (!placed && !inDesiredSet) {
     throw new ForbiddenError("sha256 is neither on a task placed on this agent nor in its desired set");
   }
@@ -145,8 +144,7 @@ function ifNoneMatchHits(header: string | undefined, etag: string): boolean {
  * matching `If-None-Match` short-circuits to a bodyless 304 (HOST-M8-14).
  */
 function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): Response {
-  const db = c.get("db");
-  const resolved = resolveBlobRef(db, sel);
+  const resolved = resolveBlobRef(c.get("host").storage, sel);
   if (!resolved) {
     throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
   }
@@ -264,7 +262,7 @@ export function agentRoutes() {
         return c.json(registerError("unsupported_protocol"), 400);
       }
 
-      const db = c.get("db");
+      const storage = host.storage;
       const launchNonce = typeof body.launchNonce === "string" && body.launchNonce.length > 0 ? body.launchNonce : null;
 
       // HOST-M3-06: registration is IDEMPOTENT per launch. A retry carrying a
@@ -272,10 +270,10 @@ export function agentRoutes() {
       // saw its token) reuses the existing row with a ROTATED connect token
       // instead of minting a duplicate whose launch binding lands on a ghost.
       if (launchNonce) {
-        const existing = reEnrollByLaunchNonce(db, launchNonce);
+        const existing = reEnrollByLaunchNonce(storage, launchNonce);
         if (existing) {
           c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
-          const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, existing.agent) };
+          const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(host.storage, existing.agent) };
           return c.json({ agentId: existing.agent.id, connectToken: existing.connectToken, config: retryConfig });
         }
       }
@@ -284,7 +282,7 @@ export function agentRoutes() {
       // never self-declares `public`. Enrollment always lands `dedicated`; a
       // host launch's admin allowlist applies at correlate, and flipping an
       // agent `public` later is the admin-only access mutation.
-      const { agent, connectToken } = enrollAgent(db, {
+      const { agent, connectToken } = enrollAgent(storage, {
         ...(typeof body.name === "string" ? { name: body.name } : {}),
         source: typeof body.source === "string" ? body.source : "manual",
         capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
@@ -298,7 +296,7 @@ export function agentRoutes() {
       // that launch (launcher_kind + launch_ref). No nonce → unchanged: a manual
       // enroll never touches the pending-launch set.
       if (launchNonce) {
-        const correlated = correlateLaunch(db, agent.id, launchNonce);
+        const correlated = correlateLaunch(storage, agent.id, launchNonce);
         if (correlated) {
           c.get("logger").info({ agentId: agent.id, launcher: correlated.launcherKind, ref: correlated.launchRef }, "agent registration correlated to launch");
         }
@@ -307,7 +305,7 @@ export function agentRoutes() {
       c.get("logger").info({ agentId: agent.id, source: agent.source }, "agent enrolled");
       host.events.emit("agent.enrolled", { agentId: agent.id });
       // M8 (B6): seed the resolved GLOBAL desired set + version on register (additive).
-      const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, agent) };
+      const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(host.storage, agent) };
       return c.json({ agentId: agent.id, connectToken, config });
     },
   );
@@ -324,30 +322,30 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       const token = c.req.header("x-internal-token") ?? "";
-      const db = c.get("db");
       const logger = c.get("logger");
       const host = c.get("host");
+      const storage = host.storage;
 
       // Per-agent auth (M3): verify against the stored hash. Throwing here
       // rejects the upgrade with the standard 401 envelope (no socket opens).
-      const agent = verifyConnectToken(db, agentId, token);
+      const agent = verifyConnectToken(storage, agentId, token);
       if (!agent) {
         throw new UnauthorizedError();
       }
 
       // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
-      const deps = { db, sender: host.sessions, agentId, logger, metrics: host.metrics, events: host.events };
+      const deps = { storage, sender: host.sessions, agentId, logger, metrics: host.metrics, events: host.events };
       return {
         onOpen(_evt, ws) {
           // Attach BEFORE replay so the replayed frames find the live socket.
           host.sessions.attach(agentId, ws);
-          setAgentStatus(db, agentId, "online");
+          setAgentStatus(storage, agentId, "online");
           host.events.emit("agent.online", { agentId });
           // HOST-M3-08 / HOST-M1M2-05: stamp `last_seen` at attach so a fresh
           // connection starts inside the sweep's grace window (never insta-swept
           // on a stale or NULL `last_seen` before its first heartbeat).
-          touchLiveness(db, agentId);
-          const replayed = replayUnacked(db, host.sessions, agentId, { logger });
+          touchLiveness(storage, agentId);
+          const replayed = replayUnacked(storage, host.sessions, agentId, { logger });
           logger.info({ agentId, replayed }, "agent ws attached");
         },
         onMessage(evt, _ws) {
@@ -366,7 +364,7 @@ export function agentRoutes() {
           // must not clobber the live session's `online` status.
           const evicted = host.sessions.detach(agentId, ws);
           if (evicted) {
-            setAgentStatus(db, agentId, "offline");
+            setAgentStatus(storage, agentId, "offline");
             host.events.emit("agent.offline", { agentId, reason: "close" });
           }
           logger.info({ agentId, evicted }, "agent ws detached");
@@ -387,12 +385,12 @@ export function agentRoutes() {
     (c) => {
       const agentId = c.req.param("agentId");
       const token = c.req.header("x-internal-token") ?? "";
-      const agent = agentId ? verifyConnectToken(c.get("db"), agentId, token) : null;
+      const agent = agentId ? verifyConnectToken(c.get("host").storage, agentId, token) : null;
       if (!agent || !agentId) {
         throw new UnauthorizedError();
       }
       // M8 (B6): mirror the resolved GLOBAL desired set + version alongside the config.
-      return c.json({ ...agentConfig(agentId, c.get("host").options.heartbeatIntervalMs), ...globalConfig(c.get("db"), agent) });
+      return c.json({ ...agentConfig(agentId, c.get("host").options.heartbeatIntervalMs), ...globalConfig(c.get("host").storage, agent) });
     },
   );
 
@@ -408,7 +406,7 @@ export function agentRoutes() {
     async (c) => {
       const agentId = c.req.param("agentId");
       const token = c.req.header("x-internal-token") ?? "";
-      const agent = agentId ? verifyConnectToken(c.get("db"), agentId, token) : null;
+      const agent = agentId ? verifyConnectToken(c.get("host").storage, agentId, token) : null;
       if (!agent || !agentId) {
         throw new UnauthorizedError();
       }
@@ -420,7 +418,7 @@ export function agentRoutes() {
         // Host events (M6 HOST-M5M6-04: a stored thread_message triggers the webhook pump via `transcript.message`).
         const host = c.get("host");
         return c.json(ingestHttpFrame(
-          { db: c.get("db"), agentId, logger: c.get("logger"), metrics: host.metrics, events: host.events },
+          { storage: host.storage, agentId, logger: c.get("logger"), metrics: host.metrics, events: host.events },
           raw,
         ));
       }
@@ -507,7 +505,7 @@ export function agentRoutes() {
       if ((taskId == null) !== (threadId == null)) {
         return c.json({ success: false, error: { code: "BAD_REQUEST", message: "task_id and thread_id must be provided together" } }, 400);
       }
-      if (taskId != null && !isAgentPlacedOnTask(c.get("db"), requesterId, taskId)) {
+      if (taskId != null && !isAgentPlacedOnTask(c.get("host").storage, requesterId, taskId)) {
         throw new ForbiddenError("cannot write an attachment for a task placed on another agent");
       }
       const contentType = c.req.query("content_type") ?? c.req.header("content-type") ?? "application/octet-stream";
@@ -552,7 +550,7 @@ export function agentRoutes() {
         direction,
       };
       if (taskId != null && threadId != null) {
-        writeAttachmentDescriptors(c.get("db"), { taskId, threadId, descriptors: [descriptor] });
+        writeAttachmentDescriptors(host.storage, { taskId, threadId, descriptors: [descriptor] });
       }
       c.get("logger").info({ id: descriptor.id, taskId, threadId, sha256: blob.sha256, size: blob.size }, "attachment ingested");
       return c.json(descriptor, 201);

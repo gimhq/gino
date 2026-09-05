@@ -16,8 +16,7 @@
 // Every host→agent effect goes through the M2 outbox (orchestrator). Crons/
 // threads/messages are M5 read-only mirrors here. Responses use the shared
 // `{ success, data }` envelope.
-import type { AppDatabase } from "@/db";
-import type { Cron, Task } from "@/db/schema";
+import type { CronRow, Storage, TaskRow } from "@/host/ports/storage";
 import type { CronUpsertData } from "@/protocol/frames";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
@@ -45,7 +44,7 @@ import {
 } from "@/tasks";
 
 /** Public projection of a task row. */
-function serializeTask(task: Task) {
+function serializeTask(task: TaskRow) {
   return {
     id: task.id,
     ownerId: task.ownerId,
@@ -64,7 +63,7 @@ function serializeTask(task: Task) {
   };
 }
 
-function serializeCron(cron: Cron) {
+function serializeCron(cron: CronRow) {
   return {
     id: cron.id,
     taskId: cron.taskId,
@@ -131,8 +130,8 @@ function cronData(body: z.infer<typeof updateCronBody>, prompt: string): CronUps
 }
 
 /** The cron mirror row for `cronId` under `taskId`, or 404 (HOST-M4-11). */
-function requireCron(db: AppDatabase, taskId: string, cronId: string): Cron {
-  const cron = getCron(db, cronId);
+function requireCron(storage: Storage, taskId: string, cronId: string): CronRow {
+  const cron = getCron(storage, cronId);
   if (!cron || cron.taskId !== taskId) {
     throw new AppError(`cron ${cronId} not found on task ${taskId}`, 404, "CRON_NOT_FOUND");
   }
@@ -160,7 +159,7 @@ export function adminTaskRoutes() {
       responses: { ...jsonOk(z.array(z.any()), "Tasks"), ...errors(401) },
     }),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const ownerId = c.req.query("owner_id");
       const agentId = c.req.query("agent_id");
       const status = c.req.query("status");
@@ -169,7 +168,7 @@ export function adminTaskRoutes() {
         ...(agentId ? { agentId } : {}),
         ...(status ? { status } : {}),
       };
-      return c.json(ok(listTasks(db, filter).map(serializeTask)));
+      return c.json(ok(listTasks(storage, filter).map(serializeTask)));
     },
   );
 
@@ -183,9 +182,9 @@ export function adminTaskRoutes() {
     }),
     validator("json", createBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const b = c.req.valid("json");
-      const created = createTask(db, {
+      const created = createTask(storage, {
         ownerId: b.owner_id,
         engine: b.engine,
         model: b.model,
@@ -195,8 +194,8 @@ export function adminTaskRoutes() {
         ...(b.kind != null ? { kind: b.kind } : {}),
         ...(b.status != null ? { status: b.status } : {}),
       });
-      const dispatch = placeTask(db, created.id, c.get("host").events);
-      const task = requireTask(db, created.id);
+      const dispatch = placeTask(storage, created.id, c.get("host").events);
+      const task = requireTask(storage, created.id);
       return c.json(ok({ task: serializeTask(task), dispatch }), 201);
     },
   );
@@ -211,11 +210,11 @@ export function adminTaskRoutes() {
     }),
     validator("query", detailQuery),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const id = c.req.param("id");
-      const task = requireTask(db, id);
+      const task = requireTask(storage, id);
       const q = c.req.valid("query");
-      const threadIds = getTaskThreads(db, id);
+      const threadIds = getTaskThreads(storage, id);
 
       // Transcript page (HOST-M1M2-16): a bounded seq-cursor read of ONE
       // thread, never the full transcript of every thread.
@@ -223,26 +222,26 @@ export function adminTaskRoutes() {
         if (!threadIds.includes(q.thread)) {
           throw new AppError(`thread ${q.thread} not found on task ${id}`, 404, "THREAD_NOT_FOUND");
         }
-        const page = getTranscript(db, q.thread, {
+        const page = getTranscript(storage, q.thread, {
           ...(q.after != null ? { afterSeq: q.after } : {}),
           limit: q.limit ?? TRANSCRIPT_PAGE_LIMIT,
         });
         return c.json(ok({
           threadId: q.thread,
-          run: getThreadRun(db, q.thread) ?? null,
+          run: getThreadRun(storage, q.thread) ?? null,
           messages: page,
         }));
       }
 
       const threads = threadIds.map(threadId => ({
         threadId,
-        run: getThreadRun(db, threadId) ?? null,
-        ...getTranscriptStats(db, threadId),
+        run: getThreadRun(storage, threadId) ?? null,
+        ...getTranscriptStats(storage, threadId),
       }));
       return c.json(ok({
         ...serializeTask(task),
         threads,
-        crons: listTaskCrons(db, id).map(serializeCron),
+        crons: listTaskCrons(storage, id).map(serializeCron),
       }));
     },
   );
@@ -257,12 +256,12 @@ export function adminTaskRoutes() {
     }),
     validator("json", assignBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const id = c.req.param("id");
-      requireTask(db, id); // 404 before placement
+      requireTask(storage, id); // 404 before placement
       const { agent_id } = c.req.valid("json");
       const events = c.get("host").events;
-      const dispatch = agent_id ? assignTaskToAgent(db, id, agent_id, events) : placeTask(db, id, events);
+      const dispatch = agent_id ? assignTaskToAgent(storage, id, agent_id, events) : placeTask(storage, id, events);
       return c.json(ok(dispatch));
     },
   );
@@ -277,11 +276,11 @@ export function adminTaskRoutes() {
     }),
     validator("json", messageBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
-      const task = requireTask(db, c.req.param("id"));
+      const task = requireTask(storage, c.req.param("id"));
       const b = c.req.valid("json");
-      const sent = sendTaskMessage(db, host.sessions, task, {
+      const sent = sendTaskMessage(storage, host.sessions, task, {
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),
         ...(b.new_thread != null ? { newThread: b.new_thread } : {}),
@@ -303,10 +302,10 @@ export function adminTaskRoutes() {
       responses: { ...jsonOk(z.any(), "Interrupted"), ...errors(401, 404, 409) },
     }),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
-      const task = requireTask(db, c.req.param("id"));
-      const row = emitInterrupt(db, host.sessions, task);
+      const task = requireTask(storage, c.req.param("id"));
+      const row = emitInterrupt(storage, host.sessions, task);
       return c.json(ok({ taskId: task.id, outboxId: row.id }));
     },
   );
@@ -320,22 +319,22 @@ export function adminTaskRoutes() {
       responses: { ...jsonOk(z.any(), "Closed"), ...errors(401, 404, 409) },
     }),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
       const id = c.req.param("id");
-      const task = requireTask(db, id);
+      const task = requireTask(storage, id);
       // Never-placed: no agent to command — just record the terminal status
       // instead of 409ing on placement (HOST-M4-09).
       if (task.agentId == null) {
-        const closed = transitionTaskStatus(db, id, TASK_STATUS.closed);
+        const closed = transitionTaskStatus(storage, id, TASK_STATUS.closed);
         return c.json(ok({ task: serializeTask(closed), outboxId: null }));
       }
       // The interrupt is a live-only signal (HOST-M4-03): best-effort while the
       // agent is online; an offline agent still learns the terminal status from
       // the durable task_upsert below.
-      const interrupt = host.sessions.isOnline(task.agentId) ? emitInterrupt(db, host.sessions, task) : null;
-      const closed = closeTask(db, id);
-      emitTaskUpsert(db, host.sessions, closed); // carries status "closed" to the agent
+      const interrupt = host.sessions.isOnline(task.agentId) ? emitInterrupt(storage, host.sessions, task) : null;
+      const closed = closeTask(storage, id);
+      emitTaskUpsert(storage, host.sessions, closed); // carries status "closed" to the agent
       return c.json(ok({ task: serializeTask(closed), outboxId: interrupt?.id ?? null }));
     },
   );
@@ -349,10 +348,10 @@ export function adminTaskRoutes() {
       responses: { ...jsonOk(z.array(z.any()), "Crons"), ...errors(401, 404) },
     }),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const id = c.req.param("id");
-      requireTask(db, id);
-      return c.json(ok(listTaskCrons(db, id).map(serializeCron)));
+      requireTask(storage, id);
+      return c.json(ok(listTaskCrons(storage, id).map(serializeCron)));
     },
   );
 
@@ -365,11 +364,11 @@ export function adminTaskRoutes() {
     }),
     validator("json", createCronBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
-      const task = requireTask(db, c.req.param("id"));
+      const task = requireTask(storage, c.req.param("id"));
       const b = c.req.valid("json");
-      const { cron, cronId } = emitCronUpsert(db, host.sessions, task, { data: cronData(b, b.prompt) });
+      const { cron, cronId } = emitCronUpsert(storage, host.sessions, task, { data: cronData(b, b.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }), 201);
     },
   );
@@ -383,16 +382,16 @@ export function adminTaskRoutes() {
     }),
     validator("json", updateCronBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
-      const task = requireTask(db, c.req.param("id"));
+      const task = requireTask(storage, c.req.param("id"));
       const cronId = c.req.param("cronId");
       // Update addresses an EXISTING trigger only — an unknown id must 404, not
       // silently create a second cron (HOST-M4-11). Omitted prompt → keep the
       // cron's current one (the wire field is required, HOST-M4-10).
-      const existing = requireCron(db, task.id, cronId);
+      const existing = requireCron(storage, task.id, cronId);
       const b = c.req.valid("json");
-      const { cron } = emitCronUpsert(db, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
+      const { cron } = emitCronUpsert(storage, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }));
     },
   );
@@ -405,12 +404,12 @@ export function adminTaskRoutes() {
       responses: { ...jsonOk(z.any(), "Cron delete sent"), ...errors(401, 404, 409) },
     }),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const host = c.get("host");
-      const task = requireTask(db, c.req.param("id"));
+      const task = requireTask(storage, c.req.param("id"));
       const cronId = c.req.param("cronId");
-      requireCron(db, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
-      const row = emitCronDelete(db, host.sessions, task, cronId);
+      requireCron(storage, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
+      const row = emitCronDelete(storage, host.sessions, task, cronId);
       return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
     },
   );

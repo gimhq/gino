@@ -1,6 +1,7 @@
 import type { DnsResolver, FetchLike, WebhookAttemptState } from "@/channels";
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
+import type { Storage } from "@/host/ports/storage";
 import type { ThreadMessageData } from "@/protocol/frames";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
@@ -20,6 +21,7 @@ import {
 import { createDb } from "@/db";
 import { messages } from "@/db/schema";
 import { writeThreadMessage } from "@/msgstore";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask } from "@/tasks";
 
 // M6 egress (OD10) — tail the M5 store by a per-(channel, task) cursor: deliver
@@ -31,26 +33,28 @@ const OWNER = "owner-egress";
 const THREAD = "thread-egress-1";
 
 let db: AppDatabase;
+let storage: Storage;
 
 type Kind = ThreadMessageData["kind"];
 
 /** Seed N transcript events on a task's thread (seq 1..N) from a kind list. */
 function seed(taskId: string, kinds: Kind[]): void {
   kinds.forEach((kind, i) => {
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: i + 1, kind, content: `${kind}-${i + 1}` } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: i + 1, kind, content: `${kind}-${i + 1}` } });
   });
 }
 
 function makeTask(): string {
-  return createTask(db, { ownerId: OWNER, engine: "claude", model: "sonnet" }).id;
+  return createTask(storage, { ownerId: OWNER, engine: "claude", model: "sonnet" }).id;
 }
 
 function channel(filter?: Record<string, unknown>, type = "http"): Channel {
-  return registerChannel(db, { name: `c-${type}`, type, ownerId: OWNER, ...(filter ? { filter } : {}) });
+  return registerChannel(storage, { name: `c-${type}`, type, ownerId: OWNER, ...(filter ? { filter } : {}) });
 }
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -64,25 +68,25 @@ describe("M6 egress — cursor tail", () => {
     seed(taskId, ["user_input", "assistant_text", "tool_use", "tool_result"]);
 
     // First poll → every kind, in seq order.
-    const first = pollChannel(db, ch, { taskId });
+    const first = pollChannel(storage, ch, { taskId });
     expect(first).toHaveLength(1);
     expect(first[0]!.messages.map(m => m.kind)).toEqual(["user_input", "assistant_text", "tool_use", "tool_result"]);
     expect(first[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3, 4]);
 
     // Acking the delivered cursor advances the stored cursor to it.
-    expect(pollChannel(db, ch, { taskId, ack: first[0]!.cursor })).toHaveLength(0);
-    const cursor = readCursor(db, ch.id, taskId);
+    expect(pollChannel(storage, ch, { taskId, ack: first[0]!.cursor })).toHaveLength(0);
+    const cursor = readCursor(storage, ch.id, taskId);
     expect(cursor).toBe(first[0]!.cursor);
     expect(cursor).toBeGreaterThan(0);
 
     // A new message → only the new one is delivered.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 5, kind: "assistant_text", content: "more" } });
-    const third = pollChannel(db, ch, { taskId });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 5, kind: "assistant_text", content: "more" } });
+    const third = pollChannel(storage, ch, { taskId });
     expect(third[0]!.messages.map(m => m.seq)).toEqual([5]);
 
     // A stale (lower) ack is a no-op — the cursor never moves backwards.
-    pollChannel(db, ch, { taskId, ack: 1 });
-    expect(readCursor(db, ch.id, taskId)).toBe(cursor);
+    pollChannel(storage, ch, { taskId, ack: 1 });
+    expect(readCursor(storage, ch.id, taskId)).toBe(cursor);
   });
 
   it("re-reads idempotently from a stale (explicit) cursor without confirming receipt", () => {
@@ -91,19 +95,19 @@ describe("M6 egress — cursor tail", () => {
     seed(taskId, ["user_input", "assistant_text"]);
 
     // Drain: deliver, then ack the batch.
-    const first = pollChannel(db, ch, { taskId });
+    const first = pollChannel(storage, ch, { taskId });
     expect(first[0]!.messages).toHaveLength(2);
-    expect(pollChannel(db, ch, { taskId, ack: first[0]!.cursor })).toHaveLength(0);
+    expect(pollChannel(storage, ch, { taskId, ack: first[0]!.cursor })).toHaveLength(0);
 
     // A re-read from position 0 re-delivers everything (restarts/failures re-read
     // without corrupting the record) …
-    const replay = tailTask(db, ch, taskId, { after: 0 });
+    const replay = tailTask(storage, ch, taskId, { after: 0 });
     expect(replay.messages.map(m => m.seq)).toEqual([1, 2]);
 
     // … and does not move the stored cursor (`after` reads, never confirms).
-    const before = readCursor(db, ch.id, taskId);
-    pollChannel(db, ch, { taskId, after: 0 });
-    expect(readCursor(db, ch.id, taskId)).toBe(before);
+    const before = readCursor(storage, ch.id, taskId);
+    pollChannel(storage, ch, { taskId, after: 0 });
+    expect(readCursor(storage, ch.id, taskId)).toBe(before);
   });
 
   it("honours an opt-in kind filter and acks past filtered rows (OD10)", () => {
@@ -111,11 +115,11 @@ describe("M6 egress — cursor tail", () => {
     const ch = channel({ kinds: ["assistant_text"] });
     seed(taskId, ["user_input", "assistant_text", "tool_use", "assistant_text"]);
 
-    const delivered = pollChannel(db, ch, { taskId });
+    const delivered = pollChannel(storage, ch, { taskId });
     expect(delivered[0]!.messages.map(m => m.kind)).toEqual(["assistant_text", "assistant_text"]);
     // The delivered cursor covers the filtered-out rows too → after the ack they
     // are never re-scanned.
-    expect(pollChannel(db, ch, { taskId, ack: delivered[0]!.cursor })).toHaveLength(0);
+    expect(pollChannel(storage, ch, { taskId, ack: delivered[0]!.cursor })).toHaveLength(0);
   });
 
   it("limit caps the batch and the acked cursor covers only included rows", () => {
@@ -123,9 +127,9 @@ describe("M6 egress — cursor tail", () => {
     const ch = channel();
     seed(taskId, ["user_input", "assistant_text", "thinking", "tool_use"]);
 
-    const batch1 = pollChannel(db, ch, { taskId, limit: 2 });
+    const batch1 = pollChannel(storage, ch, { taskId, limit: 2 });
     expect(batch1[0]!.messages.map(m => m.seq)).toEqual([1, 2]);
-    const batch2 = pollChannel(db, ch, { taskId, limit: 2, ack: batch1[0]!.cursor });
+    const batch2 = pollChannel(storage, ch, { taskId, limit: 2, ack: batch1[0]!.cursor });
     expect(batch2[0]!.messages.map(m => m.seq)).toEqual([3, 4]);
   });
 });
@@ -138,18 +142,18 @@ describe("M6 egress — at-least-once poll (HOST-M5M6-01)", () => {
 
     // The client polls but the response is never received (disconnect/crash
     // mid-flush): the stored cursor must be unchanged.
-    const lost = pollChannel(db, ch, { taskId });
+    const lost = pollChannel(storage, ch, { taskId });
     expect(lost[0]!.messages).toHaveLength(2);
-    expect(readCursor(db, ch.id, taskId)).toBe(0);
+    expect(readCursor(storage, ch.id, taskId)).toBe(0);
 
     // The next poll re-delivers the exact same batch.
-    const retry = pollChannel(db, ch, { taskId });
+    const retry = pollChannel(storage, ch, { taskId });
     expect(retry[0]!.messages.map(m => m.seq)).toEqual([1, 2]);
     expect(retry[0]!.cursor).toBe(lost[0]!.cursor);
 
     // Only the explicit ack confirms receipt and drains the channel.
-    expect(pollChannel(db, ch, { taskId, ack: retry[0]!.cursor })).toHaveLength(0);
-    expect(readCursor(db, ch.id, taskId)).toBe(retry[0]!.cursor);
+    expect(pollChannel(storage, ch, { taskId, ack: retry[0]!.cursor })).toHaveLength(0);
+    expect(readCursor(storage, ch.id, taskId)).toBe(retry[0]!.cursor);
   });
 });
 
@@ -160,9 +164,9 @@ describe("M6 egress — cursor stability (HOST-M5M6-03)", () => {
     seed(taskId, ["user_input", "assistant_text", "tool_use", "tool_result", "assistant_text"]);
 
     // Deliver + ack everything (cursor = high-water messages.id = 5).
-    const first = pollChannel(db, ch, { taskId });
-    pollChannel(db, ch, { taskId, ack: first[0]!.cursor });
-    const cursor = readCursor(db, ch.id, taskId);
+    const first = pollChannel(storage, ch, { taskId });
+    pollChannel(storage, ch, { taskId, ack: first[0]!.cursor });
+    const cursor = readCursor(storage, ch.id, taskId);
 
     // Simulate retention + compaction: delete early rows, then VACUUM. With an
     // implicit rowid this renumbers the survivors (4,5 → 1,2) and re-points the
@@ -175,8 +179,8 @@ describe("M6 egress — cursor stability (HOST-M5M6-03)", () => {
 
     // A new message gets a NEW id past the cursor — it is delivered, exactly once
     // acked, with no replay of the survivors and no silent skip.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 6, kind: "assistant_text", content: "post-vacuum" } });
-    const next = pollChannel(db, ch, { taskId });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 6, kind: "assistant_text", content: "post-vacuum" } });
+    const next = pollChannel(storage, ch, { taskId });
     expect(next).toHaveLength(1);
     expect(next[0]!.messages.map(m => m.seq)).toEqual([6]);
     expect(next[0]!.cursor).toBeGreaterThan(cursor);
@@ -189,19 +193,19 @@ describe("M6 egress — seq-order delivery (HOST-M5M6-10)", () => {
     const ch = channel();
     // Reconnect replay: seq 3 and 1 are stored AFTER seq 5 (higher arrival ids).
     for (const seq of [2, 5, 3, 1, 4]) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
-    const delivered = pollChannel(db, ch, { taskId });
+    const delivered = pollChannel(storage, ch, { taskId });
     expect(delivered[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3, 4, 5]);
   });
 
   it("orders across threads by (thread, seq), not arrival", () => {
     const taskId = makeTask();
     const ch = channel();
-    writeThreadMessage(db, { taskId, threadId: "thr-b", data: { seq: 2, kind: "assistant_text", content: "b2" } });
-    writeThreadMessage(db, { taskId, threadId: "thr-a", data: { seq: 1, kind: "assistant_text", content: "a1" } });
-    writeThreadMessage(db, { taskId, threadId: "thr-b", data: { seq: 1, kind: "assistant_text", content: "b1" } });
-    const delivered = pollChannel(db, ch, { taskId });
+    writeThreadMessage(storage, { taskId, threadId: "thr-b", data: { seq: 2, kind: "assistant_text", content: "b2" } });
+    writeThreadMessage(storage, { taskId, threadId: "thr-a", data: { seq: 1, kind: "assistant_text", content: "a1" } });
+    writeThreadMessage(storage, { taskId, threadId: "thr-b", data: { seq: 1, kind: "assistant_text", content: "b1" } });
+    const delivered = pollChannel(storage, ch, { taskId });
     expect(delivered[0]!.messages.map(m => `${m.threadId}:${m.seq}`)).toEqual(["thr-a:1", "thr-b:1", "thr-b:2"]);
   });
 
@@ -210,13 +214,13 @@ describe("M6 egress — seq-order delivery (HOST-M5M6-10)", () => {
     const ch = channel();
     // seq 5 arrives first (store id 1), then seq 1..3 (store ids 2..4).
     for (const seq of [5, 1, 2, 3]) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
     // limit 2 → the window is the two OLDEST store positions (seq 5, then 1),
     // delivered sorted by seq; acking it must not skip seq 2..3.
-    const batch1 = pollChannel(db, ch, { taskId, limit: 2 });
+    const batch1 = pollChannel(storage, ch, { taskId, limit: 2 });
     expect(batch1[0]!.messages.map(m => m.seq)).toEqual([1, 5]);
-    const batch2 = pollChannel(db, ch, { taskId, limit: 2, ack: batch1[0]!.cursor });
+    const batch2 = pollChannel(storage, ch, { taskId, limit: 2, ack: batch1[0]!.cursor });
     expect(batch2[0]!.messages.map(m => m.seq)).toEqual([2, 3]);
   });
 });
@@ -227,19 +231,19 @@ describe("M6 egress — bounded reads (HOST-M5M6-08)", () => {
     const ch = channel();
     const total = MAX_POLL_LIMIT + 5;
     for (let seq = 1; seq <= total; seq++) {
-      writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
 
     // No limit → a first-time poll (cursor 0) is still bounded, not the whole backlog.
-    const first = pollChannel(db, ch, { taskId });
+    const first = pollChannel(storage, ch, { taskId });
     expect(first[0]!.messages).toHaveLength(DEFAULT_POLL_LIMIT);
 
     // An oversized limit is clamped to the hard cap.
-    const capped = tailTask(db, ch, taskId, { limit: MAX_POLL_LIMIT * 10 });
+    const capped = tailTask(storage, ch, taskId, { limit: MAX_POLL_LIMIT * 10 });
     expect(capped.scanned).toBe(MAX_POLL_LIMIT);
 
     // The remainder is deliverable after acking the first window (bounded ≠ lost).
-    const rest = pollChannel(db, ch, { taskId, ack: first[0]!.cursor });
+    const rest = pollChannel(storage, ch, { taskId, ack: first[0]!.cursor });
     expect(rest[0]!.messages).toHaveLength(DEFAULT_POLL_LIMIT);
   });
 });
@@ -248,9 +252,9 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
   it("advances the cursor after a 2xx and re-reads after a failure", async () => {
     const taskId = makeTask();
     const base = channel(undefined, "webhook");
-    bindConversation(db, base.id, "conv-wh", taskId); // egress fans out over bound tasks
-    addWebhook(db, base.id, { url: "https://hooks.example.com/in" });
-    const ch = getChannel(db, base.id)!; // re-read so it carries the webhook config
+    bindConversation(storage, base.id, "conv-wh", taskId); // egress fans out over bound tasks
+    addWebhook(storage, base.id, { url: "https://hooks.example.com/in" });
+    const ch = getChannel(storage, base.id)!; // re-read so it carries the webhook config
     seed(taskId, ["user_input", "assistant_text"]);
 
     // Inject a resolver so delivery's SSRF DNS re-check never touches the network
@@ -259,19 +263,19 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
 
     // A failing receiver (500) → cursor NOT advanced (nothing lost).
     const fail: FetchLike = async () => ({ status: 500 });
-    const failed = await pushChannelWebhooks(db, ch, { fetchImpl: fail, resolver: publicResolver });
+    const failed = await pushChannelWebhooks(storage, ch, { fetchImpl: fail, resolver: publicResolver });
     expect(failed[0]!.ok).toBe(false);
-    expect(readCursor(db, ch.id, taskId)).toBe(0);
+    expect(readCursor(storage, ch.id, taskId)).toBe(0);
 
     // A succeeding receiver (200) → re-reads the same batch, then advances.
     const okFetch: FetchLike = async () => ({ status: 200 });
-    const sent = await pushChannelWebhooks(db, ch, { fetchImpl: okFetch, resolver: publicResolver });
+    const sent = await pushChannelWebhooks(storage, ch, { fetchImpl: okFetch, resolver: publicResolver });
     expect(sent[0]!.ok).toBe(true);
     expect(sent[0]!.delivered).toBe(2);
-    expect(readCursor(db, ch.id, taskId)).toBeGreaterThan(0);
+    expect(readCursor(storage, ch.id, taskId)).toBeGreaterThan(0);
 
     // Drained — a second push delivers nothing.
-    const again = await pushChannelWebhooks(db, ch, { fetchImpl: okFetch, resolver: publicResolver });
+    const again = await pushChannelWebhooks(storage, ch, { fetchImpl: okFetch, resolver: publicResolver });
     expect(again).toHaveLength(0);
   });
 
@@ -289,74 +293,74 @@ describe("M6 egress — webhook push (cursor-driven)", () => {
   it("dead-letters a persistently failing batch after maxAttempts and later messages still deliver (HOST-M5M6-05)", async () => {
     const taskId = makeTask();
     const base = channel(undefined, "webhook");
-    bindConversation(db, base.id, "conv-wh", taskId);
-    addWebhook(db, base.id, { url: "https://hooks.example.com/in" });
-    const ch = getChannel(db, base.id)!;
+    bindConversation(storage, base.id, "conv-wh", taskId);
+    addWebhook(storage, base.id, { url: "https://hooks.example.com/in" });
+    const ch = getChannel(storage, base.id)!;
     seed(taskId, ["user_input"]);
 
     const publicResolver: DnsResolver = async () => [{ address: "93.184.216.34", family: 4 }];
     const attempts = new Map<string, WebhookAttemptState>();
     const fail: FetchLike = async () => ({ status: 500 });
     const push = (fetchImpl: FetchLike) =>
-      pushChannelWebhooks(db, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
+      pushChannelWebhooks(storage, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
 
     // Attempts 1..2 — bounded retries: the cursor stays pinned, nothing skipped yet.
     for (let i = 0; i < 2; i++) {
       expect((await push(fail))[0]!.ok).toBe(false);
     }
-    expect(readCursor(db, ch.id, taskId)).toBe(0);
+    expect(readCursor(storage, ch.id, taskId)).toBe(0);
 
     // Attempt 3 = maxAttempts → the poison batch is dead-lettered: the cursor
     // advances PAST it so the channel is no longer wedged.
     expect((await push(fail))[0]!.ok).toBe(false);
-    const skipped = readCursor(db, ch.id, taskId);
+    const skipped = readCursor(storage, ch.id, taskId);
     expect(skipped).toBeGreaterThan(0);
 
     // A later message flows normally — head-of-line blocking is broken.
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "after-poison" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "after-poison" } });
     const delivered = await push(async () => ({ status: 200 }));
     expect(delivered[0]!.ok).toBe(true);
     expect(delivered[0]!.delivered).toBe(1); // only the post-poison row, never the skipped one
-    expect(readCursor(db, ch.id, taskId)).toBeGreaterThan(skipped);
+    expect(readCursor(storage, ch.id, taskId)).toBeGreaterThan(skipped);
   });
 
   it("a success (or new rows) resets the attempt budget — only the SAME failing batch is counted", async () => {
     const taskId = makeTask();
     const base = channel(undefined, "webhook");
-    bindConversation(db, base.id, "conv-wh", taskId);
-    addWebhook(db, base.id, { url: "https://hooks.example.com/in" });
-    const ch = getChannel(db, base.id)!;
+    bindConversation(storage, base.id, "conv-wh", taskId);
+    addWebhook(storage, base.id, { url: "https://hooks.example.com/in" });
+    const ch = getChannel(storage, base.id)!;
     seed(taskId, ["user_input"]);
 
     const publicResolver: DnsResolver = async () => [{ address: "93.184.216.34", family: 4 }];
     const attempts = new Map<string, WebhookAttemptState>();
     const push = (fetchImpl: FetchLike) =>
-      pushChannelWebhooks(db, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
+      pushChannelWebhooks(storage, ch, { fetchImpl, resolver: publicResolver, attempts, maxAttempts: 3 });
 
     // Two failures, then a success: the budget is cleared, nothing skipped.
     await push(async () => ({ status: 500 }));
     await push(async () => ({ status: 500 }));
     await push(async () => ({ status: 200 }));
     expect(attempts.size).toBe(0);
-    const acked = readCursor(db, ch.id, taskId);
+    const acked = readCursor(storage, ch.id, taskId);
     expect(acked).toBeGreaterThan(0);
 
     // A NEW batch failing twice starts from a fresh budget (cursor moved).
-    writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "next" } });
+    writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 2, kind: "assistant_text", content: "next" } });
     await push(async () => ({ status: 500 }));
     await push(async () => ({ status: 500 }));
-    expect(readCursor(db, ch.id, taskId)).toBe(acked); // not dead-lettered — 2 < maxAttempts
+    expect(readCursor(storage, ch.id, taskId)).toBe(acked); // not dead-lettered — 2 < maxAttempts
   });
 
   it("a channel with no webhooks is a no-op push", async () => {
     const taskId = makeTask();
     const ch = channel(undefined, "webhook");
-    bindConversation(db, ch.id, "conv-wh", taskId);
+    bindConversation(storage, ch.id, "conv-wh", taskId);
     seed(taskId, ["user_input"]);
-    const results = await pushChannelWebhooks(db, ch, { fetchImpl: async () => ({ status: 200 }) });
+    const results = await pushChannelWebhooks(storage, ch, { fetchImpl: async () => ({ status: 200 }) });
     // No outbound endpoints → a true no-op: nothing pushed, the cursor untouched.
     expect(results).toHaveLength(0);
-    expect(readCursor(db, ch.id, taskId)).toBe(0);
+    expect(readCursor(storage, ch.id, taskId)).toBe(0);
   });
 });
 
@@ -366,8 +370,8 @@ describe("M6 egress — storage ⟂ distribution", () => {
     const ch = channel();
     seed(taskId, ["user_input", "assistant_text"]);
     const before = db.select().from(messages).all().length;
-    pollChannel(db, ch, { taskId });
-    pollChannel(db, ch, { taskId, after: 0, ack: 1 });
+    pollChannel(storage, ch, { taskId });
+    pollChannel(storage, ch, { taskId, after: 0, ack: 1 });
     const after = db.select().from(messages).all().length;
     expect(after).toBe(before); // egress only reads messages + writes channel_cursors
   });

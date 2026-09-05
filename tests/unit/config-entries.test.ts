@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { ConfigEntry } from "@/protocol/frames";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
@@ -16,12 +17,14 @@ import {
 import { createDb } from "@/db";
 import { configArtifacts } from "@/db/schema";
 import { ValidationError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 import { closeTask, createTask, setTaskEntries, transitionTaskStatus } from "@/tasks";
 
 // M8 — the per-scope desired set + per-engine `target` resolution. The host
 // resolves the landing path; the agent stays engine-agnostic (target/kind only).
 
 let db: AppDatabase;
+let storage: Storage;
 
 /** Register a `config_artifacts` row so a sha passes write-time validation (HOST-M8-07). */
 function seedArtifact(sha: string, name = `seed-${sha.slice(0, 8)}`): void {
@@ -39,6 +42,7 @@ const SHA_D = "d".repeat(64);
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
   for (const sha of [SHA_A, SHA_B, SHA_C, SHA_D]) {
     seedArtifact(sha);
   }
@@ -83,19 +87,19 @@ describe("desired set — set/get/replace + UNIQUE(scope, target)", () => {
       { name: "CLAUDE.md", sha256: SHA_A, kind: "file" },
       { name: "reviewer", sha256: SHA_B, kind: "dir" },
     ]);
-    setEntries(db, GLOBAL_SCOPE, entries);
+    setEntries(storage, GLOBAL_SCOPE, entries);
 
-    const rows = getEntries(db, GLOBAL_SCOPE);
+    const rows = getEntries(storage, GLOBAL_SCOPE);
     expect(rows.map(r => r.target).sort()).toEqual([".claude/skills/reviewer", "CLAUDE.md"]);
   });
 
   it("REPLACES the desired set (an empty list clears it)", () => {
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
-    expect(getEntries(db, GLOBAL_SCOPE).map(r => r.target)).toEqual([".claude/skills/reviewer"]);
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
+    expect(getEntries(storage, GLOBAL_SCOPE).map(r => r.target)).toEqual([".claude/skills/reviewer"]);
 
-    setEntries(db, GLOBAL_SCOPE, []);
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(0);
+    setEntries(storage, GLOBAL_SCOPE, []);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(0);
   });
 
   it("dedups by target (last write wins) — never violates UNIQUE(scope, target)", () => {
@@ -104,74 +108,74 @@ describe("desired set — set/get/replace + UNIQUE(scope, target)", () => {
       { name: "CLAUDE.md", sha256: SHA_A, kind: "file" },
       { name: "instructions", sha256: SHA_C, kind: "file" },
     ]);
-    setEntries(db, GLOBAL_SCOPE, entries);
-    const rows = getEntries(db, GLOBAL_SCOPE);
+    setEntries(storage, GLOBAL_SCOPE, entries);
+    const rows = getEntries(storage, GLOBAL_SCOPE);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.target).toBe("CLAUDE.md");
     expect(rows[0]!.sha256).toBe(SHA_C);
   });
 
   it("scopes are independent (global vs a task id)", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
-    setEntries(db, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(1);
-    expect(getEntries(db, task.id)).toHaveLength(1);
-    expect(getEntries(db, task.id)[0]!.target).toBe(".claude/skills/reviewer");
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
+    expect(getEntries(storage, task.id)).toHaveLength(1);
+    expect(getEntries(storage, task.id)[0]!.target).toBe(".claude/skills/reviewer");
   });
 });
 
 describe("global config version — monotonic, bumped only by GLOBAL writes (HOST-M8-01)", () => {
   it("starts at 0 and advances on every global setEntries (including a clear)", () => {
-    expect(getGlobalConfigVersion(db)).toBe(0);
+    expect(getGlobalConfigVersion(storage)).toBe(0);
 
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
-    expect(getGlobalConfigVersion(db)).toBe(1);
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    expect(getGlobalConfigVersion(storage)).toBe(1);
 
-    setEntries(db, GLOBAL_SCOPE, []);
-    expect(getGlobalConfigVersion(db)).toBe(2);
+    setEntries(storage, GLOBAL_SCOPE, []);
+    expect(getGlobalConfigVersion(storage)).toBe(2);
   });
 
   it("a task-scope write never touches the global version", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
-    setEntries(db, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
-    expect(getGlobalConfigVersion(db)).toBe(0);
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
+    setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
+    expect(getGlobalConfigVersion(storage)).toBe(0);
   });
 });
 
 describe("setEntries is transactional — delete+insert is all-or-nothing (HOST-M8-02)", () => {
   it("a failing insert leaves the previous set intact and the version unmoved", () => {
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
-    expect(getGlobalConfigVersion(db)).toBe(1);
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    expect(getGlobalConfigVersion(storage)).toBe(1);
 
     // A NULL kind passes write-time validation but violates NOT NULL at insert
     // time — AFTER the delete ran.
     const bad = [{ name: "reviewer", sha256: SHA_B, target: ".claude/skills/reviewer", kind: null }] as unknown as ConfigEntry[];
-    expect(() => setEntries(db, GLOBAL_SCOPE, bad)).toThrow();
+    expect(() => setEntries(storage, GLOBAL_SCOPE, bad)).toThrow();
 
     // Rolled back: the old desired set survives, the version did not advance.
-    expect(getEntries(db, GLOBAL_SCOPE).map(r => r.target)).toEqual(["CLAUDE.md"]);
-    expect(getGlobalConfigVersion(db)).toBe(1);
+    expect(getEntries(storage, GLOBAL_SCOPE).map(r => r.target)).toEqual(["CLAUDE.md"]);
+    expect(getGlobalConfigVersion(storage)).toBe(1);
   });
 });
 
 describe("write-time validation — sha256 + scope (HOST-M8-07)", () => {
   it("rejects an entry whose sha256 no ingested artifact holds (422)", () => {
     const unknownSha = "e".repeat(64);
-    expect(() => setEntries(db, GLOBAL_SCOPE, [{ name: "ghost.md", sha256: unknownSha, target: "ghost.md", kind: "file" }]))
+    expect(() => setEntries(storage, GLOBAL_SCOPE, [{ name: "ghost.md", sha256: unknownSha, target: "ghost.md", kind: "file" }]))
       .toThrow(ValidationError);
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(0);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(0);
   });
 
   it("rejects a malformed sha256 (not 64 lowercase hex)", () => {
     for (const sha of ["abc123", "A".repeat(64), `${"a".repeat(63)}g`, ""]) {
-      expect(() => setEntries(db, GLOBAL_SCOPE, [{ name: "x.md", sha256: sha, target: "x.md", kind: "file" }]))
+      expect(() => setEntries(storage, GLOBAL_SCOPE, [{ name: "x.md", sha256: sha, target: "x.md", kind: "file" }]))
         .toThrow(ValidationError);
     }
   });
 
   it("rejects a scope that is neither 'global' nor an existing task id (422)", () => {
-    expect(() => setEntries(db, "no-such-task", [{ name: "x.md", sha256: SHA_A, target: "x.md", kind: "file" }]))
+    expect(() => setEntries(storage, "no-such-task", [{ name: "x.md", sha256: SHA_A, target: "x.md", kind: "file" }]))
       .toThrow(ValidationError);
   });
 });
@@ -193,22 +197,22 @@ describe("write-time validation — traversal-shaped name/target (HOST-M8-08)", 
       "",
     ];
     for (const target of badTargets) {
-      expect(() => setEntries(db, GLOBAL_SCOPE, [{ name: "x", sha256: SHA_A, target, kind: "file" }]))
+      expect(() => setEntries(storage, GLOBAL_SCOPE, [{ name: "x", sha256: SHA_A, target, kind: "file" }]))
         .toThrow(ValidationError);
     }
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(0);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(0);
   });
 
   it("rejects a name that is not a single safe path segment", () => {
     for (const name of ["..", "a/b", "a\\b", ""]) {
-      expect(() => setEntries(db, GLOBAL_SCOPE, [{ name, sha256: SHA_A, target: "ok.md", kind: "file" }]))
+      expect(() => setEntries(storage, GLOBAL_SCOPE, [{ name, sha256: SHA_A, target: "ok.md", kind: "file" }]))
         .toThrow(ValidationError);
     }
   });
 
   it("accepts normal relative multi-segment targets", () => {
-    setEntries(db, GLOBAL_SCOPE, [{ name: "reviewer", sha256: SHA_B, target: ".claude/skills/reviewer", kind: "dir" }]);
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(1);
+    setEntries(storage, GLOBAL_SCOPE, [{ name: "reviewer", sha256: SHA_B, target: ".claude/skills/reviewer", kind: "dir" }]);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
   });
 });
 
@@ -216,120 +220,120 @@ describe("delivery — resolveEntriesForEngine filters by engine", () => {
   it("delivers an engine its own targets + universal ones, never another engine's", () => {
     // A multi-engine standard lands as both a CLAUDE.md and an AGENTS.md row,
     // plus a universal design.md.
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       { name: "CLAUDE.md", sha256: SHA_A, target: "CLAUDE.md", kind: "file" },
       { name: "AGENTS.md", sha256: SHA_A, target: "AGENTS.md", kind: "file" },
       { name: "design.md", sha256: SHA_D, target: "design.md", kind: "file" },
     ]);
 
-    const forClaude = resolveEntriesForEngine(db, GLOBAL_SCOPE, "claude");
+    const forClaude = resolveEntriesForEngine(storage, GLOBAL_SCOPE, "claude");
     expect(forClaude.map(e => e.target).sort()).toEqual(["CLAUDE.md", "design.md"]);
 
-    const forCodex = resolveEntriesForEngine(db, GLOBAL_SCOPE, "codex");
+    const forCodex = resolveEntriesForEngine(storage, GLOBAL_SCOPE, "codex");
     expect(forCodex.map(e => e.target).sort()).toEqual(["AGENTS.md", "design.md"]);
   });
 
   it("returns the wire shape ({name, sha256, target, kind} only)", () => {
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
-    const [entry] = resolveEntriesForEngine(db, GLOBAL_SCOPE, "claude");
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
+    const [entry] = resolveEntriesForEngine(storage, GLOBAL_SCOPE, "claude");
     expect(Object.keys(entry!).sort()).toEqual(["kind", "name", "sha256", "target"]);
   });
 });
 
 describe("delivery — a multi-engine agent receives the UNION of its engines (HOST-M8-03)", () => {
   it("resolveEntriesForEngines unions every declared engine's targets", () => {
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       { name: "CLAUDE.md", sha256: SHA_A, target: "CLAUDE.md", kind: "file" },
       { name: "AGENTS.md", sha256: SHA_A, target: "AGENTS.md", kind: "file" },
       { name: "design.md", sha256: SHA_D, target: "design.md", kind: "file" },
     ]);
 
-    const both = resolveEntriesForEngines(db, GLOBAL_SCOPE, ["claude", "codex"]);
+    const both = resolveEntriesForEngines(storage, GLOBAL_SCOPE, ["claude", "codex"]);
     expect(both.map(e => e.target).sort()).toEqual(["AGENTS.md", "CLAUDE.md", "design.md"]);
 
     // A single-engine list still filters the other engine out.
-    const claudeOnly = resolveEntriesForEngines(db, GLOBAL_SCOPE, ["claude"]);
+    const claudeOnly = resolveEntriesForEngines(storage, GLOBAL_SCOPE, ["claude"]);
     expect(claudeOnly.map(e => e.target).sort()).toEqual(["CLAUDE.md", "design.md"]);
   });
 
   it("an empty capability list falls back to the default engine", () => {
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       { name: "CLAUDE.md", sha256: SHA_A, target: "CLAUDE.md", kind: "file" },
       { name: "AGENTS.md", sha256: SHA_A, target: "AGENTS.md", kind: "file" },
     ]);
-    const fallback = resolveEntriesForEngines(db, GLOBAL_SCOPE, []);
+    const fallback = resolveEntriesForEngines(storage, GLOBAL_SCOPE, []);
     expect(fallback.map(e => e.target)).toEqual(["CLAUDE.md"]);
   });
 });
 
 describe("task-scope entries — store wiring", () => {
   it("setTaskEntries persists scope=<task_id> resolved by the task's engine", () => {
-    const task = createTask(db, { ownerId: "o", engine: "codex", model: "gpt" });
-    setTaskEntries(db, task.id, [
+    const task = createTask(storage, { ownerId: "o", engine: "codex", model: "gpt" });
+    setTaskEntries(storage, task.id, [
       { name: "instructions", sha256: SHA_A, kind: "file" },
       { name: "reviewer", sha256: SHA_B, kind: "dir" },
     ]);
-    const rows = getEntries(db, task.id);
+    const rows = getEntries(storage, task.id);
     expect(rows.map(r => r.target).sort()).toEqual([".codex/skills/reviewer", "AGENTS.md"]);
   });
 
   it("createTask persists its initial entries on create", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }],
     });
-    expect(getEntries(db, task.id).map(r => r.target)).toEqual(["CLAUDE.md"]);
+    expect(getEntries(storage, task.id).map(r => r.target)).toEqual(["CLAUDE.md"]);
   });
 });
 
 describe("task lifecycle cleanup — closing a task drops its scope (HOST-M8-10)", () => {
   it("closeTask removes the task's config_entries rows; global is untouched", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "reviewer", sha256: SHA_B, kind: "dir" }],
     });
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
-    expect(getEntries(db, task.id)).toHaveLength(1);
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    expect(getEntries(storage, task.id)).toHaveLength(1);
 
-    closeTask(db, task.id);
+    closeTask(storage, task.id);
 
-    expect(getEntries(db, task.id)).toHaveLength(0);
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(1);
+    expect(getEntries(storage, task.id)).toHaveLength(0);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
   });
 
   it("transitionTaskStatus to 'closed' also drops the scope (never-placed close path)", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "reviewer", sha256: SHA_B, kind: "dir" }],
     });
-    transitionTaskStatus(db, task.id, "closed");
-    expect(getEntries(db, task.id)).toHaveLength(0);
+    transitionTaskStatus(storage, task.id, "closed");
+    expect(getEntries(storage, task.id)).toHaveLength(0);
   });
 
   it("a non-terminal transition keeps the scope's entries", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "reviewer", sha256: SHA_B, kind: "dir" }],
     });
-    transitionTaskStatus(db, task.id, "active");
-    expect(getEntries(db, task.id)).toHaveLength(1);
+    transitionTaskStatus(storage, task.id, "active");
+    expect(getEntries(storage, task.id)).toHaveLength(1);
   });
 
   it("clearEntries drops exactly one scope", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
-    setEntries(db, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
+    setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
 
-    clearEntries(db, task.id);
-    expect(getEntries(db, task.id)).toHaveLength(0);
-    expect(getEntries(db, GLOBAL_SCOPE)).toHaveLength(1);
+    clearEntries(storage, task.id);
+    expect(getEntries(storage, task.id)).toHaveLength(0);
+    expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
   });
 });
