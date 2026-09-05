@@ -12,7 +12,7 @@
 // stores it verbatim. M6 never writes the transcript — these routes touch only
 // `channels` / `channel_bindings`. Responses use the shared `{ success, data }`
 // envelope. Webhook secrets are never returned.
-import type { Channel } from "@/db/schema";
+import type { ChannelRow } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -34,7 +34,7 @@ import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/s
 import { requireTask } from "@/tasks";
 
 /** Public projection of a channel row — config/webhook secrets are NOT leaked. */
-function serializeChannel(channel: Channel) {
+function serializeChannel(channel: ChannelRow) {
   return {
     id: channel.id,
     name: channel.name,
@@ -75,8 +75,8 @@ export function adminChannelRoutes() {
       responses: { ...jsonOk(z.array(z.any()), "Channels"), ...errors(401) },
     }),
     (c) => {
-      const db = c.get("db");
-      return c.json(ok(listChannels(db).map(serializeChannel)));
+      const storage = c.get("host").storage;
+      return c.json(ok(listChannels(storage).map(serializeChannel)));
     },
   );
 
@@ -90,9 +90,9 @@ export function adminChannelRoutes() {
     }),
     validator("json", registerBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const b = c.req.valid("json");
-      const channel = registerChannel(db, {
+      const channel = registerChannel(storage, {
         name: b.name,
         type: b.type,
         ownerId: b.owner_id,
@@ -112,11 +112,11 @@ export function adminChannelRoutes() {
       responses: { ...jsonOk(z.any(), "Channel"), ...errors(401, 404) },
     }),
     (c) => {
-      const db = c.get("db");
-      const channel = requireChannel(db, c.req.param("id"));
+      const storage = c.get("host").storage;
+      const channel = requireChannel(storage, c.req.param("id"));
       return c.json(ok({
         ...serializeChannel(channel),
-        bindings: listChannelBindings(db, channel.id).map(b => ({
+        bindings: listChannelBindings(storage, channel.id).map(b => ({
           conversationRef: b.conversationRef,
           taskId: b.taskId,
           createdAt: b.createdAt,
@@ -136,15 +136,15 @@ export function adminChannelRoutes() {
     }),
     validator("json", webhookBody),
     (c) => {
-      const db = c.get("db");
+      const storage = c.get("host").storage;
       const id = c.req.param("id");
-      requireChannel(db, id); // 404 (resolve by id/name) before mutating
-      const channel = getChannel(db, id);
+      requireChannel(storage, id); // 404 (resolve by id/name) before mutating
+      const channel = getChannel(storage, id);
       if (!channel) {
         throw new NotFoundError("channel", id);
       }
       const b = c.req.valid("json");
-      const endpoint = addWebhook(db, channel.id, { url: b.url, ...(b.secret != null ? { secret: b.secret } : {}) });
+      const endpoint = addWebhook(storage, channel.id, { url: b.url, ...(b.secret != null ? { secret: b.secret } : {}) });
       return c.json(ok({ id: endpoint.id, url: endpoint.url }), 201);
     },
   );
@@ -157,10 +157,10 @@ export function adminChannelRoutes() {
       responses: { ...jsonOk(z.any(), "Webhook removed"), ...errors(401, 404) },
     }),
     (c) => {
-      const db = c.get("db");
-      const channel = requireChannel(db, c.req.param("id"));
+      const storage = c.get("host").storage;
+      const channel = requireChannel(storage, c.req.param("id"));
       const hookId = c.req.param("hookId");
-      const removed = removeWebhook(db, channel.id, hookId);
+      const removed = removeWebhook(storage, channel.id, hookId);
       if (!removed) {
         throw new NotFoundError("webhook", hookId);
       }
@@ -178,12 +178,12 @@ export function adminChannelRoutes() {
     }),
     validator("json", bindBody),
     (c) => {
-      const db = c.get("db");
-      const channel = requireChannel(db, c.req.param("id"));
+      const storage = c.get("host").storage;
+      const channel = requireChannel(storage, c.req.param("id"));
       const b = c.req.valid("json");
-      requireTask(db, b.task_id); // 404 if the task does not exist
-      bindConversation(db, channel.id, b.conversation_ref, b.task_id);
-      const binding = getBinding(db, channel.id, b.conversation_ref);
+      requireTask(storage, b.task_id); // 404 if the task does not exist
+      bindConversation(storage, channel.id, b.conversation_ref, b.task_id);
+      const binding = getBinding(storage, channel.id, b.conversation_ref);
       return c.json(ok({
         channelId: channel.id,
         conversationRef: b.conversation_ref,

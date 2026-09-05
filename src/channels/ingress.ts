@@ -9,16 +9,14 @@
 // `owner_id` (OD16 — the host never computes user→owner; the external system
 // supplied it at registration) → M4 dispatch (owner-pinned, §3) → deliver the
 // message. The old "group" delivery role is dissolved into this routing.
-import type { AppDatabase } from "@/db";
-import type { Channel } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
+import type { ChannelRow, Storage } from "@/host/ports/storage";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { AttachmentDescriptor } from "@/protocol/frames";
-import type { FrameSender } from "@/protocol/outbox";
 import type { DispatchResult } from "@/tasks";
-import { and, eq } from "drizzle-orm";
-import { channelBindings } from "@/db/schema";
 import { ValidationError } from "@/shared/lib/errors";
 import { createTask, getTask, placeTask, requireTask, sendTaskMessage } from "@/tasks";
+import { requireChannels } from "./registry";
 
 export interface InboundMessage {
   /** Conversation identity within the channel (`channel_bindings.conversation_ref`). */
@@ -47,22 +45,9 @@ export interface RouteResult {
   dispatch?: DispatchResult;
 }
 
-/** Resolve the `(channel, conversation_ref)` binding → task id, if the conversation exists. */
-function findBinding(db: AppDatabase, channelId: string, conversationRef: string) {
-  return db
-    .select()
-    .from(channelBindings)
-    .where(and(eq(channelBindings.channelId, channelId), eq(channelBindings.conversationRef, conversationRef)))
-    .get();
-}
-
 /** Bind a conversation to a task (idempotent on `(channel, conversation_ref)`). */
-export function bindConversation(db: AppDatabase, channelId: string, conversationRef: string, taskId: string): void {
-  db
-    .insert(channelBindings)
-    .values({ channelId, conversationRef, taskId })
-    .onConflictDoNothing({ target: [channelBindings.channelId, channelBindings.conversationRef] })
-    .run();
+export function bindConversation(storage: Storage, channelId: string, conversationRef: string, taskId: string): void {
+  requireChannels(storage).bindIfAbsent({ channelId, conversationRef, taskId });
 }
 
 interface NewTaskShape {
@@ -73,7 +58,7 @@ interface NewTaskShape {
 }
 
 /** Engine/model for a NEW conversation: request override → channel `config` default (else 422). */
-function resolveNewTaskShape(channel: Channel, input: InboundMessage): NewTaskShape {
+function resolveNewTaskShape(channel: ChannelRow, input: InboundMessage): NewTaskShape {
   const config = (channel.config ?? {}) as { engine?: unknown; model?: unknown; workdir?: unknown; meta?: unknown };
   const engine = input.engine ?? (typeof config.engine === "string" ? config.engine : undefined);
   const model = input.model ?? (typeof config.model === "string" ? config.model : undefined);
@@ -96,16 +81,16 @@ function resolveNewTaskShape(channel: Channel, input: InboundMessage): NewTaskSh
  * the message is NOT delivered yet (`delivered: false`) — the binding persists so
  * a later send/assign continues the same conversation.
  */
-export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Channel, input: InboundMessage, events?: HostEvents): RouteResult {
+export function routeInbound(storage: Storage, sender: AgentTransport, channel: ChannelRow, input: InboundMessage, events?: HostEvents): RouteResult {
   if (!input.conversationRef) {
     throw new ValidationError("conversation_ref is required", { formErrors: ["conversation_ref is required"], fieldErrors: {} });
   }
 
-  const existing = findBinding(db, channel.id, input.conversationRef);
+  const existing = requireChannels(storage).getBinding(channel.id, input.conversationRef);
   if (existing) {
     // CONTINUE — the conversation already maps to a task (OD9).
-    const task = requireTask(db, existing.taskId);
-    const sent = sendTaskMessage(db, sender, task, {
+    const task = requireTask(storage, existing.taskId);
+    const sent = sendTaskMessage(storage, sender, task, {
       text: input.text,
       ...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
     });
@@ -121,7 +106,7 @@ export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Chan
 
   // NEW conversation → NEW task stamped with the channel owner (OD16).
   const shape = resolveNewTaskShape(channel, input);
-  const task = createTask(db, {
+  const task = createTask(storage, {
     ownerId: channel.ownerId,
     engine: shape.engine,
     model: shape.model,
@@ -134,15 +119,15 @@ export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Chan
       conversationRef: input.conversationRef,
     },
   });
-  bindConversation(db, channel.id, input.conversationRef, task.id);
+  bindConversation(storage, channel.id, input.conversationRef, task.id);
 
   // M4 dispatch (owner-pinned, §3).
-  const dispatch = placeTask(db, task.id, events);
+  const dispatch = placeTask(storage, task.id, events);
   if (!dispatch.placed) {
     return {
       taskId: task.id,
       conversationRef: input.conversationRef,
-      threadId: getTask(db, task.id)?.currentThreadId ?? "",
+      threadId: getTask(storage, task.id)?.currentThreadId ?? "",
       created: true,
       delivered: false,
       msgId: null,
@@ -150,8 +135,8 @@ export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Chan
     };
   }
 
-  const placed = requireTask(db, task.id);
-  const sent = sendTaskMessage(db, sender, placed, {
+  const placed = requireTask(storage, task.id);
+  const sent = sendTaskMessage(storage, sender, placed, {
     text: input.text,
     ...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
   });
