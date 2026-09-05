@@ -89,11 +89,10 @@ export function adminConfigRoutes() {
     }),
     validator("json", entriesBody),
     (c) => {
-      const db = c.get("db");
       const storage = c.get("host").storage;
       const b = c.req.valid("json");
       // Resolve the engine: explicit > the task's engine (for a task scope) > claude.
-      const taskEngine = b.scope !== GLOBAL_SCOPE ? getTask(db, b.scope)?.engine : undefined;
+      const taskEngine = b.scope !== GLOBAL_SCOPE ? getTask(storage, b.scope)?.engine : undefined;
       const engine = b.engine ?? taskEngine ?? DEFAULT_ENGINE;
       const inputs = b.entries.map(e => ({
         name: e.name,
@@ -108,7 +107,7 @@ export function adminConfigRoutes() {
         // setEntries) and is re-pushed live to every online agent; offline
         // agents converge on their next versioned config pull.
         const version = getGlobalConfigVersion(storage);
-        const pushed = broadcastGlobalConfig(db, c.get("host").sessions);
+        const pushed = broadcastGlobalConfig(storage, c.get("host").sessions);
         c.get("logger").info({ scope: b.scope, engine, count: persisted.length, version, pushed: pushed.length }, "config entries set");
         return c.json(ok({ scope: b.scope, engine, entries: persisted, version }));
       }

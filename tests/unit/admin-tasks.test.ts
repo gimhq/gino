@@ -64,9 +64,9 @@ function enrolledAgent(opts: { online?: boolean } = {}): string {
 }
 
 function placedTask(agentId: string) {
-  const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
-  setPlacement(db, task.id, agentId);
-  return getTask(db, task.id)!;
+  const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
+  setPlacement(storage, task.id, agentId);
+  return getTask(storage, task.id)!;
 }
 
 describe("POST /admin/tasks/:id/close", () => {
@@ -92,7 +92,7 @@ describe("POST /admin/tasks/:id/close", () => {
     expect(upsert).toBeDefined();
     expect((upsert!.dataJson as { status?: string }).status).toBe("closed");
 
-    expect(getTask(db, task.id)?.status).toBe("closed");
+    expect(getTask(storage, task.id)?.status).toBe("closed");
   });
 
   it("closes a task on an OFFLINE agent: no interrupt, durable task_upsert only (HOST-M4-03)", async () => {
@@ -111,7 +111,7 @@ describe("POST /admin/tasks/:id/close", () => {
   });
 
   it("closes a NEVER-PLACED task: pure status write, no 409, no frames (HOST-M4-09)", async () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     expect(task.agentId ?? null).toBeNull();
 
     const res = await taskApp().request(`/${task.id}/close`, { method: "POST" });
@@ -120,7 +120,7 @@ describe("POST /admin/tasks/:id/close", () => {
     expect(body.data.task.status).toBe("closed");
     expect(body.data.outboxId).toBeNull();
 
-    expect(getTask(db, task.id)?.status).toBe("closed");
+    expect(getTask(storage, task.id)?.status).toBe("closed");
     expect(db.select().from(outbox).all()).toHaveLength(0);
   });
 });

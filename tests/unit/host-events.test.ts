@@ -49,8 +49,8 @@ function spyLogger(): { logger: Logger; warns: unknown[][] } {
 /** Enroll a fresh agent, create a task, and place it on that agent. */
 function placedAgentTask(): { agentId: string; taskId: string } {
   const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
-  const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
+  const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
   return { agentId, taskId };
 }
 
@@ -135,13 +135,13 @@ describe("createHostEvents — emission sites", () => {
   it("placeTask emits task.placed once — not on the already-placed replay", () => {
     const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
     grantOwner(storage, agentId, "owner"); // a dedicated agent must be granted to the task's owner (OD13)
-    const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet" }).id;
+    const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet" }).id;
     const events = createHostEvents();
     const placed: HostEventMap["task.placed"][] = [];
     events.on("task.placed", p => placed.push(p));
 
-    expect(placeTask(db, taskId, events).reason).toBe("placed");
-    expect(placeTask(db, taskId, events).reason).toBe("already-placed");
+    expect(placeTask(storage, taskId, events).reason).toBe("placed");
+    expect(placeTask(storage, taskId, events).reason).toBe("already-placed");
     expect(placed).toEqual([{ taskId, agentId }]);
   });
 });

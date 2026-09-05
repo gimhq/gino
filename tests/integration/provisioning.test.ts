@@ -165,8 +165,8 @@ describe("global delivery — register / GET /agent/config carry config.entries"
     // Task scope: no version minted (the response carries none).
     const reg = await register(["claude"]);
     const { agentId } = await reg.json() as { agentId: string };
-    const task = createTask(db, { ownerId: "owner-v", engine: "claude", model: "sonnet" });
-    setPlacement(db, task.id, agentId);
+    const task = createTask(storage, { ownerId: "owner-v", engine: "claude", model: "sonnet" });
+    setPlacement(storage, task.id, agentId);
     const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
     const taskPut = await (await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }])).json() as { data: { version?: number } };
     expect(taskPut.data.version).toBeUndefined();
@@ -234,8 +234,8 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
     const reg = await register(["claude"]);
     const { agentId } = await reg.json() as { agentId: string };
 
-    const task = createTask(db, { ownerId: "owner-1", engine: "claude", model: "sonnet" });
-    setPlacement(db, task.id, agentId);
+    const task = createTask(storage, { ownerId: "owner-1", engine: "claude", model: "sonnet" });
+    setPlacement(storage, task.id, agentId);
 
     // Declare the task-scope desired set via the admin surface (scope = task id).
     const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
@@ -243,7 +243,7 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
     expect(put.status).toBe(200);
 
     // The orchestrator resolves config_entries WHERE scope=<task_id> into the frame.
-    const row = emitTaskUpsert(db, sender, getTask(db, task.id)!);
+    const row = emitTaskUpsert(storage, sender, getTask(storage, task.id)!);
     const data = row.dataJson as { entries?: { name: string; sha256: string; target: string; kind: string }[] };
     expect(data.entries).toEqual([{ name: "reviewer", sha256: skSha, target: ".claude/skills/reviewer", kind: "dir" }]);
   });
@@ -251,17 +251,17 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
   it("a task with no declared set emits no entries (backward-compatible)", async () => {
     const reg = await register(["claude"]);
     const { agentId } = await reg.json() as { agentId: string };
-    const task = createTask(db, { ownerId: "owner-2", engine: "claude", model: "sonnet" });
-    setPlacement(db, task.id, agentId);
-    const row = emitTaskUpsert(db, sender, getTask(db, task.id)!);
+    const task = createTask(storage, { ownerId: "owner-2", engine: "claude", model: "sonnet" });
+    setPlacement(storage, task.id, agentId);
+    const row = emitTaskUpsert(storage, sender, getTask(storage, task.id)!);
     expect((row.dataJson as { entries?: unknown }).entries).toBeUndefined();
   });
 
   it("closing a task via the admin surface drops its task-scope entries (HOST-M8-10)", async () => {
     const reg = await register(["claude"]);
     const { agentId } = await reg.json() as { agentId: string };
-    const task = createTask(db, { ownerId: "owner-3", engine: "claude", model: "sonnet" });
-    setPlacement(db, task.id, agentId);
+    const task = createTask(storage, { ownerId: "owner-3", engine: "claude", model: "sonnet" });
+    setPlacement(storage, task.id, agentId);
 
     const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
     expect((await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }])).status).toBe(200);
