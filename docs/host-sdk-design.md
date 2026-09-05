@@ -251,6 +251,8 @@ after them — the 2026-08 alignment audit showed it is the only test that catch
 | P2 — package split | workspace layout of §3; `apps/host` is the only place with `Bun.*`, env, lode, docs, CLI; `host-channels`/`host-proxy` extracted | per-package `check`; app e2e unchanged; a new `examples/embed-node` (express or Fastify + `ws`) that enrolls a real `gino-agent` and round-trips one task — the SDK's own cross-implementation test |
 | P3 — API freeze | typed docs for `Host`/`Wire`/events; semver from 0.x; publish to the internal registry | consumer example pinned to the published version |
 
+**P0 status (2026-09-05):** landed in place on branch `bkd/qsi4ffym` (`src/host/{context,options,events,metrics}.ts`, `src/shared/lib/net.ts`) via merges 8de5d8d (net util), a9fcbf9 (HostContext + de-singleton sessions/launchers + `Metrics` sink), 91597e7 (`HostOptions`, `createStore(storeDir)`), 5e3f49f (`HostEvents`, pump subscription, `webhookPump` removed), 0ac295f (`host.start()/stop()` lifecycle); verified by `bun run check` (701 tests) and `e2e/run.sh` (57/57 checks) on the integrated branch.
+
 Estimated size: P0 ≈ 1.5k lines touched (mostly mechanical), P1 ≈ 2k (extraction), P2 ≈ moves +
 build config, P3 ≈ docs. No protocol version bump at any phase.
 
