@@ -1,5 +1,4 @@
 import type { DecodedFrame } from "./envelope";
-import type { FrameSender } from "./outbox";
 // M2 — INBOUND (frame → demux by threadId → dispatch by type → M5 writer → ack).
 //
 // The receive half of the only wire-aware module. Each agent→host frame is:
@@ -27,6 +26,7 @@ import type { FrameSender } from "./outbox";
 import type { AppDatabase } from "@/db";
 import type { HostEvents } from "@/host/events";
 import type { Metrics } from "@/host/metrics";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
 import { touchLiveness } from "@/agents/registry";
 import {
@@ -46,7 +46,7 @@ import { ackMessage, ackOutbox } from "./outbox";
 export interface InboundDeps {
   db: AppDatabase;
   /** Live socket to ack back over (absent for the HTTP `/agent/output` fallback). */
-  sender?: FrameSender;
+  sender?: AgentTransport;
   agentId: string;
   logger?: Logger;
   /**
