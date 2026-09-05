@@ -1,24 +1,16 @@
-import type { Storage } from "@/host/ports/storage";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { sql } from "drizzle-orm";
 import { createDb } from "@/db";
-import { sqliteAgentRepo } from "@/store/sqlite/agents";
-import { sqliteOutboxRepo } from "@/store/sqlite/outbox";
-import { sqliteTaskRepo } from "@/store/sqlite/tasks";
-import { sqliteThreadRunRepo } from "@/store/sqlite/thread-runs";
-import { sqliteTranscriptRepo } from "@/store/sqlite/transcript";
-import {
-  describeAgentRepoConformance,
-  describeOutboxRepoConformance,
-  describeTaskRepoConformance,
-  describeThreadRunRepoConformance,
-  describeTranscriptRepoConformance,
-} from "./storage.conformance";
+import { sqliteStorage } from "@/store/sqlite";
+import { describeStorageConformance } from "./storage.conformance";
 
 // The sqlite (drizzle + bun:sqlite) `Storage` adapter against the shared
-// conformance spec — part 1: the five repos that exist so far. The partial
-// object is cast because the remaining repos land with part 2.
+// conformance spec, with the filesystem `BlobStore` rooted in a throwaway
+// directory per test.
 
-const target = {
+describeStorageConformance({
   name: "sqlite",
   open: () => {
     const db = createDb(":memory:");
@@ -26,25 +18,16 @@ const target = {
     // that was never enrolled, a run for a task never created), so the
     // schema's foreign keys are switched off for the conformance database.
     db.run(sql`PRAGMA foreign_keys = OFF`);
-    const storage = {
-      agents: sqliteAgentRepo(db),
-      tasks: sqliteTaskRepo(db),
-      outbox: sqliteOutboxRepo(db),
-      transcript: sqliteTranscriptRepo(db),
-      threadRuns: sqliteThreadRunRepo(db),
-    } as unknown as Storage;
+    const storeDir = mkdtempSync(join(tmpdir(), "gino-conformance-store-"));
+    const storage = sqliteStorage(db, { storeDir });
     return {
       storage,
-      tamperBlob: () => {
-        throw new Error("not in part 1");
+      // A ref `<name>/<sha256[:12]>` is the file `<storeDir>/<name>/<sha256[:12]>`.
+      tamperBlob: ref => writeFileSync(join(storeDir, ref), "tampered bytes"),
+      close: () => {
+        db.close();
+        rmSync(storeDir, { recursive: true, force: true });
       },
-      close: () => db.close(),
     };
   },
-};
-
-describeAgentRepoConformance(target);
-describeTaskRepoConformance(target);
-describeOutboxRepoConformance(target);
-describeTranscriptRepoConformance(target);
-describeThreadRunRepoConformance(target);
+});
