@@ -9,7 +9,7 @@
 // transcript (storage ⟂ distribution, §9). Ingress hands the message to M4 via
 // the orchestrator (it writes only `channel_bindings`). Explicit routes only —
 // no catch-all.
-import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -86,8 +86,8 @@ function sleep(ms: number): Promise<void> {
  * SMALLEST delivery cursor received, or ack per task with scoped polls.
  * `after` reads from an explicit position without confirming anything.
  */
-async function runPoll(db: AppDatabase, channelRef: string, params: PollParams) {
-  const channel = requireChannel(db, channelRef);
+async function runPoll(storage: Storage, channelRef: string, params: PollParams) {
+  const channel = requireChannel(storage, channelRef);
   const base = {
     ...(params.conversationRef != null ? { conversationRef: params.conversationRef } : {}),
     ...(params.taskId != null ? { taskId: params.taskId } : {}),
@@ -99,10 +99,10 @@ async function runPoll(db: AppDatabase, channelRef: string, params: PollParams) 
   const deadline = Date.now() + Math.min(Math.max(params.waitMs, 0), LONG_POLL_MAX_MS);
   // Re-polling with the same options is idempotent: reads don't move the
   // cursor and the forward-only `ack` is a no-op after the first iteration.
-  let deliveries = pollChannel(db, channel, base);
+  let deliveries = pollChannel(storage, channel, base);
   while (deliveries.length === 0 && Date.now() < deadline) {
     await sleep(LONG_POLL_INTERVAL_MS);
-    deliveries = pollChannel(db, channel, base);
+    deliveries = pollChannel(storage, channel, base);
   }
   return { channel: channel.id, deliveries };
 }
@@ -138,11 +138,10 @@ export function messagesRoutes() {
     }),
     validator("json", sendBody),
     (c) => {
-      const db = c.get("db");
       const host = c.get("host");
-      const channel = requireChannel(db, c.req.param("channel"));
+      const channel = requireChannel(host.storage, c.req.param("channel"));
       const b = c.req.valid("json");
-      const result = routeInbound(db, host.sessions, channel, {
+      const result = routeInbound(host.storage, host.sessions, channel, {
         conversationRef: b.conversation_ref,
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),
@@ -165,11 +164,10 @@ export function messagesRoutes() {
     }),
     validator("json", sendBody),
     (c) => {
-      const db = c.get("db");
       const host = c.get("host");
-      const channel = requireChannel(db, c.req.param("channel"));
+      const channel = requireChannel(host.storage, c.req.param("channel"));
       const b = c.req.valid("json");
-      const result = routeInbound(db, host.sessions, channel, {
+      const result = routeInbound(host.storage, host.sessions, channel, {
         conversationRef: b.conversation_ref,
         text: b.text,
         ...(b.attachments != null ? { attachments: b.attachments } : {}),
@@ -193,7 +191,7 @@ export function messagesRoutes() {
     validator("query", pollQuery),
     async (c) => {
       const q = c.req.valid("query");
-      const result = await runPoll(c.get("db"), c.req.param("channel"), {
+      const result = await runPoll(c.get("host").storage, c.req.param("channel"), {
         ...(q.conversation_ref != null ? { conversationRef: q.conversation_ref } : {}),
         ...(q.task != null ? { taskId: q.task } : {}),
         ...(q.after != null ? { after: q.after } : {}),
@@ -216,7 +214,7 @@ export function messagesRoutes() {
     validator("json", pollBody),
     async (c) => {
       const b = c.req.valid("json");
-      const result = await runPoll(c.get("db"), c.req.param("channel"), {
+      const result = await runPoll(c.get("host").storage, c.req.param("channel"), {
         ...(b.conversation_ref != null ? { conversationRef: b.conversation_ref } : {}),
         ...(b.task != null ? { taskId: b.task } : {}),
         ...(b.after != null ? { after: b.after } : {}),

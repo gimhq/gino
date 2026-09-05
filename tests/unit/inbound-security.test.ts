@@ -41,8 +41,8 @@ function agent(): string {
 
 /** Create a task and pin it to `agentId` (set-once placement). */
 function placedTask(ownerId: string, agentId: string): string {
-  const id = createTask(db, { ownerId, engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, id, agentId);
+  const id = createTask(storage, { ownerId, engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, id, agentId);
   return id;
 }
 
@@ -103,7 +103,7 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
 
   it("DROPS a write for an unplaced (pending-assignment) task — no agent owns it yet", () => {
     const attacker = agent();
-    const pending = createTask(db, { ownerId: "owner-V", engine: "claude", model: "sonnet" }).id; // not placed
+    const pending = createTask(storage, { ownerId: "owner-V", engine: "claude", model: "sonnet" }).id; // not placed
 
     const denied = apply(attacker, { type: "thread_message", outboxId: 1, taskId: pending, threadId: "thr-P", data: tmsg(1, "x") });
     expect(denied).toEqual({ type: "ack", id: 1 }); // acked-and-dropped

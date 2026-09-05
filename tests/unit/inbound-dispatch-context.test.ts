@@ -32,8 +32,8 @@ afterEach(() => {
 /** Enroll a fresh agent, create a task, and place it on that agent. */
 function placedAgentTask(): { agentId: string; taskId: string } {
   const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
-  const taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
+  const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
   return { agentId, taskId };
 }
 

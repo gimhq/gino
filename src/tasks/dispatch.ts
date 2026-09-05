@@ -14,13 +14,10 @@
 //     only breaks ties / orders candidates.
 //   • None permitted → `pending-assignment` (surfaced in /admin/tasks); a
 //     launcher/admin grants or starts one later (deferred phase).
-import type { AppDatabase } from "@/db";
-import type { Task } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
-import type { AgentRow } from "@/host/ports/storage";
+import type { AgentRow, Storage, TaskRow } from "@/host/ports/storage";
 import { getCapacity, isOwnerPermitted, listAgents } from "@/agents/registry";
 import { AppError } from "@/shared/lib/errors";
-import { sqliteStorage } from "@/store/sqlite";
 import { requireTask, setPlacement, setStatus } from "./store";
 
 /** A task placed by dispatch becomes `active`; pin + status flip in one step. */
@@ -40,11 +37,11 @@ const ASSIGNABLE_STATUSES: readonly string[] = [STATUS_PENDING_ASSIGNMENT, STATU
  * assignment is legal; a closed/terminal task keeps its status even when the
  * pin itself is (re-)recorded. Returns the resulting status.
  */
-function activateForPlacement(db: AppDatabase, task: Task): string {
+function activateForPlacement(storage: Storage, task: TaskRow): string {
   if (!ASSIGNABLE_STATUSES.includes(task.status)) {
     return task.status;
   }
-  return setStatus(db, task.id, STATUS_ACTIVE).status;
+  return setStatus(storage, task.id, STATUS_ACTIVE).status;
 }
 
 /** A placement precondition failure (admin `/assign`) → HTTP 422. */
@@ -82,9 +79,7 @@ interface Candidate {
  * owner is permitted on it (OD13). Sorted dedicated-before-public, then
  * spare-capacity, then least-loaded, then online, then stable by `created_at`.
  */
-function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
-  // P1 transitional — removed when tasks moves to ports
-  const storage = sqliteStorage(db);
+function rankCandidates(storage: Storage, task: TaskRow): Candidate[] {
   const candidates: Candidate[] = [];
   for (const agent of listAgents(storage)) {
     if (agent.status === "removed") {
@@ -124,23 +119,23 @@ function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
  *   • none permitted   → leaves the task `pending-assignment`.
  * A fresh pin is announced as `task.placed` on `events` (after the write).
  */
-export function placeTask(db: AppDatabase, taskId: string, events?: HostEvents): DispatchResult {
-  const task = requireTask(db, taskId);
+export function placeTask(storage: Storage, taskId: string, events?: HostEvents): DispatchResult {
+  const task = requireTask(storage, taskId);
   if (task.agentId != null) {
     return { taskId, placed: true, agentId: task.agentId, status: task.status, reason: "already-placed" };
   }
 
-  const chosen = rankCandidates(db, task)[0];
+  const chosen = rankCandidates(storage, task)[0];
   if (!chosen) {
     // No permitted agent — queue for assignment (a launcher/admin acts later).
     if (task.status !== STATUS_PENDING_ASSIGNMENT) {
-      setStatus(db, taskId, STATUS_PENDING_ASSIGNMENT);
+      setStatus(storage, taskId, STATUS_PENDING_ASSIGNMENT);
     }
     return { taskId, placed: false, agentId: null, status: STATUS_PENDING_ASSIGNMENT, reason: "no-permitted-agent" };
   }
 
-  setPlacement(db, taskId, chosen.agent.id); // SET ONCE
-  const status = activateForPlacement(db, task);
+  setPlacement(storage, taskId, chosen.agent.id); // SET ONCE
+  const status = activateForPlacement(storage, task);
   events?.emit("task.placed", { taskId, agentId: chosen.agent.id });
   return { taskId, placed: true, agentId: chosen.agent.id, status, reason: "placed" };
 }
@@ -153,15 +148,13 @@ export function placeTask(db: AppDatabase, taskId: string, events?: HostEvents):
  * SAME agent is a full no-op (`already-placed`); set-once is enforced by
  * `setPlacement` (a second, different agent → 409).
  */
-export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: string, events?: HostEvents): DispatchResult {
-  const task = requireTask(db, taskId);
+export function assignTaskToAgent(storage: Storage, taskId: string, agentId: string, events?: HostEvents): DispatchResult {
+  const task = requireTask(storage, taskId);
   if (task.agentId === agentId) {
     // Idempotent replay of the same assign: report the existing pin and touch
     // NOTHING — a retried assign must not flip a closed task back to `active`.
     return { taskId, placed: true, agentId, status: task.status, reason: "already-placed" };
   }
-  // P1 transitional — removed when tasks moves to ports
-  const storage = sqliteStorage(db);
   const agent = listAgents(storage).find(a => a.id === agentId);
   if (!agent || agent.status === "removed") {
     throw new DispatchError(`agent ${agentId} is not available for placement`, "AGENT_UNAVAILABLE");
@@ -173,8 +166,8 @@ export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: stri
     throw new DispatchError(`owner ${task.ownerId} is not permitted on agent ${agentId}`, "NOT_PERMITTED");
   }
 
-  setPlacement(db, taskId, agentId); // SET ONCE (409 on a different agent while placed)
-  const status = activateForPlacement(db, task);
+  setPlacement(storage, taskId, agentId); // SET ONCE (409 on a different agent while placed)
+  const status = activateForPlacement(storage, task);
   events?.emit("task.placed", { taskId, agentId });
   return { taskId, placed: true, agentId, status, reason: "placed" };
 }

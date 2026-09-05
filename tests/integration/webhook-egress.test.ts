@@ -40,11 +40,11 @@ interface Setup {
 /** Enroll an agent, place a task on it, and bind the task to a webhook channel with one endpoint. */
 function setup(): Setup {
   const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
-  const taskId = createTask(db, { ownerId: "owner-A", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
-  const channel = registerChannel(db, { name: "wh", type: "webhook", ownerId: "owner-A" });
-  bindConversation(db, channel.id, "conv-1", taskId);
-  addWebhook(db, channel.id, { url: "https://hooks.example.com/in", secret: "shh" });
+  const taskId = createTask(storage, { ownerId: "owner-A", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
+  const channel = registerChannel(storage, { name: "wh", type: "webhook", ownerId: "owner-A" });
+  bindConversation(storage, channel.id, "conv-1", taskId);
+  addWebhook(storage, channel.id, { url: "https://hooks.example.com/in", secret: "shh" });
   return { agentId, taskId, channelId: channel.id };
 }
 
@@ -68,7 +68,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     };
     const events = createHostEvents();
     const pump = startWebhookPump({
-      db,
+      storage,
       events,
       fetchImpl,
       resolver: async () => [{ address: PUBLIC_IP, family: 4 }],
@@ -87,7 +87,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     expect(body.conversationRef).toBe("conv-1");
     expect(body.messages.map(m => m.content)).toEqual(["hello"]);
     expect(received[0]!.headers?.["x-webhook-secret"]).toBe("shh");
-    expect(readCursor(db, channelId, taskId)).toBeGreaterThan(0); // 2xx confirmed → cursor advanced
+    expect(readCursor(storage, channelId, taskId)).toBeGreaterThan(0); // 2xx confirmed → cursor advanced
 
     // Drained: another notify pushes nothing (no duplicate fan-out).
     pump.notifyTask(taskId);
@@ -107,7 +107,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     };
     const events = createHostEvents();
     const pump = startWebhookPump({
-      db,
+      storage,
       events,
       fetchImpl,
       resolver: async () => [{ address: PUBLIC_IP, family: 4 }],
@@ -118,7 +118,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "first"));
     await pump.flush();
     expect(bodies).toHaveLength(1);
-    expect(readCursor(db, channelId, taskId)).toBe(0);
+    expect(readCursor(storage, channelId, taskId)).toBe(0);
 
     // Recovery: the next trigger re-reads and re-delivers the SAME batch.
     status = 200;
@@ -126,22 +126,22 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     await pump.flush();
     expect(bodies).toHaveLength(2);
     expect(JSON.parse(bodies[1]!).messages.map((m: { content: string }) => m.content)).toEqual(["first"]);
-    expect(readCursor(db, channelId, taskId)).toBeGreaterThan(0);
+    expect(readCursor(storage, channelId, taskId)).toBeGreaterThan(0);
 
     pump.stop();
   });
 
   it("a task with no webhook channel bound never triggers a push (quiet no-op)", async () => {
     const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
-    const taskId = createTask(db, { ownerId: "owner-B", engine: "claude", model: "sonnet", status: "active" }).id;
-    setPlacement(db, taskId, agentId);
+    const taskId = createTask(storage, { ownerId: "owner-B", engine: "claude", model: "sonnet", status: "active" }).id;
+    setPlacement(storage, taskId, agentId);
     let called = 0;
     const fetchImpl: FetchLike = async () => {
       called++;
       return { status: 200 };
     };
     const events = createHostEvents();
-    const pump = startWebhookPump({ db, events, fetchImpl, intervalMs: 60_000 });
+    const pump = startWebhookPump({ storage, events, fetchImpl, intervalMs: 60_000 });
 
     ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "unbound"));
     await pump.flush();

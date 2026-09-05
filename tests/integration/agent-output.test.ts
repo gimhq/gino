@@ -47,8 +47,8 @@ beforeAll(async () => {
   expect(res.status).toBe(200);
   ({ agentId, connectToken } = await res.json() as { agentId: string; connectToken: string });
 
-  taskId = createTask(db, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
-  setPlacement(db, taskId, agentId);
+  taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet", status: "active" }).id;
+  setPlacement(storage, taskId, agentId);
 });
 
 afterAll(() => {

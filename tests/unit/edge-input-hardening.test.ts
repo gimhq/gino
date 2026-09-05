@@ -79,8 +79,8 @@ async function registerAgent(): Promise<{ agentId: string; connectToken: string 
 }
 
 function placeTaskOn(agentId: string): string {
-  const task = createTask(db, { ownerId: OWNER, engine: "claude", model: "sonnet" });
-  setPlacement(db, task.id, agentId);
+  const task = createTask(storage, { ownerId: OWNER, engine: "claude", model: "sonnet" });
+  setPlacement(storage, task.id, agentId);
   return task.id;
 }
 
@@ -236,7 +236,7 @@ describe("HOST-M1M2-12 — attachments validated against the wire schema", () =>
     // A routable channel: an owner with a permitted (granted) agent.
     const { agent } = enrollAgent(storage, { capabilities: { engines: ["claude"] } });
     grantOwner(storage, agent.id, OWNER);
-    registerChannel(db, { name: "hardening-chat", type: "http", ownerId: OWNER, config: { engine: "claude", model: "sonnet" } });
+    registerChannel(storage, { name: "hardening-chat", type: "http", ownerId: OWNER, config: { engine: "claude", model: "sonnet" } });
   });
 
   function send(attachments: unknown) {

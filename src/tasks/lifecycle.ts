@@ -14,10 +14,8 @@
 // reassignment; it is a brand-new, unrelated task created on the new agent with
 // no continuity carried — the old task stays as history. So there is no
 // `migrate(task)` here by design: callers just `createTask` + `placeTask` anew.
-import type { AppDatabase } from "@/db";
-import type { Task } from "@/db/schema";
+import type { Storage, TaskRow } from "@/host/ports/storage";
 import { clearEntries } from "@/configstore";
-import { sqliteStorage } from "@/store/sqlite";
 import { setStatus } from "./store";
 
 /**
@@ -45,16 +43,15 @@ export type TaskStatus = (typeof TASK_STATUS)[keyof typeof TASK_STATUS];
  * (HOST-M8-10): its `config_entries` rows stop pinning artifacts in the GC
  * root set. Re-opening a task does not resurrect them — re-declare if needed.
  */
-export function transitionTaskStatus(db: AppDatabase, taskId: string, status: string): Task {
-  const task = setStatus(db, taskId, status);
+export function transitionTaskStatus(storage: Storage, taskId: string, status: string): TaskRow {
+  const task = setStatus(storage, taskId, status);
   if (status === TASK_STATUS.closed) {
-    // P1 transitional — removed when tasks moves to ports
-    clearEntries(sqliteStorage(db), taskId);
+    clearEntries(storage, taskId);
   }
   return task;
 }
 
 /** Mark a task `closed` (user/admin `/close`); pairs with a task-scoped `interrupt` + `task_upsert{status:"closed"}`. */
-export function closeTask(db: AppDatabase, taskId: string): Task {
-  return transitionTaskStatus(db, taskId, TASK_STATUS.closed);
+export function closeTask(storage: Storage, taskId: string): TaskRow {
+  return transitionTaskStatus(storage, taskId, TASK_STATUS.closed);
 }

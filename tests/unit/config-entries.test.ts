@@ -116,7 +116,7 @@ describe("desired set — set/get/replace + UNIQUE(scope, target)", () => {
   });
 
   it("scopes are independent (global vs a task id)", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
     setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
     expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
@@ -137,7 +137,7 @@ describe("global config version — monotonic, bumped only by GLOBAL writes (HOS
   });
 
   it("a task-scope write never touches the global version", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
     expect(getGlobalConfigVersion(storage)).toBe(0);
   });
@@ -268,8 +268,8 @@ describe("delivery — a multi-engine agent receives the UNION of its engines (H
 
 describe("task-scope entries — store wiring", () => {
   it("setTaskEntries persists scope=<task_id> resolved by the task's engine", () => {
-    const task = createTask(db, { ownerId: "o", engine: "codex", model: "gpt" });
-    setTaskEntries(db, task.id, [
+    const task = createTask(storage, { ownerId: "o", engine: "codex", model: "gpt" });
+    setTaskEntries(storage, task.id, [
       { name: "instructions", sha256: SHA_A, kind: "file" },
       { name: "reviewer", sha256: SHA_B, kind: "dir" },
     ]);
@@ -278,7 +278,7 @@ describe("task-scope entries — store wiring", () => {
   });
 
   it("createTask persists its initial entries on create", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
@@ -290,7 +290,7 @@ describe("task-scope entries — store wiring", () => {
 
 describe("task lifecycle cleanup — closing a task drops its scope (HOST-M8-10)", () => {
   it("closeTask removes the task's config_entries rows; global is untouched", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
@@ -299,36 +299,36 @@ describe("task lifecycle cleanup — closing a task drops its scope (HOST-M8-10)
     setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
     expect(getEntries(storage, task.id)).toHaveLength(1);
 
-    closeTask(db, task.id);
+    closeTask(storage, task.id);
 
     expect(getEntries(storage, task.id)).toHaveLength(0);
     expect(getEntries(storage, GLOBAL_SCOPE)).toHaveLength(1);
   });
 
   it("transitionTaskStatus to 'closed' also drops the scope (never-placed close path)", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "reviewer", sha256: SHA_B, kind: "dir" }],
     });
-    transitionTaskStatus(db, task.id, "closed");
+    transitionTaskStatus(storage, task.id, "closed");
     expect(getEntries(storage, task.id)).toHaveLength(0);
   });
 
   it("a non-terminal transition keeps the scope's entries", () => {
-    const task = createTask(db, {
+    const task = createTask(storage, {
       ownerId: "o",
       engine: "claude",
       model: "sonnet",
       entries: [{ name: "reviewer", sha256: SHA_B, kind: "dir" }],
     });
-    transitionTaskStatus(db, task.id, "active");
+    transitionTaskStatus(storage, task.id, "active");
     expect(getEntries(storage, task.id)).toHaveLength(1);
   });
 
   it("clearEntries drops exactly one scope", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     setEntries(storage, task.id, resolveEntries("claude", [{ name: "reviewer", sha256: SHA_B, kind: "dir" }]));
     setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: SHA_A, kind: "file" }]));
 

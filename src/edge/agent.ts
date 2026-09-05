@@ -1,6 +1,5 @@
 import type { Context } from "hono";
 import type { AgentCapabilities } from "@/agents/registry";
-import type { AppDatabase } from "@/db";
 import type { AgentRow, Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
@@ -81,8 +80,8 @@ function globalConfig(storage: Storage, agent: AgentRow) {
  */
 
 /** True iff `agentId` is the agent currently PLACED on `taskId` (set-once, §3). */
-function isAgentPlacedOnTask(db: AppDatabase, agentId: string, taskId: string): boolean {
-  const task = getTask(db, taskId);
+function isAgentPlacedOnTask(storage: Storage, agentId: string, taskId: string): boolean {
+  const task = getTask(storage, taskId);
   return task != null && task.agentId === agentId;
 }
 
@@ -91,12 +90,12 @@ function isAgentPlacedOnTask(db: AppDatabase, agentId: string, taskId: string): 
  * agent placed on the attachment's `task_id`. Unknown id → 404; wrong agent → 403.
  */
 function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string): Response {
-  const db = c.get("db");
-  const att = getAttachmentById(c.get("host").storage, id);
+  const storage = c.get("host").storage;
+  const att = getAttachmentById(storage, id);
   if (!att) {
     throw new NotFoundError("attachment", id);
   }
-  if (!isAgentPlacedOnTask(db, requesterId, att.taskId)) {
+  if (!isAgentPlacedOnTask(storage, requesterId, att.taskId)) {
     throw new ForbiddenError("attachment belongs to another agent's task");
   }
   return serveBlob(c, { id });
@@ -110,14 +109,13 @@ function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string
  * same verified content. Unknown sha → 404; known-but-unauthorized → 403.
  */
 function serveBySha(c: Context<AppEnv>, requesterId: string, sha256: string): Response {
-  const db = c.get("db");
   const storage = c.get("host").storage;
   const atts = attachmentsBySha(storage, sha256);
   const artifact = getArtifactBySha(storage, sha256);
   if (atts.length === 0 && !artifact) {
     throw new NotFoundError("attachment", sha256);
   }
-  const placed = atts.some(a => isAgentPlacedOnTask(db, requesterId, a.taskId));
+  const placed = atts.some(a => isAgentPlacedOnTask(storage, requesterId, a.taskId));
   const inDesiredSet = artifact != null && isShaInAgentDesiredSet(storage, requesterId, sha256);
   if (!placed && !inDesiredSet) {
     throw new ForbiddenError("sha256 is neither on a task placed on this agent nor in its desired set");
@@ -507,7 +505,7 @@ export function agentRoutes() {
       if ((taskId == null) !== (threadId == null)) {
         return c.json({ success: false, error: { code: "BAD_REQUEST", message: "task_id and thread_id must be provided together" } }, 400);
       }
-      if (taskId != null && !isAgentPlacedOnTask(c.get("db"), requesterId, taskId)) {
+      if (taskId != null && !isAgentPlacedOnTask(c.get("host").storage, requesterId, taskId)) {
         throw new ForbiddenError("cannot write an attachment for a task placed on another agent");
       }
       const contentType = c.req.query("content_type") ?? c.req.header("content-type") ?? "application/octet-stream";

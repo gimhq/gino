@@ -46,11 +46,11 @@ afterEach(() => {
 });
 
 function channel(ownerId: string): Channel {
-  return registerChannel(db, { name: `c-${ownerId}`, type: "http", ownerId });
+  return registerChannel(storage, { name: `c-${ownerId}`, type: "http", ownerId });
 }
 
 function task(ownerId: string): string {
-  return createTask(db, { ownerId, engine: "claude", model: "sonnet" }).id;
+  return createTask(storage, { ownerId, engine: "claude", model: "sonnet" }).id;
 }
 
 function seed(taskId: string): void {
@@ -77,12 +77,12 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     seed(victim);
 
     // The IDOR: an owner-A channel asks for owner-B's task by id.
-    expect404(() => pollChannel(db, ch, { taskId: victim }));
-    expect404(() => tailTask(db, ch, victim)); // defense in depth: lower-level API also refuses
-    expect(isTaskOnChannel(db, ch, victim)).toBe(false);
+    expect404(() => pollChannel(storage, ch, { taskId: victim }));
+    expect404(() => tailTask(storage, ch, victim)); // defense in depth: lower-level API also refuses
+    expect(isTaskOnChannel(storage, ch, victim)).toBe(false);
 
     // It must NOT leak the transcript by any path.
-    expect404(() => pollChannel(db, ch, { taskId: victim, after: 0 }));
+    expect404(() => pollChannel(storage, ch, { taskId: victim, after: 0 }));
   });
 
   it("allows an explicit taskId that shares the channel's owner", () => {
@@ -90,34 +90,34 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
     const mine = task("owner-A"); // same owner → authorized (OD16)
     seed(mine);
 
-    expect(isTaskOnChannel(db, ch, mine)).toBe(true);
-    const deliveries = pollChannel(db, ch, { taskId: mine });
+    expect(isTaskOnChannel(storage, ch, mine)).toBe(true);
+    const deliveries = pollChannel(storage, ch, { taskId: mine });
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]!.messages.map(m => m.content)).toEqual(["secret transcript"]);
-    expect(() => tailTask(db, ch, mine)).not.toThrow();
+    expect(() => tailTask(storage, ch, mine)).not.toThrow();
   });
 
   it("allows an explicit taskId bound to the channel even if owned elsewhere", () => {
     const ch = channel("owner-A");
     const bound = task("owner-B"); // different owner, but explicitly bound to this channel
-    bindConversation(db, ch.id, "conv-x", bound);
+    bindConversation(storage, ch.id, "conv-x", bound);
     seed(bound);
 
-    expect(isTaskOnChannel(db, ch, bound)).toBe(true);
-    const deliveries = pollChannel(db, ch, { taskId: bound });
+    expect(isTaskOnChannel(storage, ch, bound)).toBe(true);
+    const deliveries = pollChannel(storage, ch, { taskId: bound });
     expect(deliveries[0]!.messages).toHaveLength(1);
   });
 
   it("keeps the channel-scoped binding/fan-out paths working (no regression)", () => {
     const ch = channel("owner-A");
     const bound = task("owner-B");
-    bindConversation(db, ch.id, "conv-y", bound);
+    bindConversation(storage, ch.id, "conv-y", bound);
     seed(bound);
 
     // conversationRef-resolved and all-bound fan-out are channel-scoped and
     // unchanged (reads are non-destructive, so the two polls don't couple).
-    expect(pollChannel(db, ch, { conversationRef: "conv-y", after: 0 })[0]!.messages).toHaveLength(1);
-    expect(pollChannel(db, ch, { after: 0 }).some(d => d.taskId === bound)).toBe(true);
+    expect(pollChannel(storage, ch, { conversationRef: "conv-y", after: 0 })[0]!.messages).toHaveLength(1);
+    expect(pollChannel(storage, ch, { after: 0 }).some(d => d.taskId === bound)).toBe(true);
   });
 });
 

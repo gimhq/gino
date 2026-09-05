@@ -21,19 +21,17 @@
 // bounded round — never redelivery of acked rows, never loss of unacked ones.
 import type { WebhookAttemptState } from "./egress";
 import type { DnsResolver, FetchLike } from "./webhooks";
-import type { AppDatabase } from "@/db";
 import type { HostEvents } from "@/host/events";
+import type { Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
-import { eq } from "drizzle-orm";
-import { channelBindings } from "@/db/schema";
 import { pushChannelWebhooks } from "./egress";
-import { getChannel, listChannels, listWebhooks } from "./registry";
+import { getChannel, listChannels, listWebhooks, requireChannels } from "./registry";
 
 /** Default retry-tick cadence: how often failed/backlogged webhook batches are re-pushed. */
 export const DEFAULT_WEBHOOK_RETRY_INTERVAL_MS = 15_000;
 
 export interface WebhookPumpDeps {
-  readonly db: AppDatabase;
+  readonly storage: Storage;
   readonly logger?: Logger;
   /** Host events: when given, the pump subscribes to `transcript.message` (the EVENT trigger) until `stop()`. */
   readonly events?: HostEvents;
@@ -75,12 +73,12 @@ export function startWebhookPump(deps: WebhookPumpDeps): WebhookPump {
     queued.add(channelId);
     chain = chain.then(async () => {
       queued.delete(channelId); // before the push: a notify arriving mid-push re-queues
-      const channel = getChannel(deps.db, channelId);
+      const channel = getChannel(deps.storage, channelId);
       if (!channel) {
         return;
       }
       try {
-        await pushChannelWebhooks(deps.db, channel, {
+        await pushChannelWebhooks(deps.storage, channel, {
           ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
           ...(deps.resolver ? { resolver: deps.resolver } : {}),
           ...(deps.timeoutMs != null ? { timeoutMs: deps.timeoutMs } : {}),
@@ -96,22 +94,17 @@ export function startWebhookPump(deps: WebhookPumpDeps): WebhookPump {
   };
 
   const notifyTask = (taskId: string): void => {
-    const bound = deps.db
-      .select({ channelId: channelBindings.channelId })
-      .from(channelBindings)
-      .where(eq(channelBindings.taskId, taskId))
-      .all();
-    for (const { channelId } of bound) {
-      const channel = getChannel(deps.db, channelId);
-      if (channel && listWebhooks(channel).length > 0) {
-        enqueue(channelId);
+    const repo = requireChannels(deps.storage);
+    for (const channel of repo.list()) {
+      if (listWebhooks(channel).length > 0 && repo.isTaskBound(channel.id, taskId)) {
+        enqueue(channel.id);
       }
     }
   };
 
   const tick = (): void => {
     try {
-      for (const channel of listChannels(deps.db)) {
+      for (const channel of listChannels(deps.storage)) {
         if (listWebhooks(channel).length > 0) {
           enqueue(channel.id);
         }
