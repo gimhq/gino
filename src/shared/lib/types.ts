@@ -1,13 +1,12 @@
 import type { Config } from "@/config";
-import type { AppDatabase } from "@/db";
-import type { HostContext } from "@/host";
+import type { Host } from "@/host";
 import type { Logger } from "@/shared/lib/logger";
 
 /**
  * Hono environment shared by every route + middleware. The data-plane
  * modules (M1–M8) extend `Variables` with their own request-scoped state as
  * they land — for the scaffold it carries the request id, the resolved
- * config, the logger, and the v2 database handle.
+ * config, the logger, and the host instance.
  */
 export interface AppEnv {
   Bindings: {
@@ -15,11 +14,10 @@ export interface AppEnv {
   };
   Variables: {
     requestId: string;
-    db: AppDatabase;
     config: Config;
     logger: Logger;
-    /** The per-instance host context (sessions, launchers, metrics sink, …). */
-    host: HostContext;
+    /** The per-instance host (storage, sessions, launchers, wire, namespaces, …). */
+    host: Host;
     /**
      * The connect-token-resolved agent identity on the `/agent/*` data plane.
      * Set by `connectTokenAuth` from the token's `connect_token_hash` (never a

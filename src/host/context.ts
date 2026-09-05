@@ -7,12 +7,12 @@ import type { Wire } from "./wire";
 // One `HostContext` per host instance: it owns the live session registry
 // (M3), the launcher registry (M3), the metrics sink, the resolved options +
 // the `Storage` port (repositories + blob store), the clock/id seams, and the
-// background-loop lifecycle (`start` / `stop`).
-// The standalone app builds one in `bootstrap` and threads it through the
-// hono context; tests and embedding hosts build their own.
+// background-loop lifecycle (`start` / `stop`). `createHost` (host.ts) layers
+// the public namespaces on top; the standalone app builds one in `bootstrap`
+// and threads it through the hono context; tests and embedding hosts build
+// their own.
 import type { Launcher } from "@/agents/launchers";
-import type { AppDatabase } from "@/db";
-import type { BlobStorePort, Storage } from "@/host/ports/storage";
+import type { Storage } from "@/host/ports/storage";
 import type { Logger } from "@/shared/lib/logger";
 import { startLaunchReaper } from "@/agents/launch-reaper";
 import { DEFAULT_LAUNCHERS, LauncherRegistry } from "@/agents/launchers";
@@ -21,15 +21,12 @@ import { SessionRegistry } from "@/agents/sessions";
 import { startConfigStoreGc } from "@/configstore";
 import { generateId, ulid } from "@/platform/ids";
 import { startOutboxGc } from "@/protocol/outbox";
-import { sqliteStorage } from "@/store/sqlite";
 import { createHostEvents } from "./events";
 import { noopMetrics } from "./metrics";
 import { resolveHostOptions } from "./options";
 import { createWire } from "./wire";
 
 export interface HostContext {
-  /** Transitional (P1): the raw sqlite handle the not-yet-migrated domain modules still take. */
-  readonly db: AppDatabase;
   readonly logger: Logger;
   readonly sessions: SessionRegistry;
   readonly launchers: LauncherRegistry;
@@ -40,8 +37,6 @@ export interface HostContext {
   readonly options: HostOptions;
   /** The `Storage` port (host-sdk-design §8.3) — repositories + the blob store. */
   readonly storage: Storage;
-  /** The unified blob store (`storage.blobs`); kept until every caller reads it off `storage`. */
-  readonly store: BlobStorePort;
   readonly clock: () => number;
   readonly ids: { readonly generateId: typeof generateId; readonly ulid: typeof ulid };
   /** The framework-free `/agent/*` data plane (host-sdk-design §3.2); the Hono shim mounts it 1:1. */
@@ -70,10 +65,9 @@ interface Stoppable {
 }
 
 export interface CreateHostContextOptions {
-  readonly db: AppDatabase;
+  /** The `Storage` port (repositories + blob store); `stop()` closes it. */
+  readonly storage: Storage;
   readonly logger: Logger;
-  /** Storage port to use; defaults to the sqlite adapter over `db` with the blob store at `options.storeDir`. */
-  readonly storage?: Storage;
   /** Launchers to register; defaults to `DEFAULT_LAUNCHERS` (manual + docker). */
   readonly launchers?: readonly Launcher[];
   /** Metrics sink; defaults to `noopMetrics`. */
@@ -90,12 +84,11 @@ export interface CreateHostContextOptions {
 
 /** Build a fresh context: every call gets its own session + launcher registries. */
 export function createHostContext(opts: CreateHostContextOptions): HostContext {
-  const { db, logger } = opts;
+  const { storage, logger } = opts;
   const options = resolveHostOptions(opts.options);
   const sessions = new SessionRegistry();
   const launchers = new LauncherRegistry(opts.launchers ?? DEFAULT_LAUNCHERS);
   const events = opts.events ?? createHostEvents(logger);
-  const storage = opts.storage ?? sqliteStorage(db, { storeDir: options.storeDir });
 
   const services: Stoppable[] = [];
   let loops: Stoppable[] | null = null;
@@ -141,7 +134,6 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
 
   const metrics = opts.metrics ?? noopMetrics;
   return {
-    db,
     logger,
     sessions,
     launchers,
@@ -149,7 +141,6 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
     events,
     options,
     storage,
-    store: storage.blobs,
     clock: opts.clock ?? Date.now,
     ids: { generateId: opts.ids?.generateId ?? generateId, ulid: opts.ids?.ulid ?? ulid },
     wire: createWire({ storage, sessions, logger, metrics, events, options }),

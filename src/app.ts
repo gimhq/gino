@@ -1,7 +1,7 @@
 import type { Launcher } from "./agents/launchers";
 import type { Config } from "./config";
 import type { AppDatabase } from "./db";
-import type { HostContext, HostOptions } from "./host";
+import type { Host, HostOptions } from "./host";
 import type { Logger } from "./shared/lib/logger";
 import type { AppEnv } from "./shared/lib/types";
 import { Hono } from "hono";
@@ -13,7 +13,7 @@ import { startWebhookPump } from "./channels";
 import { loadConfig } from "./config";
 import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
-import { createHostContext, resolveHostOptions } from "./host";
+import { createHost, resolveHostOptions } from "./host";
 import { docsCspRelax, mountDocs } from "./modules/docs";
 import { publicRoutes } from "./routes";
 import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
@@ -23,13 +23,14 @@ import { adminTokenAuth } from "./shared/middleware/auth";
 import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
+import { sqliteStorage } from "./store/sqlite";
 
 // ─── Types ───
 
 interface AppDeps {
   readonly config: Config;
-  /** The per-instance host context (db, logger, sessions, launchers, metrics). */
-  readonly host: HostContext;
+  /** The per-instance host (storage, logger, sessions, launchers, metrics). */
+  readonly host: Host;
 }
 
 export interface BootstrapResult {
@@ -42,13 +43,12 @@ export interface BootstrapResult {
   readonly websocket: typeof websocket;
   readonly config: Config;
   readonly logger: Logger;
-  /** The host context the app was composed with. */
-  readonly host: HostContext;
+  /** The host the app was composed with. */
+  readonly host: Host;
   /**
-   * The open database handle. Exposed so the boot entrypoint can ping it for the
-   * lode readiness probe and checkpoint the WAL on the staged-update prepare
-   * prompt (src/index.ts). The request pipeline uses the per-request `db` from
-   * the hono context, not this.
+   * The open database handle. Exposed so the boot entrypoint can checkpoint the
+   * WAL on the lode staged-update prepare prompt (src/index.ts). The request
+   * pipeline reaches the database only through `host.storage`, not this.
    */
   readonly db: AppDatabase;
 }
@@ -74,14 +74,28 @@ export function hostOptionsFromConfig(config: Config): HostOptions {
   });
 }
 
-/** Build the host context the way the standalone app does: the global Prometheus registry is the metrics sink. */
-export function createAppHost({ config, db, logger, launchers }: AppHostDeps): HostContext {
-  return createHostContext({
-    db,
+/**
+ * Build the host the way the standalone app does: the sqlite adapter over `db`
+ * with the blob store at `STORE_DIR`, and the global Prometheus registry as the
+ * metrics sink.
+ */
+export function createAppHost({ config, db, logger, launchers }: AppHostDeps): Host {
+  const options = hostOptionsFromConfig(config);
+  return createHost({
+    storage: sqliteStorage(db, { storeDir: options.storeDir }),
     logger,
     metrics: registryMetrics,
-    options: hostOptionsFromConfig(config),
     ...(launchers ? { launchers } : {}),
+    storeDir: options.storeDir,
+    agents: {
+      registerToken: options.registerToken,
+      registrationEnabled: options.registrationEnabled,
+      heartbeatIntervalMs: options.heartbeatIntervalMs,
+      offlineGraceMs: options.offlineGraceMs,
+    },
+    attachments: { maxUploadBytes: options.maxUploadBytes },
+    configGc: options.configGc,
+    webhooks: options.webhooks,
   });
 }
 
@@ -99,7 +113,7 @@ function resolveCorsOrigin(config: Config): string | string[] {
 
 /**
  * Build the host's single `Hono<AppEnv>` API app. Owns transport (request-id,
- * CORS, structured logging), threads the per-request context (db / config /
+ * CORS, structured logging), threads the per-request context (host / config /
  * logger), mounts the OpenAPI docs and the route modules, then wraps it in
  * the security-header outer shell.
  *
@@ -126,7 +140,6 @@ export function createApp({ config, host }: AppDeps) {
   api.use("*", cors({ origin: resolveCorsOrigin(config) }));
   api.use("*", (c, next) => {
     c.set("host", host);
-    c.set("db", host.db);
     c.set("config", config);
     c.set("logger", host.logger);
     return next();

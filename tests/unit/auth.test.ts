@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { enrollAgent } from "@/agents/registry";
 import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
-import { createHostContext } from "@/host/context";
+import { createHost } from "@/host";
 import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
@@ -84,16 +84,15 @@ describe("connectTokenAuth (token → agent identity)", () => {
   // context — identity comes from the token, never a client-supplied param.
   const db = createDb(":memory:");
   const storage = sqliteStorage(db);
-  const host = createHostContext({ db, logger: createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" })), storage });
+  const host = createHost({ storage, logger: createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" })) });
   const { agent, connectToken } = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } });
 
-  // App wired as production is (config + db in context, then the middleware as a
+  // App wired as production is (config + host in context, then the middleware as a
   // route handler so `:agentId` params populate), echoing the resolved agentId.
   function tokenApp(path = "/") {
     const app = new Hono<AppEnv>();
     app.use("*", (c, next) => {
       c.set("config", TEST_CONFIG);
-      c.set("db", db);
       c.set("host", host);
       return next();
     });

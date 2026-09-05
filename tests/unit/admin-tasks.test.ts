@@ -9,7 +9,7 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { outbox } from "@/db/schema";
 import { adminTaskRoutes } from "@/edge/admin/tasks";
-import { createHostContext } from "@/host";
+import { createHost } from "@/host";
 import { getCron, writeThreadMessage, writeThreadResult } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
@@ -24,13 +24,13 @@ const logger = createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL:
 
 let db: AppDatabase;
 let storage: Storage;
-let host: ReturnType<typeof createHostContext>;
+let host: ReturnType<typeof createHost>;
 const attached: string[] = [];
 
 beforeEach(() => {
   db = createDb(":memory:");
   storage = sqliteStorage(db);
-  host = createHostContext({ db, logger });
+  host = createHost({ storage, logger });
 });
 
 afterEach(() => {
@@ -40,12 +40,11 @@ afterEach(() => {
   db.close();
 });
 
-/** The admin task router with the test db injected (as app.ts does). */
+/** The admin task router with the test host injected (as app.ts does). */
 function taskApp() {
   const app = new Hono<AppEnv>();
   app.onError(errorHandler);
   app.use("*", (c, next) => {
-    c.set("db", db);
     c.set("host", host);
     return next();
   });
