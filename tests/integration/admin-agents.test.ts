@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -11,6 +12,7 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { tasks } from "@/db/schema";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M3 — `/admin/agents` OOB control API (behind the channel token).
 
@@ -30,10 +32,12 @@ const config = loadConfigStrict({
 });
 
 let db: AppDatabase;
+let storage: Storage;
 let app: ReturnType<typeof createApp>;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
@@ -220,7 +224,7 @@ describe("M3 /admin/agents — stop + remove", () => {
     expect(body.data.orphanedTasks).toBe(1);
 
     // Token revoked, status removed.
-    expect(verifyConnectToken(db, agentId, connectToken)).toBeNull();
+    expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
     const get = await admin(`/agents/${agentId}`);
     expect(((await get.json()) as { data: { status: string } }).data.status).toBe("removed");
 

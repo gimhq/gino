@@ -10,6 +10,7 @@ import { createDb } from "@/db";
 import { messages } from "@/db/schema";
 import { writeThreadMessage } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 // D-B4 — channels over a LIVE server: register a channel (owner) → ingress routes
 // a new conversation to a new task (owner-stamped, dispatched) and continues it on
@@ -33,11 +34,13 @@ const config = loadConfigStrict({
 });
 
 let db: ReturnType<typeof createDb>;
+let storage: ReturnType<typeof sqliteStorage>;
 let server: ReturnType<typeof Bun.serve>;
 let httpBase: string;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   const app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
   server = Bun.serve({
     port: 0,
@@ -139,9 +142,9 @@ describe("D-B4 channels — ingress routing", () => {
 
     // ── EGRESS: seed the M5 store for c1's task, then tail it by cursor ────────
     const thread = "thread-ch-1";
-    writeThreadMessage(db, { taskId: r1.taskId, threadId: thread, data: { seq: 1, kind: "user_input", content: "hello there" } });
-    writeThreadMessage(db, { taskId: r1.taskId, threadId: thread, data: { seq: 2, kind: "assistant_text", content: "hi! how can I help?" } });
-    writeThreadMessage(db, { taskId: r1.taskId, threadId: thread, data: { seq: 3, kind: "assistant_text", content: "anything else?" } });
+    writeThreadMessage(storage, { taskId: r1.taskId, threadId: thread, data: { seq: 1, kind: "user_input", content: "hello there" } });
+    writeThreadMessage(storage, { taskId: r1.taskId, threadId: thread, data: { seq: 2, kind: "assistant_text", content: "hi! how can I help?" } });
+    writeThreadMessage(storage, { taskId: r1.taskId, threadId: thread, data: { seq: 3, kind: "assistant_text", content: "anything else?" } });
 
     const poll1 = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1" }) });
     expect(poll1.status).toBe(200);
@@ -219,7 +222,7 @@ describe("D-B4s security — explicit-taskId IDOR is 404 at the API layer", () =
     // A task owned by a DIFFERENT tenant, not bound to this channel.
     const create = await authed("/admin/tasks", { method: "POST", body: JSON.stringify({ owner_id: "other-owner", engine: "claude", model: "sonnet" }) });
     const victimTaskId = (await create.json() as { data: { task: { id: string } } }).data.task.id;
-    writeThreadMessage(db, { taskId: victimTaskId, threadId: "thread-idor", data: { seq: 1, kind: "assistant_text", content: "private" } });
+    writeThreadMessage(storage, { taskId: victimTaskId, threadId: "thread-idor", data: { seq: 1, kind: "assistant_text", content: "private" } });
 
     // GET and POST poll by explicit task → 404 (no transcript leaked).
     expect((await authed(`/messages/${channelId}/poll?task=${victimTaskId}`)).status).toBe(404);

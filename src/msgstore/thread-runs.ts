@@ -12,11 +12,8 @@
 // repeat them (protocol §4.1). `result`/`error` from the frame are NOT stored:
 // the schema has no column for them; the assistant's text already lives in the
 // transcript (`messages`), and `thread_runs` is the terminal summary only.
-import type { AppDatabase } from "@/db";
-import type { ThreadRun } from "@/db/schema";
+import type { Storage, ThreadRunRow } from "@/host/ports/storage";
 import type { ThreadResultData } from "@/protocol/frames";
-import { count, eq, max } from "drizzle-orm";
-import { messages, threadRuns } from "@/db/schema";
 
 export interface ThreadResultWrite {
   taskId: string;
@@ -36,33 +33,21 @@ export interface ThreadResultWrite {
  * column unchanged; `source`/`cron_id`/timestamps are set once at creation.
  */
 export function writeThreadResult(
-  db: AppDatabase,
+  storage: Storage,
   { taskId, threadId, data, source = "chat", cronId }: ThreadResultWrite,
 ): void {
-  db.insert(threadRuns)
-    .values({
-      threadId,
-      taskId,
-      cronId: cronId ?? null,
-      source,
-      status: data.status,
-      failureReason: data.failure_reason ?? null,
-      engineSessionId: data.engine_session_id ?? null,
-      durationMs: data.duration_ms,
-      finalSeq: data.final_seq,
-      finishedAt: Date.now(),
-    })
-    .onConflictDoUpdate({
-      target: threadRuns.threadId,
-      set: {
-        status: data.status,
-        failureReason: data.failure_reason ?? null,
-        engineSessionId: data.engine_session_id ?? null,
-        durationMs: data.duration_ms,
-        finalSeq: data.final_seq,
-      },
-    })
-    .run();
+  storage.threadRuns.upsert({
+    threadId,
+    taskId,
+    cronId: cronId ?? null,
+    source,
+    status: data.status,
+    failureReason: data.failure_reason ?? null,
+    engineSessionId: data.engine_session_id ?? null,
+    durationMs: data.duration_ms,
+    finalSeq: data.final_seq,
+    finishedAt: Date.now(),
+  });
 }
 
 export interface TranscriptCompleteness {
@@ -80,14 +65,8 @@ export interface TranscriptCompleteness {
  * exactly when every seq in `1..=final_seq` is present (seq ≥ 1 per §6).
  * Diagnostic only — the caller logs/flags a gap, it never blocks the ack.
  */
-export function checkTranscriptCompleteness(db: AppDatabase, threadId: string, finalSeq: number): TranscriptCompleteness {
-  const row = db
-    .select({ messageCount: count(), maxSeq: max(messages.seq) })
-    .from(messages)
-    .where(eq(messages.threadId, threadId))
-    .get();
-  const messageCount = row?.messageCount ?? 0;
-  const maxSeq = row?.maxSeq ?? null;
+export function checkTranscriptCompleteness(storage: Storage, threadId: string, finalSeq: number): TranscriptCompleteness {
+  const { messageCount, lastSeq: maxSeq } = storage.transcript.stats(threadId);
   return {
     complete: messageCount === finalSeq && (maxSeq ?? 0) === finalSeq,
     messageCount,
@@ -97,10 +76,6 @@ export function checkTranscriptCompleteness(db: AppDatabase, threadId: string, f
 }
 
 /** The run record for a thread (terminal summary), or `undefined` if none yet. */
-export function getThreadRun(db: AppDatabase, threadId: string): ThreadRun | undefined {
-  return db
-    .select()
-    .from(threadRuns)
-    .where(eq(threadRuns.threadId, threadId))
-    .get();
+export function getThreadRun(storage: Storage, threadId: string): ThreadRunRow | undefined {
+  return storage.threadRuns.get(threadId);
 }

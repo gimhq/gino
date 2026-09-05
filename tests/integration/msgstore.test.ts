@@ -19,6 +19,7 @@ import {
   writeThreadResult,
 } from "@/msgstore";
 import { ulid } from "@/shared/lib/id";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M5 is the SINK: writers persist ONLY what an inbound frame carries, are
 // idempotent (at-least-once replay can re-deliver any frame), and never touch
@@ -27,9 +28,11 @@ import { ulid } from "@/shared/lib/id";
 
 const dbPath = resolve(tmpdir(), `gino-msgstore-${process.pid}-${Date.now()}.db`);
 let db: ReturnType<typeof createDb>;
+let storage: ReturnType<typeof sqliteStorage>;
 
 beforeAll(() => {
   db = createDb(dbPath);
+  storage = sqliteStorage(db);
 });
 
 afterAll(() => {
@@ -67,11 +70,11 @@ describe("writeThreadMessage → messages (transcript)", () => {
     const taskId = seedTask();
     const threadId = ulid();
     // Arrive out of order: 2 before 1.
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 2, kind: "assistant_text", content: "second" } });
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "first" } });
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 3, kind: "status", content: "done" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 2, kind: "assistant_text", content: "second" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "first" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 3, kind: "status", content: "done" } });
 
-    const transcript = getTranscript(db, threadId);
+    const transcript = getTranscript(storage, threadId);
     expect(transcript.map(m => m.seq)).toEqual([1, 2, 3]);
     expect(transcript.map(m => m.content)).toEqual(["first", "second", "done"]);
   });
@@ -79,10 +82,10 @@ describe("writeThreadMessage → messages (transcript)", () => {
   it("is idempotent on (thread_id, seq): a replay neither duplicates nor errors", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "hi" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "hi" } });
     // Replay the identical frame — at-least-once delivery.
     expect(() =>
-      writeThreadMessage(db, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "hi" } }),
+      writeThreadMessage(storage, { taskId, threadId, data: { seq: 1, kind: "user_input", content: "hi" } }),
     ).not.toThrow();
     expect(countMessages(threadId)).toBe(1);
   });
@@ -90,27 +93,27 @@ describe("writeThreadMessage → messages (transcript)", () => {
   it("dedupes strictly on (thread_id, seq): first write wins, no overwrite", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 5, kind: "assistant_text", content: "original" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 5, kind: "assistant_text", content: "original" } });
     // A re-sent seq with DIFFERENT content must be ignored (not overwrite).
-    writeThreadMessage(db, { taskId, threadId, data: { seq: 5, kind: "assistant_text", content: "tampered" } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 5, kind: "assistant_text", content: "tampered" } });
     expect(countMessages(threadId)).toBe(1);
-    expect(getTranscript(db, threadId)[0]?.content).toBe("original");
+    expect(getTranscript(storage, threadId)[0]?.content).toBe("original");
   });
 
   it("round-trips tool_use JSON input/output and persists task_id", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    writeThreadMessage(db, {
+    writeThreadMessage(storage, {
       taskId,
       threadId,
       data: { seq: 1, kind: "tool_use", role: "assistant", tool: "bash", input: { cmd: "ls", args: ["-la"] } },
     });
-    writeThreadMessage(db, {
+    writeThreadMessage(storage, {
       taskId,
       threadId,
       data: { seq: 2, kind: "tool_result", tool: "bash", output: { code: 0, lines: 3 } },
     });
-    const [a, b] = getTranscript(db, threadId);
+    const [a, b] = getTranscript(storage, threadId);
     expect(a?.taskId).toBe(taskId);
     expect(a?.tool).toBe("bash");
     expect(a?.input).toEqual({ cmd: "ls", args: ["-la"] });
@@ -122,12 +125,12 @@ describe("writeThreadResult → thread_runs (UPSERT by thread_id)", () => {
   it("inserts a run and stores the terminal mirror fields", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    writeThreadResult(db, {
+    writeThreadResult(storage, {
       taskId,
       threadId,
       data: { status: "succeeded", result: "ok", engine_session_id: "sess-1", duration_ms: 1234, final_seq: 9 },
     });
-    const run = getThreadRun(db, threadId);
+    const run = getThreadRun(storage, threadId);
     expect(run?.status).toBe("succeeded");
     expect(run?.engineSessionId).toBe("sess-1");
     expect(run?.durationMs).toBe(1234);
@@ -141,14 +144,14 @@ describe("writeThreadResult → thread_runs (UPSERT by thread_id)", () => {
     const cronId = ulid();
     db.insert(crons).values({ id: cronId, taskId, kind: "interval", prompt: "tick", continuity: "fresh" }).run();
     const threadId = ulid();
-    writeThreadResult(db, {
+    writeThreadResult(storage, {
       taskId,
       threadId,
       source: "cron",
       cronId,
       data: { status: "succeeded", duration_ms: 10, final_seq: 1 },
     });
-    const run = getThreadRun(db, threadId);
+    const run = getThreadRun(storage, threadId);
     expect(run?.source).toBe("cron");
     expect(run?.cronId).toBe(cronId);
   });
@@ -161,10 +164,10 @@ describe("writeThreadResult → thread_runs (UPSERT by thread_id)", () => {
       threadId,
       data: { status: "succeeded" as const, engine_session_id: "s", duration_ms: 50, final_seq: 4 },
     };
-    writeThreadResult(db, frame);
-    const first = getThreadRun(db, threadId);
-    writeThreadResult(db, frame); // replay
-    const second = getThreadRun(db, threadId);
+    writeThreadResult(storage, frame);
+    const first = getThreadRun(storage, threadId);
+    writeThreadResult(storage, frame); // replay
+    const second = getThreadRun(storage, threadId);
     expect(second).toEqual(first); // every column preserved (incl. timestamps)
     expect(countThreadRuns(threadId)).toBe(1);
   });
@@ -172,13 +175,13 @@ describe("writeThreadResult → thread_runs (UPSERT by thread_id)", () => {
   it("overwrites the terminal fields on a state change (never a dup row)", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    writeThreadResult(db, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: 2 } });
-    writeThreadResult(db, {
+    writeThreadResult(storage, { taskId, threadId, data: { status: "succeeded", duration_ms: 5, final_seq: 2 } });
+    writeThreadResult(storage, {
       taskId,
       threadId,
       data: { status: "failed", failure_reason: "agent.timeout", duration_ms: 7, final_seq: 3 },
     });
-    const run = getThreadRun(db, threadId);
+    const run = getThreadRun(storage, threadId);
     expect(run?.status).toBe("failed");
     expect(run?.failureReason).toBe("agent.timeout");
     expect(run?.finalSeq).toBe(3);
@@ -197,7 +200,7 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
   it("inserts a mirror, coercing next_run to epoch-ms", () => {
     const taskId = seedTask();
     const cronId = ulid();
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId,
       data: {
@@ -211,7 +214,7 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
         skipped_count: 0,
       },
     });
-    const cron = getCron(db, cronId);
+    const cron = getCron(storage, cronId);
     expect(cron?.kind).toBe("interval");
     expect(cron?.scheduleValue).toBe("5m");
     expect(cron?.continuity).toBe("fresh");
@@ -222,20 +225,20 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
   it("coerces an ISO next_run to epoch-ms and a non-parseable one to null", () => {
     const taskId = seedTask();
     const iso = ulid();
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId: iso,
       data: { kind: "cron", continuity: "fresh", next_run: "2026-01-01T00:00:00.000Z", round_count: 0, skipped_count: 0 },
     });
-    expect(getCron(db, iso)?.nextRun).toBe(Date.parse("2026-01-01T00:00:00.000Z"));
+    expect(getCron(storage, iso)?.nextRun).toBe(Date.parse("2026-01-01T00:00:00.000Z"));
 
     const bad = ulid();
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId: bad,
       data: { kind: "cron", continuity: "fresh", next_run: "not-a-date", round_count: 0, skipped_count: 0 },
     });
-    expect(getCron(db, bad)?.nextRun).toBeNull();
+    expect(getCron(storage, bad)?.nextRun).toBeNull();
   });
 
   it("reads a timezone-less ISO next_run as UTC regardless of host TZ (HOST-XC-01)", () => {
@@ -244,21 +247,21 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
     try {
       process.env.TZ = "America/New_York"; // UTC-4/-5 — local parse would shift the epoch
       const tzLess = ulid();
-      writeCronState(db, {
+      writeCronState(storage, {
         taskId,
         cronId: tzLess,
         data: { kind: "cron", continuity: "fresh", next_run: "2026-07-10T09:00:00", round_count: 0, skipped_count: 0 },
       });
-      expect(getCron(db, tzLess)?.nextRun).toBe(Date.UTC(2026, 6, 10, 9, 0, 0));
+      expect(getCron(storage, tzLess)?.nextRun).toBe(Date.UTC(2026, 6, 10, 9, 0, 0));
 
       // An explicit offset is still honored, not double-shifted.
       const offset = ulid();
-      writeCronState(db, {
+      writeCronState(storage, {
         taskId,
         cronId: offset,
         data: { kind: "cron", continuity: "fresh", next_run: "2026-07-10T09:00:00+02:00", round_count: 0, skipped_count: 0 },
       });
-      expect(getCron(db, offset)?.nextRun).toBe(Date.UTC(2026, 6, 10, 7, 0, 0));
+      expect(getCron(storage, offset)?.nextRun).toBe(Date.UTC(2026, 6, 10, 7, 0, 0));
     }
     finally {
       if (priorTz === undefined) {
@@ -280,14 +283,14 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
       round_count: 0,
       skipped_count: 0,
     };
-    writeCronState(db, { taskId, cronId, data: { ...base } });
+    writeCronState(storage, { taskId, cronId, data: { ...base } });
     // A later mirror with advanced counters + new status.
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId,
       data: { ...base, status: "running", last_status: "succeeded", round_count: 3, skipped_count: 1 },
     });
-    const cron = getCron(db, cronId);
+    const cron = getCron(storage, cronId);
     expect(cron?.roundCount).toBe(3);
     expect(cron?.skippedCount).toBe(1);
     expect(cron?.status).toBe("running");
@@ -309,10 +312,10 @@ describe("writeCronState → crons (read-only mirror, UPSERT by id)", () => {
       round_count: 2,
       skipped_count: 0,
     };
-    writeCronState(db, { taskId, cronId, data });
-    const { updatedAt: _a, ...first } = getCron(db, cronId)!;
-    writeCronState(db, { taskId, cronId, data }); // replay
-    const { updatedAt: _b, ...second } = getCron(db, cronId)!;
+    writeCronState(storage, { taskId, cronId, data });
+    const { updatedAt: _a, ...first } = getCron(storage, cronId)!;
+    writeCronState(storage, { taskId, cronId, data }); // replay
+    const { updatedAt: _b, ...second } = getCron(storage, cronId)!;
     expect(second).toEqual(first);
     expect(countCrons(cronId)).toBe(1);
   });
@@ -329,15 +332,15 @@ describe("writeCronPrompt → crons.prompt (dispatch-side write, HOST-M5M6-09)",
   it("seeds the prompt before the first cron_state; the mirror preserves it", () => {
     const taskId = seedTask();
     const cronId = ulid();
-    writeCronPrompt(db, { taskId, cronId, prompt: "send the daily digest" });
-    expect(getCron(db, cronId)?.prompt).toBe("send the daily digest");
+    writeCronPrompt(storage, { taskId, cronId, prompt: "send the daily digest" });
+    expect(getCron(storage, cronId)?.prompt).toBe("send the daily digest");
 
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId,
       data: { kind: "schedule", continuity: "isolated", status: "scheduled", round_count: 1, skipped_count: 0 },
     });
-    const cron = getCron(db, cronId);
+    const cron = getCron(storage, cronId);
     expect(cron?.prompt).toBe("send the daily digest");
     expect(cron?.kind).toBe("schedule");
     expect(cron?.roundCount).toBe(1);
@@ -347,13 +350,13 @@ describe("writeCronPrompt → crons.prompt (dispatch-side write, HOST-M5M6-09)",
   it("updates only the prompt when the mirror row already exists", () => {
     const taskId = seedTask();
     const cronId = ulid();
-    writeCronState(db, {
+    writeCronState(storage, {
       taskId,
       cronId,
       data: { kind: "interval", schedule_type: "every", schedule_value: "5m", continuity: "fresh", round_count: 2, skipped_count: 0 },
     });
-    writeCronPrompt(db, { taskId, cronId, prompt: "rotated command" });
-    const cron = getCron(db, cronId);
+    writeCronPrompt(storage, { taskId, cronId, prompt: "rotated command" });
+    const cron = getCron(storage, cronId);
     expect(cron?.prompt).toBe("rotated command");
     expect(cron?.kind).toBe("interval");
     expect(cron?.scheduleValue).toBe("5m");
@@ -368,7 +371,7 @@ describe("writeAttachmentDescriptors → attachments (idempotent on id)", () => 
     const threadId = ulid();
     const a = ulid();
     const b = ulid();
-    writeAttachmentDescriptors(db, {
+    writeAttachmentDescriptors(storage, {
       taskId,
       threadId,
       descriptors: [
@@ -388,13 +391,13 @@ describe("writeAttachmentDescriptors → attachments (idempotent on id)", () => 
     const taskId = seedTask();
     const threadId = ulid();
     const id = ulid();
-    writeAttachmentDescriptors(db, {
+    writeAttachmentDescriptors(storage, {
       taskId,
       threadId,
       descriptors: [{ id, name: "orig.txt", content_type: "text/plain", size: 1, sha256: "a", ref: "blob://a" }],
     });
     // Replay with the SAME id but tampered fields — must be ignored.
-    writeAttachmentDescriptors(db, {
+    writeAttachmentDescriptors(storage, {
       taskId,
       threadId,
       descriptors: [{ id, name: "tampered.txt", content_type: "text/plain", size: 2, sha256: "b", ref: "blob://b" }],
@@ -409,7 +412,7 @@ describe("writeAttachmentDescriptors → attachments (idempotent on id)", () => 
   it("no-ops on an empty descriptor list", () => {
     const taskId = seedTask();
     const threadId = ulid();
-    expect(() => writeAttachmentDescriptors(db, { taskId, threadId, descriptors: [] })).not.toThrow();
+    expect(() => writeAttachmentDescriptors(storage, { taskId, threadId, descriptors: [] })).not.toThrow();
   });
 });
 
@@ -419,13 +422,13 @@ describe("read models", () => {
     const t1 = ulid();
     const t2 = ulid();
     // t1 gets a message first, then t2 — getTaskThreads orders by earliest.
-    writeThreadMessage(db, { taskId, threadId: t1, data: { seq: 1, kind: "user_input", content: "a" } });
-    writeThreadMessage(db, { taskId, threadId: t2, data: { seq: 1, kind: "user_input", content: "b" } });
+    writeThreadMessage(storage, { taskId, threadId: t1, data: { seq: 1, kind: "user_input", content: "a" } });
+    writeThreadMessage(storage, { taskId, threadId: t2, data: { seq: 1, kind: "user_input", content: "b" } });
     // A thread known only via thread_runs is still surfaced.
     const t3 = ulid();
-    writeThreadResult(db, { taskId, threadId: t3, data: { status: "succeeded", duration_ms: 1, final_seq: 1 } });
+    writeThreadResult(storage, { taskId, threadId: t3, data: { status: "succeeded", duration_ms: 1, final_seq: 1 } });
 
-    const threads = getTaskThreads(db, taskId);
+    const threads = getTaskThreads(storage, taskId);
     expect(threads).toContain(t1);
     expect(threads).toContain(t2);
     expect(threads).toContain(t3);
@@ -433,17 +436,17 @@ describe("read models", () => {
   });
 
   it("getThreadRun / getCron return undefined when nothing has been mirrored", () => {
-    expect(getThreadRun(db, ulid())).toBeUndefined();
-    expect(getCron(db, ulid())).toBeUndefined();
+    expect(getThreadRun(storage, ulid())).toBeUndefined();
+    expect(getCron(storage, ulid())).toBeUndefined();
   });
 
   it("getTranscript is scoped to one thread", () => {
     const taskId = seedTask();
     const mine = ulid();
     const other = ulid();
-    writeThreadMessage(db, { taskId, threadId: mine, data: { seq: 1, kind: "user_input", content: "mine" } });
-    writeThreadMessage(db, { taskId, threadId: other, data: { seq: 1, kind: "user_input", content: "other" } });
-    const transcript = getTranscript(db, mine);
+    writeThreadMessage(storage, { taskId, threadId: mine, data: { seq: 1, kind: "user_input", content: "mine" } });
+    writeThreadMessage(storage, { taskId, threadId: other, data: { seq: 1, kind: "user_input", content: "other" } });
+    const transcript = getTranscript(storage, mine);
     expect(transcript.length).toBe(1);
     expect(transcript[0]?.content).toBe("mine");
   });
@@ -453,16 +456,16 @@ describe("read models", () => {
     const threadId = ulid();
     const total = TRANSCRIPT_READ_LIMIT + 5;
     for (let seq = 1; seq <= total; seq++) {
-      writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+      writeThreadMessage(storage, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
     }
 
     // A bare read never materializes the whole thread — and an oversized limit
     // is clamped to the same cap.
-    expect(getTranscript(db, threadId)).toHaveLength(TRANSCRIPT_READ_LIMIT);
-    expect(getTranscript(db, threadId, { limit: total * 10 })).toHaveLength(TRANSCRIPT_READ_LIMIT);
+    expect(getTranscript(storage, threadId)).toHaveLength(TRANSCRIPT_READ_LIMIT);
+    expect(getTranscript(storage, threadId, { limit: total * 10 })).toHaveLength(TRANSCRIPT_READ_LIMIT);
 
     // Paging with afterSeq walks the remainder (bounded ≠ unreachable).
-    const page2 = getTranscript(db, threadId, { afterSeq: TRANSCRIPT_READ_LIMIT });
+    const page2 = getTranscript(storage, threadId, { afterSeq: TRANSCRIPT_READ_LIMIT });
     expect(page2.map(m => m.seq)).toEqual([1, 2, 3, 4, 5].map(i => TRANSCRIPT_READ_LIMIT + i));
   });
 });

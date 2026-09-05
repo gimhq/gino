@@ -229,7 +229,7 @@ export function bootstrap(): BootstrapResult {
   // webhook delivery: pushed on the `transcript.message` host event, retried
   // on a tick. App-owned, so it is registered with the host and stopped first.
   host.registerService(startWebhookPump({
-    db,
+    storage: host.storage,
     logger,
     events: host.events,
     timeoutMs: host.options.webhooks.timeoutMs,

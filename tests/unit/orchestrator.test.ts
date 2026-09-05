@@ -1,6 +1,7 @@
 import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
-import type { FrameSender } from "@/protocol/outbox";
+import type { Storage } from "@/host/ports/storage";
+import type { AgentTransport } from "@/host/ports/transport";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "@/agents/registry";
 import { GLOBAL_SCOPE, resolveEntries, setEntries } from "@/configstore";
@@ -8,6 +9,7 @@ import { createDb } from "@/db";
 import { configArtifacts, outbox } from "@/db/schema";
 import { getCron } from "@/msgstore";
 import { gcOutbox, OUTBOX_RETENTION_MS, replayUnacked } from "@/protocol/outbox";
+import { sqliteStorage } from "@/store/sqlite";
 import {
   broadcastGlobalConfig,
   emitClose,
@@ -24,9 +26,10 @@ import { createTask, getTask, setPlacement } from "@/tasks/store";
 // M4 orchestrator — the host→agent SOURCE: every command rides the M2 outbox.
 
 let db: AppDatabase;
+let storage: Storage;
 
 /** Records every frame pushed; reports the agent online so enqueue delivers. */
-class FakeSender implements FrameSender {
+class FakeSender implements AgentTransport {
   readonly online = new Set<string>();
   readonly sent: Array<{ agentId: string; frame: Record<string, unknown> }> = [];
   isOnline(agentId: string): boolean {
@@ -37,6 +40,10 @@ class FakeSender implements FrameSender {
     this.sent.push({ agentId, frame });
     return true;
   }
+
+  closeAgent(agentId: string): boolean {
+    return this.online.delete(agentId);
+  }
 }
 
 let sender: FakeSender;
@@ -44,8 +51,9 @@ let agentId: string;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
   sender = new FakeSender();
-  agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   sender.online.add(agentId);
   // Register the shas the config-entry tests declare (write-time validation, HOST-M8-07).
   db
@@ -60,15 +68,15 @@ afterEach(() => {
 
 /** A placed task (orchestrator requires a SOURCE target). */
 function placedTask(): Task {
-  const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet", name: "demo", workdir: "/w", meta: { x: 1 } });
-  setPlacement(db, task.id, agentId);
-  return getTask(db, task.id)!;
+  const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet", name: "demo", workdir: "/w", meta: { x: 1 } });
+  setPlacement(storage, task.id, agentId);
+  return getTask(storage, task.id)!;
 }
 
 describe("M4 orchestrator — task_upsert", () => {
   it("seeds the OD15 payload (engine/model/workdir/meta) and rides the outbox", () => {
     const task = placedTask();
-    const row = emitTaskUpsert(db, sender, task);
+    const row = emitTaskUpsert(storage, sender, task);
 
     expect(row.type).toBe("task_upsert");
     expect(row.taskId).toBe(task.id);
@@ -83,15 +91,15 @@ describe("M4 orchestrator — task_upsert", () => {
   it("carries task-scope config entries when supplied (M8 passthrough)", () => {
     const task = placedTask();
     const entries = [{ name: "CLAUDE.md", sha256: "abc", target: "CLAUDE.md", kind: "file" }];
-    const row = emitTaskUpsert(db, sender, task, { entries });
+    const row = emitTaskUpsert(storage, sender, task, { entries });
     expect((row.dataJson as { entries?: unknown[] }).entries).toEqual(entries);
   });
 
   it("refuses to emit for an unplaced task (409)", () => {
-    const task = createTask(db, { ownerId: "o", engine: "claude", model: "sonnet" });
+    const task = createTask(storage, { ownerId: "o", engine: "claude", model: "sonnet" });
     let code: number | undefined;
     try {
-      emitTaskUpsert(db, sender, task);
+      emitTaskUpsert(storage, sender, task);
     }
     catch (err) {
       code = (err as { statusCode?: number }).statusCode;
@@ -103,14 +111,14 @@ describe("M4 orchestrator — task_upsert", () => {
 describe("M4 orchestrator — message threading (OD7+OD9)", () => {
   it("opens a thread on the first message + records it as current; continue reuses it", () => {
     const task = placedTask();
-    const first = emitMessage(db, sender, task, { text: "hello" });
+    const first = emitMessage(storage, sender, task, { text: "hello" });
     expect(first.threadId).toMatch(/^[0-9a-z]{26}$/);
     expect(first.message.type).toBe("message");
     expect(first.message.msgId).toBe(first.message.id); // message carries msgId
-    expect(getTask(db, task.id)?.currentThreadId).toBe(first.threadId);
+    expect(getTask(storage, task.id)?.currentThreadId).toBe(first.threadId);
 
     // Continue: re-fetch the (now-threaded) task → same thread.
-    const continued = emitMessage(db, sender, getTask(db, task.id)!, { text: "again" });
+    const continued = emitMessage(storage, sender, getTask(storage, task.id)!, { text: "again" });
     expect(continued.threadId).toBe(first.threadId);
 
     // The wire message frame carries msgId + threadId (not outboxId).
@@ -123,19 +131,19 @@ describe("M4 orchestrator — message threading (OD7+OD9)", () => {
 
   it("newThread opens a fresh thread within the task", () => {
     const task = placedTask();
-    const first = emitMessage(db, sender, task, { text: "a" });
-    const fresh = emitMessage(db, sender, getTask(db, task.id)!, { text: "b", newThread: true });
+    const first = emitMessage(storage, sender, task, { text: "a" });
+    const fresh = emitMessage(storage, sender, getTask(storage, task.id)!, { text: "b", newThread: true });
     expect(fresh.threadId).not.toBe(first.threadId);
-    expect(getTask(db, task.id)?.currentThreadId).toBe(fresh.threadId);
+    expect(getTask(storage, task.id)?.currentThreadId).toBe(fresh.threadId);
   });
 });
 
 describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOST-M4-04)", () => {
   it("every message frame carries a host-minted threadId — the absent-threadId wire path is never used", () => {
     const task = placedTask();
-    emitMessage(db, sender, task, { text: "first" });
-    emitMessage(db, sender, getTask(db, task.id)!, { text: "continue" });
-    emitMessage(db, sender, getTask(db, task.id)!, { text: "fresh", newThread: true });
+    emitMessage(storage, sender, task, { text: "first" });
+    emitMessage(storage, sender, getTask(storage, task.id)!, { text: "continue" });
+    emitMessage(storage, sender, getTask(storage, task.id)!, { text: "fresh", newThread: true });
 
     const wires = sender.sent.filter(s => s.frame.type === "message").map(s => s.frame);
     expect(wires).toHaveLength(3);
@@ -150,18 +158,19 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
     // re-sends under the SAME id instead of forking the conversation.
     const task = placedTask();
     const currentAtSend: Array<string | null> = [];
-    const observingSender: FrameSender = {
+    const observingSender: AgentTransport = {
       isOnline: () => true,
       send: (_agent, frame) => {
         if (frame.type === "message") {
-          currentAtSend.push(getTask(db, task.id)?.currentThreadId ?? null);
+          currentAtSend.push(getTask(storage, task.id)?.currentThreadId ?? null);
         }
         return true;
       },
+      closeAgent: () => false,
     };
 
-    const first = emitMessage(db, observingSender, task, { text: "hello" });
-    const fresh = emitMessage(db, observingSender, getTask(db, task.id)!, { text: "restart", newThread: true });
+    const first = emitMessage(storage, observingSender, task, { text: "hello" });
+    const fresh = emitMessage(storage, observingSender, getTask(storage, task.id)!, { text: "restart", newThread: true });
     expect(currentAtSend).toEqual([first.threadId, fresh.threadId]);
   });
 });
@@ -169,11 +178,11 @@ describe("M4 orchestrator — host-minted thread-id contract (HOST-M1M2-02 / HOS
 describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
   it("first message seeds task_upsert + message; subsequent messages do not re-seed", () => {
     const task = placedTask();
-    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    const first = sendTaskMessage(storage, sender, task, { text: "go" });
     expect(first.taskUpsert).toBeDefined();
     expect(first.taskUpsert!.type).toBe("task_upsert");
 
-    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "more" });
+    const second = sendTaskMessage(storage, sender, getTask(storage, task.id)!, { text: "more" });
     expect(second.taskUpsert).toBeUndefined();
 
     // Exactly one task_upsert frame went out.
@@ -183,17 +192,17 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
 
   it("seed state survives outbox retention GC (durable tasks.seeded_at flag)", () => {
     const task = placedTask();
-    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    const first = sendTaskMessage(storage, sender, task, { text: "go" });
     expect(first.taskUpsert).toBeDefined();
 
     // Ack the whole history and GC far past the retention window: the seed
     // frame's outbox row is gone, but the durable flag keeps the task seeded.
     db.update(outbox).set({ ackedAt: Date.now() }).run();
-    expect(gcOutbox(db, { now: () => Date.now() + OUTBOX_RETENTION_MS + 1000 })).toBeGreaterThan(0);
+    expect(gcOutbox(storage, { now: () => Date.now() + OUTBOX_RETENTION_MS + 1000 })).toBeGreaterThan(0);
     expect(db.select().from(outbox).all()).toHaveLength(0);
-    expect(hasSeededTask(db, task.id)).toBe(true);
+    expect(hasSeededTask(storage, task.id)).toBe(true);
 
-    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "more" });
+    const second = sendTaskMessage(storage, sender, getTask(storage, task.id)!, { text: "more" });
     expect(second.taskUpsert).toBeUndefined();
     expect(sender.sent.filter(s => s.frame.type === "task_upsert")).toHaveLength(1);
   });
@@ -202,27 +211,27 @@ describe("M4 orchestrator — sendTaskMessage seeds task_upsert once", () => {
 describe("M4 orchestrator — orphaned task re-placement re-seeds (HOST-M4-05)", () => {
   it("re-placed task gets a fresh task_upsert seed + a fresh thread on the new agent", () => {
     const task = placedTask();
-    const first = sendTaskMessage(db, sender, task, { text: "go" });
+    const first = sendTaskMessage(storage, sender, task, { text: "go" });
     expect(first.taskUpsert).toBeDefined();
     const oldThread = first.threadId;
 
-    removeAgent(db, agentId); // orphans the task (agent_id → NULL)
-    expect(getTask(db, task.id)?.agentId).toBeNull();
+    removeAgent(storage, agentId); // orphans the task (agent_id → NULL)
+    expect(getTask(storage, task.id)?.agentId).toBeNull();
 
     // Re-place on a NEW agent: the pin resets the seed gate + thread binding.
-    const freshAgent = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+    const freshAgent = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
     sender.online.add(freshAgent);
-    setPlacement(db, task.id, freshAgent);
-    expect(hasSeededTask(db, task.id)).toBe(false);
-    expect(getTask(db, task.id)?.currentThreadId).toBeNull();
+    setPlacement(storage, task.id, freshAgent);
+    expect(hasSeededTask(storage, task.id)).toBe(false);
+    expect(getTask(storage, task.id)?.currentThreadId).toBeNull();
 
     // The next message re-seeds the NEW agent and opens a fresh thread —
     // no dead current_thread_id from the removed agent is carried along.
-    const second = sendTaskMessage(db, sender, getTask(db, task.id)!, { text: "again" });
+    const second = sendTaskMessage(storage, sender, getTask(storage, task.id)!, { text: "again" });
     expect(second.taskUpsert).toBeDefined();
     expect(second.taskUpsert!.agentId).toBe(freshAgent);
     expect(second.threadId).not.toBe(oldThread);
-    expect(getTask(db, task.id)?.currentThreadId).toBe(second.threadId);
+    expect(getTask(storage, task.id)?.currentThreadId).toBe(second.threadId);
 
     // The new agent's wire history starts with its own seed, then the message.
     const toFresh = sender.sent.filter(s => s.agentId === freshAgent).map(s => s.frame.type);
@@ -233,7 +242,7 @@ describe("M4 orchestrator — orphaned task re-placement re-seeds (HOST-M4-05)",
 describe("M4 orchestrator — cron commands + control", () => {
   it("emitCronUpsert mints a cronId + emits the command; cron_delete addresses it", () => {
     const task = placedTask();
-    const { cron, cronId } = emitCronUpsert(db, sender, task, {
+    const { cron, cronId } = emitCronUpsert(storage, sender, task, {
       data: { kind: "schedule", continuity: "isolated", schedule_type: "cron", schedule_value: "0 9 * * *", prompt: "daily" },
     });
     expect(cronId).toMatch(/^[0-9a-z]{26}$/);
@@ -241,28 +250,28 @@ describe("M4 orchestrator — cron commands + control", () => {
     expect(cron.cronId).toBe(cronId);
     expect(cron.dataJson).toMatchObject({ kind: "schedule", continuity: "isolated", prompt: "daily" });
 
-    const del = emitCronDelete(db, sender, task, cronId);
+    const del = emitCronDelete(storage, sender, task, cronId);
     expect(del.type).toBe("cron_delete");
     expect(del.cronId).toBe(cronId);
   });
 
   it("emitCronUpsert persists the prompt into the crons mirror (HOST-M5M6-09)", () => {
     const task = placedTask();
-    const { cronId } = emitCronUpsert(db, sender, task, {
+    const { cronId } = emitCronUpsert(storage, sender, task, {
       data: { kind: "schedule", continuity: "isolated", schedule_type: "cron", schedule_value: "0 9 * * *", prompt: "daily digest" },
     });
-    expect(getCron(db, cronId)?.prompt).toBe("daily digest");
+    expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
 
     // A later upsert with a new prompt overwrites it.
-    emitCronUpsert(db, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated", prompt: "weekly digest" } });
-    expect(getCron(db, cronId)?.prompt).toBe("weekly digest");
+    emitCronUpsert(storage, sender, task, { cronId, data: { kind: "schedule", continuity: "isolated", prompt: "weekly digest" } });
+    expect(getCron(storage, cronId)?.prompt).toBe("weekly digest");
   });
 
   it("first cron on a never-seeded task seeds task_upsert before the command (HOST-M4-02)", () => {
     const task = placedTask();
-    expect(hasSeededTask(db, task.id)).toBe(false);
+    expect(hasSeededTask(storage, task.id)).toBe(false);
 
-    const { cron } = emitCronUpsert(db, sender, task, {
+    const { cron } = emitCronUpsert(storage, sender, task, {
       data: { kind: "schedule", continuity: "isolated", schedule_value: "0 9 * * *", prompt: "daily" },
     });
 
@@ -272,17 +281,17 @@ describe("M4 orchestrator — cron commands + control", () => {
     expect(seed).toBeDefined();
     expect(seed!.taskId).toBe(task.id);
     expect(seed!.id).toBeLessThan(cron.id);
-    expect(hasSeededTask(db, task.id)).toBe(true);
+    expect(hasSeededTask(storage, task.id)).toBe(true);
 
     // A second cron does not re-seed.
-    emitCronUpsert(db, sender, task, { data: { kind: "schedule", continuity: "isolated", prompt: "weekly" } });
+    emitCronUpsert(storage, sender, task, { data: { kind: "schedule", continuity: "isolated", prompt: "weekly" } });
     expect(db.select().from(outbox).all().filter(r => r.type === "task_upsert")).toHaveLength(1);
   });
 
   it("interrupt + close are task-scoped control frames", () => {
     const task = placedTask();
-    expect(emitInterrupt(db, sender, task).type).toBe("interrupt");
-    const close = emitClose(db, sender, task);
+    expect(emitInterrupt(storage, sender, task).type).toBe("interrupt");
+    const close = emitClose(storage, sender, task);
     expect(close.type).toBe("close");
     expect(close.taskId).toBe(task.id);
   });
@@ -292,7 +301,7 @@ describe("M4 orchestrator — cron commands + control", () => {
     sender.online.delete(agentId);
     let code: string | undefined;
     try {
-      emitInterrupt(db, sender, task);
+      emitInterrupt(storage, sender, task);
     }
     catch (err) {
       code = (err as { code?: string }).code;
@@ -303,28 +312,28 @@ describe("M4 orchestrator — cron commands + control", () => {
 
   it("interrupt is never replayed on reconnect — no stale cancel (HOST-M4-03)", () => {
     const task = placedTask();
-    const row = emitInterrupt(db, sender, task);
+    const row = emitInterrupt(storage, sender, task);
     expect(row.ackedAt).not.toBeNull(); // expired at enqueue: at-most-once
     expect(sender.sent.filter(s => s.frame.type === "interrupt")).toHaveLength(1); // live push happened
 
     // Reconnect replay pushes nothing for the interrupt.
     const replaySender = new FakeSender();
     replaySender.online.add(agentId);
-    replayUnacked(db, replaySender, agentId);
+    replayUnacked(storage, replaySender, agentId);
     expect(replaySender.sent.filter(s => s.frame.type === "interrupt")).toHaveLength(0);
   });
 });
 
 describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", () => {
   it("pushes config_update{entries, version} to online agents, per their engine", () => {
-    const codexId = enrollAgent(db, { capabilities: { engines: ["codex"] } }).agent.id;
+    const codexId = enrollAgent(storage, { capabilities: { engines: ["codex"] } }).agent.id;
     sender.online.add(codexId);
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
       ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
     ]);
 
-    const rows = broadcastGlobalConfig(db, sender);
+    const rows = broadcastGlobalConfig(storage, sender);
     expect(rows).toHaveLength(2);
     expect(rows.every(r => r.type === "config_update" && r.taskId === null)).toBe(true);
 
@@ -338,14 +347,14 @@ describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", 
   });
 
   it("a multi-engine agent receives the UNION of its engines' targets (HOST-M8-03)", () => {
-    const multiId = enrollAgent(db, { capabilities: { engines: ["claude", "codex"] } }).agent.id;
+    const multiId = enrollAgent(storage, { capabilities: { engines: ["claude", "codex"] } }).agent.id;
     sender.online.add(multiId);
-    setEntries(db, GLOBAL_SCOPE, [
+    setEntries(storage, GLOBAL_SCOPE, [
       ...resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]),
       ...resolveEntries("codex", [{ name: "instructions", sha256: "a".repeat(64), kind: "file" }]),
     ]);
 
-    const rows = broadcastGlobalConfig(db, sender);
+    const rows = broadcastGlobalConfig(storage, sender);
     const byAgent = new Map(rows.map(r => [r.agentId, r.dataJson as { entries: { target: string }[] }]));
     // NOT just engines[0] — both declared engines' rows are delivered.
     expect(byAgent.get(multiId)!.entries.map(e => e.target).sort()).toEqual(["AGENTS.md", "CLAUDE.md"]);
@@ -354,10 +363,10 @@ describe("M4 orchestrator — broadcastGlobalConfig (HOST-M8-01 live re-push)", 
   });
 
   it("skips offline agents (they converge on the next versioned config pull)", () => {
-    enrollAgent(db, { capabilities: { engines: ["claude"] } }); // never marked online
-    setEntries(db, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
+    enrollAgent(storage, { capabilities: { engines: ["claude"] } }); // never marked online
+    setEntries(storage, GLOBAL_SCOPE, resolveEntries("claude", [{ name: "CLAUDE.md", sha256: "a".repeat(64), kind: "file" }]));
 
-    const rows = broadcastGlobalConfig(db, sender);
+    const rows = broadcastGlobalConfig(storage, sender);
     expect(rows.map(r => r.agentId)).toEqual([agentId]);
   });
 });

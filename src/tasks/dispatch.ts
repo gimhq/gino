@@ -14,9 +14,8 @@
 //     only breaks ties / orders candidates.
 //   • None permitted → `pending-assignment` (surfaced in /admin/tasks); a
 //     launcher/admin grants or starts one later (deferred phase).
-import type { AppDatabase } from "@/db";
-import type { Agent, Task } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
+import type { AgentRow, Storage, TaskRow } from "@/host/ports/storage";
 import { getCapacity, isOwnerPermitted, listAgents } from "@/agents/registry";
 import { AppError } from "@/shared/lib/errors";
 import { requireTask, setPlacement, setStatus } from "./store";
@@ -38,11 +37,11 @@ const ASSIGNABLE_STATUSES: readonly string[] = [STATUS_PENDING_ASSIGNMENT, STATU
  * assignment is legal; a closed/terminal task keeps its status even when the
  * pin itself is (re-)recorded. Returns the resulting status.
  */
-function activateForPlacement(db: AppDatabase, task: Task): string {
+function activateForPlacement(storage: Storage, task: TaskRow): string {
   if (!ASSIGNABLE_STATUSES.includes(task.status)) {
     return task.status;
   }
-  return setStatus(db, task.id, STATUS_ACTIVE).status;
+  return setStatus(storage, task.id, STATUS_ACTIVE).status;
 }
 
 /** A placement precondition failure (admin `/assign`) → HTTP 422. */
@@ -63,7 +62,7 @@ export interface DispatchResult {
 
 /** A scored placement candidate (lower sort key = preferred). */
 interface Candidate {
-  agent: Agent;
+  agent: AgentRow;
   /** 0 = dedicated (the owner's own agent), 1 = public (shared). */
   tier: number;
   /** 0 = has spare capacity now, 1 = at/over capacity (back-pressure within). */
@@ -80,19 +79,19 @@ interface Candidate {
  * owner is permitted on it (OD13). Sorted dedicated-before-public, then
  * spare-capacity, then least-loaded, then online, then stable by `created_at`.
  */
-function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
+function rankCandidates(storage: Storage, task: TaskRow): Candidate[] {
   const candidates: Candidate[] = [];
-  for (const agent of listAgents(db)) {
+  for (const agent of listAgents(storage)) {
     if (agent.status === "removed") {
       continue;
     }
     if (!agent.capabilities.engines.includes(task.engine)) {
       continue; // an agent must hold the task's engine capability (§3)
     }
-    if (!isOwnerPermitted(db, agent.id, task.ownerId)) {
+    if (!isOwnerPermitted(storage, agent.id, task.ownerId)) {
       continue;
     }
-    const capacity = getCapacity(db, agent.id);
+    const capacity = getCapacity(storage, agent.id);
     candidates.push({
       agent,
       tier: agent.access === "dedicated" ? 0 : 1,
@@ -120,23 +119,23 @@ function rankCandidates(db: AppDatabase, task: Task): Candidate[] {
  *   • none permitted   → leaves the task `pending-assignment`.
  * A fresh pin is announced as `task.placed` on `events` (after the write).
  */
-export function placeTask(db: AppDatabase, taskId: string, events?: HostEvents): DispatchResult {
-  const task = requireTask(db, taskId);
+export function placeTask(storage: Storage, taskId: string, events?: HostEvents): DispatchResult {
+  const task = requireTask(storage, taskId);
   if (task.agentId != null) {
     return { taskId, placed: true, agentId: task.agentId, status: task.status, reason: "already-placed" };
   }
 
-  const chosen = rankCandidates(db, task)[0];
+  const chosen = rankCandidates(storage, task)[0];
   if (!chosen) {
     // No permitted agent — queue for assignment (a launcher/admin acts later).
     if (task.status !== STATUS_PENDING_ASSIGNMENT) {
-      setStatus(db, taskId, STATUS_PENDING_ASSIGNMENT);
+      setStatus(storage, taskId, STATUS_PENDING_ASSIGNMENT);
     }
     return { taskId, placed: false, agentId: null, status: STATUS_PENDING_ASSIGNMENT, reason: "no-permitted-agent" };
   }
 
-  setPlacement(db, taskId, chosen.agent.id); // SET ONCE
-  const status = activateForPlacement(db, task);
+  setPlacement(storage, taskId, chosen.agent.id); // SET ONCE
+  const status = activateForPlacement(storage, task);
   events?.emit("task.placed", { taskId, agentId: chosen.agent.id });
   return { taskId, placed: true, agentId: chosen.agent.id, status, reason: "placed" };
 }
@@ -149,26 +148,26 @@ export function placeTask(db: AppDatabase, taskId: string, events?: HostEvents):
  * SAME agent is a full no-op (`already-placed`); set-once is enforced by
  * `setPlacement` (a second, different agent → 409).
  */
-export function assignTaskToAgent(db: AppDatabase, taskId: string, agentId: string, events?: HostEvents): DispatchResult {
-  const task = requireTask(db, taskId);
+export function assignTaskToAgent(storage: Storage, taskId: string, agentId: string, events?: HostEvents): DispatchResult {
+  const task = requireTask(storage, taskId);
   if (task.agentId === agentId) {
     // Idempotent replay of the same assign: report the existing pin and touch
     // NOTHING — a retried assign must not flip a closed task back to `active`.
     return { taskId, placed: true, agentId, status: task.status, reason: "already-placed" };
   }
-  const agent = listAgents(db).find(a => a.id === agentId);
+  const agent = listAgents(storage).find(a => a.id === agentId);
   if (!agent || agent.status === "removed") {
     throw new DispatchError(`agent ${agentId} is not available for placement`, "AGENT_UNAVAILABLE");
   }
   if (!agent.capabilities.engines.includes(task.engine)) {
     throw new DispatchError(`agent ${agentId} does not support engine '${task.engine}'`, "ENGINE_MISMATCH");
   }
-  if (!isOwnerPermitted(db, agentId, task.ownerId)) {
+  if (!isOwnerPermitted(storage, agentId, task.ownerId)) {
     throw new DispatchError(`owner ${task.ownerId} is not permitted on agent ${agentId}`, "NOT_PERMITTED");
   }
 
-  setPlacement(db, taskId, agentId); // SET ONCE (409 on a different agent while placed)
-  const status = activateForPlacement(db, task);
+  setPlacement(storage, taskId, agentId); // SET ONCE (409 on a different agent while placed)
+  const status = activateForPlacement(storage, task);
   events?.emit("task.placed", { taskId, agentId });
   return { taskId, placed: true, agentId, status, reason: "placed" };
 }

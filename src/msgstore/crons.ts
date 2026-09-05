@@ -12,11 +12,8 @@
 // preserves `prompt` across mirror updates (never clobbers it) and only
 // overwrites `continuity` when the frame actually carries it. `next_run`
 // arrives as a string on the wire but the column is epoch-ms, so it is coerced.
-import type { AppDatabase } from "@/db";
-import type { Cron } from "@/db/schema";
+import type { CronRow, Storage } from "@/host/ports/storage";
 import type { CronStateData } from "@/protocol/frames";
-import { eq } from "drizzle-orm";
-import { crons } from "@/db/schema";
 
 export interface CronStateWrite {
   taskId: string;
@@ -52,8 +49,10 @@ function toEpochMs(value: string | undefined): number | null {
  * preserved; `continuity` is updated only when the frame carries it. Idempotent
  * on the cron id — no duplicate rows, ever.
  */
-export function writeCronState(db: AppDatabase, { taskId, cronId, data }: CronStateWrite): void {
-  const mirror = {
+export function writeCronState(storage: Storage, { taskId, cronId, data }: CronStateWrite): void {
+  storage.crons.upsertState({
+    id: cronId,
+    taskId,
     kind: data.kind,
     scheduleType: data.schedule_type ?? null,
     scheduleValue: data.schedule_value ?? null,
@@ -63,26 +62,8 @@ export function writeCronState(db: AppDatabase, { taskId, cronId, data }: CronSt
     roundCount: data.round_count,
     skippedCount: data.skipped_count,
     updatedAt: Date.now(),
-  };
-
-  db.insert(crons)
-    .values({
-      id: cronId,
-      taskId,
-      // `prompt` is the dispatch-side work command — not carried by `cron_state`.
-      // Seed empty on first mirror; preserved (never in the conflict set) after.
-      prompt: "",
-      continuity: data.continuity ?? "",
-      ...mirror,
-    })
-    .onConflictDoUpdate({
-      target: crons.id,
-      set: {
-        ...mirror,
-        ...(data.continuity !== undefined ? { continuity: data.continuity } : {}),
-      },
-    })
-    .run();
+    ...(data.continuity !== undefined ? { continuity: data.continuity } : {}),
+  });
 }
 
 export interface CronPromptWrite {
@@ -98,18 +79,11 @@ export interface CronPromptWrite {
  * first `cron_state` (the usual order — the host mints the id); on conflict
  * update ONLY `prompt`, leaving every mirror field to `writeCronState`.
  */
-export function writeCronPrompt(db: AppDatabase, { taskId, cronId, prompt }: CronPromptWrite): void {
-  db.insert(crons)
-    .values({ id: cronId, taskId, kind: "", prompt, continuity: "" })
-    .onConflictDoUpdate({ target: crons.id, set: { prompt, updatedAt: Date.now() } })
-    .run();
+export function writeCronPrompt(storage: Storage, { taskId, cronId, prompt }: CronPromptWrite): void {
+  storage.crons.upsertPrompt({ id: cronId, taskId, prompt, updatedAt: Date.now() });
 }
 
 /** The mirrored cron row, or `undefined` if no `cron_state` has been seen. */
-export function getCron(db: AppDatabase, cronId: string): Cron | undefined {
-  return db
-    .select()
-    .from(crons)
-    .where(eq(crons.id, cronId))
-    .get();
+export function getCron(storage: Storage, cronId: string): CronRow | undefined {
+  return storage.crons.get(cronId);
 }

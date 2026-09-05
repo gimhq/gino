@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -16,6 +17,7 @@ import {
   ShaMismatchError,
 } from "@/configstore";
 import { createDb } from "@/db";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M8 — the content-addressed blob store + the immutable artifact registry index.
 
@@ -23,11 +25,13 @@ const enc = new TextEncoder();
 let storeDir: string;
 let store: BlobStore;
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   storeDir = resolve(tmpdir(), `gino-store-${process.pid}-${Date.now()}-${Math.round(Math.random() * 1e6)}`);
   store = new BlobStore(storeDir);
   db = createDb(":memory:");
+  storage = sqliteStorage(db, { blobs: store });
 });
 
 afterEach(() => {
@@ -124,7 +128,7 @@ describe("BlobStore — content-addressed put/read", () => {
 describe("config_artifacts registry — ingest/get/list", () => {
   it("ingests bytes + upserts an immutable row (dedup by sha256)", () => {
     const bytes = enc.encode("# skill bundle");
-    const first = ingestArtifact(db, store, { name: "my-skill", kind: "dir", bytes, contentType: "application/gzip" });
+    const first = ingestArtifact(storage, { name: "my-skill", kind: "dir", bytes, contentType: "application/gzip" });
 
     expect(first.name).toBe("my-skill");
     expect(first.kind).toBe("dir");
@@ -133,39 +137,39 @@ describe("config_artifacts registry — ingest/get/list", () => {
     expect(first.contentType).toBe("application/gzip");
 
     // A re-ingest of identical (name, content) is a no-op: still one row.
-    ingestArtifact(db, store, { name: "my-skill", kind: "dir", bytes });
-    expect(listArtifacts(db)).toHaveLength(1);
+    ingestArtifact(storage, { name: "my-skill", kind: "dir", bytes });
+    expect(listArtifacts(storage)).toHaveLength(1);
 
-    expect(getArtifact(db, "my-skill", first.sha256)?.size).toBe(bytes.byteLength);
-    expect(getArtifactBySha(db, first.sha256)?.name).toBe("my-skill");
+    expect(getArtifact(storage, "my-skill", first.sha256)?.size).toBe(bytes.byteLength);
+    expect(getArtifactBySha(storage, first.sha256)?.name).toBe("my-skill");
   });
 
   it("a new version (new content) is a new immutable row", () => {
-    ingestArtifact(db, store, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v1") });
-    ingestArtifact(db, store, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v2") });
-    expect(listArtifacts(db).filter(a => a.name === "CLAUDE.md")).toHaveLength(2);
+    ingestArtifact(storage, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v1") });
+    ingestArtifact(storage, { name: "CLAUDE.md", kind: "file", bytes: enc.encode("v2") });
+    expect(listArtifacts(storage).filter(a => a.name === "CLAUDE.md")).toHaveLength(2);
   });
 
   it("re-ingesting identical (name, bytes) with different metadata UPDATES kind/content_type (HOST-M8-13)", () => {
     const bytes = enc.encode("bundle-bytes");
-    const first = ingestArtifact(db, store, { name: "bundle", kind: "file", bytes, contentType: "text/plain" });
+    const first = ingestArtifact(storage, { name: "bundle", kind: "file", bytes, contentType: "text/plain" });
     expect(first.kind).toBe("file");
     expect(first.contentType).toBe("text/plain");
 
     // The corrective re-ingest is NOT silently ignored: metadata last-write-wins.
-    const second = ingestArtifact(db, store, { name: "bundle", kind: "dir", bytes, contentType: "application/gzip" });
+    const second = ingestArtifact(storage, { name: "bundle", kind: "dir", bytes, contentType: "application/gzip" });
     expect(second.sha256).toBe(first.sha256);
     expect(second.kind).toBe("dir");
     expect(second.contentType).toBe("application/gzip");
 
     // Still one content-addressed row + one physical blob (the bytes dedup).
-    expect(listArtifacts(db).filter(a => a.name === "bundle")).toHaveLength(1);
+    expect(listArtifacts(storage).filter(a => a.name === "bundle")).toHaveLength(1);
     expect(readdirSync(resolve(storeDir, "bundle"))).toHaveLength(1);
   });
 
   it("a file artifact carries kind:file (a skill is just kind:dir — one abstraction)", () => {
-    const file = ingestArtifact(db, store, { name: "design.md", kind: "file", bytes: enc.encode("doc") });
-    const dir = ingestArtifact(db, store, { name: "reviewer", kind: "dir", bytes: enc.encode("bundle") });
+    const file = ingestArtifact(storage, { name: "design.md", kind: "file", bytes: enc.encode("doc") });
+    const dir = ingestArtifact(storage, { name: "reviewer", kind: "dir", bytes: enc.encode("bundle") });
     expect(file.kind).toBe("file");
     expect(dir.kind).toBe("dir");
     // Both materialized as physical blobs under the unified store.

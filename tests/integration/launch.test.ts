@@ -1,5 +1,6 @@
 import type { SpawnFn } from "@/agents/launchers";
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -12,6 +13,7 @@ import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
 import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 // D-B2b — launch + launch↔register nonce correlation (OD17), end-to-end through
 // the HTTP surface. The docker launcher's shell-out is MOCKED (a recording
@@ -35,6 +37,7 @@ const config = loadConfigStrict({
 });
 
 let db: AppDatabase;
+let storage: Storage;
 let app: ReturnType<typeof createApp>;
 
 /** Captured docker argv + spawn env across the suite (the recording `spawn` pushes here). */
@@ -48,6 +51,7 @@ const recordingSpawn: SpawnFn = async (cmd, opts) => {
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   // The host's "docker" launcher is a mocked one (recording spawn + a fixed
   // image so a body without `image` still launches).
   const host = createAppHost({
@@ -194,7 +198,7 @@ describe("HOST-M3-06 — registration is idempotent per launch nonce", () => {
     const launched = await launch({ kind: "docker", hostUrl: "https://host.example" });
     const { data } = await launched.json() as { data: { nonce: string; ref: string } };
 
-    const before = listAgents(db).length;
+    const before = listAgents(storage).length;
     const first = await register({ launchNonce: data.nonce });
     const { agentId: firstId, connectToken: firstToken } = await first.json() as { agentId: string; connectToken: string };
 
@@ -204,10 +208,10 @@ describe("HOST-M3-06 — registration is idempotent per launch nonce", () => {
     const { agentId: secondId, connectToken: secondToken } = await second.json() as { agentId: string; connectToken: string };
 
     expect(secondId).toBe(firstId); // same agent row — no ghost duplicate
-    expect(listAgents(db).length).toBe(before + 1); // exactly one row minted
+    expect(listAgents(storage).length).toBe(before + 1); // exactly one row minted
     expect(secondToken).not.toBe(firstToken); // connect token rotated on retry
-    expect(verifyConnectToken(db, firstId, secondToken)?.id).toBe(firstId); // retry token works
-    expect(verifyConnectToken(db, firstId, firstToken)).toBeNull(); // the lost token is dead
+    expect(verifyConnectToken(storage, firstId, secondToken)?.id).toBe(firstId); // retry token works
+    expect(verifyConnectToken(storage, firstId, firstToken)).toBeNull(); // the lost token is dead
 
     // The launch binding stays on the one live row.
     const agent = (await (await admin(`/agents/${firstId}`)).json() as { data: { launchRef: string | null } }).data;
@@ -226,7 +230,7 @@ describe("HOST-M3-06 — registration is idempotent per launch nonce", () => {
     expect(retry.status).toBe(200);
     const { agentId: retryId } = await retry.json() as { agentId: string };
     expect(retryId).not.toBe(agentId); // fresh enrollment, not a resurrection
-    expect(getAgent(db, agentId)?.status).toBe("removed");
+    expect(getAgent(storage, agentId)?.status).toBe("removed");
   });
 });
 
@@ -235,7 +239,7 @@ describe("HOST-M3-09 — access policy is never client-declared at enroll", () =
     const reg = await register({ access: "public" });
     expect(reg.status).toBe(200);
     const { agentId } = await reg.json() as { agentId: string };
-    expect(getAgent(db, agentId)?.access).toBe("dedicated");
+    expect(getAgent(storage, agentId)?.access).toBe("dedicated");
   });
 
   it("an admin launch may allowlist public — applied at correlate, register body still ignored", async () => {
@@ -244,7 +248,7 @@ describe("HOST-M3-09 — access policy is never client-declared at enroll", () =
 
     const reg = await register({ launchNonce: data.nonce, access: "dedicated" });
     const { agentId } = await reg.json() as { agentId: string };
-    expect(getAgent(db, agentId)?.access).toBe("public"); // the ADMIN allowlist won, not the body
+    expect(getAgent(storage, agentId)?.access).toBe("public"); // the ADMIN allowlist won, not the body
   });
 });
 
@@ -252,6 +256,6 @@ describe("HOST-M3-15 — register token provenance", () => {
   it("registerTokenRef is populated at enroll with the token's at-rest hash", async () => {
     const reg = await register({});
     const { agentId } = await reg.json() as { agentId: string };
-    expect(getAgent(db, agentId)?.registerTokenRef).toBe(hashToken(REGISTER_TOKEN));
+    expect(getAgent(storage, agentId)?.registerTokenRef).toBe(hashToken(REGISTER_TOKEN));
   });
 });
