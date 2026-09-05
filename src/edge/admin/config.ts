@@ -63,9 +63,8 @@ export function adminConfigRoutes() {
       const host = c.get("host");
       const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);
 
-      const store = host.store;
       try {
-        const artifact = ingestArtifact(c.get("db"), store, {
+        const artifact = ingestArtifact(host.storage, {
           name,
           kind,
           bytes,
@@ -91,6 +90,7 @@ export function adminConfigRoutes() {
     validator("json", entriesBody),
     (c) => {
       const db = c.get("db");
+      const storage = c.get("host").storage;
       const b = c.req.valid("json");
       // Resolve the engine: explicit > the task's engine (for a task scope) > claude.
       const taskEngine = b.scope !== GLOBAL_SCOPE ? getTask(db, b.scope)?.engine : undefined;
@@ -102,12 +102,12 @@ export function adminConfigRoutes() {
         ...(e.target != null ? { target: e.target } : {}),
       }));
       const resolved = resolveEntries(engine, inputs);
-      const persisted = setEntries(db, b.scope, resolved);
+      const persisted = setEntries(storage, b.scope, resolved);
       if (b.scope === GLOBAL_SCOPE) {
         // M8 delivery: a global change bumps the monotonic version (inside
         // setEntries) and is re-pushed live to every online agent; offline
         // agents converge on their next versioned config pull.
-        const version = getGlobalConfigVersion(db);
+        const version = getGlobalConfigVersion(storage);
         const pushed = broadcastGlobalConfig(db, c.get("host").sessions);
         c.get("logger").info({ scope: b.scope, engine, count: persisted.length, version, pushed: pushed.length }, "config entries set");
         return c.json(ok({ scope: b.scope, engine, entries: persisted, version }));

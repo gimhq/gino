@@ -17,6 +17,7 @@
 import type { AppDatabase } from "@/db";
 import type { Task } from "@/db/schema";
 import { clearEntries } from "@/configstore";
+import { sqliteStorage } from "@/store/sqlite";
 import { setStatus } from "./store";
 
 /**
@@ -47,7 +48,8 @@ export type TaskStatus = (typeof TASK_STATUS)[keyof typeof TASK_STATUS];
 export function transitionTaskStatus(db: AppDatabase, taskId: string, status: string): Task {
   const task = setStatus(db, taskId, status);
   if (status === TASK_STATUS.closed) {
-    clearEntries(db, taskId);
+    // P1 transitional — removed when tasks moves to ports
+    clearEntries(sqliteStorage(db), taskId);
   }
   return task;
 }

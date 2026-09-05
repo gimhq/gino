@@ -1,10 +1,12 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { DecodedFrame } from "@/protocol/envelope";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import { getThreadRun, writeCronState } from "@/msgstore";
 import { applyFrame, ingestHttpFrame } from "@/protocol/inbound";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 // HOST-M1M2-06 / HOST-M5M6-06 — `thread_result` dispatch context is derived at
@@ -16,9 +18,11 @@ import { createTask, setPlacement } from "@/tasks";
 // stays `source='chat'`, `cron_id=NULL`.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -35,7 +39,7 @@ function placedAgentTask(): { agentId: string; taskId: string } {
 
 /** Seed the crons mirror with one cron for `taskId` (as a `cron_state` would). */
 function seedCron(taskId: string, cronId: string): void {
-  writeCronState(db, { taskId, cronId, data: { kind: "interval", round_count: 0, skipped_count: 0 } });
+  writeCronState(storage, { taskId, cronId, data: { kind: "interval", round_count: 0, skipped_count: 0 } });
 }
 
 /** A valid `thread_result` frame for the given ids. */
@@ -50,7 +54,7 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
 
     const ack = applyFrame({ db, agentId }, resultFrame(taskId, "cr-1@1718000000000", 1));
     expect(ack).toEqual({ type: "ack", id: 1 });
-    expect(getThreadRun(db, "cr-1@1718000000000")).toMatchObject({ source: "cron", cronId: "cr-1", taskId });
+    expect(getThreadRun(storage, "cr-1@1718000000000")).toMatchObject({ source: "cron", cronId: "cr-1", taskId });
   });
 
   it("records a shared-continuity fire (`<cronId>@shared`) as source='cron'", () => {
@@ -58,7 +62,7 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
     seedCron(taskId, "cr-2");
 
     applyFrame({ db, agentId }, resultFrame(taskId, "cr-2@shared", 2));
-    expect(getThreadRun(db, "cr-2@shared")).toMatchObject({ source: "cron", cronId: "cr-2" });
+    expect(getThreadRun(storage, "cr-2@shared")).toMatchObject({ source: "cron", cronId: "cr-2" });
   });
 
   it("leaves an interactive thread unchanged: source='chat', cron_id NULL", () => {
@@ -66,14 +70,14 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
     seedCron(taskId, "cr-3"); // a cron exists, but this thread is not its fire
 
     applyFrame({ db, agentId }, resultFrame(taskId, "thr-chat-1", 3));
-    expect(getThreadRun(db, "thr-chat-1")).toMatchObject({ source: "chat", cronId: null });
+    expect(getThreadRun(storage, "thr-chat-1")).toMatchObject({ source: "chat", cronId: null });
   });
 
   it("treats a cron-shaped id whose prefix is not a known cron as chat", () => {
     const { agentId, taskId } = placedAgentTask();
 
     applyFrame({ db, agentId }, resultFrame(taskId, "ghost@1718000000000", 4));
-    expect(getThreadRun(db, "ghost@1718000000000")).toMatchObject({ source: "chat", cronId: null });
+    expect(getThreadRun(storage, "ghost@1718000000000")).toMatchObject({ source: "chat", cronId: null });
   });
 
   it("does not attribute a run to ANOTHER task's cron (stays chat)", () => {
@@ -82,7 +86,7 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
     seedCron(otherTask.taskId, "cr-other");
 
     applyFrame({ db, agentId }, resultFrame(taskId, "cr-other@1718000000000", 5));
-    expect(getThreadRun(db, "cr-other@1718000000000")).toMatchObject({ source: "chat", cronId: null });
+    expect(getThreadRun(storage, "cr-other@1718000000000")).toMatchObject({ source: "chat", cronId: null });
   });
 
   it("survives malformed cron-ish thread ids without crashing ingest (all land as chat)", () => {
@@ -93,7 +97,7 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
     for (const [i, threadId] of malformed.entries()) {
       const ack = applyFrame({ db, agentId }, resultFrame(taskId, threadId, 10 + i));
       expect(ack).toEqual({ type: "ack", id: 10 + i }); // ingest never crashes
-      expect(getThreadRun(db, threadId)).toMatchObject({ source: "chat", cronId: null });
+      expect(getThreadRun(storage, threadId)).toMatchObject({ source: "chat", cronId: null });
     }
   });
 
@@ -103,7 +107,7 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
     const raw = JSON.stringify({ type: "thread_result", outboxId: 30, taskId, threadId: "cr-5@shared", data: { status: "succeeded", duration_ms: 5, final_seq: 0 } });
 
     expect(ingestHttpFrame({ db, agentId }, raw)).toEqual({ type: "ack", id: 30 });
-    expect(getThreadRun(db, "cr-5@shared")).toMatchObject({ source: "cron", cronId: "cr-5" });
+    expect(getThreadRun(storage, "cr-5@shared")).toMatchObject({ source: "cron", cronId: "cr-5" });
   });
 
   it("keeps source/cron_id stable across an at-least-once replay (set once at creation)", () => {
@@ -113,6 +117,6 @@ describe("HOST-M1M2-06/M5M6-06 — thread_result derives source/cron_id from the
 
     applyFrame({ db, agentId }, frame);
     applyFrame({ db, agentId }, frame); // replay is a safe no-op
-    expect(getThreadRun(db, "cr-6@1718000000000")).toMatchObject({ source: "cron", cronId: "cr-6" });
+    expect(getThreadRun(storage, "cr-6@1718000000000")).toMatchObject({ source: "cron", cronId: "cr-6" });
   });
 });

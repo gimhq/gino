@@ -7,20 +7,14 @@
 // engine-agnostic — it only ever sees `target`/`kind`, never "claude vs codex".
 // A multi-engine standard lands as two rows (a `CLAUDE.md` + an `AGENTS.md`
 // target); on delivery we hand each agent only the rows its engines land.
-import type { AppDatabase } from "@/db";
-import type { ConfigEntry as ConfigEntryRow } from "@/db/schema";
+import type { ConfigEntryRow, Storage } from "@/host/ports/storage";
 import type { ConfigEntry } from "@/protocol/frames";
-import { and, eq } from "drizzle-orm";
-import { configEntries, routerState, tasks } from "@/db/schema";
 import { ValidationError } from "@/shared/lib/errors";
 import { getArtifactBySha } from "./artifacts";
 import { isSafeName } from "./store";
 
 /** The per-agent (non-task) scope name. */
 export const GLOBAL_SCOPE = "global" as const;
-
-/** `router_state` key holding the monotonic GLOBAL config version. */
-const GLOBAL_CONFIG_VERSION_KEY = "global_config_version" as const;
 
 /** Default engine when none is supplied (the common single-engine deployment). */
 export const DEFAULT_ENGINE = "claude" as const;
@@ -139,10 +133,10 @@ function isSafeTarget(target: string): boolean {
  * escape the agent-side project root. Throws a 422 `ValidationError` whose
  * details name every offending entry.
  */
-function assertValidEntries(db: AppDatabase, scope: string, entries: ConfigEntry[]): void {
+function assertValidEntries(storage: Storage, scope: string, entries: ConfigEntry[]): void {
   const problems: string[] = [];
   if (scope !== GLOBAL_SCOPE) {
-    const task = db.select({ id: tasks.id }).from(tasks).where(eq(tasks.id, scope)).get();
+    const task = storage.tasks.get(scope);
     if (!task) {
       problems.push(`scope ${JSON.stringify(scope)} is neither 'global' nor an existing task id`);
     }
@@ -154,7 +148,7 @@ function assertValidEntries(db: AppDatabase, scope: string, entries: ConfigEntry
     if (!RE_SHA256_HEX.test(e.sha256)) {
       problems.push(`entry ${JSON.stringify(e.name)}: sha256 must be 64 lowercase hex chars`);
     }
-    else if (!getArtifactBySha(db, e.sha256)) {
+    else if (!getArtifactBySha(storage, e.sha256)) {
       problems.push(`entry ${JSON.stringify(e.name)}: no ingested artifact holds sha256 ${e.sha256}`);
     }
     if (!isSafeTarget(e.target)) {
@@ -171,51 +165,32 @@ function assertValidEntries(db: AppDatabase, scope: string, entries: ConfigEntry
  * `router_state`). The agent reconciles the global scope only when this
  * advances (agent-architecture §9b); `0` means the global set was never written.
  */
-export function getGlobalConfigVersion(db: AppDatabase): number {
-  const row = db.select().from(routerState).where(eq(routerState.key, GLOBAL_CONFIG_VERSION_KEY)).get();
-  const parsed = row ? Number.parseInt(row.value, 10) : 0;
-  return Number.isFinite(parsed) ? parsed : 0;
+export function getGlobalConfigVersion(storage: Storage): number {
+  return storage.config.globalVersion();
 }
 
 /**
  * REPLACE the desired set for a scope (delete-then-insert): the new list IS the
  * scope's complete desired state (an empty list clears it). Entries are deduped
  * by `target` to honor UNIQUE(scope, target). The delete+insert pair runs in
- * ONE transaction — a crash or insert error can never leave the scope wiped
- * (all-or-nothing). A GLOBAL write also bumps the monotonic config version in
- * the same transaction, so the version advances iff the set actually changed
- * durably. Every write is validated first (HOST-M8-07 / HOST-M8-08) — an
- * unknown scope, an undeclarable sha256, or a traversal-shaped name/target is
- * rejected with a 422 before anything is touched. Returns the persisted set.
+ * ONE atomic unit (`ConfigRepo.replaceScope`) — a crash or insert error can
+ * never leave the scope wiped (all-or-nothing). A GLOBAL write also bumps the
+ * monotonic config version in the same unit, so the version advances iff the
+ * set actually changed durably. Every write is validated first (HOST-M8-07 /
+ * HOST-M8-08) — an unknown scope, an undeclarable sha256, or a
+ * traversal-shaped name/target is rejected with a 422 before anything is
+ * touched. Returns the persisted set.
  */
-export function setEntries(db: AppDatabase, scope: string, entries: ConfigEntry[]): ConfigEntry[] {
+export function setEntries(storage: Storage, scope: string, entries: ConfigEntry[]): ConfigEntry[] {
   const next = dedupeByTarget(entries);
-  assertValidEntries(db, scope, next);
-  db.transaction((tx) => {
-    tx.delete(configEntries).where(eq(configEntries.scope, scope)).run();
-    if (next.length > 0) {
-      tx
-        .insert(configEntries)
-        .values(next.map(e => ({ scope, name: e.name, sha256: e.sha256, target: e.target, kind: e.kind })))
-        .run();
-    }
-    if (scope === GLOBAL_SCOPE) {
-      const row = tx.select().from(routerState).where(eq(routerState.key, GLOBAL_CONFIG_VERSION_KEY)).get();
-      const current = row ? Number.parseInt(row.value, 10) : 0;
-      const value = String((Number.isFinite(current) ? current : 0) + 1);
-      tx
-        .insert(routerState)
-        .values({ key: GLOBAL_CONFIG_VERSION_KEY, value })
-        .onConflictDoUpdate({ target: routerState.key, set: { value } })
-        .run();
-    }
-  });
+  assertValidEntries(storage, scope, next);
+  storage.config.replaceScope(scope, next.map(e => ({ name: e.name, sha256: e.sha256, target: e.target, kind: e.kind })));
   return next;
 }
 
 /** Raw `config_entries` rows for a scope (admin/inspection). */
-export function getEntries(db: AppDatabase, scope: string): ConfigEntryRow[] {
-  return db.select().from(configEntries).where(eq(configEntries.scope, scope)).all();
+export function getEntries(storage: Storage, scope: string): ConfigEntryRow[] {
+  return storage.config.entriesFor(scope);
 }
 
 /**
@@ -224,8 +199,8 @@ export function getEntries(db: AppDatabase, scope: string): ConfigEntryRow[] {
  * they stop pinning artifacts in the GC root set. Task scopes carry no config
  * version, so nothing is bumped.
  */
-export function clearEntries(db: AppDatabase, scope: string): void {
-  db.delete(configEntries).where(eq(configEntries.scope, scope)).run();
+export function clearEntries(storage: Storage, scope: string): void {
+  storage.config.clearScope(scope);
 }
 
 /**
@@ -236,24 +211,14 @@ export function clearEntries(db: AppDatabase, scope: string): void {
  * bytes the host actually declared for it — never arbitrary store bytes by sha
  * (the IDOR fix; the desired set is the host-authoritative provisioning surface).
  */
-export function isShaInAgentDesiredSet(db: AppDatabase, agentId: string, sha256: string): boolean {
-  const global = db
-    .select({ scope: configEntries.scope })
-    .from(configEntries)
-    .where(and(eq(configEntries.scope, GLOBAL_SCOPE), eq(configEntries.sha256, sha256)))
-    .get();
-  if (global) {
+export function isShaInAgentDesiredSet(storage: Storage, agentId: string, sha256: string): boolean {
+  const scopes = storage.config.scopesWithSha(sha256);
+  if (scopes.includes(GLOBAL_SCOPE)) {
     return true;
   }
   // Task scope: an entry whose `scope` is a task id placed on this agent. The
-  // inner join naturally excludes the GLOBAL scope ('global' matches no task id).
-  const taskScoped = db
-    .select({ scope: configEntries.scope })
-    .from(configEntries)
-    .innerJoin(tasks, eq(tasks.id, configEntries.scope))
-    .where(and(eq(configEntries.sha256, sha256), eq(tasks.agentId, agentId)))
-    .get();
-  return taskScoped != null;
+  // task lookup naturally excludes the GLOBAL scope ('global' matches no task id).
+  return scopes.some(scope => storage.tasks.get(scope)?.agentId === agentId);
 }
 
 /**
@@ -265,9 +230,9 @@ export function isShaInAgentDesiredSet(db: AppDatabase, agentId: string, sha256:
  * target only when the agent declared that engine. An empty list falls back to
  * the default engine.
  */
-export function resolveEntriesForEngines(db: AppDatabase, scope: string, engines: string[]): ConfigEntry[] {
+export function resolveEntriesForEngines(storage: Storage, scope: string, engines: string[]): ConfigEntry[] {
   const declared = new Set(engines.length > 0 ? engines : [DEFAULT_ENGINE]);
-  return getEntries(db, scope)
+  return getEntries(storage, scope)
     .filter((r) => {
       const owner = targetEngine(r.target);
       return owner === null || declared.has(owner);
@@ -280,6 +245,6 @@ export function resolveEntriesForEngines(db: AppDatabase, scope: string, engines
  * exactly one engine). For an agent's global scope use
  * `resolveEntriesForEngines` with its full capability list.
  */
-export function resolveEntriesForEngine(db: AppDatabase, scope: string, engine: string): ConfigEntry[] {
-  return resolveEntriesForEngines(db, scope, [engine]);
+export function resolveEntriesForEngine(storage: Storage, scope: string, engine: string): ConfigEntry[] {
+  return resolveEntriesForEngines(storage, scope, [engine]);
 }

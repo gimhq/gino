@@ -20,6 +20,7 @@ import { resolveEntries, setEntries } from "@/configstore";
 import { crons, tasks } from "@/db/schema";
 import { ulid } from "@/platform";
 import { AppError, NotFoundError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 
 /** A freshly-created, unplaced task is `pending-assignment` until dispatch pins it (§3). */
 export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
@@ -74,7 +75,8 @@ export function createTask(db: AppDatabase, input: CreateTaskInput): Task {
  */
 export function setTaskEntries(db: AppDatabase, taskId: string, entries: EntryInput[]): void {
   const task = requireTask(db, taskId);
-  setEntries(db, taskId, resolveEntries(task.engine, entries));
+  // P1 transitional — removed when tasks moves to ports
+  setEntries(sqliteStorage(db), taskId, resolveEntries(task.engine, entries));
 }
 
 export function getTask(db: AppDatabase, id: string): Task | undefined {

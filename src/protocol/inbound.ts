@@ -26,6 +26,7 @@ import type { DecodedFrame } from "./envelope";
 import type { AppDatabase } from "@/db";
 import type { HostEvents } from "@/host/events";
 import type { Metrics } from "@/host/metrics";
+import type { Storage } from "@/host/ports/storage";
 import type { AgentTransport } from "@/host/ports/transport";
 import type { Logger } from "@/shared/lib/logger";
 import { touchLiveness } from "@/agents/registry";
@@ -39,6 +40,7 @@ import {
   writeThreadResult,
 } from "@/msgstore";
 import { CronStateData, HeartbeatData, RECOGNIZED_MESSAGE_KINDS, ThreadMessageData, ThreadResultData } from "@/protocol/frames";
+import { sqliteStorage } from "@/store/sqlite";
 import { getTask } from "@/tasks/store";
 import { decodeFrame } from "./envelope";
 import { ackMessage, ackOutbox } from "./outbox";
@@ -105,6 +107,7 @@ function poisonDrop(deps: InboundDeps, decoded: DecodedFrame, reason: string, de
  */
 function authorizeWrite(
   deps: InboundDeps,
+  storage: Storage,
   taskId: string,
   binding: { threadId?: string; cronId?: string },
 ): boolean {
@@ -121,13 +124,13 @@ function authorizeWrite(
     return deny("task not placed on this agent");
   }
   if (binding.threadId != null) {
-    const owner = getThreadTaskId(deps.db, binding.threadId);
+    const owner = getThreadTaskId(storage, binding.threadId);
     if (owner != null && owner !== taskId) {
       return deny("thread belongs to another task");
     }
   }
   if (binding.cronId != null) {
-    const cron = getCron(deps.db, binding.cronId);
+    const cron = getCron(storage, binding.cronId);
     if (cron != null && cron.taskId !== taskId) {
       return deny("cron belongs to another task");
     }
@@ -145,7 +148,7 @@ function authorizeWrite(
  * anything else — no `@`, a non-cron suffix, an unknown prefix, or a cron
  * belonging to another task — stays `chat` with no cron link.
  */
-function deriveDispatchContext(db: AppDatabase, taskId: string, threadId: string): { source: string; cronId?: string } {
+function deriveDispatchContext(storage: Storage, taskId: string, threadId: string): { source: string; cronId?: string } {
   const at = threadId.lastIndexOf("@");
   if (at <= 0) {
     return { source: "chat" };
@@ -155,7 +158,7 @@ function deriveDispatchContext(db: AppDatabase, taskId: string, threadId: string
     return { source: "chat" };
   }
   const cronId = threadId.slice(0, at);
-  const cron = getCron(db, cronId);
+  const cron = getCron(storage, cronId);
   if (cron == null || cron.taskId !== taskId) {
     return { source: "chat" };
   }
@@ -172,13 +175,15 @@ function deriveDispatchContext(db: AppDatabase, taskId: string, threadId: string
  */
 export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<string, unknown> | null {
   const { db, agentId } = deps;
+  // P1 transitional — removed when protocol/inbound moves to ports
+  const storage = sqliteStorage(db);
 
   switch (decoded.type) {
     case "thread_message": {
       if (decoded.taskId == null || decoded.threadId == null) {
         return poisonDrop(deps, decoded, "missing_ids");
       }
-      if (!authorizeWrite(deps, decoded.taskId, { threadId: decoded.threadId })) {
+      if (!authorizeWrite(deps, storage, decoded.taskId, { threadId: decoded.threadId })) {
         return poisonDrop(deps, decoded, "authorize_denied");
       }
       const parsed = ThreadMessageData.safeParse(decoded.data);
@@ -193,7 +198,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         deps.logger?.warn({ agentId, taskId: decoded.taskId, threadId: decoded.threadId, kind: data.kind }, "thread_message with unrecognized kind — stored opaquely");
         deps.metrics?.counterAdd("inbound_unrecognized_kinds_total", "thread_message frames whose kind is outside the recognized set", 1, { kind: data.kind });
       }
-      writeThreadMessage(db, { taskId: decoded.taskId, threadId: decoded.threadId, data });
+      writeThreadMessage(storage, { taskId: decoded.taskId, threadId: decoded.threadId, data });
       deps.events?.emit("transcript.message", { agentId, taskId: decoded.taskId, threadId: decoded.threadId, seq: data.seq, data });
       return ackFor(decoded);
     }
@@ -202,7 +207,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       if (decoded.taskId == null || decoded.threadId == null) {
         return poisonDrop(deps, decoded, "missing_ids");
       }
-      if (!authorizeWrite(deps, decoded.taskId, { threadId: decoded.threadId })) {
+      if (!authorizeWrite(deps, storage, decoded.taskId, { threadId: decoded.threadId })) {
         return poisonDrop(deps, decoded, "authorize_denied");
       }
       const parsed = ThreadResultData.safeParse(decoded.data);
@@ -213,19 +218,19 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       // `source`/`cronId` are dispatch context the frame does not carry
       // (protocol §4.1) — derived here from the cron-minted thread-id shape
       // (HOST-M1M2-06 / HOST-M5M6-06).
-      const dispatch = deriveDispatchContext(db, decoded.taskId, decoded.threadId);
-      writeThreadResult(db, { taskId: decoded.taskId, threadId: decoded.threadId, data, ...dispatch });
+      const dispatch = deriveDispatchContext(storage, decoded.taskId, decoded.threadId);
+      writeThreadResult(storage, { taskId: decoded.taskId, threadId: decoded.threadId, data, ...dispatch });
       // Register the run's outbound attachment descriptors (protocol §5 /
       // agent-architecture §9: "descriptors returned on thread_result"). The
       // agent's byte upload carries no task/thread context, so THIS is where
       // the descriptor gains its task/thread binding (idempotent on `id`).
       if (data.attachments != null && data.attachments.length > 0) {
-        writeAttachmentDescriptors(db, { taskId: decoded.taskId, threadId: decoded.threadId, descriptors: data.attachments });
+        writeAttachmentDescriptors(storage, { taskId: decoded.taskId, threadId: decoded.threadId, descriptors: data.attachments });
       }
       deps.events?.emit("thread.result", { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...dispatch, data });
       // HOST-M1M2-13: verify the transcript is exactly `1..=final_seq`
       // (protocol §6). Diagnostic only — a gap is flagged, never blocks the ack.
-      const completeness = checkTranscriptCompleteness(db, decoded.threadId, data.final_seq);
+      const completeness = checkTranscriptCompleteness(storage, decoded.threadId, data.final_seq);
       if (!completeness.complete) {
         deps.logger?.warn(
           { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...completeness },
@@ -240,14 +245,14 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       if (decoded.taskId == null || decoded.cronId == null) {
         return poisonDrop(deps, decoded, "missing_ids");
       }
-      if (!authorizeWrite(deps, decoded.taskId, { cronId: decoded.cronId })) {
+      if (!authorizeWrite(deps, storage, decoded.taskId, { cronId: decoded.cronId })) {
         return poisonDrop(deps, decoded, "authorize_denied");
       }
       const parsed = CronStateData.safeParse(decoded.data);
       if (!parsed.success) {
         return poisonDrop(deps, decoded, "schema_invalid", parsed.error.issues);
       }
-      writeCronState(db, { taskId: decoded.taskId, cronId: decoded.cronId, data: parsed.data });
+      writeCronState(storage, { taskId: decoded.taskId, cronId: decoded.cronId, data: parsed.data });
       deps.events?.emit("cron.state", { agentId, taskId: decoded.taskId, cronId: decoded.cronId, data: parsed.data });
       return ackFor(decoded);
     }

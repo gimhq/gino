@@ -1,4 +1,5 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import type { AgentTransport } from "@/host/ports/transport";
 import type { DecodedFrame } from "@/protocol/envelope";
 import type { Logger } from "@/shared/lib/logger";
@@ -8,6 +9,7 @@ import { enrollAgent } from "@/agents/registry";
 import { createDb } from "@/db";
 import { checkTranscriptCompleteness, getThreadRun, getTranscript, writeThreadMessage } from "@/msgstore";
 import { applyFrame, handleInboundFrame, ingestHttpFrame, MalformedFrameError } from "@/protocol/inbound";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 // Inbound frame lifecycle regressions:
@@ -22,9 +24,11 @@ import { createTask, setPlacement } from "@/tasks";
 //     covers `1..=final_seq` and warn-logs a gap; it never blocks the ack.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -79,7 +83,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
 
     const ack = applyFrame({ db, agentId, logger }, poison);
     expect(ack).toEqual({ type: "ack", id: 7 }); // acked → outbox row clears, no replay
-    expect(getTranscript(db, "thr-1")).toHaveLength(0); // dropped, never written
+    expect(getTranscript(storage, "thr-1")).toHaveLength(0); // dropped, never written
     expect(errors.some(args => String(args[1]).includes("acked and dropped"))).toBe(true); // logged loudly
   });
 
@@ -88,7 +92,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const poison: DecodedFrame = { type: "thread_result", outboxId: 8, taskId, threadId: "thr-2", data: { status: "exploded", duration_ms: 1, final_seq: 1 } };
 
     expect(applyFrame({ db, agentId }, poison)).toEqual({ type: "ack", id: 8 });
-    expect(getThreadRun(db, "thr-2")).toBeUndefined();
+    expect(getThreadRun(storage, "thr-2")).toBeUndefined();
   });
 
   it("acks-and-drops a cron_state whose data fails the schema", () => {
@@ -112,7 +116,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
 
     handleInboundFrame({ db, agentId, sender }, raw);
     expect(sent).toEqual([{ type: "ack", id: 11 }]);
-    expect(getTranscript(db, "thr-3")).toHaveLength(0);
+    expect(getTranscript(storage, "thr-3")).toHaveLength(0);
   });
 
   it("does NOT ack a valid frame when the storage write fails transiently (agent must replay)", () => {
@@ -133,7 +137,7 @@ describe("HOST-M1M2-04 — poison frames are acked-and-dropped; transient failur
     const frame: DecodedFrame = { type: "thread_message", outboxId: 13, taskId, threadId: "thr-5", data: { seq: 1, kind: "usage", content: "tokens: 42" } };
 
     expect(applyFrame({ db, agentId, logger }, frame)).toEqual({ type: "ack", id: 13 });
-    expect(getTranscript(db, "thr-5").map(m => m.kind)).toEqual(["usage"]); // written, not dropped
+    expect(getTranscript(storage, "thr-5").map(m => m.kind)).toEqual(["usage"]); // written, not dropped
     expect(warns.some(args => String(args[1]).includes("unrecognized kind"))).toBe(true); // flagged
   });
 });
@@ -170,7 +174,7 @@ describe("HOST-M1M2-09 — ingestHttpFrame tags only the malformed-frame error",
 
 describe("HOST-M1M2-13 — final_seq completeness is verified on thread_result ingest", () => {
   const msg = (threadId: string, taskId: string, seq: number) =>
-    writeThreadMessage(db, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq, kind: "assistant_text", content: `m${seq}` } });
 
   it("warn-logs a transcript gap when a middle seq is missing, and still acks", () => {
     const { agentId, taskId } = placedAgentTask();
@@ -210,7 +214,7 @@ describe("HOST-M1M2-13 — final_seq completeness is verified on thread_result i
   });
 
   it("checkTranscriptCompleteness: empty transcript is complete iff final_seq is 0", () => {
-    expect(checkTranscriptCompleteness(db, "thr-none", 0)).toMatchObject({ complete: true, messageCount: 0, maxSeq: null });
-    expect(checkTranscriptCompleteness(db, "thr-none", 2)).toMatchObject({ complete: false, messageCount: 0, maxSeq: null });
+    expect(checkTranscriptCompleteness(storage, "thr-none", 0)).toMatchObject({ complete: true, messageCount: 0, maxSeq: null });
+    expect(checkTranscriptCompleteness(storage, "thr-none", 2)).toMatchObject({ complete: false, messageCount: 0, maxSeq: null });
   });
 });
