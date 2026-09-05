@@ -1,6 +1,7 @@
 import type { HostEvents } from "./events";
 import type { Metrics } from "./metrics";
 import type { HostOptions, HostOptionsInput } from "./options";
+import type { Wire } from "./wire";
 // HOST — per-instance context (replaces the process-wide singletons).
 //
 // One `HostContext` per host instance: it owns the live session registry
@@ -24,6 +25,7 @@ import { sqliteStorage } from "@/store/sqlite";
 import { createHostEvents } from "./events";
 import { noopMetrics } from "./metrics";
 import { resolveHostOptions } from "./options";
+import { createWire } from "./wire";
 
 export interface HostContext {
   /** Transitional (P1): the raw sqlite handle the not-yet-migrated domain modules still take. */
@@ -42,6 +44,8 @@ export interface HostContext {
   readonly store: BlobStorePort;
   readonly clock: () => number;
   readonly ids: { readonly generateId: typeof generateId; readonly ulid: typeof ulid };
+  /** The framework-free `/agent/*` data plane (host-sdk-design §3.2); the Hono shim mounts it 1:1. */
+  readonly wire: Wire;
   /**
    * Start the background loops (liveness sweep, outbox GC, launch reaper,
    * config-store GC). Idempotent; the timers are `unref`'d so they never hold
@@ -135,18 +139,20 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
     stopOne("storage.close", { stop: () => storage.close() });
   };
 
+  const metrics = opts.metrics ?? noopMetrics;
   return {
     db,
     logger,
     sessions,
     launchers,
-    metrics: opts.metrics ?? noopMetrics,
+    metrics,
     events,
     options,
     storage,
     store: storage.blobs,
     clock: opts.clock ?? Date.now,
     ids: { generateId: opts.ids?.generateId ?? generateId, ulid: opts.ids?.ulid ?? ulid },
+    wire: createWire({ storage, sessions, logger, metrics, events, options }),
     start,
     stop,
     registerService: (service) => {
