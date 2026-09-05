@@ -7,5 +7,8 @@ export { noopMetrics } from "./metrics";
 export type { Metrics } from "./metrics";
 export { DEFAULT_HOST_OPTIONS, resolveHostOptions } from "./options";
 export type { HostOptions, HostOptionsInput } from "./options";
+export type { AgentTransport, WsLike } from "./ports/transport";
+export { createWire } from "./wire";
+export type { AttachmentIngestInput, AttachmentsWire, HttpResult, Wire, WireContext } from "./wire";
 
 export const MODULE = "host" as const;
