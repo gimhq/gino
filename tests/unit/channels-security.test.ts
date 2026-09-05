@@ -1,6 +1,7 @@
 import type { DnsResolver, FetchLike, WebhookEndpoint, WebhookPayload } from "@/channels";
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   assertSafeWebhookUrl,
@@ -15,6 +16,7 @@ import {
 import { createDb } from "@/db";
 import { writeThreadMessage } from "@/msgstore";
 import { AppError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask } from "@/tasks";
 
 // D-B4s SECURITY regression — two HIGH findings in the merged M6 channels code:
@@ -32,9 +34,11 @@ import { createTask } from "@/tasks";
 const THREAD = "thread-sec-1";
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -50,7 +54,7 @@ function task(ownerId: string): string {
 }
 
 function seed(taskId: string): void {
-  writeThreadMessage(db, { taskId, threadId: THREAD, data: { seq: 1, kind: "assistant_text", content: "secret transcript" } });
+  writeThreadMessage(storage, { taskId, threadId: THREAD, data: { seq: 1, kind: "assistant_text", content: "secret transcript" } });
 }
 
 /** Assert the thrown error is a 404 NotFound (AppError, statusCode 404). */

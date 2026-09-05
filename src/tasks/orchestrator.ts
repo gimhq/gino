@@ -29,6 +29,7 @@ import { wireAttachmentRef, writeAttachmentDescriptors, writeCronPrompt } from "
 import { ulid } from "@/platform";
 import { enqueue, enqueueLiveOnly } from "@/protocol/outbox";
 import { AppError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 import { markSeeded, setCurrentThread } from "./store";
 
 /** A task with no `agent_id` has no SOURCE target — work cannot be emitted yet. */
@@ -92,7 +93,8 @@ export function emitTaskUpsert(
   if (task.meta != null) {
     data.meta = task.meta;
   }
-  const entries = opts.entries ?? resolveEntriesForEngine(db, task.id, task.engine);
+  // P1 transitional — removed when tasks moves to ports
+  const entries = opts.entries ?? resolveEntriesForEngine(sqliteStorage(db), task.id, task.engine);
   if (entries.length > 0) {
     data.entries = entries;
   }
@@ -146,7 +148,8 @@ export function emitMessage(db: AppDatabase, sender: AgentTransport, task: Task,
     // then put the RESOLVABLE byte-channel ref on the wire: the agent joins
     // `ref` to its host base URL and fetches (agent-architecture §9), so the
     // store-internal ref must never leave the host.
-    writeAttachmentDescriptors(db, {
+    // P1 transitional — removed when tasks moves to ports
+    writeAttachmentDescriptors(sqliteStorage(db), {
       taskId: task.id,
       threadId,
       descriptors: input.attachments.map(d => ({ ...d, direction: d.direction ?? "inbound" })),
@@ -216,7 +219,8 @@ export function emitCronUpsert(db: AppDatabase, sender: AgentTransport, task: Ta
     cronId,
     data: input.data,
   });
-  writeCronPrompt(db, { taskId: task.id, cronId, prompt: input.data.prompt });
+  // P1 transitional — removed when tasks moves to ports
+  writeCronPrompt(sqliteStorage(db), { taskId: task.id, cronId, prompt: input.data.prompt });
   return { cron, cronId };
 }
 
@@ -272,13 +276,15 @@ export function emitConfigUpdate(db: AppDatabase, sender: AgentTransport, task: 
  * the enqueued rows.
  */
 export function broadcastGlobalConfig(db: AppDatabase, sender: AgentTransport): Outbox[] {
-  const version = getGlobalConfigVersion(db);
+  // P1 transitional — removed when tasks moves to ports
+  const storage = sqliteStorage(db);
+  const version = getGlobalConfigVersion(storage);
   const rows: Outbox[] = [];
   for (const agent of listAgents(db)) {
     if (agent.status === "removed" || !sender.isOnline(agent.id)) {
       continue;
     }
-    const entries = resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines);
+    const entries = resolveEntriesForEngines(storage, GLOBAL_SCOPE, agent.capabilities.engines);
     rows.push(enqueue(db, sender, { agentId: agent.id, type: "config_update", data: { entries, version } }));
   }
   return rows;

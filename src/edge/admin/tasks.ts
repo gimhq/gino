@@ -1,3 +1,4 @@
+import type { Task } from "@/db/schema";
 // M4 — `/admin/tasks` control API (mounted under `/admin`, behind the channel
 // token via the parent router). The task identity + dispatch + work surface (§7):
 //   GET    /tasks                     list tasks (+ filters owner_id/agent_id/status)
@@ -16,8 +17,7 @@
 // Every host→agent effect goes through the M2 outbox (orchestrator). Crons/
 // threads/messages are M5 read-only mirrors here. Responses use the shared
 // `{ success, data }` envelope.
-import type { AppDatabase } from "@/db";
-import type { Cron, Task } from "@/db/schema";
+import type { CronRow, Storage } from "@/host/ports/storage";
 import type { CronUpsertData } from "@/protocol/frames";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
@@ -64,7 +64,7 @@ function serializeTask(task: Task) {
   };
 }
 
-function serializeCron(cron: Cron) {
+function serializeCron(cron: CronRow) {
   return {
     id: cron.id,
     taskId: cron.taskId,
@@ -131,8 +131,8 @@ function cronData(body: z.infer<typeof updateCronBody>, prompt: string): CronUps
 }
 
 /** The cron mirror row for `cronId` under `taskId`, or 404 (HOST-M4-11). */
-function requireCron(db: AppDatabase, taskId: string, cronId: string): Cron {
-  const cron = getCron(db, cronId);
+function requireCron(storage: Storage, taskId: string, cronId: string): CronRow {
+  const cron = getCron(storage, cronId);
   if (!cron || cron.taskId !== taskId) {
     throw new AppError(`cron ${cronId} not found on task ${taskId}`, 404, "CRON_NOT_FOUND");
   }
@@ -212,10 +212,11 @@ export function adminTaskRoutes() {
     validator("query", detailQuery),
     (c) => {
       const db = c.get("db");
+      const storage = c.get("host").storage;
       const id = c.req.param("id");
       const task = requireTask(db, id);
       const q = c.req.valid("query");
-      const threadIds = getTaskThreads(db, id);
+      const threadIds = getTaskThreads(storage, id);
 
       // Transcript page (HOST-M1M2-16): a bounded seq-cursor read of ONE
       // thread, never the full transcript of every thread.
@@ -223,21 +224,21 @@ export function adminTaskRoutes() {
         if (!threadIds.includes(q.thread)) {
           throw new AppError(`thread ${q.thread} not found on task ${id}`, 404, "THREAD_NOT_FOUND");
         }
-        const page = getTranscript(db, q.thread, {
+        const page = getTranscript(storage, q.thread, {
           ...(q.after != null ? { afterSeq: q.after } : {}),
           limit: q.limit ?? TRANSCRIPT_PAGE_LIMIT,
         });
         return c.json(ok({
           threadId: q.thread,
-          run: getThreadRun(db, q.thread) ?? null,
+          run: getThreadRun(storage, q.thread) ?? null,
           messages: page,
         }));
       }
 
       const threads = threadIds.map(threadId => ({
         threadId,
-        run: getThreadRun(db, threadId) ?? null,
-        ...getTranscriptStats(db, threadId),
+        run: getThreadRun(storage, threadId) ?? null,
+        ...getTranscriptStats(storage, threadId),
       }));
       return c.json(ok({
         ...serializeTask(task),
@@ -390,7 +391,7 @@ export function adminTaskRoutes() {
       // Update addresses an EXISTING trigger only — an unknown id must 404, not
       // silently create a second cron (HOST-M4-11). Omitted prompt → keep the
       // cron's current one (the wire field is required, HOST-M4-10).
-      const existing = requireCron(db, task.id, cronId);
+      const existing = requireCron(c.get("host").storage, task.id, cronId);
       const b = c.req.valid("json");
       const { cron } = emitCronUpsert(db, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
       return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }));
@@ -409,7 +410,7 @@ export function adminTaskRoutes() {
       const host = c.get("host");
       const task = requireTask(db, c.req.param("id"));
       const cronId = c.req.param("cronId");
-      requireCron(db, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
+      requireCron(c.get("host").storage, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
       const row = emitCronDelete(db, host.sessions, task, cronId);
       return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
     },
