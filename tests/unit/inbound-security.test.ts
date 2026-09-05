@@ -36,7 +36,7 @@ afterEach(() => {
 
 /** Enroll a fresh agent and return its id (placement subject). */
 function agent(): string {
-  return enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  return enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
 }
 
 /** Create a task and pin it to `agentId` (set-once placement). */
@@ -52,7 +52,7 @@ const cstate = (round: number, status: string) => ({ kind: "interval", round_cou
 
 /** Apply one inbound frame as `agentId` (no sender/logger — returns the ack or null). */
 function apply(agentId: string, frame: DecodedFrame): Record<string, unknown> | null {
-  return applyFrame({ db, agentId }, frame);
+  return applyFrame({ storage, agentId }, frame);
 }
 
 describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is dropped", () => {

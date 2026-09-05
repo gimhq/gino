@@ -1,7 +1,9 @@
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, grantOwner, removeAgent, touchLiveness } from "@/agents/registry";
 import { createDb } from "@/db";
+import { sqliteStorage } from "@/store/sqlite";
 import { assignTaskToAgent, placeTask } from "@/tasks/dispatch";
 import { createTask, getTask, setStatus } from "@/tasks/store";
 
@@ -9,9 +11,11 @@ import { createTask, getTask, setStatus } from "@/tasks/store";
 // pending-assignment when none, no-spill, pin-once.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -29,15 +33,15 @@ interface AgentOpts {
 }
 
 function makeAgent(opts: AgentOpts = {}): string {
-  const { agent } = enrollAgent(db, {
+  const { agent } = enrollAgent(storage, {
     access: opts.access ?? "dedicated",
     capabilities: { engines: opts.engines ?? ["claude"], ...(opts.maxThreads != null ? { max_threads: opts.maxThreads } : {}) },
   });
   if (opts.grant) {
-    grantOwner(db, agent.id, opts.grant);
+    grantOwner(storage, agent.id, opts.grant);
   }
   if (opts.active != null) {
-    touchLiveness(db, agent.id, opts.active);
+    touchLiveness(storage, agent.id, opts.active);
   }
   return agent.id;
 }
@@ -169,7 +173,7 @@ describe("M4 dispatch — pin-once (set once, no migration)", () => {
     const task = newTask();
     const first = placeTask(db, task.id);
     setStatus(db, task.id, "closed");
-    removeAgent(db, first.agentId!); // orphans the task (agent_id → NULL)
+    removeAgent(storage, first.agentId!); // orphans the task (agent_id → NULL)
 
     const b = makeAgent({ access: "public" });
     const r = placeTask(db, task.id);

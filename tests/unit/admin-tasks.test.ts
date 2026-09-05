@@ -55,7 +55,7 @@ function taskApp() {
 
 /** Enroll an agent; optionally attach a fake socket so `sessions` reports it online. */
 function enrolledAgent(opts: { online?: boolean } = {}): string {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   if (opts.online) {
     host.sessions.attach(agentId, { send: () => {}, close: () => {} });
     attached.push(agentId);

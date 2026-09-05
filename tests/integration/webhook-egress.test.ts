@@ -1,11 +1,13 @@
 import type { FetchLike } from "@/channels";
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "@/agents/registry";
 import { addWebhook, bindConversation, readCursor, registerChannel, startWebhookPump } from "@/channels";
 import { createDb } from "@/db";
 import { createHostEvents } from "@/host";
 import { ingestHttpFrame } from "@/protocol/inbound";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, setPlacement } from "@/tasks";
 
 // HOST-M5M6-04 regression — outbound webhook egress is WIRED. Pre-fix,
@@ -18,9 +20,11 @@ import { createTask, setPlacement } from "@/tasks";
 const PUBLIC_IP = "93.184.216.34";
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -35,7 +39,7 @@ interface Setup {
 
 /** Enroll an agent, place a task on it, and bind the task to a webhook channel with one endpoint. */
 function setup(): Setup {
-  const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+  const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   const taskId = createTask(db, { ownerId: "owner-A", engine: "claude", model: "sonnet", status: "active" }).id;
   setPlacement(db, taskId, agentId);
   const channel = registerChannel(db, { name: "wh", type: "webhook", ownerId: "owner-A" });
@@ -72,7 +76,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     });
 
     // The production inbound path: store the frame, emit `transcript.message` → the pump.
-    const ack = ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "hello"));
+    const ack = ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "hello"));
     expect(ack).toEqual({ type: "ack", id: 1 });
     await pump.flush();
 
@@ -111,7 +115,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     });
 
     // A failing receiver → the cursor must NOT move (nothing lost).
-    ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "first"));
+    ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "first"));
     await pump.flush();
     expect(bodies).toHaveLength(1);
     expect(readCursor(db, channelId, taskId)).toBe(0);
@@ -128,7 +132,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
   });
 
   it("a task with no webhook channel bound never triggers a push (quiet no-op)", async () => {
-    const agentId = enrollAgent(db, { capabilities: { engines: ["claude"] } }).agent.id;
+    const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
     const taskId = createTask(db, { ownerId: "owner-B", engine: "claude", model: "sonnet", status: "active" }).id;
     setPlacement(db, taskId, agentId);
     let called = 0;
@@ -139,7 +143,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
     const events = createHostEvents();
     const pump = startWebhookPump({ db, events, fetchImpl, intervalMs: 60_000 });
 
-    ingestHttpFrame({ db, agentId, events }, threadMessageFrame(taskId, 1, "unbound"));
+    ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "unbound"));
     await pump.flush();
     expect(called).toBe(0);
 

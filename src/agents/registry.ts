@@ -1,5 +1,4 @@
-import type { AppDatabase } from "@/db";
-import type { Agent, AgentGrant } from "@/db/schema";
+import type { AgentGrantRow, AgentRow, Storage } from "@/host/ports/storage";
 // M3 — AGENT REGISTRY (identity, enrollment, the per-agent connect token).
 //
 // Agents are host resources with an access policy (OD13). The registry owns the
@@ -10,10 +9,10 @@ import type { Agent, AgentGrant } from "@/db/schema";
 // or parses frame `data` — that is M2's job.
 //
 // It also owns `agent_grants` (the OD13 access policy) + the capacity (DP3) and
-// removal helpers the control layer (M3 `control.ts`) builds on.
+// removal helpers the control layer (M3 `control.ts`) builds on. Storage goes
+// through the `Storage` port (`storage.agents` / `storage.tasks`); the token
+// hashing, id minting and status policy stay here.
 import { randomBytes } from "node:crypto";
-import { and, desc, eq, lt, ne } from "drizzle-orm";
-import { agentGrants, agents, pendingLaunches, tasks } from "@/db/schema";
 import { hashToken, ulid, verifyToken } from "@/platform";
 
 export type AgentStatus = "enrolled" | "online" | "offline" | "removed";
@@ -41,7 +40,7 @@ export interface EnrollInput {
 }
 
 export interface EnrollResult {
-  agent: Agent;
+  agent: AgentRow;
   /** The plaintext connect token — returned to the agent ONCE; only its hash is stored. */
   connectToken: string;
 }
@@ -57,36 +56,32 @@ function mintConnectToken(): string {
  * `enrolled`. The plaintext token is returned once for the register response;
  * the row keeps only `connect_token_hash`.
  */
-export function enrollAgent(db: AppDatabase, input: EnrollInput): EnrollResult {
+export function enrollAgent(storage: Storage, input: EnrollInput): EnrollResult {
   const id = ulid();
   const connectToken = mintConnectToken();
 
-  const agent = db
-    .insert(agents)
-    .values({
-      id,
-      name: input.name ?? null,
-      source: input.source ?? "manual",
-      access: input.access ?? "dedicated",
-      connectTokenHash: hashToken(connectToken),
-      registerTokenRef: input.registerTokenRef ?? null,
-      capabilities: input.capabilities,
-      status: "enrolled",
-      activeThreads: 0,
-    })
-    .returning()
-    .get();
+  const agent = storage.agents.insert({
+    id,
+    name: input.name ?? null,
+    source: input.source ?? "manual",
+    access: input.access ?? "dedicated",
+    connectTokenHash: hashToken(connectToken),
+    registerTokenRef: input.registerTokenRef ?? null,
+    capabilities: input.capabilities,
+    status: "enrolled",
+    activeThreads: 0,
+  });
 
   return { agent, connectToken };
 }
 
-export function getAgent(db: AppDatabase, agentId: string): Agent | undefined {
-  return db.select().from(agents).where(eq(agents.id, agentId)).get();
+export function getAgent(storage: Storage, agentId: string): AgentRow | undefined {
+  return storage.agents.get(agentId);
 }
 
 /** List every agent (admin observe surface), newest first. */
-export function listAgents(db: AppDatabase): Agent[] {
-  return db.select().from(agents).orderBy(desc(agents.createdAt)).all();
+export function listAgents(storage: Storage): AgentRow[] {
+  return storage.agents.list();
 }
 
 /**
@@ -95,8 +90,8 @@ export function listAgents(db: AppDatabase): Agent[] {
  * — an unknown agent, a `removed` agent (token revoked, OD12), or a bad token
  * all fail closed.
  */
-export function verifyConnectToken(db: AppDatabase, agentId: string, token: string): Agent | null {
-  const agent = getAgent(db, agentId);
+export function verifyConnectToken(storage: Storage, agentId: string, token: string): AgentRow | null {
+  const agent = getAgent(storage, agentId);
   if (!agent || agent.status === "removed") {
     return null;
   }
@@ -114,16 +109,11 @@ export function verifyConnectToken(db: AppDatabase, agentId: string, token: stri
  * IDOR fix). A `removed` agent (token revoked, OD12) and an unmatched token both
  * return `null` — fail closed. Mirrors the M7 proxy credential lookup idiom.
  */
-export function getAgentByConnectToken(db: AppDatabase, token: string): Agent | null {
+export function getAgentByConnectToken(storage: Storage, token: string): AgentRow | null {
   if (!token) {
     return null;
   }
-  const agent = db
-    .select()
-    .from(agents)
-    .where(and(eq(agents.connectTokenHash, hashToken(token)), ne(agents.status, "removed")))
-    .get();
-  return agent ?? null;
+  return storage.agents.getByConnectTokenHash(hashToken(token)) ?? null;
 }
 
 /**
@@ -133,12 +123,8 @@ export function getAgentByConnectToken(db: AppDatabase, token: string): Agent | 
  * `offline` (a resurrected row would again pass the `status === "removed"`
  * fail-closed gates while its connect token stays revoked).
  */
-export function setAgentStatus(db: AppDatabase, agentId: string, status: AgentStatus): void {
-  db
-    .update(agents)
-    .set({ status })
-    .where(and(eq(agents.id, agentId), ne(agents.status, "removed")))
-    .run();
+export function setAgentStatus(storage: Storage, agentId: string, status: AgentStatus): void {
+  storage.agents.updateStatusIf(agentId, { notFrom: "removed" }, status);
 }
 
 /**
@@ -151,20 +137,9 @@ export function setAgentStatus(db: AppDatabase, agentId: string, status: AgentSt
  * restore `online`. The transition is a guarded CAS out of `offline` ONLY —
  * `removed` stays terminal and `enrolled` is untouched.
  */
-export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: number): void {
-  db
-    .update(agents)
-    .set({
-      lastSeen: Date.now(),
-      ...(activeThreads != null ? { activeThreads } : {}),
-    })
-    .where(eq(agents.id, agentId))
-    .run();
-  db
-    .update(agents)
-    .set({ status: "online" })
-    .where(and(eq(agents.id, agentId), eq(agents.status, "offline")))
-    .run();
+export function touchLiveness(storage: Storage, agentId: string, activeThreads?: number): void {
+  storage.agents.touchLiveness(agentId, Date.now(), activeThreads);
+  storage.agents.updateStatusIf(agentId, { from: "offline" }, "online");
 }
 
 // ─── Access policy (OD13) — agent_grants ───
@@ -174,16 +149,13 @@ export function touchLiveness(db: AppDatabase, agentId: string, activeThreads?: 
  * a no-op). For a `public` agent a grant is harmless but unnecessary
  * (`isOwnerPermitted` already returns true for any owner).
  */
-export function grantOwner(db: AppDatabase, agentId: string, ownerId: string): void {
-  db.insert(agentGrants).values({ agentId, ownerId }).onConflictDoNothing().run();
+export function grantOwner(storage: Storage, agentId: string, ownerId: string): void {
+  storage.agents.grant(agentId, ownerId);
 }
 
 /** Revoke an owner's grant on an agent (idempotent). */
-export function revokeOwner(db: AppDatabase, agentId: string, ownerId: string): void {
-  db
-    .delete(agentGrants)
-    .where(and(eq(agentGrants.agentId, agentId), eq(agentGrants.ownerId, ownerId)))
-    .run();
+export function revokeOwner(storage: Storage, agentId: string, ownerId: string): void {
+  storage.agents.revoke(agentId, ownerId);
 }
 
 /**
@@ -192,17 +164,13 @@ export function revokeOwner(db: AppDatabase, agentId: string, ownerId: string): 
  * lands `dedicated` (or the launch config's admin allowlist via
  * `correlateLaunch`), never a register-body value.
  */
-export function setAgentAccess(db: AppDatabase, agentId: string, access: "dedicated" | "public"): void {
-  db
-    .update(agents)
-    .set({ access })
-    .where(and(eq(agents.id, agentId), ne(agents.status, "removed")))
-    .run();
+export function setAgentAccess(storage: Storage, agentId: string, access: "dedicated" | "public"): void {
+  storage.agents.setAccess(agentId, access);
 }
 
 /** List the owners granted access to an agent. */
-export function listGrants(db: AppDatabase, agentId: string): AgentGrant[] {
-  return db.select().from(agentGrants).where(eq(agentGrants.agentId, agentId)).all();
+export function listGrants(storage: Storage, agentId: string): AgentGrantRow[] {
+  return storage.agents.listGrants(agentId);
 }
 
 /**
@@ -211,20 +179,15 @@ export function listGrants(db: AppDatabase, agentId: string): AgentGrant[] {
  * `agent_grants`. An unknown or `removed` agent is permitted to no one (fails
  * closed).
  */
-export function isOwnerPermitted(db: AppDatabase, agentId: string, ownerId: string): boolean {
-  const agent = getAgent(db, agentId);
+export function isOwnerPermitted(storage: Storage, agentId: string, ownerId: string): boolean {
+  const agent = getAgent(storage, agentId);
   if (!agent || agent.status === "removed") {
     return false;
   }
   if (agent.access === "public") {
     return true;
   }
-  const grant = db
-    .select()
-    .from(agentGrants)
-    .where(and(eq(agentGrants.agentId, agentId), eq(agentGrants.ownerId, ownerId)))
-    .get();
-  return grant != null;
+  return storage.agents.hasGrant(agentId, ownerId);
 }
 
 // ─── Capacity (DP3) ───
@@ -243,8 +206,8 @@ export interface AgentCapacity {
  * (host-overridable). `max_threads` unset = unbounded. Returns null for an
  * unknown agent.
  */
-export function getCapacity(db: AppDatabase, agentId: string): AgentCapacity | null {
-  const agent = getAgent(db, agentId);
+export function getCapacity(storage: Storage, agentId: string): AgentCapacity | null {
+  const agent = getAgent(storage, agentId);
   if (!agent) {
     return null;
   }
@@ -275,20 +238,11 @@ export interface RemoveAgentResult {
  * The runtime teardown (launcher.remove / a WS `close`) is the control layer's
  * job — this is purely the durable bookkeeping.
  */
-export function removeAgent(db: AppDatabase, agentId: string): RemoveAgentResult {
+export function removeAgent(storage: Storage, agentId: string): RemoveAgentResult {
   const revokedHash = hashToken(randomBytes(32).toString("hex"));
-  db
-    .update(agents)
-    .set({ status: "removed", connectTokenHash: revokedHash })
-    .where(eq(agents.id, agentId))
-    .run();
+  storage.agents.setRemoved(agentId, revokedHash);
 
-  const orphaned = db
-    .update(tasks)
-    .set({ agentId: null, updatedAt: Date.now() })
-    .where(eq(tasks.agentId, agentId))
-    .returning({ id: tasks.id })
-    .all();
+  const orphaned = storage.tasks.orphanByAgent(agentId, Date.now());
 
   return { orphanedTasks: orphaned.length };
 }
@@ -323,16 +277,13 @@ export interface ExpiredPendingLaunch extends PendingLaunch {
 }
 
 /** Record a pending launch keyed by its per-launch nonce (called by `control.launchAgent`). */
-export function recordPendingLaunch(db: AppDatabase, nonce: string, pending: PendingLaunch): void {
-  db
-    .insert(pendingLaunches)
-    .values({
-      nonce,
-      launcherKind: pending.launcherKind,
-      launchRef: pending.launchRef,
-      access: pending.access ?? "dedicated",
-    })
-    .run();
+export function recordPendingLaunch(storage: Storage, nonce: string, pending: PendingLaunch): void {
+  storage.agents.recordPending({
+    nonce,
+    launcherKind: pending.launcherKind,
+    launchRef: pending.launchRef,
+    access: pending.access ?? "dedicated",
+  });
 }
 
 /**
@@ -344,31 +295,17 @@ export function recordPendingLaunch(db: AppDatabase, nonce: string, pending: Pen
  * nonce returns `null` and changes nothing — so a register WITHOUT a nonce
  * (manual enroll) is entirely unaffected (backward-compatible).
  */
-export function correlateLaunch(db: AppDatabase, agentId: string, nonce: string): PendingLaunch | null {
-  const pending = db
-    .delete(pendingLaunches)
-    .where(eq(pendingLaunches.nonce, nonce))
-    .returning()
-    .get();
+export function correlateLaunch(storage: Storage, agentId: string, nonce: string): PendingLaunch | null {
+  const pending = storage.agents.correlate(agentId, nonce);
   if (!pending) {
     return null;
   }
-  db
-    .update(agents)
-    .set({
-      launcherKind: pending.launcherKind,
-      launchRef: pending.launchRef,
-      launchNonce: nonce,
-      access: pending.access,
-    })
-    .where(eq(agents.id, agentId))
-    .run();
   return { launcherKind: pending.launcherKind, launchRef: pending.launchRef, access: pending.access };
 }
 
 /** Whether a launch nonce is still awaiting its registration (consumed on correlate, reaped past TTL). */
-export function hasPendingLaunch(db: AppDatabase, nonce: string): boolean {
-  return db.select({ nonce: pendingLaunches.nonce }).from(pendingLaunches).where(eq(pendingLaunches.nonce, nonce)).get() != null;
+export function hasPendingLaunch(storage: Storage, nonce: string): boolean {
+  return storage.agents.hasPending(nonce);
 }
 
 /**
@@ -376,18 +313,15 @@ export function hasPendingLaunch(db: AppDatabase, nonce: string): boolean {
  * never registered inside the TTL. Read by the reaper (HOST-M3-05), which
  * tears down each runtime and then `deletePendingLaunch`es the row.
  */
-export function listExpiredPendingLaunches(db: AppDatabase, cutoff: number): ExpiredPendingLaunch[] {
-  return db
-    .select()
-    .from(pendingLaunches)
-    .where(lt(pendingLaunches.createdAt, cutoff))
-    .all()
+export function listExpiredPendingLaunches(storage: Storage, cutoff: number): ExpiredPendingLaunch[] {
+  return storage.agents
+    .listExpiredPending(cutoff)
     .map(row => ({ nonce: row.nonce, launcherKind: row.launcherKind, launchRef: row.launchRef, access: row.access }));
 }
 
 /** Drop a pending launch (reaper teardown done — or the runtime is unreachable). */
-export function deletePendingLaunch(db: AppDatabase, nonce: string): void {
-  db.delete(pendingLaunches).where(eq(pendingLaunches.nonce, nonce)).run();
+export function deletePendingLaunch(storage: Storage, nonce: string): void {
+  storage.agents.deletePending(nonce);
 }
 
 /**
@@ -398,21 +332,12 @@ export function deletePendingLaunch(db: AppDatabase, nonce: string): void {
  * is at rest, and the original plaintext reached nobody. A `removed` agent is
  * never resurrected (returns `null` → the retry enrolls a fresh row).
  */
-export function reEnrollByLaunchNonce(db: AppDatabase, nonce: string): EnrollResult | null {
-  const existing = db
-    .select()
-    .from(agents)
-    .where(and(eq(agents.launchNonce, nonce), ne(agents.status, "removed")))
-    .get();
+export function reEnrollByLaunchNonce(storage: Storage, nonce: string): EnrollResult | null {
+  const existing = storage.agents.getByLaunchNonce(nonce);
   if (!existing) {
     return null;
   }
   const connectToken = mintConnectToken();
-  const agent = db
-    .update(agents)
-    .set({ connectTokenHash: hashToken(connectToken) })
-    .where(eq(agents.id, existing.id))
-    .returning()
-    .get();
+  const agent = storage.agents.setConnectTokenHash(existing.id, hashToken(connectToken));
   return { agent: agent ?? existing, connectToken };
 }

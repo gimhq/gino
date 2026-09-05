@@ -227,7 +227,7 @@ describe("D-B1b protocol spine — register → connect → frames → store →
     expect(run?.source).toBe("chat"); // B1b dispatch default
 
     // 4. OUTBOX (host→agent): enqueue a `message`; the live session delivers it.
-    const msgRow = enqueue(db, host.sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
+    const msgRow = enqueue(storage, host.sessions, { agentId, type: "message", taskId, threadId, data: { text: "hi from host" } });
     const delivered = await waitFor(
       conn.received,
       f => f.type === "message" && (f.data as { text?: string } | undefined)?.text === "hi from host",

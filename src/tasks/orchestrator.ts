@@ -17,7 +17,8 @@
 // rarer explicit case (`newThread`); cron isolated fires add their own threads
 // agent-side (the host does not generate those ids).
 import type { AppDatabase } from "@/db";
-import type { Outbox, Task } from "@/db/schema";
+import type { Task } from "@/db/schema";
+import type { OutboxRow } from "@/host/ports/storage";
 import type { AgentTransport } from "@/host/ports/transport";
 import type { AttachmentDescriptor, ConfigEntry, CronUpsertData } from "@/protocol/frames";
 import type { EnqueuedOutbox } from "@/protocol/outbox";
@@ -74,7 +75,7 @@ export function emitTaskUpsert(
   sender: AgentTransport,
   task: Task,
   opts: { entries?: ConfigEntry[] } = {},
-): Outbox {
+): OutboxRow {
   const agentId = requirePlacement(task);
   const data: Record<string, unknown> = {
     status: task.status,
@@ -94,11 +95,12 @@ export function emitTaskUpsert(
     data.meta = task.meta;
   }
   // P1 transitional — removed when tasks moves to ports
-  const entries = opts.entries ?? resolveEntriesForEngine(sqliteStorage(db), task.id, task.engine);
+  const storage = sqliteStorage(db);
+  const entries = opts.entries ?? resolveEntriesForEngine(storage, task.id, task.engine);
   if (entries.length > 0) {
     data.entries = entries;
   }
-  const row = enqueue(db, sender, { agentId, type: "task_upsert", taskId: task.id, data });
+  const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: task.id, data });
   // Durable seed flag AFTER the frame is enqueued: a crash between the two
   // re-seeds on the next message (the agent upserts idempotently) — safe;
   // the reverse order could mark a task seeded whose frame never existed.
@@ -142,27 +144,28 @@ export function emitMessage(db: AppDatabase, sender: AgentTransport, task: Task,
     setCurrentThread(db, task.id, threadId);
   }
 
+  // P1 transitional — removed when tasks moves to ports
+  const storage = sqliteStorage(db);
   const data: Record<string, unknown> = { text: input.text };
   if (input.attachments && input.attachments.length > 0) {
     // Register the descriptors under this task/thread (idempotent on `id`),
     // then put the RESOLVABLE byte-channel ref on the wire: the agent joins
     // `ref` to its host base URL and fetches (agent-architecture §9), so the
     // store-internal ref must never leave the host.
-    // P1 transitional — removed when tasks moves to ports
-    writeAttachmentDescriptors(sqliteStorage(db), {
+    writeAttachmentDescriptors(storage, {
       taskId: task.id,
       threadId,
       descriptors: input.attachments.map(d => ({ ...d, direction: d.direction ?? "inbound" })),
     });
     data.attachments = input.attachments.map(d => ({ ...d, ref: wireAttachmentRef(d.id) }));
   }
-  const message = enqueue(db, sender, { agentId, type: "message", taskId: task.id, threadId, data });
+  const message = enqueue(storage, sender, { agentId, type: "message", taskId: task.id, threadId, data });
   return { message, threadId };
 }
 
 export interface SendMessageResult extends MessageResult {
   /** The `task_upsert` seeded on the first message, if any. */
-  taskUpsert?: Outbox;
+  taskUpsert?: OutboxRow;
 }
 
 /**
@@ -191,7 +194,7 @@ export interface CronUpsertInput {
 }
 
 export interface CronUpsertResult {
-  cron: Outbox;
+  cron: OutboxRow;
   cronId: string;
 }
 
@@ -212,22 +215,24 @@ export function emitCronUpsert(db: AppDatabase, sender: AgentTransport, task: Ta
     emitTaskUpsert(db, sender, task);
   }
   const cronId = input.cronId ?? ulid();
-  const cron = enqueue(db, sender, {
+  // P1 transitional — removed when tasks moves to ports
+  const storage = sqliteStorage(db);
+  const cron = enqueue(storage, sender, {
     agentId,
     type: "cron_upsert",
     taskId: task.id,
     cronId,
     data: input.data,
   });
-  // P1 transitional — removed when tasks moves to ports
-  writeCronPrompt(sqliteStorage(db), { taskId: task.id, cronId, prompt: input.data.prompt });
+  writeCronPrompt(storage, { taskId: task.id, cronId, prompt: input.data.prompt });
   return { cron, cronId };
 }
 
 /** Emit a `cron_delete` COMMAND — remove a trigger from the agent (OD14). */
-export function emitCronDelete(db: AppDatabase, sender: AgentTransport, task: Task, cronId: string): Outbox {
+export function emitCronDelete(db: AppDatabase, sender: AgentTransport, task: Task, cronId: string): OutboxRow {
   const agentId = requirePlacement(task);
-  return enqueue(db, sender, { agentId, type: "cron_delete", taskId: task.id, cronId });
+  // P1 transitional — removed when tasks moves to ports
+  return enqueue(sqliteStorage(db), sender, { agentId, type: "cron_delete", taskId: task.id, cronId });
 }
 
 /**
@@ -238,7 +243,7 @@ export function emitCronDelete(db: AppDatabase, sender: AgentTransport, task: Ta
  * (409 otherwise) and is never replayed on reconnect — a stale cancel must not
  * fire against an arbitrary future turn (HOST-M4-03).
  */
-export function emitInterrupt(db: AppDatabase, sender: AgentTransport, task: Task): Outbox {
+export function emitInterrupt(db: AppDatabase, sender: AgentTransport, task: Task): OutboxRow {
   const agentId = requirePlacement(task);
   if (!sender.isOnline(agentId)) {
     throw new AppError(
@@ -247,7 +252,8 @@ export function emitInterrupt(db: AppDatabase, sender: AgentTransport, task: Tas
       "AGENT_OFFLINE",
     );
   }
-  return enqueueLiveOnly(db, sender, { agentId, type: "interrupt", taskId: task.id });
+  // P1 transitional — removed when tasks moves to ports
+  return enqueueLiveOnly(sqliteStorage(db), sender, { agentId, type: "interrupt", taskId: task.id });
 }
 
 /**
@@ -255,15 +261,17 @@ export function emitInterrupt(db: AppDatabase, sender: AgentTransport, task: Tas
  * used for per-task close (that is a task-scoped `interrupt` +
  * `task_upsert{status:"closed"}`); reserve this for genuine runner shutdown.
  */
-export function emitClose(db: AppDatabase, sender: AgentTransport, task: Task): Outbox {
+export function emitClose(db: AppDatabase, sender: AgentTransport, task: Task): OutboxRow {
   const agentId = requirePlacement(task);
-  return enqueue(db, sender, { agentId, type: "close", taskId: task.id });
+  // P1 transitional — removed when tasks moves to ports
+  return enqueue(sqliteStorage(db), sender, { agentId, type: "close", taskId: task.id });
 }
 
 /** Emit a `config_update` — live config overlay for the task (opaque keys). */
-export function emitConfigUpdate(db: AppDatabase, sender: AgentTransport, task: Task, data: Record<string, unknown> = {}): Outbox {
+export function emitConfigUpdate(db: AppDatabase, sender: AgentTransport, task: Task, data: Record<string, unknown> = {}): OutboxRow {
   const agentId = requirePlacement(task);
-  return enqueue(db, sender, { agentId, type: "config_update", taskId: task.id, data });
+  // P1 transitional — removed when tasks moves to ports
+  return enqueue(sqliteStorage(db), sender, { agentId, type: "config_update", taskId: task.id, data });
 }
 
 /**
@@ -275,17 +283,17 @@ export function emitConfigUpdate(db: AppDatabase, sender: AgentTransport, task: 
  * (which carries the same version), so no frame is queued for them. Returns
  * the enqueued rows.
  */
-export function broadcastGlobalConfig(db: AppDatabase, sender: AgentTransport): Outbox[] {
+export function broadcastGlobalConfig(db: AppDatabase, sender: AgentTransport): OutboxRow[] {
   // P1 transitional — removed when tasks moves to ports
   const storage = sqliteStorage(db);
   const version = getGlobalConfigVersion(storage);
-  const rows: Outbox[] = [];
-  for (const agent of listAgents(db)) {
+  const rows: OutboxRow[] = [];
+  for (const agent of listAgents(storage)) {
     if (agent.status === "removed" || !sender.isOnline(agent.id)) {
       continue;
     }
     const entries = resolveEntriesForEngines(storage, GLOBAL_SCOPE, agent.capabilities.engines);
-    rows.push(enqueue(db, sender, { agentId: agent.id, type: "config_update", data: { entries, version } }));
+    rows.push(enqueue(storage, sender, { agentId: agent.id, type: "config_update", data: { entries, version } }));
   }
   return rows;
 }
