@@ -105,3 +105,34 @@ describe("M3 sessions — closeAll (host shutdown)", () => {
     expect(new SessionRegistry().closeAll(1001, "host shutting down")).toBe(0);
   });
 });
+
+describe("M3 sessions — closeAgent (AgentTransport port)", () => {
+  it("detaches the agent and closes its socket with the given code/reason", () => {
+    const registry = new SessionRegistry();
+    const ws = fakeWs();
+    registry.attach("a1", ws);
+
+    expect(registry.closeAgent("a1", 4001, "removed")).toBe(true);
+    expect(registry.isOnline("a1")).toBe(false);
+    expect(ws.closed).toEqual([{ code: 4001, reason: "removed" }]);
+  });
+
+  it("closeAgent of an unknown agent returns false", () => {
+    const registry = new SessionRegistry();
+    expect(registry.closeAgent("nobody", 4001, "removed")).toBe(false);
+  });
+
+  it("a throwing socket is swallowed and the session is still detached", () => {
+    const registry = new SessionRegistry();
+    const broken: WsLike = {
+      send: () => {},
+      close: () => {
+        throw new Error("gone");
+      },
+    };
+    registry.attach("a1", broken);
+
+    expect(registry.closeAgent("a1", 4001, "removed")).toBe(true);
+    expect(registry.isOnline("a1")).toBe(false);
+  });
+});

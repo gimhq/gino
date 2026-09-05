@@ -12,8 +12,8 @@
 import type { AppDatabase } from "@/db";
 import type { Channel } from "@/db/schema";
 import type { HostEvents } from "@/host/events";
+import type { AgentTransport } from "@/host/ports/transport";
 import type { AttachmentDescriptor } from "@/protocol/frames";
-import type { FrameSender } from "@/protocol/outbox";
 import type { DispatchResult } from "@/tasks";
 import { and, eq } from "drizzle-orm";
 import { channelBindings } from "@/db/schema";
@@ -96,7 +96,7 @@ function resolveNewTaskShape(channel: Channel, input: InboundMessage): NewTaskSh
  * the message is NOT delivered yet (`delivered: false`) — the binding persists so
  * a later send/assign continues the same conversation.
  */
-export function routeInbound(db: AppDatabase, sender: FrameSender, channel: Channel, input: InboundMessage, events?: HostEvents): RouteResult {
+export function routeInbound(db: AppDatabase, sender: AgentTransport, channel: Channel, input: InboundMessage, events?: HostEvents): RouteResult {
   if (!input.conversationRef) {
     throw new ValidationError("conversation_ref is required", { formErrors: ["conversation_ref is required"], fieldErrors: {} });
   }

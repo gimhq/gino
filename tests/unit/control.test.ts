@@ -41,6 +41,7 @@ function fakeSender(online = true) {
         sent.push({ agentId, frame });
         return true;
       },
+      closeAgent: () => false,
     },
   };
 }

@@ -1,7 +1,7 @@
 import type { Context } from "hono";
 import type { AgentCapabilities } from "@/agents/registry";
 import type { AppDatabase } from "@/db";
-import type { Agent } from "@/db/schema";
+import type { AgentRow, Storage } from "@/host/ports/storage";
 import type { AppEnv } from "@/shared/lib/types";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
@@ -63,10 +63,10 @@ function agentConfig(agentId: string, heartbeatIntervalMs: number) {
  * only when the version advances — agent-architecture §9b). Empty entries when
  * nothing is declared, so the response stays backward-compatible.
  */
-function globalConfig(db: AppDatabase, agent: Agent) {
+function globalConfig(storage: Storage, agent: AgentRow) {
   return {
-    entries: resolveEntriesForEngines(db, GLOBAL_SCOPE, agent.capabilities.engines),
-    version: getGlobalConfigVersion(db),
+    entries: resolveEntriesForEngines(storage, GLOBAL_SCOPE, agent.capabilities.engines),
+    version: getGlobalConfigVersion(storage),
   };
 }
 
@@ -92,7 +92,7 @@ function isAgentPlacedOnTask(db: AppDatabase, agentId: string, taskId: string): 
  */
 function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string): Response {
   const db = c.get("db");
-  const att = getAttachmentById(db, id);
+  const att = getAttachmentById(c.get("host").storage, id);
   if (!att) {
     throw new NotFoundError("attachment", id);
   }
@@ -111,13 +111,14 @@ function serveAttachmentById(c: Context<AppEnv>, requesterId: string, id: string
  */
 function serveBySha(c: Context<AppEnv>, requesterId: string, sha256: string): Response {
   const db = c.get("db");
-  const atts = attachmentsBySha(db, sha256);
-  const artifact = getArtifactBySha(db, sha256);
+  const storage = c.get("host").storage;
+  const atts = attachmentsBySha(storage, sha256);
+  const artifact = getArtifactBySha(storage, sha256);
   if (atts.length === 0 && !artifact) {
     throw new NotFoundError("attachment", sha256);
   }
   const placed = atts.some(a => isAgentPlacedOnTask(db, requesterId, a.taskId));
-  const inDesiredSet = artifact != null && isShaInAgentDesiredSet(db, requesterId, sha256);
+  const inDesiredSet = artifact != null && isShaInAgentDesiredSet(storage, requesterId, sha256);
   if (!placed && !inDesiredSet) {
     throw new ForbiddenError("sha256 is neither on a task placed on this agent nor in its desired set");
   }
@@ -145,8 +146,7 @@ function ifNoneMatchHits(header: string | undefined, etag: string): boolean {
  * matching `If-None-Match` short-circuits to a bodyless 304 (HOST-M8-14).
  */
 function serveBlob(c: Context<AppEnv>, sel: { id?: string; sha256?: string }): Response {
-  const db = c.get("db");
-  const resolved = resolveBlobRef(db, sel);
+  const resolved = resolveBlobRef(c.get("host").storage, sel);
   if (!resolved) {
     throw new NotFoundError("attachment", sel.id ?? sel.sha256 ?? "");
   }
@@ -275,7 +275,7 @@ export function agentRoutes() {
         const existing = reEnrollByLaunchNonce(db, launchNonce);
         if (existing) {
           c.get("logger").info({ agentId: existing.agent.id, source: existing.agent.source }, "agent register retry — existing enrollment reused (token rotated)");
-          const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, existing.agent) };
+          const retryConfig = { ...agentConfig(existing.agent.id, host.options.heartbeatIntervalMs), ...globalConfig(host.storage, existing.agent) };
           return c.json({ agentId: existing.agent.id, connectToken: existing.connectToken, config: retryConfig });
         }
       }
@@ -307,7 +307,7 @@ export function agentRoutes() {
       c.get("logger").info({ agentId: agent.id, source: agent.source }, "agent enrolled");
       host.events.emit("agent.enrolled", { agentId: agent.id });
       // M8 (B6): seed the resolved GLOBAL desired set + version on register (additive).
-      const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(db, agent) };
+      const config = { ...agentConfig(agent.id, host.options.heartbeatIntervalMs), ...globalConfig(host.storage, agent) };
       return c.json({ agentId: agent.id, connectToken, config });
     },
   );
@@ -392,7 +392,7 @@ export function agentRoutes() {
         throw new UnauthorizedError();
       }
       // M8 (B6): mirror the resolved GLOBAL desired set + version alongside the config.
-      return c.json({ ...agentConfig(agentId, c.get("host").options.heartbeatIntervalMs), ...globalConfig(c.get("db"), agent) });
+      return c.json({ ...agentConfig(agentId, c.get("host").options.heartbeatIntervalMs), ...globalConfig(c.get("host").storage, agent) });
     },
   );
 
@@ -552,7 +552,7 @@ export function agentRoutes() {
         direction,
       };
       if (taskId != null && threadId != null) {
-        writeAttachmentDescriptors(c.get("db"), { taskId, threadId, descriptors: [descriptor] });
+        writeAttachmentDescriptors(host.storage, { taskId, threadId, descriptors: [descriptor] });
       }
       c.get("logger").info({ id: descriptor.id, taskId, threadId, sha256: blob.sha256, size: blob.size }, "attachment ingested");
       return c.json(descriptor, 201);

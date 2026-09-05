@@ -54,6 +54,14 @@ describe("createHostContext — isolation", () => {
     expect(host.ids.ulid()).toHaveLength(26);
     db.close();
   });
+
+  it("exposes the Storage port; `store` is its blob store", () => {
+    const db = createDb(":memory:");
+    const host = createHostContext({ db, logger });
+    expect(host.storage).toBeDefined();
+    expect(host.store).toBe(host.storage.blobs);
+    db.close();
+  });
 });
 
 describe("createHostContext — metrics sink", () => {

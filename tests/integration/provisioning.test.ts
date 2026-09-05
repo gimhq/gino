@@ -1,5 +1,6 @@
 import type { AppDatabase } from "@/db";
-import type { FrameSender } from "@/protocol/outbox";
+import type { Storage } from "@/host/ports/storage";
+import type { AgentTransport } from "@/host/ports/transport";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -10,6 +11,7 @@ import { loadConfigStrict } from "@/config";
 import { getEntries, listArtifacts } from "@/configstore";
 import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 import { createTask, emitTaskUpsert, getTask, setPlacement } from "@/tasks";
 
 // M8/B6 end-to-end provisioning (host = single source of truth):
@@ -36,13 +38,15 @@ const config = loadConfigStrict({
 });
 
 let db: AppDatabase;
+let storage: Storage;
 let app: ReturnType<typeof createApp>;
 
 /** Offline sender: enqueue persists to the outbox regardless (we read it back). */
-const sender: FrameSender = { isOnline: () => false, send: () => false };
+const sender: AgentTransport = { isOnline: () => false, send: () => false, closeAgent: () => false };
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
+  storage = sqliteStorage(db);
   app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
 });
 
@@ -102,7 +106,7 @@ describe("admin config — artifact upload (content-addressed + deduped)", () =>
     const again = await uploadArtifact("CLAUDE.md", "file", "# global instructions", "text/markdown");
     expect(again.status).toBe(201);
     expect((await again.json() as { data: { sha256: string } }).data.sha256).toBe(fileSha.sha256);
-    expect(listArtifacts(db).filter(x => x.name === "CLAUDE.md")).toHaveLength(1);
+    expect(listArtifacts(storage).filter(x => x.name === "CLAUDE.md")).toHaveLength(1);
   });
 
   it("re-uploading identical bytes with a different kind updates the row (HOST-M8-13)", async () => {
@@ -114,7 +118,7 @@ describe("admin config — artifact upload (content-addressed + deduped)", () =>
     const fixed = await uploadArtifact("mislabelled", "dir", "actually-a-bundle");
     expect(fixed.status).toBe(201);
     expect((await fixed.json() as { data: { kind: string } }).data.kind).toBe("dir");
-    expect(listArtifacts(db).filter(x => x.name === "mislabelled")).toHaveLength(1);
+    expect(listArtifacts(storage).filter(x => x.name === "mislabelled")).toHaveLength(1);
   });
 
   it("rejects a bad kind / missing metadata (400)", async () => {
@@ -261,12 +265,12 @@ describe("task delivery — task_upsert.data.entries (orchestrator seam filled)"
 
     const skSha = await uploadSha("reviewer", "dir", "skill-bundle-bytes");
     expect((await putEntries(task.id, [{ name: "reviewer", sha256: skSha, kind: "dir" }])).status).toBe(200);
-    expect(getEntries(db, task.id)).toHaveLength(1);
+    expect(getEntries(storage, task.id)).toHaveLength(1);
 
     const closed = await app.fetch(new Request(`http://local/api/admin/tasks/${task.id}/close`, { method: "POST", headers: admin }));
     expect(closed.status).toBe(200);
 
     // The orphaned scope no longer pins the artifact in the GC root set.
-    expect(getEntries(db, task.id)).toHaveLength(0);
+    expect(getEntries(storage, task.id)).toHaveLength(0);
   });
 });
