@@ -63,7 +63,7 @@ export const connectTokenAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
   const token = c.req.header("x-internal-token");
   if (!token || token.trim().length === 0)
     throw new UnauthorizedError();
-  const agent = getAgentByConnectToken(c.get("db"), token);
+  const agent = getAgentByConnectToken(c.get("host").storage, token);
   if (!agent)
     throw new UnauthorizedError();
   c.set("agentId", agent.id);

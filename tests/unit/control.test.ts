@@ -1,5 +1,6 @@
 import type { InspectState, Launcher } from "@/agents/launchers/types";
 import type { AppDatabase } from "@/db";
+import type { Storage } from "@/host/ports/storage";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import {
@@ -16,14 +17,17 @@ import { SessionRegistry } from "@/agents/sessions";
 import { createDb } from "@/db";
 import { agents, outbox, tasks } from "@/db/schema";
 import { AppError } from "@/shared/lib/errors";
+import { sqliteStorage } from "@/store/sqlite";
 
 // M3 control — OOB stop/restart/remove/inspect (launcher-delegated, WS-close
 // fallback) + grant/revoke. The launcher + the live sender are injected.
 
 let db: AppDatabase;
+let storage: Storage;
 
 beforeEach(() => {
   db = createDb(":memory:");
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -41,6 +45,7 @@ function fakeSender(online = true) {
         sent.push({ agentId, frame });
         return true;
       },
+      closeAgent: () => false,
     },
   };
 }
@@ -71,7 +76,7 @@ function capableLauncher(): { launcher: Launcher; calls: LauncherCalls } {
 }
 
 function enrollOnline(access = "dedicated") {
-  const { agent, connectToken } = enrollAgent(db, { source: "manual", access, capabilities: { engines: ["claude"] } });
+  const { agent, connectToken } = enrollAgent(storage, { source: "manual", access, capabilities: { engines: ["claude"] } });
   return { agentId: agent.id, connectToken };
 }
 
@@ -84,7 +89,7 @@ describe("M3 control — stop", () => {
     const { agentId } = enrollOnline();
     const { sender, sent } = fakeSender();
 
-    const res = await stopAgent({ db, sender }, agentId);
+    const res = await stopAgent({ storage, sender }, agentId);
 
     expect(res.via).toBe("ws-close");
     expect(res.launcherKind).toBe("manual");
@@ -101,7 +106,7 @@ describe("M3 control — stop", () => {
     const { launcher, calls } = capableLauncher();
     const { sender, sent } = fakeSender();
 
-    const res = await stopAgent({ db, sender, resolveLauncher: () => launcher }, agentId);
+    const res = await stopAgent({ storage, sender, resolveLauncher: () => launcher }, agentId);
 
     expect(res.via).toBe("launcher");
     expect(calls.stop).toEqual(["c-123"]);
@@ -113,12 +118,12 @@ describe("M3 control — stop", () => {
 describe("M3 control — restart", () => {
   it("manual → WS close; capable launcher → launcher.restart(ref)", async () => {
     const { agentId } = enrollOnline();
-    const manual = await restartAgent({ db, sender: fakeSender().sender }, agentId);
+    const manual = await restartAgent({ storage, sender: fakeSender().sender }, agentId);
     expect(manual.via).toBe("ws-close");
 
     setRuntime(agentId, "docker", "c-9");
     const { launcher, calls } = capableLauncher();
-    const viaLauncher = await restartAgent({ db, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId);
+    const viaLauncher = await restartAgent({ storage, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId);
     expect(viaLauncher.via).toBe("launcher");
     expect(calls.restart).toEqual(["c-9"]);
   });
@@ -137,12 +142,12 @@ describe("M3 control — remove", () => {
     }).run();
     const { sender } = fakeSender();
 
-    const res = await removeAgentControl({ db, sender }, agentId);
+    const res = await removeAgentControl({ storage, sender }, agentId);
 
     expect(res.via).toBe("ws-close");
     expect(res.orphanedTasks).toBe(1);
     // Token revoked (OD12): the old connect token no longer authenticates.
-    expect(verifyConnectToken(db, agentId, connectToken)).toBeNull();
+    expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
     expect(db.select().from(agents).where(eq(agents.id, agentId)).get()?.status).toBe("removed");
     // DP4: the task survives as history — row kept, placement cleared.
     const task = db.select().from(tasks).where(eq(tasks.id, "t-1")).get();
@@ -155,7 +160,7 @@ describe("M3 control — remove", () => {
     setRuntime(agentId, "docker", "c-42");
     const { launcher, calls } = capableLauncher();
 
-    const res = await removeAgentControl({ db, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId);
+    const res = await removeAgentControl({ storage, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId);
 
     expect(res.via).toBe("launcher");
     expect(calls.remove).toEqual(["c-42"]);
@@ -184,11 +189,11 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     };
     const { sender, sent } = fakeSender();
 
-    const res = await removeAgentControl({ db, sender, resolveLauncher: () => launcher }, agentId);
+    const res = await removeAgentControl({ storage, sender, resolveLauncher: () => launcher }, agentId);
 
     expect(res.via).toBe("ws-close");
     expect(res.orphanedTasks).toBe(1);
-    expect(verifyConnectToken(db, agentId, connectToken)).toBeNull();
+    expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
     expect(db.select().from(agents).where(eq(agents.id, agentId)).get()?.status).toBe("removed");
     // The fallback close still went out on the live socket.
     expect(sent.some(s => s.frame.type === "close")).toBe(true);
@@ -203,11 +208,11 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     };
     const { sender, sent } = fakeSender();
 
-    const res = await removeAgentControl({ db, sender, resolveLauncher: () => launcher }, agentId);
+    const res = await removeAgentControl({ storage, sender, resolveLauncher: () => launcher }, agentId);
 
     expect(res.via).toBe("launcher");
     expect(sent).toHaveLength(0);
-    expect(verifyConnectToken(db, agentId, connectToken)).toBeNull();
+    expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
   });
 
   it("HOST-M3-04: a DockerOpTimeoutError degrades to ws close; bookkeeping proceeds", async () => {
@@ -219,11 +224,11 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     };
     const { sender, sent } = fakeSender();
 
-    const res = await removeAgentControl({ db, sender, resolveLauncher: () => launcher }, agentId);
+    const res = await removeAgentControl({ storage, sender, resolveLauncher: () => launcher }, agentId);
 
     expect(res.via).toBe("ws-close");
     expect(sent.some(s => s.frame.type === "close")).toBe(true);
-    expect(verifyConnectToken(db, agentId, connectToken)).toBeNull();
+    expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
   });
 
   it("HOST-M3-04: remove is idempotent — a repeat on a removed agent is a no-op cleanup", async () => {
@@ -231,7 +236,7 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     setRuntime(agentId, "docker", "c-1");
     seedTask(agentId);
     const { launcher, calls } = capableLauncher();
-    const deps = { db, sender: fakeSender().sender, resolveLauncher: () => launcher };
+    const deps = { storage, sender: fakeSender().sender, resolveLauncher: () => launcher };
 
     const first = await removeAgentControl(deps, agentId);
     expect(first.orphanedTasks).toBe(1);
@@ -252,7 +257,7 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     });
     expect(registry.isOnline(agentId)).toBe(true);
 
-    await removeAgentControl({ db, sender: registry, sessions: registry }, agentId);
+    await removeAgentControl({ storage, sender: registry, sessions: registry }, agentId);
 
     // The socket was closed by the HOST and the session evicted — revocation
     // does not depend on the agent honouring the close frame.
@@ -266,11 +271,11 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
     const other = enrollOnline().agentId;
     // Seed undeliverable frames while both agents are offline.
     const { sender } = fakeSender(false);
-    await stopAgent({ db, sender }, agentId);
-    await stopAgent({ db, sender }, other);
+    await stopAgent({ storage, sender }, agentId);
+    await stopAgent({ storage, sender }, other);
     expect(db.select().from(outbox).where(eq(outbox.agentId, agentId)).all()).toHaveLength(1);
 
-    await removeAgentControl({ db, sender }, agentId);
+    await removeAgentControl({ storage, sender }, agentId);
 
     expect(db.select().from(outbox).where(eq(outbox.agentId, agentId)).all()).toHaveLength(0);
     expect(db.select().from(outbox).where(eq(outbox.agentId, other)).all()).toHaveLength(1);
@@ -278,7 +283,7 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
 
   it("HOST-M3-12: stop/restart/grant on a removed agent are rejected with 410; revoke still works", async () => {
     const { agentId } = enrollOnline();
-    const deps = { db, sender: fakeSender().sender };
+    const deps = { storage, sender: fakeSender().sender };
     grantAgentOwner(deps, agentId, "owner-x");
     await removeAgentControl(deps, agentId);
 
@@ -299,11 +304,11 @@ describe("M3 control — remove hardening (HOST-M3-04/07/12)", () => {
 describe("M3 control — inspect", () => {
   it("manual → 'unknown'; capable launcher → its runtime state", async () => {
     const { agentId } = enrollOnline();
-    expect(await inspectAgent({ db, sender: fakeSender().sender }, agentId)).toBe("unknown");
+    expect(await inspectAgent({ storage, sender: fakeSender().sender }, agentId)).toBe("unknown");
 
     setRuntime(agentId, "docker", "c-7");
     const { launcher, calls } = capableLauncher();
-    expect(await inspectAgent({ db, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId)).toBe("running");
+    expect(await inspectAgent({ storage, sender: fakeSender().sender, resolveLauncher: () => launcher }, agentId)).toBe("running");
     expect(calls.inspect).toEqual(["c-7"]);
   });
 });
@@ -311,23 +316,23 @@ describe("M3 control — inspect", () => {
 describe("M3 control — grant/revoke enforce OD13 (dedicated vs public)", () => {
   it("dedicated: an owner must be granted; revoke removes access", () => {
     const { agentId } = enrollOnline("dedicated");
-    const deps = { db, sender: fakeSender().sender };
+    const deps = { storage, sender: fakeSender().sender };
 
-    expect(isOwnerPermitted(db, agentId, "owner-x")).toBe(false);
+    expect(isOwnerPermitted(storage, agentId, "owner-x")).toBe(false);
     grantAgentOwner(deps, agentId, "owner-x");
-    expect(isOwnerPermitted(db, agentId, "owner-x")).toBe(true);
-    expect(isOwnerPermitted(db, agentId, "owner-y")).toBe(false);
+    expect(isOwnerPermitted(storage, agentId, "owner-x")).toBe(true);
+    expect(isOwnerPermitted(storage, agentId, "owner-y")).toBe(false);
     revokeAgentOwner(deps, agentId, "owner-x");
-    expect(isOwnerPermitted(db, agentId, "owner-x")).toBe(false);
+    expect(isOwnerPermitted(storage, agentId, "owner-x")).toBe(false);
   });
 
   it("public: any owner is permitted without a grant", () => {
     const { agentId } = enrollOnline("public");
-    expect(isOwnerPermitted(db, agentId, "anyone")).toBe(true);
+    expect(isOwnerPermitted(storage, agentId, "anyone")).toBe(true);
   });
 
   it("grant/revoke on an unknown agent → 404 (NotFoundError)", () => {
-    const deps = { db, sender: fakeSender().sender };
+    const deps = { storage, sender: fakeSender().sender };
     expect(() => grantAgentOwner(deps, "no-such-agent", "owner-x")).toThrow();
     expect(() => revokeAgentOwner(deps, "no-such-agent", "owner-x")).toThrow();
   });

@@ -1,6 +1,5 @@
 import type { LodePrepareWatcher } from "./lode";
 import process from "node:process";
-import { sql } from "drizzle-orm";
 import { bootstrap } from "./app";
 import { BUILD_INFO } from "./build-info";
 import { dispatchCliSubcommand } from "./cli";
@@ -96,7 +95,7 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
     await reportLodeServing({
       logger,
       probe: () => {
-        db.run(sql`SELECT 1`);
+        host.storage.ping();
         return true;
       },
     });

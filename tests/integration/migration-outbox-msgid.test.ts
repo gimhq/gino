@@ -10,6 +10,7 @@ import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { createDb } from "@/db";
 import { ROOT_DIR } from "@/dirs";
 import { ackMessage, replayUnacked } from "@/protocol/outbox";
+import { sqliteStorage } from "@/store/sqlite";
 
 // Migration 0003 drops the vestigial `outbox.msg_id` column (HOST-M1M2-07
 // follow-up: the delivery id is derived from the row id, never stored) and the
@@ -81,6 +82,7 @@ describe("migration 0003 — drop outbox.msg_id on a legacy DB", () => {
     // 2. Reopen through the real bootstrap — createDb runs the remaining
     //    migrations (0003 drops the index, then the column).
     const db = createDb(dbPath);
+    const storage = sqliteStorage(db);
     try {
       const names = (db.all(
         sql`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'outbox'`,
@@ -109,15 +111,16 @@ describe("migration 0003 — drop outbox.msg_id on a legacy DB", () => {
           sent.push(frame);
           return true;
         },
+        closeAgent: () => false,
       };
-      expect(replayUnacked(db, sender, "agent-legacy")).toBe(2);
+      expect(replayUnacked(storage, sender, "agent-legacy")).toBe(2);
       expect(sent[0]).toMatchObject({ type: "message", msgId: 1 });
       expect(sent[1]).toMatchObject({ type: "message", msgId: 2 });
 
-      ackMessage(db, "agent-legacy", 1);
-      ackMessage(db, "agent-legacy", 2);
+      ackMessage(storage, "agent-legacy", 1);
+      ackMessage(storage, "agent-legacy", 2);
       sent.length = 0;
-      expect(replayUnacked(db, sender, "agent-legacy")).toBe(0);
+      expect(replayUnacked(storage, sender, "agent-legacy")).toBe(0);
     }
     finally {
       db.close();

@@ -5,10 +5,14 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { enrollAgent } from "@/agents/registry";
+import { loadConfigStrict } from "@/config";
 import { createDb } from "@/db";
+import { createHost } from "@/host";
 import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
+import { createLogger } from "@/shared/lib/logger";
 import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
 import { errorHandler } from "@/shared/middleware/error-handler";
+import { sqliteStorage } from "@/store/sqlite";
 
 // ─── platform crypto ───
 
@@ -79,15 +83,17 @@ describe("connectTokenAuth (token → agent identity)", () => {
   // connect token to its OWNING agent (by connect_token_hash) and puts the id in
   // context — identity comes from the token, never a client-supplied param.
   const db = createDb(":memory:");
-  const { agent, connectToken } = enrollAgent(db, { source: "manual", capabilities: { engines: ["claude"] } });
+  const storage = sqliteStorage(db);
+  const host = createHost({ storage, logger: createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" })) });
+  const { agent, connectToken } = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } });
 
-  // App wired as production is (config + db in context, then the middleware as a
+  // App wired as production is (config + host in context, then the middleware as a
   // route handler so `:agentId` params populate), echoing the resolved agentId.
   function tokenApp(path = "/") {
     const app = new Hono<AppEnv>();
     app.use("*", (c, next) => {
       c.set("config", TEST_CONFIG);
-      c.set("db", db);
+      c.set("host", host);
       return next();
     });
     app.get(path, connectTokenAuth, c => c.json({ agentId: c.get("agentId") }));

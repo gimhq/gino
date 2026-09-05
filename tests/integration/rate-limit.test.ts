@@ -3,6 +3,7 @@
 // §3), the /llm/* proxy surface (per-principal keying), and the /messages/*
 // channel-token routes. Each `newApp` call builds a fresh config object, so
 // its rate-limit buckets are isolated (state is keyed by config identity).
+import type { Storage } from "@/host/ports/storage";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -15,12 +16,14 @@ import { createDb } from "@/db";
 import { agents } from "@/db/schema";
 import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
+import { sqliteStorage } from "@/store/sqlite";
 
 const REGISTER_TOKEN = "reg-secret-rl";
 const CHANNEL_TOKEN = "chan-secret-rl";
 const dbPath = resolve(tmpdir(), `gino-rl-${process.pid}-${Date.now()}.db`);
 
 let db: ReturnType<typeof createDb>;
+let storage: Storage;
 const realFetch = globalThis.fetch;
 
 function newApp(overrides: Record<string, string> = {}) {
@@ -39,6 +42,7 @@ function newApp(overrides: Record<string, string> = {}) {
 
 beforeAll(() => {
   db = createDb(dbPath);
+  storage = sqliteStorage(db);
 });
 
 afterEach(() => {
@@ -148,7 +152,7 @@ describe("rate limit — /messages/* channel routes (HOST-M9-02)", () => {
     });
 
   it("valid-bearer traffic is limited per principal; under the limit unaffected", async () => {
-    const channel = registerChannel(db, { name: "rl-chan", type: "test", ownerId: "owner-rl" });
+    const channel = registerChannel(storage, { name: "rl-chan", type: "test", ownerId: "owner-rl" });
     const app = newApp({ GINO_RATE_LIMIT_MESSAGES_MAX: "3" });
 
     for (let i = 0; i < 3; i++) {
@@ -161,7 +165,7 @@ describe("rate limit — /messages/* channel routes (HOST-M9-02)", () => {
   });
 
   it("bad-bearer floods drain the IP budget, not the valid principal's", async () => {
-    const channel = registerChannel(db, { name: "rl-chan-2", type: "test", ownerId: "owner-rl" });
+    const channel = registerChannel(storage, { name: "rl-chan-2", type: "test", ownerId: "owner-rl" });
     const app = newApp({ GINO_RATE_LIMIT_MESSAGES_MAX: "2" });
 
     // Rotating guessed bearers all land in the shared per-IP bucket.
