@@ -1,6 +1,6 @@
-import type { DnsResolver, FetchLike, WebhookPayload } from "@/channels";
+import type { DnsResolver, FetchLike, WebhookPayload } from "../../src/index";
 import { describe, expect, it } from "bun:test";
-import { deliverWebhook } from "@/channels";
+import { deliverWebhook } from "../../src/index";
 
 // M6 webhook delivery hardening —
 //   HOST-M5M6-05: every request carries an abort timeout, and a transport

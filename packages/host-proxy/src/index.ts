@@ -5,14 +5,15 @@
 // (`credentials`), the Claude↔OpenAI translator (`translator`), the Claude→
 // OpenAI WS bridge (`bridge`), the HTTP forward path (`handler`), proxy auth
 // (`auth`), and the structured config (`config`). The `/llm/*` router lives in
-// `src/edge/llm.ts` and delegates here.
+// `src/edge/llm.ts` and delegates here. The raw Codex WS relay (`ws-bridge`)
+// is Bun-only and exported from the separate `./bun` entry (`./bun.ts`).
 
 export { verifyProxyCredential } from "./auth";
 export type { ProxyAuthOpts } from "./auth";
 export { bridgeClaudeToOpenAI, CODEX_WS_URL } from "./bridge";
 export type { BridgeDeps, BridgeSocket, WsFactory } from "./bridge";
 export { buildProxyConfig, parseModelMap } from "./config";
-export type { ProviderUpstream, ProxyConfig } from "./config";
+export type { ProviderUpstream, ProxyConfig, ProxyEnv } from "./config";
 export { CredentialStore } from "./credentials";
 export type { FetchLike, ResolvedCredential } from "./credentials";
 export { createProxyHandler } from "./handler";
@@ -36,7 +37,5 @@ export {
   openAIEventToClaudeSSE,
 } from "./translator";
 export type { ClaudeRequest, OpenAIResponsesRequest, TranslatorState } from "./translator";
-export { createCodexRelay } from "./ws-bridge";
-export type { ClientSocket, CodexRelay, CodexRelayDeps } from "./ws-bridge";
 
 export const MODULE = "proxy" as const;

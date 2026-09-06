@@ -1,7 +1,7 @@
-import type { FetchLike, ProxyConfig } from "@/proxy";
-import type { Logger } from "@/shared/lib/logger";
+import type { Logger } from "@gino/host-core";
+import type { FetchLike, ProxyConfig } from "../../src/index";
 import { describe, expect, it } from "bun:test";
-import { CredentialStore } from "@/proxy";
+import { CredentialStore } from "../../src/index";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {

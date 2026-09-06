@@ -3,11 +3,11 @@ import type { AppDatabase } from "@gino/host-store-sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerChannel } from "@gino/host-channels";
 import { createTask, enrollAgent, grantOwner, setPlacement } from "@gino/host-core/domain";
 import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
-import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
