@@ -5,6 +5,7 @@
 #   ./run.sh --rebuild   force a fresh `cargo build` of the runner binary
 #   ./run.sh --logs      dump per-service logs after the run
 #   ./run.sh --keep      leave the stack up after the run (no `compose down`)
+#   ./run.sh --build-only  build/stage the runner binary and exit (no compose run)
 #
 # The runner is compiled in a rust:1.96-bookworm container with the host's warm
 # cargo registry mounted (fast, offline-friendly) and staged as gino-agent.bin
@@ -15,12 +16,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE=(docker compose -f "$SCRIPT_DIR/docker-compose.yml")
 
-REBUILD=0 DUMP_LOGS=0 KEEP=0
+REBUILD=0 DUMP_LOGS=0 KEEP=0 BUILD_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --rebuild) REBUILD=1 ;;
     --logs) DUMP_LOGS=1 ;;
     --keep) KEEP=1 ;;
+    --build-only) BUILD_ONLY=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -50,6 +52,11 @@ if [ "$REBUILD" = 1 ] || [ ! -f "$BIN" ]; then
   build_binary
 else
   echo "reusing staged runner binary ($BIN) — pass --rebuild to recompile"
+fi
+
+if [ "$BUILD_ONLY" = 1 ]; then
+  echo "── --build-only: runner binary staged at $BIN; skipping the compose run ──"
+  exit 0
 fi
 
 cleanup() {

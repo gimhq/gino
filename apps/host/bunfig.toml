@@ -1,0 +1,18 @@
+[run]
+shell = "system"
+
+# Coverage targets the unit-testable logic surface. HTTP route files
+# (`*.routes.ts`), the app composer (`app.ts`), entry points and build
+# artefacts are excluded — they are exercised by the integration tests
+# (tests/integration/**) against a live in-process app.
+[test]
+coverage = true
+coveragePathIgnorePatterns = [
+  "src/index.ts",
+  "src/cli.ts",
+  "src/app.ts",
+  "**/*.routes.ts",
+  "**/*.test.ts",
+]
+coverageReporter = ["text"]
+coverageSkipTestFiles = true

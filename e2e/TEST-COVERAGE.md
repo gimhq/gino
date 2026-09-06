@@ -13,7 +13,7 @@ the real code path.
 
 | Component | What it is | Why |
 |-----------|-----------|-----|
-| `host` | the real control plane, `bun src/index.ts`, repo bind-mounted read-only | the system under test |
+| `host` | the real control plane, `bun apps/host/src/index.ts`, repo bind-mounted read-only | the system under test |
 | `agent` | the real Rust `gino-agent` binary + a fake `claude` engine (`fake-claude`) | the real WS/runner code path, no model/network |
 | `mock-llm` | a tiny Bun server emulating the Anthropic upstream | lets `/llm` proxy be tested without real credentials |
 | `tester` | the Bun test driver (`e2e.ts`) | drives the host API + asserts |
