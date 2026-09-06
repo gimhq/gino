@@ -1,3 +1,4 @@
+import type { HostEvents, Logger, Storage } from "@gino/host-core";
 // M6 — WEBHOOK PUMP (HOST-M5M6-04): the production driver of outbound webhook
 // egress. Until this landed, `pushChannelWebhooks` had no caller — webhook
 // channels stored endpoints that were never pushed to.
@@ -21,9 +22,6 @@
 // bounded round — never redelivery of acked rows, never loss of unacked ones.
 import type { WebhookAttemptState } from "./egress";
 import type { DnsResolver, FetchLike } from "./webhooks";
-import type { HostEvents } from "@/host/events";
-import type { Storage } from "@/host/ports/storage";
-import type { Logger } from "@/shared/lib/logger";
 import { pushChannelWebhooks } from "./egress";
 import { getChannel, listChannels, listWebhooks, requireChannels } from "./registry";
 

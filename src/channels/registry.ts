@@ -10,10 +10,10 @@
 // under `channel.config.webhooks` and are managed here. Their URLs are
 // SSRF-guarded at registration time (see ./webhooks).
 
+import type { ChannelBindingRow, ChannelRepo, ChannelRow, Storage } from "@gino/host-core";
 import type { WebhookEndpoint } from "./webhooks";
-import type { ChannelBindingRow, ChannelRepo, ChannelRow, Storage } from "@/host/ports/storage";
-import { ulid } from "@/platform";
-import { AppError, NotFoundError } from "@/shared/lib/errors";
+import { AppError, NotFoundError } from "@gino/host-core";
+import { ulid } from "@gino/host-core/domain";
 import { assertSafeWebhookUrl } from "./webhooks";
 
 /** The `ChannelRepo` is optional on the port; a host running M6 must provide it (the sqlite adapter always does). */

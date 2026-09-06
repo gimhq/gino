@@ -2,13 +2,13 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createDb } from "@gino/host-store-sqlite";
+import { outbox, tasks } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { and, eq, isNotNull } from "drizzle-orm";
 import { websocket } from "hono/bun";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { outbox, tasks } from "@/db/schema";
 import { createLogger } from "@/shared/lib/logger";
 
 // D-B3 — the END-TO-END MILESTONE, proven against a LIVE Bun server + real WS:

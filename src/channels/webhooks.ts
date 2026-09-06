@@ -27,8 +27,8 @@
 //      request is bounded by a timeout (AbortSignal, HOST-M5M6-05).
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { AppError, ValidationError } from "@/shared/lib/errors";
-import { isPrivateUpstreamHost } from "@/shared/lib/net";
+import { AppError, ValidationError } from "@gino/host-core";
+import { isPrivateUpstreamHost } from "@gino/host-core/domain";
 
 /** A registered outbound webhook on a channel (stored under `channel.config.webhooks`). */
 export interface WebhookEndpoint {

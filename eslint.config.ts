@@ -23,9 +23,13 @@ export default antfu({
     "**/*.yaml",
     "gino-agent/**",
     "backup/**",
-    "dist/**",
+    // Cross-implementation e2e harness + skills docs: outside the TS lint scope (as before the workspace split).
+    "e2e/**",
+    "skills/**",
+    "**/dist/**",
+    "**/node_modules/**",
     "data/**",
-    "drizzle/**",
+    "**/drizzle/**",
     "docs/**",
     // Vendored verbatim from upstream lode (re-copied to update) — not ours to lint.
     "src/lode/sdk.ts",
@@ -35,7 +39,7 @@ export default antfu({
   // refuse — relax the most-friction-prone ones to `warn` / `off`.
   files: [
     "**/*.test.ts",
-    "tests/**/*.ts",
+    "**/tests/**/*.ts",
   ],
   rules: {
     "ts/no-explicit-any": "warn",

@@ -12,8 +12,10 @@
 // stores it verbatim. M6 never writes the transcript — these routes touch only
 // `channels` / `channel_bindings`. Responses use the shared `{ success, data }`
 // envelope. Webhook secrets are never returned.
-import type { ChannelRow } from "@/host/ports/storage";
+import type { ChannelRow } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
+import { NotFoundError } from "@gino/host-core";
+import { requireTask } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
 import {
@@ -29,9 +31,7 @@ import {
   requireChannel,
 } from "@/channels";
 import { ok } from "@/shared/lib/api-response";
-import { NotFoundError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import { requireTask } from "@/tasks";
 
 /** Public projection of a channel row — config/webhook secrets are NOT leaked. */
 function serializeChannel(channel: ChannelRow) {

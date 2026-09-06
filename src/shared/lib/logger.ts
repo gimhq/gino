@@ -1,3 +1,4 @@
+import type { Logger as HostLogger } from "@gino/host-core";
 import type { ConsolaInstance } from "consola";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -255,3 +256,9 @@ export function createLogger(config: LoggerConfig) {
 }
 
 export type Logger = ReturnType<typeof createLogger>;
+
+// The app logger must stay structurally assignable to the SDK's `Logger` seam
+// (host-sdk-design D7): `createHost({ logger })` relies on it. A signature
+// drift fails typecheck here (type-level only, no runtime cost), not at a call site.
+type AssertAssignable<_T extends U, U> = true;
+export type AppLoggerSatisfiesHostLogger = AssertAssignable<Logger, HostLogger>;

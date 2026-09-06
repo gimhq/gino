@@ -12,23 +12,13 @@
 //
 // Every response uses the shared `{ success, data }` envelope. The stored
 // connect-token hash is NEVER serialized.
-import type { AgentRow } from "@/host/ports/storage";
+import type { AgentRow } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
+import { NotFoundError } from "@gino/host-core";
+import { getAgent, getCapacity, grantAgentOwner, inspectAgent, launchAgent, listAgents, listGrants, removeAgentControl, restartAgent, revokeAgentOwner, setAgentAccessControl, stopAgent } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import {
-  grantAgentOwner,
-  inspectAgent,
-  launchAgent,
-  removeAgentControl,
-  restartAgent,
-  revokeAgentOwner,
-  setAgentAccessControl,
-  stopAgent,
-} from "@/agents/control";
-import { getAgent, getCapacity, listAgents, listGrants } from "@/agents/registry";
 import { ok } from "@/shared/lib/api-response";
-import { NotFoundError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 
 /** Public projection of an agent — the connect-token hash is never exposed. */

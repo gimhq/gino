@@ -24,10 +24,9 @@
 // order — so an out-of-order arrival (reconnect replay) inside the window is
 // re-sorted before delivery (HOST-M5M6-10).
 
+import type { ChannelRow, Logger, MessageRow, Storage } from "@gino/host-core";
 import type { DnsResolver, FetchLike } from "./webhooks";
-import type { ChannelRow, MessageRow, Storage } from "@/host/ports/storage";
-import type { Logger } from "@/shared/lib/logger";
-import { NotFoundError } from "@/shared/lib/errors";
+import { NotFoundError } from "@gino/host-core";
 import { listWebhooks, requireChannels } from "./registry";
 import { deliverWebhook } from "./webhooks";
 
