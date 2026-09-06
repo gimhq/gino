@@ -1,9 +1,9 @@
 import type { ChannelRepo, ChannelRow, NewChannelBindingRow, NewChannelRow } from "@gino/host-core/domain";
-// SQLITE STORE — `ChannelRepo` on drizzle + bun:sqlite (channels /
+// SQLITE STORE — `ChannelRepo` on drizzle + sqlite (channels /
 // channel_bindings / channel_cursors). Each method is the one statement the
 // domain issues today (`channels/registry.ts`, `channels/ingress.ts`,
 // `channels/egress.ts`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
 import { channelBindings, channelCursors, channels } from "../schema";
 

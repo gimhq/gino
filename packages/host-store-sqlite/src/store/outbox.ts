@@ -1,8 +1,8 @@
 import type { NewOutboxRow, OutboxRepo, OutboxRow } from "@gino/host-core/domain";
-// SQLITE STORE — `OutboxRepo` on drizzle + bun:sqlite (outbox). Each method is
+// SQLITE STORE — `OutboxRepo` on drizzle + sqlite (outbox). Each method is
 // the one statement the domain issues today (`protocol/outbox.ts`), unchanged.
 // The AUTOINCREMENT `id` IS the monotonic delivery id (`outboxId` / `msgId`).
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
 import { outbox } from "../schema";
 

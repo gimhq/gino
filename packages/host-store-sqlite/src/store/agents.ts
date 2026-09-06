@@ -1,8 +1,8 @@
 import type { AgentRepo, AgentRow, NewAgentRow, NewPendingLaunchRow, PendingLaunchRow, StatusGuard } from "@gino/host-core/domain";
-// SQLITE STORE — `AgentRepo` on drizzle + bun:sqlite (agents / pending_launches
+// SQLITE STORE — `AgentRepo` on drizzle + sqlite (agents / pending_launches
 // / agent_grants). Each method is the one statement the domain issues today
 // (`agents/registry.ts`, `agents/liveness.ts`, `proxy/auth.ts`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, desc, eq, isNotNull, lt, ne, sql } from "drizzle-orm";
 import { agentGrants, agents, pendingLaunches } from "../schema";
 

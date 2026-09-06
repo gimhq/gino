@@ -1,10 +1,16 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { acquireMigrationLock, createDb, materializeEmbeddedMigrations, runMigrations } from "../../src/db";
+import { migrate } from "drizzle-orm/bun-sqlite/migrator";
+import { acquireMigrationLock } from "../../src/db";
+import { bunSqliteDriver, createDb } from "../../src/drivers/bun";
+import { embeddedMigrations } from "../../src/embedded-migrations";
+import { runMigrations } from "../../src/migrate";
+import { testDrivers } from "../helpers/drivers";
 
 function journalJson(entries: { tag: string; when: number }[]): string {
   return JSON.stringify({
@@ -14,18 +20,22 @@ function journalJson(entries: { tag: string; when: number }[]): string {
   });
 }
 
-function embeddedMap(table: string): Map<string, string> {
+function embeddedMap(table: string, when = 1000): Map<string, string> {
   return new Map([
-    ["meta/_journal.json", journalJson([{ tag: `0000_${table}`, when: 1000 }])],
+    ["meta/_journal.json", journalJson([{ tag: `0000_${table}`, when }])],
     [`0000_${table}.sql`, `CREATE TABLE ${table} (id integer primary key);`],
   ]);
 }
 
-function writeFsMigrations(root: string, table: string): void {
-  const folder = join(root, "drizzle");
-  mkdirSync(join(folder, "meta"), { recursive: true });
-  writeFileSync(join(folder, "meta/_journal.json"), journalJson([{ tag: `0000_${table}`, when: 1000 }]));
-  writeFileSync(join(folder, `0000_${table}.sql`), `CREATE TABLE ${table} (id integer primary key);`);
+interface JournalRow { id: number | null; hash: string; created_at: number }
+interface MasterRow { name: string; sql: string | null }
+
+function journalRows(sqlite: Database): JournalRow[] {
+  return sqlite.query("SELECT id, hash, created_at FROM __drizzle_migrations ORDER BY created_at").all() as JournalRow[];
+}
+
+function schemaRows(sqlite: Database): MasterRow[] {
+  return sqlite.query("SELECT name, sql FROM sqlite_master ORDER BY type, name").all() as MasterRow[];
 }
 
 function tableNames(sqlite: Database): string[] {
@@ -33,81 +43,137 @@ function tableNames(sqlite: Database): string[] {
     .map(r => r.name);
 }
 
-describe("materializeEmbeddedMigrations (HOST-M9-06)", () => {
-  const dirs: string[] = [];
-  afterEach(() => {
-    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+/** Apply the real embedded set with drizzle's folder migrator (the reference implementation). */
+function migrateWithDrizzle(sqlite: Database, migrations: ReadonlyMap<string, string> = embeddedMigrations): void {
+  const dir = mkdtempSync(join(tmpdir(), "gino-drizzle-ref-"));
+  try {
+    mkdirSync(join(dir, "meta"), { recursive: true });
+    for (const [name, content] of migrations) writeFileSync(join(dir, name), content);
+    migrate(drizzle(sqlite), { migrationsFolder: dir });
+  }
+  finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("runMigrations (driver-agnostic, drizzle-journal compatible)", () => {
+  const entryCount = (JSON.parse(embeddedMigrations.get("meta/_journal.json")!) as { entries: unknown[] }).entries.length;
+
+  for (const driver of testDrivers) {
+    describe(driver.name, () => {
+      it("a fresh db gets every embedded migration; a second run is a no-op", () => {
+        const handle = driver.open(":memory:");
+        try {
+          runMigrations(handle.db);
+          const first = handle.db.all(sql`SELECT id, hash, created_at FROM "__drizzle_migrations" ORDER BY created_at`) as JournalRow[];
+          expect(first).toHaveLength(entryCount);
+          expect(handle.db.all(sql`SELECT name FROM sqlite_master WHERE name = 'agents'`)).toHaveLength(1);
+
+          runMigrations(handle.db);
+          const second = handle.db.all(sql`SELECT id, hash, created_at FROM "__drizzle_migrations" ORDER BY created_at`) as JournalRow[];
+          expect(second).toEqual(first);
+        }
+        finally {
+          handle.close();
+        }
+      });
+    });
+  }
+
+  it("leaves a db pre-migrated by drizzle's own migrator untouched", () => {
+    const sqlite = new Database(":memory:");
+    try {
+      migrateWithDrizzle(sqlite);
+      const before = journalRows(sqlite);
+      expect(before).toHaveLength(entryCount);
+
+      runMigrations(drizzle(sqlite));
+      expect(journalRows(sqlite)).toEqual(before);
+    }
+    finally {
+      sqlite.close();
+    }
   });
 
-  it("writes the map into a fresh unpredictable owner-only temp dir", () => {
-    const map = embeddedMap("m906");
-    const dir1 = materializeEmbeddedMigrations(map);
-    const dir2 = materializeEmbeddedMigrations(map);
-    dirs.push(dir1, dir2);
-
-    // mkdtemp: random suffix (two calls never collide) — not the old
-    // predictable `gino-migrations-<pid>` name an attacker could pre-create.
-    expect(dir1).not.toBe(dir2);
-    expect(dirname(dir1)).toBe(tmpdir());
-    expect(dir1).toContain("gino-migrations-");
-
-    // Owner-only permissions: no other local user can read or swap contents.
-    expect(statSync(dir1).mode & 0o777).toBe(0o700);
-
-    // Contents materialized, including the nested meta/ journal.
-    expect(readFileSync(join(dir1, "0000_m906.sql"), "utf8")).toContain("CREATE TABLE m906");
-    expect(existsSync(join(dir1, "meta/_journal.json"))).toBe(true);
-  });
-});
-
-describe("runMigrations source preference (HOST-M9-13)", () => {
-  let root: string;
-  let sqlite: Database;
-
-  beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), "gino-migsrc-"));
-    sqlite = new Database(":memory:");
+  it("produces the same __drizzle_migrations rows and sqlite_master as drizzle's migrator", () => {
+    const reference = new Database(":memory:");
+    const ours = new Database(":memory:");
+    try {
+      migrateWithDrizzle(reference);
+      runMigrations(drizzle(ours));
+      expect(journalRows(ours)).toEqual(journalRows(reference));
+      expect(schemaRows(ours)).toEqual(schemaRows(reference));
+    }
+    finally {
+      reference.close();
+      ours.close();
+    }
   });
 
-  afterEach(() => {
-    sqlite.close();
-    rmSync(root, { recursive: true, force: true });
+  it("applies only the entries newer than the last recorded one", () => {
+    const sqlite = new Database(":memory:");
+    try {
+      runMigrations(drizzle(sqlite), embeddedMap("first", 1000));
+      const grown = new Map(embeddedMap("first", 1000));
+      grown.set("meta/_journal.json", journalJson([{ tag: "0000_first", when: 1000 }, { tag: "0001_second", when: 2000 }]));
+      grown.set("0001_second.sql", "CREATE TABLE second (id integer primary key);");
+      runMigrations(drizzle(sqlite), grown);
+      expect(tableNames(sqlite)).toEqual(expect.arrayContaining(["first", "second"]));
+      expect(journalRows(sqlite).map(r => r.created_at)).toEqual([1000, 2000]);
+    }
+    finally {
+      sqlite.close();
+    }
   });
 
-  it("compiled binary ignores an on-disk drizzle/ tree and applies the embedded set", () => {
-    writeFsMigrations(root, "planted_fs");
-    runMigrations(drizzle(sqlite), { compiled: true, embedded: embeddedMap("vetted"), rootDir: root });
-    expect(tableNames(sqlite)).toContain("vetted");
-    expect(tableNames(sqlite)).not.toContain("planted_fs");
+  it("splits a migration on statement-breakpoint markers and commits it atomically", () => {
+    const sqlite = new Database(":memory:");
+    try {
+      const map = new Map([
+        ["meta/_journal.json", journalJson([{ tag: "0000_multi", when: 1000 }])],
+        ["0000_multi.sql", "CREATE TABLE a (id integer primary key);\n--> statement-breakpoint\nCREATE TABLE b (id integer primary key);"],
+      ]);
+      runMigrations(drizzle(sqlite), map);
+      expect(tableNames(sqlite)).toEqual(expect.arrayContaining(["a", "b"]));
+
+      // A failing statement rolls the whole entry back: no table, no journal row.
+      const broken = new Map([
+        ["meta/_journal.json", journalJson([{ tag: "0000_multi", when: 1000 }, { tag: "0001_broken", when: 2000 }])],
+        ["0000_multi.sql", map.get("0000_multi.sql")!],
+        ["0001_broken.sql", "CREATE TABLE c (id integer primary key);\n--> statement-breakpoint\nCREATE TABLE a (id integer primary key);"],
+      ]);
+      expect(() => runMigrations(drizzle(sqlite), broken)).toThrow();
+      expect(tableNames(sqlite)).not.toContain("c");
+      expect(journalRows(sqlite).map(r => r.created_at)).toEqual([1000]);
+    }
+    finally {
+      sqlite.close();
+    }
   });
 
-  it("a populated embedded map wins over the filesystem even when not compiled (packaged bundle)", () => {
-    writeFsMigrations(root, "planted_fs");
-    runMigrations(drizzle(sqlite), { compiled: false, embedded: embeddedMap("vetted"), rootDir: root });
-    expect(tableNames(sqlite)).toContain("vetted");
-    expect(tableNames(sqlite)).not.toContain("planted_fs");
+  it("rejects a map without the journal sentinel as corrupt", () => {
+    const sqlite = new Database(":memory:");
+    try {
+      const map = embeddedMap("vetted");
+      map.delete("meta/_journal.json");
+      expect(() => runMigrations(drizzle(sqlite), map)).toThrow(/meta\/_journal\.json missing/);
+      expect(tableNames(sqlite)).not.toContain("vetted");
+    }
+    finally {
+      sqlite.close();
+    }
   });
 
-  it("dev run (empty embedded stub) applies the filesystem drizzle/ folder", () => {
-    writeFsMigrations(root, "dev_fs");
-    runMigrations(drizzle(sqlite), { compiled: false, embedded: new Map(), rootDir: root });
-    expect(tableNames(sqlite)).toContain("dev_fs");
-  });
-
-  it("compiled binary with an empty embedded map fails fast instead of reading the filesystem", () => {
-    writeFsMigrations(root, "planted_fs");
-    expect(() =>
-      runMigrations(drizzle(sqlite), { compiled: true, embedded: new Map(), rootDir: root }),
-    ).toThrow(/No migrations available/);
-    expect(tableNames(sqlite)).not.toContain("planted_fs");
-  });
-
-  it("embedded map without the journal sentinel is rejected as corrupt", () => {
-    const map = embeddedMap("vetted");
-    map.delete("meta/_journal.json");
-    expect(() =>
-      runMigrations(drizzle(sqlite), { compiled: true, embedded: map, rootDir: root }),
-    ).toThrow(/meta\/_journal\.json missing/);
+  it("rejects a map whose journal lists a missing .sql file", () => {
+    const sqlite = new Database(":memory:");
+    try {
+      const map = embeddedMap("vetted");
+      map.delete("0000_vetted.sql");
+      expect(() => runMigrations(drizzle(sqlite), map)).toThrow(/0000_vetted\.sql missing/);
+    }
+    finally {
+      sqlite.close();
+    }
   });
 });
 
@@ -128,6 +194,14 @@ describe("migration lock (HOST-M9-14)", () => {
     release();
     const release2 = acquireMigrationLock(dbPath, 0);
     release2();
+  });
+
+  it("waits for the holder up to the timeout before giving up", () => {
+    const release = acquireMigrationLock(dbPath, 0);
+    const started = Date.now();
+    expect(() => acquireMigrationLock(dbPath, 150)).toThrow(/migration lock/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+    release();
   });
 
   it("reclaims a stale lock left behind by a dead process", () => {
@@ -161,6 +235,17 @@ describe("migration lock (HOST-M9-14)", () => {
     try {
       const release = acquireMigrationLock(dbPath, 0);
       release();
+    }
+    finally {
+      db.close();
+    }
+  });
+
+  it("createDb is openDatabase over the bun driver", () => {
+    const db = createDb(":memory:");
+    try {
+      expect(bunSqliteDriver.name).toBe("bun:sqlite");
+      expect(db.all(sql`SELECT count(*) as c FROM "__drizzle_migrations"`)).toEqual([{ c: (JSON.parse(embeddedMigrations.get("meta/_journal.json")!) as { entries: unknown[] }).entries.length }]);
     }
     finally {
       db.close();

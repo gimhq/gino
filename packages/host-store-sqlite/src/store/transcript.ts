@@ -1,8 +1,8 @@
 import type { NewMessageRow, TranscriptRepo } from "@gino/host-core/domain";
-// SQLITE STORE — `TranscriptRepo` on drizzle + bun:sqlite (messages). Each
+// SQLITE STORE — `TranscriptRepo` on drizzle + sqlite (messages). Each
 // method is the one statement the domain issues today (`msgstore/messages.ts`,
 // `msgstore/reads.ts`, `channels/egress.ts`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, eq, gt, sql } from "drizzle-orm";
 import { messages } from "../schema";
 

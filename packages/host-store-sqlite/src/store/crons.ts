@@ -1,8 +1,8 @@
 import type { CronMirrorRepo, CronPromptUpsert, CronStateUpsert } from "@gino/host-core/domain";
-// SQLITE STORE — `CronMirrorRepo` on drizzle + bun:sqlite (crons). Each method
+// SQLITE STORE — `CronMirrorRepo` on drizzle + sqlite (crons). Each method
 // is the one statement the domain issues today (`msgstore/crons.ts`,
 // `tasks/store.listTaskCrons`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { asc, desc, eq, sql } from "drizzle-orm";
 import { crons } from "../schema";
 

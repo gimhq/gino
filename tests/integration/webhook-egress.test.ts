@@ -3,7 +3,8 @@ import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { FetchLike } from "@/channels";
 import { createHostEvents } from "@gino/host-core";
 import { createTask, enrollAgent, ingestHttpFrame, setPlacement } from "@gino/host-core/domain";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { addWebhook, bindConversation, readCursor, registerChannel, startWebhookPump } from "@/channels";
 

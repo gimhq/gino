@@ -2,7 +2,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
-import { createDb } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { outbox, tasks } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { and, eq, isNotNull } from "drizzle-orm";

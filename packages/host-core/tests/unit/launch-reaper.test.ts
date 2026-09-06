@@ -5,7 +5,8 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { reapPendingLaunches } from "../../src/agents/launch-reaper";
 import {

@@ -1,7 +1,8 @@
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Storage } from "../../src/host/ports/storage";
 import type { ConfigEntry } from "../../src/protocol/frames";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { configArtifacts } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {

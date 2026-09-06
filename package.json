@@ -9,6 +9,7 @@
     "apps/*",
     "examples/*"
   ],
+  "trustedDependencies": ["drizzle-kit"],
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun dist/index.js",

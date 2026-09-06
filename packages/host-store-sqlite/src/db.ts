@@ -1,44 +1,38 @@
-import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import type { AppDatabase, SqliteDriver } from "./driver";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
-import { Database } from "bun:sqlite";
-import { drizzle } from "drizzle-orm/bun-sqlite";
-import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { embeddedMigrations } from "./embedded-migrations";
-import * as schema from "./schema";
-
-const THIS_DIR = dirname(fileURLToPath(import.meta.url));
-
-/**
- * True when running inside a compiled binary (`bun build --compile`), where
- * modules live in Bun's virtual filesystem. Consumers must not trust
- * cwd-relative code assets (e.g. a `drizzle/` tree) in this mode — see
- * HOST-M9-13.
- */
-const RUNNING_COMPILED = THIS_DIR.startsWith("/$bunfs");
-
-/** The package root (`packages/host-store-sqlite`), where the dev `drizzle/` folder lives. */
-const PACKAGE_DIR = resolve(THIS_DIR, "..");
+import { runMigrations } from "./migrate";
 
 /** The placeholder version of a dev run; the snapshot + marker are no-ops for it. */
 const DEV_VERSION = "0.0.0-dev";
 
+export interface OpenDatabaseOptions {
+  /** The sqlite binding to open the file with (`bunSqliteDriver`, `nodeSqliteDriver`). */
+  readonly driver: SqliteDriver;
+  /** Database file path; `:memory:` for an ephemeral database. */
+  readonly path: string;
+  /** The running application version that owns the on-disk schema; defaults to the dev placeholder. */
+  readonly version?: string;
+  /** How long a concurrent starter waits for the migration lock holder (default 30s). */
+  readonly migrationLockTimeoutMs?: number;
+}
+
 /**
- * Open (or create) the v2 host database on `bun:sqlite` via
- * `drizzle-orm/bun-sqlite`, apply the WAL / foreign-keys / busy-timeout
- * PRAGMAs, run migrations, and return the drizzle handle augmented with
- * `close()`. There is no encryption-at-rest: the host is the credential
- * proxy, not the keystore (see docs/host-v2-design.md).
+ * Open (or create) the v2 host database through `driver`, apply the WAL /
+ * foreign-keys / busy-timeout PRAGMAs, run migrations, and return the drizzle
+ * handle augmented with `close()` and `checkpoint()`. There is no
+ * encryption-at-rest: the host is the credential proxy, not the keystore (see
+ * docs/host-v2-design.md).
  *
  * `:memory:` is passed through untouched for ephemeral test databases.
  *
- * `opts.version` is the running application version that owns the on-disk
- * schema (pre-migration snapshot + version marker); it defaults to the dev
+ * `version` is the running application version that owns the on-disk schema
+ * (pre-migration snapshot + version marker); it defaults to the dev
  * placeholder, for which both are no-ops.
  */
-export function createDb(path: string, opts: { migrationLockTimeoutMs?: number; version?: string } = {}): AppDatabase {
+export function openDatabase(opts: OpenDatabaseOptions): AppDatabase {
+  const { driver, path } = opts;
   if (path !== ":memory:") {
     const dir = dirname(path);
     if (!existsSync(dir)) {
@@ -46,7 +40,7 @@ export function createDb(path: string, opts: { migrationLockTimeoutMs?: number; 
     }
   }
 
-  const sqlite = new Database(path, { create: true });
+  const sqlite = driver.open(path);
 
   sqlite.exec("PRAGMA journal_mode = WAL");
   sqlite.exec("PRAGMA foreign_keys = ON");
@@ -69,7 +63,7 @@ export function createDb(path: string, opts: { migrationLockTimeoutMs?: number; 
     }
   }
 
-  const db = drizzle(sqlite, { schema });
+  const db = sqlite.db;
 
   // Pre-migration snapshot (host-upgrade-design.md §7): on a version change, back
   // up the existing DB BEFORE the new code migrates it, so a rollback to the
@@ -117,7 +111,7 @@ const VERSION_MARKER = ".gino-version";
  * an unchanged version. Best-effort: a failure logs and continues (the running
  * version is still good; only the rollback safety net is missed).
  */
-export function snapshotOnVersionChange(sqlite: Database, dbPath: string, version: string): void {
+export function snapshotOnVersionChange(sqlite: { exec: (sql: string) => void }, dbPath: string, version: string): void {
   if (dbPath === ":memory:" || version === DEV_VERSION)
     return;
   const dir = dirname(dbPath);
@@ -155,13 +149,11 @@ export function recordDbVersion(dbPath: string, version: string): void {
   }
 }
 
-type DrizzleDb = ReturnType<typeof drizzle<typeof schema>>;
-
 /**
  * Cross-process guard around the snapshot + migrate window (HOST-M9-14): an
  * exclusively-created (`O_EXCL`) pidfile beside the DB. A SQLite
  * `BEGIN EXCLUSIVE` on a sidecar file would be the natural choice, but
- * bun:sqlite's VFS does not place OS file locks, so its transactions are
+ * the Bun sqlite binding's VFS does not place OS file locks, so its transactions are
  * invisible to other processes — verified empirically (a concurrent `sqlite3`
  * CLI writes straight through a held `BEGIN EXCLUSIVE`).
  *
@@ -205,7 +197,8 @@ export function acquireMigrationLock(dbPath: string, busyTimeoutMs = 30_000): ()
         + `starting up, then retry — or delete the file if that process is gone`,
       );
     }
-    Bun.sleepSync(Math.min(100, deadline - Date.now()));
+    // Synchronous sleep without a Bun-only API: block on a never-notified atomic.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(100, deadline - Date.now()));
   }
 }
 
@@ -229,85 +222,3 @@ function isProcessAlive(pid: number): boolean {
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
-
-/**
- * Materialize an embedded-migrations map into a fresh private temp directory
- * so drizzle's folder-based migrator can read it. `mkdtemp` yields an
- * unpredictable, owner-only (0700) directory, so a local attacker cannot
- * pre-create it or swap contents between write and migrate (HOST-M9-06).
- * The caller removes the directory when done.
- */
-export function materializeEmbeddedMigrations(migrations: ReadonlyMap<string, string>): string {
-  const dir = mkdtempSync(join(tmpdir(), "gino-migrations-"));
-  for (const [name, content] of migrations) {
-    const filePath = resolve(dir, name);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, content);
-  }
-  return dir;
-}
-
-/**
- * Apply migrations from the right source. Packaged builds — the compiled
- * binary (`/$bunfs`) or the `bun run package` bundle, both of which carry a
- * populated `embeddedMigrations` map — use the embedded set exclusively, so a
- * stale, foreign, or attacker-planted `drizzle/` tree in the working
- * directory can never reach the database (HOST-M9-13). Only a dev/test run
- * (empty stub map) reads the package's own `drizzle/` folder from disk.
- *
- * Exported for tests; runtime callers use the defaults.
- */
-export function runMigrations(
-  db: DrizzleDb,
-  opts: { compiled?: boolean; embedded?: ReadonlyMap<string, string>; rootDir?: string } = {},
-): void {
-  const compiled = opts.compiled ?? RUNNING_COMPILED;
-  const embedded = opts.embedded ?? embeddedMigrations;
-  const rootDir = opts.rootDir ?? PACKAGE_DIR;
-
-  if (!compiled && embedded.size === 0) {
-    const fsMigrationsFolder = resolve(rootDir, "drizzle");
-    if (existsSync(resolve(fsMigrationsFolder, "meta/_journal.json"))) {
-      migrate(db, { migrationsFolder: fsMigrationsFolder });
-      return;
-    }
-  }
-
-  // Package path: `scripts/package.ts` writes the migration files into
-  // `embedded-migrations.ts` before invoking `bun build`, then
-  // restores the stub. A binary built outside that step — or from a
-  // worktree where the stub was restored but `drizzle/` was excluded — would
-  // otherwise boot with an empty map and crash later on its first DB write.
-  // Fail fast with a concrete fix.
-  if (embedded.size === 0) {
-    throw new Error(
-      "No migrations available: filesystem drizzle/ folder is missing and the "
-      + "compiled binary has no embedded migrations. This binary was built "
-      + "outside `bun run package` (which populates embedded-migrations.ts at "
-      + "build time) or against a worktree without `drizzle/`. Run "
-      + "`bun run package` to rebuild, or restore the repo's drizzle/ folder "
-      + "for dev runs.",
-    );
-  }
-
-  // Migration journal sentinel — when present in the embedded map it proves
-  // the compile step finished writing the full set, not just a truncated
-  // prefix. Drizzle's migrator reads it first, so a missing journal here
-  // would silently no-op.
-  if (!embedded.has("meta/_journal.json")) {
-    throw new Error(
-      "Embedded migrations are corrupt: meta/_journal.json missing. "
-      + "Rebuild the bundle with `bun run package`.",
-    );
-  }
-
-  const tmpMigrations = materializeEmbeddedMigrations(embedded);
-  try {
-    migrate(db, { migrationsFolder: tmpMigrations });
-  }
-  finally {
-    rmSync(tmpMigrations, { recursive: true, force: true });
-  }
-}
-
-export type AppDatabase = DrizzleDb & { close: () => void; checkpoint: () => void };
