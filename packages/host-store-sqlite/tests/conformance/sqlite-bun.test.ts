@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeStorageConformance } from "@gino/host-core/testing";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { sql } from "drizzle-orm";
 import { openDatabase } from "../../src/db";
 import { bunSqliteDriver } from "../../src/drivers/bun";
@@ -31,4 +32,4 @@ describeStorageConformance({
       },
     };
   },
-});
+}, { describe, test, beforeEach, afterEach, expect });
