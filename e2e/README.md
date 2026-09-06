@@ -1,6 +1,6 @@
 # Gino docker-compose end-to-end test
 
-A black-box, docker-orchestrated e2e that runs the **real host** (`src/`,
+A black-box, docker-orchestrated e2e that runs the **real host** (`apps/host/src/`,
 protocol-v2 control plane) and a **real gino-agent** (`gino-agent/`, the Rust
 daemon) side by side and drives the host's entire HTTP surface to exercise every
 major feature. It is the first test that runs **host-v2 and runner-v2 together** —
@@ -47,7 +47,7 @@ needed — the engine and the LLM upstream are both faked.
 
 ```
  tester ──HTTP──▶ host ◀──WS / HTTP── agent (runner + fake claude engine)
-   (oven/bun)    (bun src/index.ts)        (Dockerfile.agent)
+   (oven/bun)    (bun apps/host/src/index.ts)  (Dockerfile.agent)
                     │  /llm proxy
                     ▼
                  mock-llm

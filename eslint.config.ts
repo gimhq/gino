@@ -29,10 +29,11 @@ export default antfu({
     "**/dist/**",
     "**/node_modules/**",
     "data/**",
+    "**/data/**",
     "**/drizzle/**",
     "docs/**",
     // Vendored verbatim from upstream lode (re-copied to update) — not ours to lint.
-    "src/lode/sdk.ts",
+    "apps/host/src/lode/sdk.ts",
   ],
 }, {
   // Plain-JS entry points run by `node` directly (the package Node smoke

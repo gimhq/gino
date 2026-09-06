@@ -3,14 +3,14 @@
 /**
  * Validate the `dist/` lode release outputs before they are uploaded — an
  * INDEPENDENT guard (run by `.github/workflows/release.yml`, and usable locally
- * after `bun run package`). It re-reads `dist/<asset>`, `dist/manifest.json` and
- * `dist/checksums.txt`, re-hashes the asset bytes, and asserts the `lode/v1`
+ * after `bun run package`). It re-reads `apps/host/dist/<asset>`, `manifest.json`
+ * and `checksums.txt` beside it, re-hashes the asset bytes, and asserts the `lode/v1`
  * manifest is well-formed and consistent with the actual bytes + expected
  * release coordinates. Exits non-zero (with `::error::` annotations) on any
  * problem, so a packaging bug or a hand-edit can't ship a mismatched release.
  *
  * Usage:
- *   bun scripts/validate-release.ts --version 0.2.0 \
+ *   bun apps/host/scripts/validate-release.ts --version 0.2.0 \
  *     --asset-url https://github.com/gimhq/gino/releases/download/v0.2.0/gino.js
  *   # optional: --app-name gino-host  --asset-name gino.js
  */

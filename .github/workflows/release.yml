@@ -67,7 +67,7 @@ jobs:
       - name: Validate lode release assets
         run: |
           set -euo pipefail
-          bun scripts/validate-release.ts \
+          bun apps/host/scripts/validate-release.ts \
             --app-name "${APP_NAME}" \
             --asset-name "${HOST_ASSET}" \
             --version "${RELEASE_VERSION}" \
@@ -76,8 +76,8 @@ jobs:
       # OPTIONAL signing (ed25519). Set a publisher key as the secret
       # LODE_SIGN_KEY to sign the asset + catalog with lode-cli; skipped otherwise
       # (an unsigned manifest still carries integrity).
-      #   - run: lode-cli sign "dist/${HOST_ASSET}" --version "${RELEASE_VERSION}" --key-env LODE_SIGN_KEY ...
-      #   - run: lode-cli manifest-sign --into dist/manifest.json --key-env LODE_SIGN_KEY
+      #   - run: lode-cli sign "apps/host/dist/${HOST_ASSET}" --version "${RELEASE_VERSION}" --key-env LODE_SIGN_KEY ...
+      #   - run: lode-cli manifest-sign --into apps/host/dist/manifest.json --key-env LODE_SIGN_KEY
 
       - name: Upload to the GitHub release
         env:
@@ -86,9 +86,9 @@ jobs:
           set -euo pipefail
           gh release view "${TAG_NAME}" >/dev/null
           gh release upload "${TAG_NAME}" \
-            "dist/${HOST_ASSET}" \
-            dist/manifest.json \
-            dist/checksums.txt \
+            "apps/host/dist/${HOST_ASSET}" \
+            apps/host/dist/manifest.json \
+            apps/host/dist/checksums.txt \
             --clobber
 
   agent:

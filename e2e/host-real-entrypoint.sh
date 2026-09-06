@@ -27,4 +27,4 @@ if [ -z "${GINO_PROXY_ANTHROPIC_API_KEY:-}" ] \
   fi
 fi
 
-exec bun src/index.ts
+exec bun apps/host/src/index.ts

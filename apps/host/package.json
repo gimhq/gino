@@ -1,0 +1,39 @@
+{
+  "name": "@gino/host",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gino host — protocol-v2 control plane (Bun + Hono) composed from the @gino/host-* packages.",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun dist/index.js",
+    "build": "bun build src/index.ts --outdir dist --target bun --minify",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "bun --env-file=/dev/null test ./tests/",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build",
+    "package": "bun scripts/package.ts",
+    "clean": "bun scripts/clean.ts"
+  },
+  "dependencies": {
+    "@gino/host-channels": "workspace:*",
+    "@gino/host-core": "workspace:*",
+    "@gino/host-hono": "workspace:*",
+    "@gino/host-proxy": "workspace:*",
+    "@gino/host-store-sqlite": "workspace:*",
+    "@scalar/hono-api-reference": "0.11.5",
+    "cac": "7.0.0",
+    "consola": "3.4.2",
+    "hono": "4.12.26",
+    "hono-openapi": "1.3.0",
+    "nanoid": "5.1.15",
+    "pino": "10.3.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "drizzle-orm": "0.45.2",
+    "eslint": "10.5.0",
+    "typescript": "6.0.3"
+  }
+}
