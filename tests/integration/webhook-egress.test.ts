@@ -1,14 +1,11 @@
+import type { Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { FetchLike } from "@/channels";
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import { createHostEvents } from "@gino/host-core";
+import { createTask, enrollAgent, ingestHttpFrame, setPlacement } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent } from "@/agents/registry";
 import { addWebhook, bindConversation, readCursor, registerChannel, startWebhookPump } from "@/channels";
-import { createDb } from "@/db";
-import { createHostEvents } from "@/host";
-import { ingestHttpFrame } from "@/protocol/inbound";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, setPlacement } from "@/tasks";
 
 // HOST-M5M6-04 regression — outbound webhook egress is WIRED. Pre-fix,
 // `pushChannelWebhooks` had no production caller: webhook channels stored

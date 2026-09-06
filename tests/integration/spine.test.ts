@@ -2,16 +2,14 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { enqueue, getThreadRun, getTranscript } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { tasks } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { tasks } from "@/db/schema";
-import { getThreadRun, getTranscript } from "@/msgstore";
-import { enqueue } from "@/protocol/outbox";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 // D-B1b — the PROTOCOL SPINE, proven end-to-end against a LIVE Bun server with a
 // real WebSocket: register → connect (connect-token auth) → frames persist + ack

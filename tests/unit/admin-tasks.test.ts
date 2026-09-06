@@ -1,20 +1,17 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { AppEnv } from "@/shared/lib/types";
+import { createHost } from "@gino/host-core";
+import { createTask, enrollAgent, getCron, getTask, setPlacement, writeThreadMessage, writeThreadResult } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { outbox } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { enrollAgent } from "@/agents/registry";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { outbox } from "@/db/schema";
 import { adminTaskRoutes } from "@/edge/admin/tasks";
-import { createHost } from "@/host";
-import { getCron, writeThreadMessage, writeThreadResult } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, getTask, setPlacement } from "@/tasks/store";
 
 // M4 admin surface — close lifecycle (HOST-M4-01/M4-09), cron addressing
 // (HOST-M4-02/M4-11), live-only interrupt (HOST-M4-03), and the bounded task

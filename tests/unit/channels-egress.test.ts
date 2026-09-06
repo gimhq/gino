@@ -1,8 +1,10 @@
+import type { Storage, ThreadMessageData } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
+import type { Channel } from "@gino/host-store-sqlite/schema";
 import type { DnsResolver, FetchLike, WebhookAttemptState } from "@/channels";
-import type { AppDatabase } from "@/db";
-import type { Channel } from "@/db/schema";
-import type { Storage } from "@/host/ports/storage";
-import type { ThreadMessageData } from "@/protocol/frames";
+import { createTask, writeThreadMessage } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { messages } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
 import {
@@ -18,11 +20,6 @@ import {
   registerChannel,
   tailTask,
 } from "@/channels";
-import { createDb } from "@/db";
-import { messages } from "@/db/schema";
-import { writeThreadMessage } from "@/msgstore";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask } from "@/tasks";
 
 // M6 egress (OD10) — tail the M5 store by a per-(channel, task) cursor: deliver
 // all kinds by default at-least-once (the cursor advances only on ack, never on

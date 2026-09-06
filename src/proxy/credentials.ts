@@ -1,4 +1,3 @@
-import type { ProviderUpstream, ProxyConfig } from "./config";
 // M7 — credential resolution + OAuth refresh. The host holds the real upstream
 // credentials; this store hands the right one to the forward path and refreshes
 // the Codex (ChatGPT) OAuth access token on demand from a configured refresh
@@ -7,7 +6,8 @@ import type { ProviderUpstream, ProxyConfig } from "./config";
 // src/auth/credential-manager.ts), reshaped for v2: credentials come from host
 // config (host = sole config source), refresh is lazy/on-demand (no background
 // timer), and nothing is read from `~/.claude` / `~/.codex`.
-import type { Logger } from "@/shared/lib/logger";
+import type { Logger } from "@gino/host-core";
+import type { ProviderUpstream, ProxyConfig } from "./config";
 
 // Codex OAuth constants (from the v1 reference / CLIProxyAPI).
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";

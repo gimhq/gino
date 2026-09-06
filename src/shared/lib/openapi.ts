@@ -16,9 +16,9 @@
 import type { ValidationTargets } from "hono";
 import type { StatusCode } from "hono/utils/http-status";
 import type { ZodType } from "zod";
+import { ValidationError } from "@gino/host-core";
 import { validator as baseValidator, describeRoute, resolver } from "hono-openapi";
 import { z } from "zod";
-import { ValidationError } from "@/shared/lib/errors";
 
 export { describeRoute, resolver };
 

@@ -1,13 +1,10 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
-import type { AgentTransport } from "@/host/ports/transport";
+import type { AgentTransport, Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
+import { enrollAgent, getTask, grantOwner } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { messages } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { enrollAgent, grantOwner } from "@/agents/registry";
 import { getBinding, registerChannel, routeInbound } from "@/channels";
-import { createDb } from "@/db";
-import { messages } from "@/db/schema";
-import { sqliteStorage } from "@/store/sqlite";
-import { getTask } from "@/tasks";
 
 // M6 ingress (OD9/OD16) — route an inbound message: continue a known conversation
 // or open a NEW task stamped with the CHANNEL's owner, dispatch it, deliver. The

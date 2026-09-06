@@ -1,18 +1,15 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
-import type { AgentTransport } from "@/host/ports/transport";
+import type { AgentTransport, Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createTask, emitTaskUpsert, getEntries, getTask, listArtifacts, setPlacement } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { getEntries, listArtifacts } from "@/configstore";
-import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, emitTaskUpsert, getTask, setPlacement } from "@/tasks";
 
 // M8/B6 end-to-end provisioning (host = single source of truth):
 //   1. POST /admin/config/artifacts  → content-addressed store + config_artifacts

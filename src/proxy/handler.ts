@@ -1,6 +1,3 @@
-import type { WsFactory } from "./bridge";
-import type { ProxyConfig } from "./config";
-import type { CredentialStore, FetchLike } from "./credentials";
 // M7 — the HTTP forward path. Given an upstream subpath (already `/llm`-stripped
 // by the router) and the raw request, it: detects the provider, resolves the
 // model (alias → upstream), bridges Claude→OpenAI when a `/v1/messages` request
@@ -8,7 +5,10 @@ import type { CredentialStore, FetchLike } from "./credentials";
 // scrubs hop/internal headers, rewrites the aliased model, and forwards via an
 // injectable `fetch`. Tests drive it with a mock `fetchImpl` + `wsFactory` — no
 // real network.
-import type { Logger } from "@/shared/lib/logger";
+import type { Logger } from "@gino/host-core";
+import type { WsFactory } from "./bridge";
+import type { ProxyConfig } from "./config";
+import type { CredentialStore, FetchLike } from "./credentials";
 import { bridgeClaudeToOpenAI } from "./bridge";
 import { resolveModel } from "./model-map";
 import {

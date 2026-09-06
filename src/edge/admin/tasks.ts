@@ -16,32 +16,14 @@
 // Every host→agent effect goes through the M2 outbox (orchestrator). Crons/
 // threads/messages are M5 read-only mirrors here. Responses use the shared
 // `{ success, data }` envelope.
-import type { CronRow, Storage, TaskRow } from "@/host/ports/storage";
-import type { CronUpsertData } from "@/protocol/frames";
+import type { CronRow, CronUpsertData, Storage, TaskRow } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
+import { AppError, AttachmentDescriptor } from "@gino/host-core";
+import { assignTaskToAgent, closeTask, createTask, emitCronDelete, emitCronUpsert, emitInterrupt, emitTaskUpsert, getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, listTaskCrons, listTasks, placeTask, requireTask, sendTaskMessage, TASK_STATUS, TRANSCRIPT_READ_LIMIT, transitionTaskStatus } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, TRANSCRIPT_READ_LIMIT } from "@/msgstore";
-import { AttachmentDescriptor } from "@/protocol/frames";
 import { ok } from "@/shared/lib/api-response";
-import { AppError } from "@/shared/lib/errors";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import {
-  assignTaskToAgent,
-  closeTask,
-  createTask,
-  emitCronDelete,
-  emitCronUpsert,
-  emitInterrupt,
-  emitTaskUpsert,
-  listTaskCrons,
-  listTasks,
-  placeTask,
-  requireTask,
-  sendTaskMessage,
-  TASK_STATUS,
-  transitionTaskStatus,
-} from "@/tasks";
 
 /** Public projection of a task row. */
 function serializeTask(task: TaskRow) {
