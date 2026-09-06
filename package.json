@@ -18,10 +18,11 @@
     "lint:fix": "eslint . --fix",
     "test": "bun --env-file=/dev/null test",
     "test:coverage": "bun --env-file=/dev/null test --coverage",
-    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run --filter @gino/host-channels check && bun run --filter @gino/host-hono check && bun run --filter @gino/host-proxy check && bun run --filter @gino/host check",
+    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run --filter @gino/host-channels check && bun run --filter @gino/host-hono check && bun run --filter @gino/host-proxy check && bun run --filter @gino/host check && bun run --filter @gino/example-embed-node check",
     "package": "bun apps/host/scripts/package.ts",
     "clean": "bun apps/host/scripts/clean.ts",
     "e2e": "bash e2e/run.sh",
+    "example:embed-node": "bun run --filter @gino/example-embed-node e2e",
     "gen:frames-schema": "bun run scripts/gen-frames-schema.ts",
     "db:generate": "bun run --filter @gino/host-store-sqlite db:generate",
     "db:studio": "bun run --filter @gino/host-store-sqlite db:studio"
