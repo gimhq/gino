@@ -1,11 +1,10 @@
 import type { AppEnv } from "@/shared/lib/types";
 import { AppError } from "@gino/host-core";
+import { describeRoute, errors, jsonOk, ok, resolver, SECURITY, TAGS, validator } from "@gino/host-hono";
 import { Hono } from "hono";
 import { z } from "zod";
 import { BUILD_INFO } from "@/build-info";
 import { getLodeSummary, requestLodeRestart, requestLodeRollback, requestLodeUpdate, setLodeHold } from "@/lode";
-import { ok } from "@/shared/lib/api-response";
-import { describeRoute, errors, jsonOk, resolver, SECURITY, TAGS, validator } from "@/shared/lib/openapi";
 import { adminTokenAuth } from "@/shared/middleware/auth";
 
 // A lode version token: a concrete version or the "latest" channel pointer.

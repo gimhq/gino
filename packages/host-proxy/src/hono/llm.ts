@@ -1,56 +1,48 @@
-import type { ProxyHandler, WsFactory } from "@gino/host-proxy";
-import type { ClientSocket, CodexRelay } from "@gino/host-proxy/bun";
+import type { Host } from "@gino/host-core";
+import type { HostEnv } from "@gino/host-hono";
 import type { MiddlewareHandler } from "hono";
-import type { Config } from "@/config";
-import type { AppEnv } from "@/shared/lib/types";
+import type { WsFactory } from "../bridge";
+import type { ProxyEnv } from "../config";
+import type { ClientSocket, CodexRelay } from "../ws-bridge";
 import { UnauthorizedError } from "@gino/host-core";
-import { hashToken } from "@gino/host-core/domain";
-import { buildProxyConfig, createProxyHandler, CredentialStore, extractProxyCredential, verifyProxyCredential } from "@gino/host-proxy";
-import { createCodexRelay } from "@gino/host-proxy/bun";
+import { bindHost, describeRoute, errors, raw, TAGS } from "@gino/host-hono";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { describeRoute, errors, raw, TAGS } from "@/shared/lib/openapi";
-import { rateLimit } from "@/shared/middleware/rate-limit";
+import { verifyProxyCredential } from "../auth";
+import { buildProxyConfig } from "../config";
+import { CredentialStore } from "../credentials";
+import { createProxyHandler } from "../handler";
+import { createCodexRelay } from "../ws-bridge";
 
 /**
- * Validate the engine's proxy credential; 401 (UnauthorizedError) on failure.
- * Auth is path-aware: an Anthropic temp key only clears the pass-through
- * paths, never the host-credential-injecting ones (HOST-M7-01).
- */
-const proxyAuth: MiddlewareHandler<AppEnv> = async (c, next) => {
-  const config = c.get("config");
-  const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
-  const ok = verifyProxyCredential(c.req.raw.headers, {
-    storage: c.get("host").storage,
-    staticKey: config.PROXY_STATIC_KEY || undefined,
-  }, pathname);
-  if (!ok)
-    throw new UnauthorizedError();
-  await next();
-};
-
-/**
- * M7 — `/llm/*` credential proxy (mounted at `/llm`). The engine's LLM traffic
+ * M7 — `/llm/*` credential proxy (mount at `/llm`). The engine's LLM traffic
  * enters here (its ANTHROPIC_BASE_URL/OPENAI_BASE_URL = `<hostUrl>/llm`); the
  * host injects the real upstream credential and forwards. Explicit prefixes
  * only — no catch-all, so an unknown `/llm/...` path 404s. Every route is
  * guarded by the proxy credential (per-agent connect token vs
- * `agents.connect_token_hash`, or the static proxy key — see `src/proxy/auth`).
+ * `agents.connect_token_hash`, or the static proxy key — see `../auth`).
  *
  * The forward handler (provider detect, credential inject, header strip,
- * model-map, Claude→OpenAI bridge) lives in `src/proxy`; this router is the thin
- * transport edge that strips the `/llm` prefix and delegates.
+ * model-map, Claude→OpenAI bridge) lives in the package root; this router is
+ * the thin transport edge that strips the `/llm` prefix and delegates.
  *
- * `/v1/responses` (the raw Codex WS passthrough) is a real WebSocket UPGRADE:
- * it reuses the host's shared `hono/bun` `upgradeWebSocket` (the same
- * `createBunWebSocket` instance whose `websocket` handler is registered on
- * `Bun.serve` in `src/app.ts`/`src/index.ts`) and hands the upgraded peer to the
- * proxy's `createCodexRelay` (raw bidirectional Codex passthrough). The
+ * BUN-ONLY (`@gino/host-proxy/hono`, host-sdk-design §7.5): `/v1/responses`
+ * (the raw Codex WS passthrough) is a real WebSocket UPGRADE over the shared
+ * `hono/bun` `upgradeWebSocket` (the same instance whose `websocket` handler
+ * the app registers on `Bun.serve`) and hands the upgraded peer to
+ * `createCodexRelay` (raw bidirectional Codex passthrough). The
  * proxy-credential gate runs as ordinary `/llm` middleware BEFORE the upgrade,
  * so an unauthenticated handshake is rejected and no socket opens. A plain
  * (non-Upgrade) GET gets a clean `426 Upgrade Required`.
+ *
+ * Rate limiting (HOST-M7-03, per verified principal) is the embedder's
+ * middleware, applied ahead of this mount (D10).
  */
-export interface LlmRoutesOptions {
+export interface LlmRouterOptions {
+  /** The host env's `PROXY_*` settings (the standalone app passes its resolved config). */
+  readonly config: ProxyEnv;
+  /** The app's base path: the router is expected to be mounted at `${basePath}/api/llm` (see `stripLlmPrefix`). */
+  readonly basePath: string;
   /**
    * Override the upstream Codex WS factory for `/v1/responses`. Production uses
    * the real `WebSocket`; tests inject a fake so the relay is exercised with no
@@ -61,46 +53,33 @@ export interface LlmRoutesOptions {
   readonly upstreamUrl?: string;
 }
 
-export function llmRoutes(opts: LlmRoutesOptions = {}) {
-  const router = new Hono<AppEnv>();
+export function llmRouter(host: Host, opts: LlmRouterOptions) {
+  const router = new Hono<HostEnv>();
+  const { basePath } = opts;
+  const logger = host.logger;
 
-  // Lazily build the proxy handler + credential store from the resolved config
-  // (set per-request by app middleware). Memoised across requests so the Codex
-  // OAuth refresh state in the CredentialStore persists — and so the WS relay
-  // shares the same store as the HTTP forward path.
-  let proxy: { handler: ProxyHandler; credentials: CredentialStore } | null = null;
-  let builtFor: Config | null = null;
-  const getProxy = (config: Config, logger: AppEnv["Variables"]["logger"]) => {
-    if (!proxy || builtFor !== config) {
-      const proxyConfig = buildProxyConfig(config, logger);
-      const credentials = new CredentialStore(proxyConfig, { logger });
-      proxy = { handler: createProxyHandler({ config: proxyConfig, credentials, logger }), credentials };
-      builtFor = config;
-    }
-    return proxy;
+  // The proxy handler + credential store are built once per router so the
+  // Codex OAuth refresh state in the CredentialStore persists — and so the WS
+  // relay shares the same store as the HTTP forward path.
+  const proxyConfig = buildProxyConfig(opts.config, logger);
+  const credentials = new CredentialStore(proxyConfig, { logger });
+  const handler = createProxyHandler({ config: proxyConfig, credentials, logger });
+  const staticKey = opts.config.PROXY_STATIC_KEY || undefined;
+
+  /**
+   * Validate the engine's proxy credential; 401 (UnauthorizedError) on failure.
+   * Auth is path-aware: an Anthropic temp key only clears the pass-through
+   * paths, never the host-credential-injecting ones (HOST-M7-01).
+   */
+  const proxyAuth: MiddlewareHandler<HostEnv> = async (c, next) => {
+    const { pathname } = stripLlmPrefix(c.req.url, basePath);
+    const ok = verifyProxyCredential(c.req.raw.headers, { storage: host.storage, staticKey }, pathname);
+    if (!ok)
+      throw new UnauthorizedError();
+    await next();
   };
 
-  // HOST-M7-03: throttle the whole /llm surface ahead of auth. A VERIFIED
-  // proxy credential drains its own per-principal budget (keyed by token
-  // hash, never the raw secret) so agents sharing a NAT don't collide; an
-  // absent or invalid credential falls back to the client IP, so failed-auth
-  // floods cannot rotate guessed tokens to evade the limit.
-  router.use("*", rateLimit({
-    bucket: "llm",
-    limits: config => ({ windowMs: config.RATE_LIMIT_LLM_WINDOW_MS, max: config.RATE_LIMIT_LLM_MAX }),
-    key: (c) => {
-      const config = c.var.config;
-      const cred = extractProxyCredential(c.req.raw.headers);
-      if (!cred)
-        return null;
-      const { pathname } = stripLlmPrefix(c.req.url, config.BASE_PATH);
-      const ok = verifyProxyCredential(c.req.raw.headers, {
-        storage: c.var.host.storage,
-        staticKey: config.PROXY_STATIC_KEY || undefined,
-      }, pathname);
-      return ok ? `cred:${hashToken(cred)}` : null;
-    },
-  }));
+  router.use("*", bindHost(host));
 
   // Proxy-credential auth on every /llm route — including the WS handshake, so
   // an unauthenticated upgrade is rejected (401) before any socket opens.
@@ -112,10 +91,9 @@ export function llmRoutes(opts: LlmRoutesOptions = {}) {
       summary,
       responses: { ...raw(200, "application/json", "Upstream response (passthrough / SSE)"), ...errors(401, 404, 502) },
     }),
-    (c: Parameters<MiddlewareHandler<AppEnv>>[0]) => {
-      const config = c.get("config");
-      const { pathname, search } = stripLlmPrefix(c.req.url, config.BASE_PATH);
-      return getProxy(config, c.get("logger")).handler.handle(c.req.raw, pathname, search);
+    (c: Parameters<MiddlewareHandler<HostEnv>>[0]) => {
+      const { pathname, search } = stripLlmPrefix(c.req.url, basePath);
+      return handler.handle(c.req.raw, pathname, search);
     },
   ] as const;
 
@@ -129,10 +107,7 @@ export function llmRoutes(opts: LlmRoutesOptions = {}) {
   // CredentialStore (which injects the upstream OAuth creds). Client frames are
   // buffered until upstream is ready, then relayed both ways (see ws-bridge).
   const wsUpgrade = upgradeWebSocket((c) => {
-    const config = c.get("config");
-    const logger = c.get("logger");
-    const { search } = stripLlmPrefix(c.req.url, config.BASE_PATH);
-    const { credentials } = getProxy(config, logger);
+    const { search } = stripLlmPrefix(c.req.url, basePath);
     let relay: CodexRelay | null = null;
     return {
       onOpen(_evt, ws) {

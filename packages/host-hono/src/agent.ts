@@ -1,26 +1,41 @@
-import type { HttpResult } from "@gino/host-core";
+import type { Host, HttpResult } from "@gino/host-core";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import type { AppEnv } from "@/shared/lib/types";
+import type { UpgradeWebSocket } from "hono/ws";
+import type { HostEnv } from "./env";
 import { UnauthorizedError } from "@gino/host-core";
-import { readBodyCapped, registerError } from "@gino/host-core/domain";
+import { readBodyCapped } from "@gino/host-core/domain";
 import { Hono } from "hono";
-import { upgradeWebSocket } from "hono/bun";
-import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
-import { bearerToken, connectTokenAuth } from "@/shared/middleware/auth";
-import { rateLimit } from "@/shared/middleware/rate-limit";
+import { bearerToken, connectTokenAuth } from "./auth";
+import { bindHost } from "./env";
+import { describeRoute, errors, TAGS } from "./openapi";
 
 /**
- * M1/M2/M3 — `/agent/*` data plane (mounted at `/agent`): a thin Hono mount over
- * `host.wire` (src/host/wire — host-sdk-design §3.2). The protocol logic lives
- * there; this shim owns only rate limiting, OpenAPI metadata, the connect-token
- * middleware, the body cap and the WebSocket upgrade. `POST /register` carries
- * the shared register token; everything else the per-agent `x-internal-token`.
- * Explicit routes only — no catch-all. An unknown `/agent/...` path 404s.
+ * M1/M2/M3 — `/agent/*` data plane (mount at `/agent`): a thin Hono mount over
+ * `host.wire` (host-core `host/wire` — host-sdk-design §3.2). The protocol
+ * logic lives there; this shim owns only OpenAPI metadata, the connect-token
+ * middleware, the body cap and the injected WebSocket upgrade (`./bun` or
+ * `./node`). Rate limiting is the embedder's (D10 — applied ahead of the
+ * mount). `POST /register` carries the shared register token; everything else
+ * the per-agent `x-internal-token`. Explicit routes only — no catch-all. An
+ * unknown `/agent/...` path 404s.
  */
 
+export interface AgentRouterOptions {
+  /** The runtime's upgrade helper: `bunWebSocket().upgradeWebSocket` or `nodeWebSocket(app).upgradeWebSocket`. */
+  readonly upgradeWebSocket: UpgradeWebSocket;
+  /**
+   * Resolve the client IP of a request (behind a trusted proxy, say). Reserved
+   * for the protocol §3 register context (host-sdk-design §3.2); the current
+   * wire does not consume it.
+   */
+  readonly clientIp?: (c: Context<HostEnv>) => string | undefined;
+  /** Byte cap for `POST /attachments` (default: `host.options.maxUploadBytes`). */
+  readonly maxUploadBytes?: number;
+}
+
 /** Map a framework-free `HttpResult` onto a hono `Response`. */
-function toResponse(c: Context<AppEnv>, result: HttpResult): Response {
+function toResponse(c: Context<HostEnv>, result: HttpResult): Response {
   const status = result.status as ContentfulStatusCode;
   const headers = result.headers ?? {};
   if (result.body instanceof Uint8Array) {
@@ -34,21 +49,19 @@ function toResponse(c: Context<AppEnv>, result: HttpResult): Response {
   return c.json(result.body, status, headers);
 }
 
-export function agentRoutes() {
-  const router = new Hono<AppEnv>();
+export function agentRouter(host: Host, opts: AgentRouterOptions) {
+  const { upgradeWebSocket } = opts;
+  const maxUploadBytes = opts.maxUploadBytes ?? host.options.maxUploadBytes;
+  const router = new Hono<HostEnv>();
+
+  router.use("*", bindHost(host));
 
   // ── Enrollment (M3) — register token; version-gated; mints the connect token.
   router.post(
     "/register",
-    // HOST-M1M2-10 / HOST-M9-02: throttle enrollment per client IP BEFORE the
-    // token check, so shared-secret brute force and register-retry loops are
-    // bounded. Over-limit renders the protocol §3 `register_error{rate_limited}`
-    // envelope (Retry-After is set by the middleware).
-    rateLimit({
-      bucket: "agent-register",
-      limits: config => ({ windowMs: config.RATE_LIMIT_REGISTER_WINDOW_MS, max: config.RATE_LIMIT_REGISTER_MAX }),
-      onLimit: c => c.json(registerError("rate_limited"), 429),
-    }),
+    // HOST-M1M2-10 / HOST-M9-02: the per-IP enrollment throttle (ahead of the
+    // token check; over-limit → protocol §3 `register_error{rate_limited}`) is
+    // the embedder's middleware, applied before this mount (D10).
     describeRoute({
       tags: [TAGS.Agents],
       summary: "Enroll an agent (returns agentId + connect token + config)",
@@ -66,13 +79,13 @@ export function agentRoutes() {
     },
   );
 
-  // ── WS session + frame pipe (M2/M3) — connect token verified per-agent (upgrade by hono/bun).
+  // ── WS session + frame pipe (M2/M3) — connect token verified per-agent (upgrade by the injected adapter).
   router.get(
     "/ws/:agentId",
     connectTokenAuth,
     upgradeWebSocket((c) => {
       const agentId = c.req.param("agentId");
-      const wire = c.get("host").wire;
+      const wire = host.wire;
       // Per-agent auth (M3): verify against the stored hash. Throwing here
       // rejects the upgrade with the standard 401 envelope (no socket opens).
       if (!agentId || !wire.authorizeAgent(agentId, c.req.header("x-internal-token") ?? "")) {
@@ -178,10 +191,9 @@ export function agentRoutes() {
       responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401, 413) },
     }),
     async (c) => {
-      const host = c.get("host");
       // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
-      const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);
+      const bytes = await readBodyCapped(c.req.raw, maxUploadBytes);
       return toResponse(c, host.wire.attachments.ingest(c.get("agentId"), {
         name: c.req.query("name") ?? c.req.header("x-attachment-name"),
         taskId: c.req.query("task_id"),

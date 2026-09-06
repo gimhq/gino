@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { err, ok, paged } from "@/shared/lib/api-response";
+import { err, ok, paged } from "../../src/api-response";
 
 describe("api-response", () => {
   it("ok wraps data in a success envelope", () => {

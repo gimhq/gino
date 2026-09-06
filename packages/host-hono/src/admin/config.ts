@@ -9,12 +9,12 @@
 // unified store (dedup by sha256); entries declare the per-scope desired set with
 // host-resolved per-engine `target`. The host NEVER materializes on an agent — it
 // only declares + serves; the agent reconciles. Responses use `{ success, data }`.
-import type { AppEnv } from "@/shared/lib/types";
+import type { HostEnv } from "../env";
 import { broadcastGlobalConfig, DEFAULT_ENGINE, getGlobalConfigVersion, getTask, GLOBAL_SCOPE, ingestArtifact, readBodyCapped, resolveEntries, setEntries } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { ok } from "@/shared/lib/api-response";
-import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
+import { ok } from "../api-response";
+import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "../openapi";
 
 const entriesBody = z.object({
   scope: z.string().min(1),
@@ -29,7 +29,7 @@ const entriesBody = z.object({
 });
 
 export function adminConfigRoutes() {
-  const router = new Hono<AppEnv>();
+  const router = new Hono<HostEnv>();
 
   // ── Upload / version an artifact (skill dir | instruction file) ────────────
   router.post(

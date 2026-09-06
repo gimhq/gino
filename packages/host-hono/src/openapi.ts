@@ -1,6 +1,6 @@
 // OpenAPI integration helpers, shared by every module's `*.routes.ts`.
 //
-// The host keeps plain `new Hono<AppEnv>()` route factories; OpenAPI is
+// The host keeps plain `new Hono<HostEnv>()` route factories; OpenAPI is
 // layered on via `hono-openapi` middleware:
 //
 //   - `describeRoute({ tags, summary, responses })` documents a route and
