@@ -1,18 +1,17 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { verifyConnectToken } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { tasks } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
-import { verifyConnectToken } from "@/agents/registry";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { tasks } from "@/db/schema";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 // M3 — `/admin/agents` OOB control API (behind the channel token).
 

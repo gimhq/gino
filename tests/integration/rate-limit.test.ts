@@ -3,20 +3,19 @@
 // §3), the /llm/* proxy surface (per-principal keying), and the /messages/*
 // channel-token routes. Each `newApp` call builds a fresh config object, so
 // its rate-limit buckets are isolated (state is keyed by config identity).
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { hashToken } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { agents } from "@gino/host-store-sqlite/schema";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
 import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { agents } from "@/db/schema";
-import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 const REGISTER_TOKEN = "reg-secret-rl";
 const CHANNEL_TOKEN = "chan-secret-rl";

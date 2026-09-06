@@ -11,7 +11,6 @@ coveragePathIgnorePatterns = [
   "src/index.ts",
   "src/cli.ts",
   "src/app.ts",
-  "src/db/embedded-migrations.ts",
   "**/*.routes.ts",
   "**/*.test.ts",
 ]

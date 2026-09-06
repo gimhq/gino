@@ -9,13 +9,10 @@
 // `owner_id` (OD16 — the host never computes user→owner; the external system
 // supplied it at registration) → M4 dispatch (owner-pinned, §3) → deliver the
 // message. The old "group" delivery role is dissolved into this routing.
-import type { HostEvents } from "@/host/events";
-import type { ChannelRow, Storage } from "@/host/ports/storage";
-import type { AgentTransport } from "@/host/ports/transport";
-import type { AttachmentDescriptor } from "@/protocol/frames";
-import type { DispatchResult } from "@/tasks";
-import { ValidationError } from "@/shared/lib/errors";
-import { createTask, getTask, placeTask, requireTask, sendTaskMessage } from "@/tasks";
+import type { AgentTransport, AttachmentDescriptor, ChannelRow, HostEvents, Storage } from "@gino/host-core";
+import type { DispatchResult } from "@gino/host-core/domain";
+import { ValidationError } from "@gino/host-core";
+import { createTask, getTask, placeTask, requireTask, sendTaskMessage } from "@gino/host-core/domain";
 import { requireChannels } from "./registry";
 
 export interface InboundMessage {

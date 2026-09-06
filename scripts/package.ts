@@ -2,7 +2,8 @@
 /* eslint-disable no-console */
 /**
  * Package the host as a **lode** release asset, end to end:
- *   1. embed the drizzle migrations into `src/db/embedded-migrations.ts`,
+ *   1. embed the drizzle migrations into
+ *      `packages/host-store-sqlite/src/embedded-migrations.ts`,
  *   2. bundle to a single JS file `dist/gino.js` via `bun build --target bun`
  *      (NOT `--compile` — lode's `[runtime]` provides `bun`), injecting
  *      `BUILD_COMMIT`/`BUILD_TIME`/`BUILD_VERSION`, then restore the stub,
@@ -37,8 +38,9 @@ const { values: args } = parseArgs({
 
 const ROOT = resolve(import.meta.dir, "..");
 const OUT_DIR = resolve(ROOT, "dist");
-const DRIZZLE_DIR = resolve(ROOT, "drizzle");
-const MIGRATIONS_FILE = resolve(ROOT, "src/db/embedded-migrations.ts");
+const STORE_PKG = resolve(ROOT, "packages/host-store-sqlite");
+const DRIZZLE_DIR = resolve(STORE_PKG, "drizzle");
+const MIGRATIONS_FILE = resolve(STORE_PKG, "src/embedded-migrations.ts");
 const MIGRATIONS_BACKUP = `${MIGRATIONS_FILE}.bak`;
 
 const APP_NAME = (args["app-name"] as string | undefined) ?? "gino-host";

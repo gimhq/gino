@@ -1,17 +1,15 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTask, enrollAgent, grantOwner, setPlacement } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { enrollAgent, grantOwner } from "@/agents/registry";
 import { createApp, createAppHost } from "@/app";
 import { registerChannel } from "@/channels";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, setPlacement } from "@/tasks";
 
 // Edge input hardening regressions:
 //   HOST-M1M2-11 — byte-ingest endpoints enforce MAX_UPLOAD_BYTES (413), on the

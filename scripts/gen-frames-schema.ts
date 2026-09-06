@@ -14,8 +14,8 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { AgentFrame, AnyFrame, HostFrame } from "@gino/host-core";
 import { z } from "zod";
-import { AgentFrame, AnyFrame, HostFrame } from "@/protocol/frames";
 
 const PROTOCOL_MD = resolve(import.meta.dir, "../docs/protocol.md");
 export const MARKER = "## 8. Frame JSON Schema (generated)";

@@ -1,4 +1,3 @@
-import type { CredentialStore } from "./credentials";
 // M7 — Claude→OpenAI bridge. Translates a Claude Messages request to the OpenAI
 // Responses API, sends it over a WebSocket to chatgpt.com, and streams the
 // response back as Claude-compatible SSE. The engine speaks the Claude Messages
@@ -8,7 +7,8 @@ import type { CredentialStore } from "./credentials";
 // reshaped for v2: credentials come from the `CredentialStore`, and the
 // WebSocket constructor is injectable (`wsFactory`) so the whole bridge is
 // unit-testable with a fake socket and no real network.
-import type { Logger } from "@/shared/lib/logger";
+import type { Logger } from "@gino/host-core";
+import type { CredentialStore } from "./credentials";
 import { claudeToOpenAIRequest, createTranslatorState, openAIEventToClaudeSSE } from "./translator";
 
 const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";

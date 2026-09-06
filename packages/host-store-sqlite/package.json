@@ -1,0 +1,41 @@
+{
+  "name": "@gino/host-store-sqlite",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Gino host Storage adapter — drizzle-orm over sqlite (bun:sqlite).",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./schema": {
+      "bun": "./src/schema.ts",
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun --env-file=/dev/null test ./tests/",
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm --packages external --external bun:sqlite && bun build src/schema.ts --outdir dist --target bun --format esm --packages external && tsc -p tsconfig.build.json",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build",
+    "db:generate": "drizzle-kit generate",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "@gino/host-core": "workspace:*",
+    "drizzle-orm": "0.45.2"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "drizzle-kit": "0.31.10",
+    "eslint": "10.5.0",
+    "typescript": "6.0.3"
+  }
+}

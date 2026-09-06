@@ -1,5 +1,3 @@
-import type { BridgeSocket, WsFactory } from "./bridge";
-import type { CredentialStore } from "./credentials";
 // M7 — raw Codex WebSocket relay for `/llm/v1/responses` (the Codex SDK's
 // streaming endpoint). This relay is LIVE and production-reachable: the
 // HTTP→WS upgrade is wired in `src/edge/llm.ts`, which authenticates the
@@ -11,7 +9,9 @@ import type { CredentialStore } from "./credentials";
 // Ported from the v1 WS proxy (backup/pre-hostv2 src/api/ws-proxy.ts), reshaped
 // to take an injectable upstream `WsFactory` + an abstract client socket so the
 // relay is exercised with no real network.
-import type { Logger } from "@/shared/lib/logger";
+import type { Logger } from "@gino/host-core";
+import type { BridgeSocket, WsFactory } from "./bridge";
+import type { CredentialStore } from "./credentials";
 import { CODEX_WS_URL } from "./bridge";
 
 // Cap on client frames buffered before the upstream opens (HOST-M7-04): a

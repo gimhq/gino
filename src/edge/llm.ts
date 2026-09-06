@@ -2,11 +2,11 @@ import type { MiddlewareHandler } from "hono";
 import type { Config } from "@/config";
 import type { ClientSocket, CodexRelay, ProxyHandler, WsFactory } from "@/proxy";
 import type { AppEnv } from "@/shared/lib/types";
+import { UnauthorizedError } from "@gino/host-core";
+import { hashToken } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { hashToken } from "@/platform";
 import { buildProxyConfig, createCodexRelay, createProxyHandler, CredentialStore, extractProxyCredential, verifyProxyCredential } from "@/proxy";
-import { UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, raw, TAGS } from "@/shared/lib/openapi";
 import { rateLimit } from "@/shared/middleware/rate-limit";
 

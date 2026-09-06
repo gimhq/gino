@@ -9,13 +9,13 @@
 // transcript (storage ⟂ distribution, §9). Ingress hands the message to M4 via
 // the orchestrator (it writes only `channel_bindings`). Explicit routes only —
 // no catch-all.
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
+import { AttachmentDescriptor } from "@gino/host-core";
+import { hashToken, safeEqual } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
 import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@/channels";
-import { hashToken, safeEqual } from "@/platform";
-import { AttachmentDescriptor } from "@/protocol/frames";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 import { bearerToken, channelTokenAuth } from "@/shared/middleware/auth";
