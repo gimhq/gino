@@ -30,7 +30,7 @@
     "test": "bun --env-file=/dev/null test ./tests/",
     "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/domain.ts --outdir dist --target node --format esm --packages external && tsc -p tsconfig.build.json",
     "check": "bun run lint && bun run typecheck && bun run test && bun run build && bun run test:node",
-    "test:node": "node --test tests/node/conformance.mts"
+    "test:node": "node --test tests/node/conformance.mts tests/node/identity.mts"
   },
   "dependencies": {
     "nanoid": "5.1.15",
