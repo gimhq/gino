@@ -29,7 +29,7 @@ services:
       - /tmp
     environment:
       NODE_ENV: development
-      ROOT_DIR: /app
+      ROOT_DIR: /app/apps/host
       GINO_PORT: "3000"
       GINO_HOST: 0.0.0.0
       GINO_DB_PATH: /tmp/gino/gino.db
