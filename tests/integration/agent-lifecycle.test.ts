@@ -1,17 +1,16 @@
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { getAgent, sweepLiveness } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
-import { sweepLiveness } from "@/agents/liveness";
-import { getAgent } from "@/agents/registry";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 // M3 agent status lifecycle against a LIVE server (HOST-M1M2-05 / HOST-M3-02 /
 // HOST-M3-08): a dirty reconnect's superseded-socket close must not clobber the

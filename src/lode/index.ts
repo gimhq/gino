@@ -6,9 +6,9 @@
 // the thin app glue: a read-only summary for /system/version, the operator
 // actions the admin UI calls, and the boot-time readiness/prepare wiring.
 
+import type { Logger } from "@gino/host-core";
 import type { LodeConfig } from "./config";
 import type { State } from "./sdk";
-import type { Logger } from "@/shared/lib/logger";
 import { readLodeConfig } from "./config";
 import { activeVersion, isSupervised, Lode, readiness } from "./sdk";
 

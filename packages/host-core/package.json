@@ -1,0 +1,47 @@
+{
+  "name": "@gino/host-core",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Gino host SDK core — protocol, domain, ports; no HTTP framework, no Bun-only API.",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./domain": {
+      "bun": "./src/domain.ts",
+      "types": "./dist/domain.d.ts",
+      "import": "./dist/domain.js"
+    },
+    "./testing": {
+      "bun": "./tests/conformance/storage.conformance.ts",
+      "types": "./tests/conformance/storage.conformance.ts",
+      "import": "./tests/conformance/storage.conformance.ts"
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun --env-file=/dev/null test ./tests/",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/domain.ts --outdir dist --target node --format esm --packages external && tsc -p tsconfig.build.json",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build && bun run test:node",
+    "test:node": "node --test tests/node/conformance.mts"
+  },
+  "dependencies": {
+    "nanoid": "5.1.15",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@gino/host-store-sqlite": "workspace:*",
+    "@types/bun": "1.3.14",
+    "@types/node": "^24.0.0",
+    "eslint": "10.5.0",
+    "expect": "30.5.1",
+    "typescript": "6.0.3"
+  }
+}
