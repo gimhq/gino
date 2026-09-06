@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { builtinModelMap, resolveModel } from "@/proxy";
+import { builtinModelMap, resolveModel } from "../../src/index";
 
 describe("M7 proxy/model-map — resolveModel", () => {
   it("resolves built-in anthropic aliases", () => {

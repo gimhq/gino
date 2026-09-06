@@ -1,7 +1,7 @@
 import type { Storage, ThreadMessageData } from "@gino/host-core";
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Channel } from "@gino/host-store-sqlite/schema";
-import type { DnsResolver, FetchLike, WebhookAttemptState } from "@/channels";
+import type { DnsResolver, FetchLike, WebhookAttemptState } from "../../src/index";
 import { createTask, writeThreadMessage } from "@gino/host-core/domain";
 import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
@@ -20,7 +20,7 @@ import {
   readCursor,
   registerChannel,
   tailTask,
-} from "@/channels";
+} from "../../src/index";
 
 // M6 egress (OD10) — tail the M5 store by a per-(channel, task) cursor: deliver
 // all kinds by default at-least-once (the cursor advances only on ack, never on

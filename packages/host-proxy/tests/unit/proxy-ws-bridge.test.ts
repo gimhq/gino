@@ -1,6 +1,8 @@
-import type { BridgeSocket, ClientSocket, ProxyConfig, WsFactory } from "@/proxy";
+import type { ClientSocket } from "../../src/bun";
+import type { BridgeSocket, ProxyConfig, WsFactory } from "../../src/index";
 import { describe, expect, it } from "bun:test";
-import { createCodexRelay, CredentialStore } from "@/proxy";
+import { createCodexRelay } from "../../src/bun";
+import { CredentialStore } from "../../src/index";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {

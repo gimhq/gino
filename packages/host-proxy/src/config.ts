@@ -1,7 +1,7 @@
 import type { Logger } from "@gino/host-core";
 import type { ModelMap, ProxyProvider } from "./model-map";
-import type { Config } from "@/config";
-// M7 — proxy config. Projects the host `Config` (env-derived) onto the
+// M7 — proxy config. Projects the host env config (`ProxyEnv`, the PROXY_*
+// slice of the app `Config`, satisfied structurally) onto the
 // structured shape the proxy module consumes: per-provider upstream origin +
 // credentials, the static proxy key (H5), the codex OAuth-refresh inputs, and
 // the parsed model-map overrides. The model-map env value is parsed + validated
@@ -9,6 +9,24 @@ import type { Config } from "@/config";
 // mappings only).
 import { z } from "zod";
 import { isPrivateUpstreamHost } from "./provider";
+
+/**
+ * The PROXY_* fields the proxy reads from the host config. The app's `Config`
+ * (config/schema.ts) satisfies this structurally; embedders may pass a literal.
+ */
+export interface ProxyEnv {
+  readonly PROXY_ALLOW_PRIVATE_UPSTREAM: boolean;
+  readonly PROXY_ANTHROPIC_API_KEY: string;
+  readonly PROXY_ANTHROPIC_BASE_URL: string;
+  readonly PROXY_ANTHROPIC_OAUTH_TOKEN: string;
+  readonly PROXY_CODEX_ACCOUNT_ID: string;
+  readonly PROXY_CODEX_REFRESH_TOKEN: string;
+  readonly PROXY_MODEL_MAP: string;
+  readonly PROXY_OPENAI_API_KEY: string;
+  readonly PROXY_OPENAI_BASE_URL: string;
+  readonly PROXY_OPENAI_OAUTH_TOKEN: string;
+  readonly PROXY_STATIC_KEY: string;
+}
 
 export interface ProviderUpstream {
   /** Upstream origin (scheme+host[:port]); requests forward to `${origin}${path}`. */
@@ -81,7 +99,7 @@ function resolveUpstream(rawUrl: string, label: string, allowPrivate: boolean): 
 }
 
 /**
- * Build the structured proxy config from the host `Config`.
+ * Build the structured proxy config from the host env config (`ProxyEnv`).
  *
  * Upstream credentials (provider API keys, codex OAuth refresh/access tokens)
  * are held as plaintext in this env-derived config and in the in-memory
@@ -89,7 +107,7 @@ function resolveUpstream(rawUrl: string, label: string, allowPrivate: boolean): 
  * is the trust boundary, secrecy relies on host env/process isolation, and the
  * proxy modules never write these values to logs or disk.
  */
-export function buildProxyConfig(config: Config, logger?: Logger): ProxyConfig {
+export function buildProxyConfig(config: ProxyEnv, logger?: Logger): ProxyConfig {
   const allowPrivate = config.PROXY_ALLOW_PRIVATE_UPSTREAM;
   return {
     anthropic: {

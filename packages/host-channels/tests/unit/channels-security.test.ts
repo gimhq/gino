@@ -1,7 +1,7 @@
 import type { Storage } from "@gino/host-core";
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Channel } from "@gino/host-store-sqlite/schema";
-import type { DnsResolver, FetchLike, WebhookEndpoint, WebhookPayload } from "@/channels";
+import type { DnsResolver, FetchLike, WebhookEndpoint, WebhookPayload } from "../../src/index";
 import { AppError } from "@gino/host-core";
 import { createTask, writeThreadMessage } from "@gino/host-core/domain";
 import { sqliteStorage } from "@gino/host-store-sqlite";
@@ -16,7 +16,7 @@ import {
   pollChannel,
   registerChannel,
   tailTask,
-} from "@/channels";
+} from "../../src/index";
 
 // D-B4s SECURITY regression — two HIGH findings in the merged M6 channels code:
 //   FINDING 1 (IDOR): pollChannel/tailTask trusted a caller-supplied taskId with

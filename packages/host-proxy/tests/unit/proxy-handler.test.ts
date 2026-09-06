@@ -1,6 +1,6 @@
-import type { FetchLike, ProxyConfig, WsFactory } from "@/proxy";
+import type { FetchLike, ProxyConfig, WsFactory } from "../../src/index";
 import { describe, expect, it } from "bun:test";
-import { createProxyHandler, CredentialStore } from "@/proxy";
+import { createProxyHandler, CredentialStore } from "../../src/index";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {

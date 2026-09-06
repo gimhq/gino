@@ -1,4 +1,4 @@
-import type { BridgeSocket, WsFactory } from "@/proxy";
+import type { BridgeSocket, WsFactory } from "@gino/host-proxy";
 import type { AppEnv } from "@/shared/lib/types";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";

@@ -11,11 +11,11 @@
 // no catch-all.
 import type { Storage } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
+import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@gino/host-channels";
 import { AttachmentDescriptor } from "@gino/host-core";
 import { hashToken, safeEqual } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@/channels";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 import { bearerToken, channelTokenAuth } from "@/shared/middleware/auth";

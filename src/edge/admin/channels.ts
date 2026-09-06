@@ -14,10 +14,6 @@
 // envelope. Webhook secrets are never returned.
 import type { ChannelRow } from "@gino/host-core";
 import type { AppEnv } from "@/shared/lib/types";
-import { NotFoundError } from "@gino/host-core";
-import { requireTask } from "@gino/host-core/domain";
-import { Hono } from "hono";
-import { z } from "zod";
 import {
   addWebhook,
   bindConversation,
@@ -29,7 +25,11 @@ import {
   registerChannel,
   removeWebhook,
   requireChannel,
-} from "@/channels";
+} from "@gino/host-channels";
+import { NotFoundError } from "@gino/host-core";
+import { requireTask } from "@gino/host-core/domain";
+import { Hono } from "hono";
+import { z } from "zod";
 import { ok } from "@/shared/lib/api-response";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
 
