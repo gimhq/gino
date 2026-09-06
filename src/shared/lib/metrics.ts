@@ -4,7 +4,7 @@
  * Emits prometheus exposition format on demand. Operators that outgrow
  * this can swap the implementation without changing call sites.
  */
-import type { Metrics } from "@/host/metrics";
+import type { Metrics } from "@gino/host-core";
 
 interface Counter {
   readonly type: "counter";

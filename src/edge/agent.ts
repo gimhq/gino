@@ -1,12 +1,11 @@
+import type { HttpResult } from "@gino/host-core";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import type { HttpResult } from "@/host";
 import type { AppEnv } from "@/shared/lib/types";
+import { UnauthorizedError } from "@gino/host-core";
+import { readBodyCapped, registerError } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { upgradeWebSocket } from "hono/bun";
-import { registerError } from "@/protocol/version";
-import { readBodyCapped } from "@/shared/lib/body-limit";
-import { UnauthorizedError } from "@/shared/lib/errors";
 import { describeRoute, errors, TAGS } from "@/shared/lib/openapi";
 import { bearerToken, connectTokenAuth } from "@/shared/middleware/auth";
 import { rateLimit } from "@/shared/middleware/rate-limit";

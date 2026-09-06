@@ -1,8 +1,8 @@
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { AppEnv } from "@/shared/lib/types";
+import { AppError } from "@gino/host-core";
 import { ZodError } from "zod";
-import { AppError } from "@/shared/lib/errors";
 
 export function errorHandler(err: Error, c: Context<AppEnv>) {
   if (err instanceof AppError) {

@@ -2,12 +2,12 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { hashToken } from "@gino/host-core/domain";
+import { createDb } from "@gino/host-store-sqlite/bun";
+import { agents } from "@gino/host-store-sqlite/schema";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { agents } from "@/db/schema";
-import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 
 const CONNECT_TOKEN = "connect-secret-proxy";

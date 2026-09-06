@@ -2,17 +2,16 @@ import type { MiddlewareHandler } from "hono";
 import type { Config } from "@/config";
 import type { AppEnv } from "@/shared/lib/types";
 import { createHash } from "node:crypto";
+import { createHost } from "@gino/host-core";
+import { enrollAgent, generateId, hashToken, safeEqual, verifyToken } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { enrollAgent } from "@/agents/registry";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { createHost } from "@/host";
-import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
 import { errorHandler } from "@/shared/middleware/error-handler";
-import { sqliteStorage } from "@/store/sqlite";
 
 // ─── platform crypto ───
 

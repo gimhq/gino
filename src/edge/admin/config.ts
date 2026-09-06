@@ -10,20 +10,11 @@
 // host-resolved per-engine `target`. The host NEVER materializes on an agent — it
 // only declares + serves; the agent reconciles. Responses use `{ success, data }`.
 import type { AppEnv } from "@/shared/lib/types";
+import { broadcastGlobalConfig, DEFAULT_ENGINE, getGlobalConfigVersion, getTask, GLOBAL_SCOPE, ingestArtifact, readBodyCapped, resolveEntries, setEntries } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import {
-  DEFAULT_ENGINE,
-  getGlobalConfigVersion,
-  GLOBAL_SCOPE,
-  ingestArtifact,
-  resolveEntries,
-  setEntries,
-} from "@/configstore";
 import { ok } from "@/shared/lib/api-response";
-import { readBodyCapped } from "@/shared/lib/body-limit";
 import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import { broadcastGlobalConfig, getTask } from "@/tasks";
 
 const entriesBody = z.object({
   scope: z.string().min(1),

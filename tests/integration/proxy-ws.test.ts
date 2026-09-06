@@ -1,21 +1,21 @@
-import type { BridgeSocket, WsFactory } from "@/proxy";
+import type { BridgeSocket, WsFactory } from "@gino/host-proxy";
 import type { AppEnv } from "@/shared/lib/types";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createHost } from "@gino/host-core";
+import { hashToken } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
+import { agents } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { websocket } from "hono/bun";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { agents } from "@/db/schema";
 import { llmRoutes } from "@/edge/llm";
-import { createHost } from "@/host";
-import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
 import { errorHandler } from "@/shared/middleware/error-handler";
-import { sqliteStorage } from "@/store/sqlite";
 
 // D-B5w — the `/llm/v1/responses` Codex WS passthrough, proven end-to-end against
 // a LIVE Bun server with a real client WebSocket. The HTTP→WS upgrade reuses the
