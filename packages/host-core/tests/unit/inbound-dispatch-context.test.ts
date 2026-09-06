@@ -1,7 +1,8 @@
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Storage } from "../../src/host/ports/storage";
 import type { DecodedFrame } from "../../src/protocol/envelope";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent } from "../../src/agents/registry";
 import { getThreadRun, writeCronState } from "../../src/msgstore";

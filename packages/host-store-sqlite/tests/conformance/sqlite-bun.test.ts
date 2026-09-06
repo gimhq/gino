@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeStorageConformance } from "@gino/host-core/testing";
 import { sql } from "drizzle-orm";
-import { createDb } from "../../src/db";
+import { openDatabase } from "../../src/db";
+import { bunSqliteDriver } from "../../src/drivers/bun";
 import { sqliteStorage } from "../../src/store";
 
 // The sqlite (drizzle + bun:sqlite) `Storage` adapter against the shared
@@ -11,9 +12,9 @@ import { sqliteStorage } from "../../src/store";
 // directory per test.
 
 describeStorageConformance({
-  name: "sqlite",
+  name: "sqlite-bun",
   open: () => {
-    const db = createDb(":memory:");
+    const db = openDatabase({ driver: bunSqliteDriver, path: ":memory:" });
     // The spec exercises each repo in isolation (an outbox row for an agent
     // that was never enrolled, a run for a task never created), so the
     // schema's foreign keys are switched off for the conformance database.

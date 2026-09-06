@@ -1,8 +1,8 @@
 import type { NewThreadRunRow, ThreadRunRepo } from "@gino/host-core/domain";
-// SQLITE STORE — `ThreadRunRepo` on drizzle + bun:sqlite (thread_runs). Each
+// SQLITE STORE — `ThreadRunRepo` on drizzle + sqlite (thread_runs). Each
 // method is the one statement the domain issues today
 // (`msgstore/thread-runs.ts`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { asc, eq, sql } from "drizzle-orm";
 import { threadRuns } from "../schema";
 

@@ -1,9 +1,9 @@
 import type { AttachmentRepo, NewAttachmentRow } from "@gino/host-core/domain";
-// SQLITE STORE — `AttachmentRepo` on drizzle + bun:sqlite (attachments). Each
+// SQLITE STORE — `AttachmentRepo` on drizzle + sqlite (attachments). Each
 // method is the one statement the domain issues today
 // (`msgstore/attachments.ts`, `configstore/serve.ts`, `configstore/gc.ts`),
 // unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { asc, eq, sql } from "drizzle-orm";
 import { attachments } from "../schema";
 

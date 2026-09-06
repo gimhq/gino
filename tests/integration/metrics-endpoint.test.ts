@@ -6,7 +6,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
-import { createDb } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";

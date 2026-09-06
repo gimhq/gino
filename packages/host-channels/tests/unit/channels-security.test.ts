@@ -4,7 +4,8 @@ import type { Channel } from "@gino/host-store-sqlite/schema";
 import type { DnsResolver, FetchLike, WebhookEndpoint, WebhookPayload } from "../../src/index";
 import { AppError } from "@gino/host-core";
 import { createTask, writeThreadMessage } from "@gino/host-core/domain";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
   assertSafeWebhookUrl,

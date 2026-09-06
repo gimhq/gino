@@ -1,8 +1,8 @@
 import type { NewTaskRow, TaskRepo, TaskRow } from "@gino/host-core/domain";
-// SQLITE STORE — `TaskRepo` on drizzle + bun:sqlite (tasks). Each method is the
+// SQLITE STORE — `TaskRepo` on drizzle + sqlite (tasks). Each method is the
 // one statement the domain issues today (`tasks/store.ts`, `agents/registry.ts`
 // `removeAgent`), unchanged.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { tasks } from "../schema";
 

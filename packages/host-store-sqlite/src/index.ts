@@ -1,9 +1,12 @@
-// @gino/host-store-sqlite — the drizzle + bun:sqlite `Storage` adapter
-// (docs/host-sdk-design.md §8.2): the database handle + migrator, the schema,
-// and the repositories over it.
-export { acquireMigrationLock, createDb, materializeEmbeddedMigrations, recordDbVersion, runMigrations, snapshotOnVersionChange } from "./db";
-export type { AppDatabase } from "./db";
+// @gino/host-store-sqlite — the drizzle + sqlite `Storage` adapter
+// (docs/host-sdk-design.md §8.2): the database opener + migrator (driver
+// agnostic; drivers live under `./bun` and `./node`), the schema, and the
+// repositories over it.
+export { acquireMigrationLock, openDatabase, recordDbVersion, snapshotOnVersionChange } from "./db";
+export type { OpenDatabaseOptions } from "./db";
+export type { AppDatabase, DrizzleSqliteDatabase, SqliteDriver, SqliteDriverHandle } from "./driver";
 export { embeddedMigrations } from "./embedded-migrations";
+export { readEmbeddedMigrations, runMigrations } from "./migrate";
 export * as schema from "./schema";
 export {
   sqliteAgentRepo,

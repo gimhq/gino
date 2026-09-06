@@ -4,7 +4,8 @@ import type { AppDatabase } from "@gino/host-store-sqlite";
 import { addWebhook, bindConversation, readCursor, registerChannel, startWebhookPump } from "@gino/host-channels";
 import { createHostEvents } from "@gino/host-core";
 import { createTask, enrollAgent, ingestHttpFrame, setPlacement } from "@gino/host-core/domain";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
 // HOST-M5M6-04 regression — outbound webhook egress is WIRED. Pre-fix,

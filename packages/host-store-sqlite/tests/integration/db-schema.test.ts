@@ -5,7 +5,7 @@ import process from "node:process";
 import { ulid } from "@gino/host-core/domain";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
-import { createDb } from "../../src/db";
+import { createDb } from "../../src/drivers/bun";
 import {
   agentGrants,
   agents,

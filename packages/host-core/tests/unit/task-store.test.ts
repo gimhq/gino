@@ -1,6 +1,7 @@
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Storage } from "../../src/host/ports/storage";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { enrollAgent, removeAgent } from "../../src/agents/registry";
 import {

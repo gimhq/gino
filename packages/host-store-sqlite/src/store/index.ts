@@ -1,9 +1,9 @@
 import type { BlobStorePort, Storage } from "@gino/host-core/domain";
-// SQLITE STORE — the drizzle + bun:sqlite `Storage` adapter (host-sdk-design
+// SQLITE STORE — the drizzle + sqlite `Storage` adapter (host-sdk-design
 // §8.2 `host-store-sqlite`): the reference implementation, one repository per
 // table group over the existing `AppDatabase`, plus the filesystem `BlobStore`
 // for the bytes. `channels` is always present here.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

@@ -1,7 +1,8 @@
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { WsLike } from "../../src/agents/sessions";
 import type { Storage } from "../../src/host/ports/storage";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { tasks } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";

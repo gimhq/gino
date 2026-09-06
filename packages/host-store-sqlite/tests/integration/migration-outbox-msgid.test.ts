@@ -8,7 +8,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
-import { createDb } from "../../src/db";
+import { createDb } from "../../src/drivers/bun";
 import { sqliteStorage } from "../../src/store";
 
 // Migration 0003 drops the vestigial `outbox.msg_id` column (HOST-M1M2-07

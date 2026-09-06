@@ -1,7 +1,8 @@
 import type { AgentTransport, Storage } from "@gino/host-core";
 import type { AppDatabase } from "@gino/host-store-sqlite";
 import { enrollAgent, getTask, grantOwner } from "@gino/host-core/domain";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { messages } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { getBinding, registerChannel, routeInbound } from "../../src/index";

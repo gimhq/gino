@@ -2,7 +2,7 @@
   "name": "@gino/host-store-sqlite",
   "type": "module",
   "version": "0.1.0",
-  "description": "Gino host Storage adapter — drizzle-orm over sqlite (bun:sqlite).",
+  "description": "Gino host Storage adapter — drizzle-orm over sqlite (bun:sqlite or better-sqlite3 driver).",
   "files": [
     "dist",
     "src"
@@ -17,22 +17,36 @@
       "bun": "./src/schema.ts",
       "types": "./dist/schema.d.ts",
       "import": "./dist/schema.js"
+    },
+    "./bun": {
+      "bun": "./src/bun.ts",
+      "types": "./dist/bun.d.ts",
+      "import": "./dist/bun.js"
+    },
+    "./node": {
+      "bun": "./src/node.ts",
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
     }
   },
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "bun --env-file=/dev/null test ./tests/",
-    "build": "bun build src/index.ts --outdir dist --target bun --format esm --packages external --external bun:sqlite && bun build src/schema.ts --outdir dist --target bun --format esm --packages external && tsc -p tsconfig.build.json",
-    "check": "bun run lint && bun run typecheck && bun run test && bun run build",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/schema.ts --outdir dist --target node --format esm --packages external && bun build src/node.ts --outdir dist --target node --format esm --packages external && bun build src/bun.ts --outdir dist --target bun --format esm --packages external --external bun:sqlite && tsc -p tsconfig.build.json",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build && bun run smoke:node",
     "db:generate": "drizzle-kit generate",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "smoke:node": "node tests/node/smoke.mts",
+    "gen:migrations": "bun scripts/gen-embedded-migrations.ts"
   },
   "dependencies": {
     "@gino/host-core": "workspace:*",
+    "better-sqlite3": "13.0.3",
     "drizzle-orm": "0.45.2"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
     "@types/bun": "1.3.14",
     "drizzle-kit": "0.31.10",
     "eslint": "10.5.0",

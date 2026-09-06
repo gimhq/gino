@@ -1,11 +1,11 @@
 import type { ConfigArtifactRow, ConfigRepo, NewConfigArtifactRow } from "@gino/host-core/domain";
-// SQLITE STORE — `ConfigRepo` on drizzle + bun:sqlite (config_artifacts /
+// SQLITE STORE — `ConfigRepo` on drizzle + sqlite (config_artifacts /
 // config_entries / the `router_state` global config version). Each method is
 // the one statement the domain issues today (`configstore/artifacts.ts`,
 // `configstore/entries.ts`, `configstore/gc.ts`), unchanged — `replaceScope`
 // keeps `setEntries`' single transaction, the one atomic multi-row unit the
 // port allows.
-import type { AppDatabase } from "../db";
+import type { AppDatabase } from "../driver";
 import { and, asc, desc, eq, sql } from "drizzle-orm";
 import { configArtifacts, configEntries, routerState } from "../schema";
 

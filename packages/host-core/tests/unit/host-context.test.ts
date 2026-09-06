@@ -1,5 +1,6 @@
 import type { Metrics } from "../../src/host";
-import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
 import { createHostContext } from "../../src/host";
