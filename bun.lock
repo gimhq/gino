@@ -30,6 +30,24 @@
         "typescript": "6.0.3",
       },
     },
+    "examples/embed-node": {
+      "name": "@gino/example-embed-node",
+      "version": "0.1.0",
+      "dependencies": {
+        "@gino/host-core": "workspace:*",
+        "@gino/host-hono": "workspace:*",
+        "@gino/host-store-sqlite": "workspace:*",
+        "@hono/node-server": "1.19.17",
+        "hono": "4.12.26",
+        "ws": "8.21.3",
+      },
+      "devDependencies": {
+        "@types/node": "^24.0.0",
+        "@types/ws": "8.18.1",
+        "eslint": "10.5.0",
+        "typescript": "6.0.3",
+      },
+    },
     "packages/host-channels": {
       "name": "@gino/host-channels",
       "version": "0.1.0",
@@ -220,6 +238,8 @@
     "@eslint/object-schema": ["@eslint/object-schema@3.0.5", "", {}, "sha512-vqTaUEgxzm+YDSdElad6PiRoX4t8VGDjCtt05zn4nU810UIx/uNEV7/lZJ6KwFThKZOzOxzXy48da+No7HZaMw=="],
 
     "@eslint/plugin-kit": ["@eslint/plugin-kit@0.7.2", "", { "dependencies": { "@eslint/core": "^1.2.1", "levn": "^0.4.1" } }, "sha512-+CNAzxglkrpNf/kKywqQfk74QjtceuOE7Qm+AF8miRvPF/wmmK5+OJOgVh3AVTT3RP2mH3+FOaxlE5v72owk0A=="],
+
+    "@gino/example-embed-node": ["@gino/example-embed-node@workspace:examples/embed-node"],
 
     "@gino/host-channels": ["@gino/host-channels@workspace:packages/host-channels"],
 
