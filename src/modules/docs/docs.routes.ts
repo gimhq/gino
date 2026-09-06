@@ -1,10 +1,10 @@
 import type { Hono, MiddlewareHandler } from "hono";
 import type { Config } from "@/config";
 import type { AppEnv } from "@/shared/lib/types";
+import { TAGS } from "@gino/host-hono";
 import { Scalar } from "@scalar/hono-api-reference";
 import { openAPIRouteHandler } from "hono-openapi";
 import { BUILD_INFO } from "@/build-info";
-import { TAGS } from "@/shared/lib/openapi";
 
 // Scalar serves an HTML shell that loads its bundle from a CDN and injects
 // inline init scripts. The host's strict global CSP (`script-src 'self'`,

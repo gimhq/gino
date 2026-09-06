@@ -1,29 +1,30 @@
-import type { Launcher } from "./agents/launchers";
+import type { Host, HostOptions, Launcher } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import type { Config } from "./config";
-import type { AppDatabase } from "./db";
-import type { Host, HostOptions } from "./host";
 import type { Logger } from "./shared/lib/logger";
 import type { AppEnv } from "./shared/lib/types";
+import { startWebhookPump } from "@gino/host-channels";
+import { createDockerLauncher, createHost, manualLauncher, resolveHostOptions } from "@gino/host-core";
+import { errorHandler } from "@gino/host-hono";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { Hono } from "hono";
 import { websocket } from "hono/bun";
 import { cors } from "hono/cors";
 import { requestId } from "hono/request-id";
 import { secureHeaders } from "hono/secure-headers";
-import { startWebhookPump } from "./channels";
+import { bunSpawn } from "./agents-bun-spawn";
+import { BUILD_INFO } from "./build-info";
 import { loadConfig } from "./config";
-import { createDb } from "./db";
 import { edgeRoutes } from "./edge";
-import { createHost, resolveHostOptions } from "./host";
 import { docsCspRelax, mountDocs } from "./modules/docs";
 import { publicRoutes } from "./routes";
 import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
 import { registryMetrics, renderPrometheus } from "./shared/lib/metrics";
 import { adminTokenAuth } from "./shared/middleware/auth";
-import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
-import { sqliteStorage } from "./store/sqlite";
 
 // ─── Types ───
 
@@ -74,10 +75,15 @@ export function hostOptionsFromConfig(config: Config): HostOptions {
   });
 }
 
+/** The standalone app's default launchers: `manual` (safe default) + `docker` shelling out via `Bun.spawn`. */
+export function defaultAppLaunchers(): readonly Launcher[] {
+  return [manualLauncher, createDockerLauncher({ spawn: bunSpawn })];
+}
+
 /**
  * Build the host the way the standalone app does: the sqlite adapter over `db`
- * with the blob store at `STORE_DIR`, and the global Prometheus registry as the
- * metrics sink.
+ * with the blob store at `STORE_DIR`, the global Prometheus registry as the
+ * metrics sink, and the manual + docker launchers unless overridden.
  */
 export function createAppHost({ config, db, logger, launchers }: AppHostDeps): Host {
   const options = hostOptionsFromConfig(config);
@@ -85,7 +91,7 @@ export function createAppHost({ config, db, logger, launchers }: AppHostDeps): H
     storage: sqliteStorage(db, { storeDir: options.storeDir }),
     logger,
     metrics: registryMetrics,
-    ...(launchers ? { launchers } : {}),
+    launchers: launchers ?? defaultAppLaunchers(),
     storeDir: options.storeDir,
     agents: {
       registerToken: options.registerToken,
@@ -161,10 +167,10 @@ export function createApp({ config, host }: AppDeps) {
   api.route("/", publicRoutes());
 
   // M1 edge — the explicit v2 prefix topology (`/agent/*`, `/admin/*`,
-  // `/messages/*`), each router carrying its own token auth. Mounted after the
-  // public system routes; `/llm/*` (M7) lands with B5. No catch-all → unknown
-  // paths fall through to the clean 404.
-  api.route("/", edgeRoutes());
+  // `/messages/*`, `/llm/*`): the package routers with the app's rate limits
+  // and bearer policy composed in (src/edge). Mounted after the public system
+  // routes. No catch-all → unknown paths fall through to the clean 404.
+  api.route("/", edgeRoutes({ config, host }));
 
   api.onError(errorHandler);
 
@@ -225,7 +231,7 @@ function buildOuterApp(api: Hono<AppEnv>, config: Config) {
 export function bootstrap(): BootstrapResult {
   const config = loadConfig();
   const logger = createLogger(config);
-  const db = createDb(config.DB_PATH);
+  const db = createDb(config.DB_PATH, { version: BUILD_INFO.version });
 
   const host = createAppHost({ config, db, logger });
   const app = createApp({ config, host });

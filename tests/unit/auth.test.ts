@@ -1,18 +1,13 @@
+import type { HostEnv } from "@gino/host-hono";
 import type { MiddlewareHandler } from "hono";
 import type { Config } from "@/config";
 import type { AppEnv } from "@/shared/lib/types";
 import { createHash } from "node:crypto";
+import { generateId, hashToken, safeEqual, verifyToken } from "@gino/host-core/domain";
+import { errorHandler, requireAuthorized } from "@gino/host-hono";
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { enrollAgent } from "@/agents/registry";
-import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { createHost } from "@/host";
-import { generateId, hashToken, safeEqual, verifyToken } from "@/platform";
-import { createLogger } from "@/shared/lib/logger";
-import { adminTokenAuth, channelTokenAuth, connectTokenAuth } from "@/shared/middleware/auth";
-import { errorHandler } from "@/shared/middleware/error-handler";
-import { sqliteStorage } from "@/store/sqlite";
+import { adminTokenAuth, adminTokenAuthorize, channelTokenAuthorize } from "@/shared/middleware/auth";
 
 // ─── platform crypto ───
 
@@ -62,7 +57,7 @@ const TEST_CONFIG = {
 // Minimal app: inject config into context (as app.ts does), apply the
 // middleware under test, then a 200 handler. The scaffold error-handler turns
 // the middleware's UnauthorizedError into the standard 401 envelope.
-function appWith(mw: MiddlewareHandler<AppEnv>, config: Config = TEST_CONFIG) {
+function appWith<E extends HostEnv>(mw: MiddlewareHandler<E>, config: Config = TEST_CONFIG) {
   const app = new Hono<AppEnv>();
   app.use("*", (c, next) => {
     c.set("config", config);
@@ -76,57 +71,32 @@ function appWith(mw: MiddlewareHandler<AppEnv>, config: Config = TEST_CONFIG) {
 
 // Register-token validation moved INTO the register handler (HOST-M1M2-14) so
 // failures render the protocol §3 `register_error` envelope — covered by
-// tests/unit/edge-input-hardening.test.ts.
+// tests/unit/edge-input-hardening.test.ts. The connect-token middleware lives
+// in @gino/host-hono (packages/host-hono/tests/unit/auth.test.ts).
 
-describe("connectTokenAuth (token → agent identity)", () => {
-  // A real in-memory db with one enrolled agent: the middleware resolves the
-  // connect token to its OWNING agent (by connect_token_hash) and puts the id in
-  // context — identity comes from the token, never a client-supplied param.
-  const db = createDb(":memory:");
-  const storage = sqliteStorage(db);
-  const host = createHost({ storage, logger: createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" })) });
-  const { agent, connectToken } = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } });
+/** The channel bearer as the messages router sees it: `authorize` behind the package gate. */
+const channelTokenAuth = requireAuthorized(channelTokenAuthorize(TEST_CONFIG));
 
-  // App wired as production is (config + host in context, then the middleware as a
-  // route handler so `:agentId` params populate), echoing the resolved agentId.
-  function tokenApp(path = "/") {
-    const app = new Hono<AppEnv>();
-    app.use("*", (c, next) => {
-      c.set("config", TEST_CONFIG);
-      c.set("host", host);
-      return next();
-    });
-    app.get(path, connectTokenAuth, c => c.json({ agentId: c.get("agentId") }));
-    app.onError(errorHandler);
-    return app;
-  }
-
-  it("401 without x-internal-token", async () => {
-    expect((await tokenApp().request("/", { method: "GET" })).status).toBe(401);
+describe("channelTokenAuthorize", () => {
+  it("admits the channel bearer as a channel principal and nothing else", () => {
+    const authorize = channelTokenAuthorize(TEST_CONFIG);
+    const ctx = (authorization?: string) =>
+      ({ req: { header: (name: string) => (name === "authorization" ? authorization : undefined) } }) as unknown as Parameters<typeof authorize>[0];
+    expect(authorize(ctx("Bearer chan-secret"))).toEqual({ kind: "channel" });
+    expect(authorize(ctx("Bearer admin-secret"))).toBeNull();
+    expect(authorize(ctx())).toBeNull();
+    expect(channelTokenAuthorize({ ...TEST_CONFIG, HTTP_CHANNEL_TOKEN: "" } as Config)(ctx("Bearer "))).toBeNull();
   });
+});
 
-  it("401 on an empty x-internal-token", async () => {
-    expect((await tokenApp().request("/", { method: "GET", headers: { "x-internal-token": "   " } })).status).toBe(401);
-  });
-
-  it("401 on a token that matches no enrolled agent (fails closed)", async () => {
-    expect((await tokenApp().request("/", { method: "GET", headers: { "x-internal-token": "not-a-real-token" } })).status).toBe(401);
-  });
-
-  it("resolves the agent from the token and exposes it as the context agentId", async () => {
-    const res = await tokenApp().request("/", { method: "GET", headers: { "x-internal-token": connectToken } });
-    expect(res.status).toBe(200);
-    expect((await res.json() as { agentId: string }).agentId).toBe(agent.id);
-  });
-
-  it("passes when the :agentId path segment IS the token's agent", async () => {
-    const res = await tokenApp("/:agentId").request(`/${agent.id}`, { method: "GET", headers: { "x-internal-token": connectToken } });
-    expect(res.status).toBe(200);
-  });
-
-  it("403 when the :agentId path segment is a DIFFERENT agent (cross-agent)", async () => {
-    const res = await tokenApp("/:agentId").request("/some-other-agent", { method: "GET", headers: { "x-internal-token": connectToken } });
-    expect(res.status).toBe(403);
+describe("adminTokenAuthorize", () => {
+  it("admits the admin bearer as an admin principal; fails closed when unconfigured", () => {
+    const authorize = adminTokenAuthorize(TEST_CONFIG);
+    const ctx = (authorization?: string) =>
+      ({ req: { header: (name: string) => (name === "authorization" ? authorization : undefined) } }) as unknown as Parameters<typeof authorize>[0];
+    expect(authorize(ctx("Bearer admin-secret"))).toEqual({ kind: "admin" });
+    expect(authorize(ctx("Bearer chan-secret"))).toBeNull();
+    expect(adminTokenAuthorize({ ...TEST_CONFIG, HTTP_ADMIN_TOKEN: "" } as Config)(ctx("Bearer chan-secret"))).toBeNull();
   });
 });
 

@@ -1,11 +1,11 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
+import { embeddedMigrations } from "@gino/host-store-sqlite";
 import { Database } from "bun:sqlite";
 import cac from "cac";
 import { consola } from "consola";
 import { BUILD_INFO } from "./build-info";
-import { embeddedMigrations } from "./db/embedded-migrations";
 import { DATA_DIR, IS_COMPILED, ROOT_DIR } from "./dirs";
 
 const migrateLog = consola.withTag("migrate");
@@ -130,9 +130,9 @@ export function listPendingMigrations(opts: { dbPath: string; migrationsFolder?:
     .map(e => e.tag);
 }
 
-// Migration source mirrors `runMigrations` (src/db/index.ts, HOST-M9-13):
-// packaged builds read the embedded set; dev reads `<ROOT_DIR>/drizzle`
-// (or an explicit folder, used by tests).
+// Migration source mirrors `runMigrations` (packages/host-store-sqlite/src/db.ts,
+// HOST-M9-13): packaged builds read the embedded set; dev reads the store
+// package's `drizzle/` folder (or an explicit folder, used by tests).
 function readJournalEntries(migrationsFolder?: string): JournalEntry[] | null {
   if (!migrationsFolder && (IS_COMPILED || embeddedMigrations.size > 0)) {
     const raw = embeddedMigrations.get("meta/_journal.json");
@@ -140,7 +140,7 @@ function readJournalEntries(migrationsFolder?: string): JournalEntry[] | null {
       return null;
     return parseJournal(raw, tag => embeddedMigrations.has(`${tag}.sql`));
   }
-  const folder = migrationsFolder ?? resolve(ROOT_DIR, "drizzle");
+  const folder = migrationsFolder ?? resolve(ROOT_DIR, "packages/host-store-sqlite/drizzle");
   const journalPath = resolve(folder, "meta/_journal.json");
   if (!existsSync(journalPath))
     return null;

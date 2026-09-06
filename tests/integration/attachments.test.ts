@@ -1,16 +1,16 @@
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createTask, setPlacement } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, setPlacement } from "@/tasks";
 
 // M8/B6 — the `/agent/attachments` byte channel: ingest → store + descriptor;
 // download verified bytes (by id | sha256); a sha256 mismatch is rejected.
