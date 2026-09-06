@@ -17,13 +17,13 @@
 // threads/messages are M5 read-only mirrors here. Responses use the shared
 // `{ success, data }` envelope.
 import type { CronRow, CronUpsertData, Storage, TaskRow } from "@gino/host-core";
-import type { AppEnv } from "@/shared/lib/types";
+import type { HostEnv } from "../env";
 import { AppError, AttachmentDescriptor } from "@gino/host-core";
 import { assignTaskToAgent, closeTask, createTask, emitCronDelete, emitCronUpsert, emitInterrupt, emitTaskUpsert, getCron, getTaskThreads, getThreadRun, getTranscript, getTranscriptStats, listTaskCrons, listTasks, placeTask, requireTask, sendTaskMessage, TASK_STATUS, TRANSCRIPT_READ_LIMIT, transitionTaskStatus } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { ok } from "@/shared/lib/api-response";
-import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
+import { ok } from "../api-response";
+import { describeRoute, errors, jsonCreated, jsonOk, TAGS, validator } from "../openapi";
 
 /** Public projection of a task row. */
 function serializeTask(task: TaskRow) {
@@ -130,7 +130,7 @@ const detailQuery = z.object({
 });
 
 export function adminTaskRoutes() {
-  const router = new Hono<AppEnv>();
+  const router = new Hono<HostEnv>();
 
   // ── List (+ filters) ───────────────────────────────────────────────────────
   router.get(

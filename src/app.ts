@@ -5,6 +5,7 @@ import type { Logger } from "./shared/lib/logger";
 import type { AppEnv } from "./shared/lib/types";
 import { startWebhookPump } from "@gino/host-channels";
 import { createDockerLauncher, createHost, manualLauncher, resolveHostOptions } from "@gino/host-core";
+import { errorHandler } from "@gino/host-hono";
 import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
 import { Hono } from "hono";
@@ -22,7 +23,6 @@ import { isSpoofableProxyConfig } from "./shared/lib/client-ip";
 import { createLogger } from "./shared/lib/logger";
 import { registryMetrics, renderPrometheus } from "./shared/lib/metrics";
 import { adminTokenAuth } from "./shared/middleware/auth";
-import { errorHandler } from "./shared/middleware/error-handler";
 import { loggingMiddleware } from "./shared/middleware/logging";
 import { propagateRequestId } from "./shared/middleware/request-id";
 
@@ -167,10 +167,10 @@ export function createApp({ config, host }: AppDeps) {
   api.route("/", publicRoutes());
 
   // M1 edge — the explicit v2 prefix topology (`/agent/*`, `/admin/*`,
-  // `/messages/*`), each router carrying its own token auth. Mounted after the
-  // public system routes; `/llm/*` (M7) lands with B5. No catch-all → unknown
-  // paths fall through to the clean 404.
-  api.route("/", edgeRoutes());
+  // `/messages/*`, `/llm/*`): the package routers with the app's rate limits
+  // and bearer policy composed in (src/edge). Mounted after the public system
+  // routes. No catch-all → unknown paths fall through to the clean 404.
+  api.route("/", edgeRoutes({ config, host }));
 
   api.onError(errorHandler);
 

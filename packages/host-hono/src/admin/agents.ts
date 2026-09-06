@@ -13,13 +13,13 @@
 // Every response uses the shared `{ success, data }` envelope. The stored
 // connect-token hash is NEVER serialized.
 import type { AgentRow } from "@gino/host-core";
-import type { AppEnv } from "@/shared/lib/types";
+import type { HostEnv } from "../env";
 import { NotFoundError } from "@gino/host-core";
 import { getAgent, getCapacity, grantAgentOwner, inspectAgent, launchAgent, listAgents, listGrants, removeAgentControl, restartAgent, revokeAgentOwner, setAgentAccessControl, stopAgent } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { ok } from "@/shared/lib/api-response";
-import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
+import { ok } from "../api-response";
+import { describeRoute, errors, jsonOk, TAGS, validator } from "../openapi";
 
 /** Public projection of an agent — the connect-token hash is never exposed. */
 function serializeAgent(agent: AgentRow, online: boolean) {
@@ -62,7 +62,7 @@ const launchBody = z.object({
 const accessBody = z.object({ access: z.enum(["dedicated", "public"]) });
 
 export function adminAgentRoutes() {
-  const router = new Hono<AppEnv>();
+  const router = new Hono<HostEnv>();
 
   // ── List ─────────────────────────────────────────────────────────────────
   router.get(

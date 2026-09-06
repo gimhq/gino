@@ -2,7 +2,7 @@
   "name": "@gino/host-proxy",
   "type": "module",
   "version": "0.1.0",
-  "description": "Gino host LLM credential proxy — provider detection, model map, credential store, Claude<->OpenAI translator and HTTP forward path. The raw Codex WS relay is Bun-only behind ./bun.",
+  "description": "Gino host LLM credential proxy — provider detection, model map, credential store, Claude<->OpenAI translator and HTTP forward path. The raw Codex WS relay is Bun-only behind ./bun; the /llm Hono router (Bun-only, WS bridge) behind ./hono.",
   "files": [
     "dist",
     "src"
@@ -17,17 +17,24 @@
       "bun": "./src/bun.ts",
       "types": "./dist/bun.d.ts",
       "import": "./dist/bun.js"
+    },
+    "./hono": {
+      "bun": "./src/hono.ts",
+      "types": "./dist/hono.d.ts",
+      "import": "./dist/hono.js"
     }
   },
   "scripts": {
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "bun --env-file=/dev/null test ./tests/",
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/bun.ts --outdir dist --target bun --format esm --packages external && tsc -p tsconfig.build.json",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/bun.ts --outdir dist --target bun --format esm --packages external && bun build src/hono.ts --outdir dist --target bun --format esm --packages external && tsc -p tsconfig.build.json",
     "check": "bun run lint && bun run typecheck && bun run test && bun run build"
   },
   "dependencies": {
     "@gino/host-core": "workspace:*",
+    "@gino/host-hono": "workspace:*",
+    "hono": "4.12.26",
     "zod": "4.4.3"
   },
   "devDependencies": {

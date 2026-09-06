@@ -2,10 +2,10 @@
 // the structured error code, not message text: only uniqueness codes are a
 // 409 conflict; FK / NOT NULL / CHECK violations (host data bugs) and
 // non-database errors that merely quote constraint text stay logged 500s.
-import type { AppEnv } from "@/shared/lib/types";
+import type { HostEnv } from "../../src/env";
 import { describe, expect, it } from "bun:test";
 import { Hono } from "hono";
-import { errorHandler } from "@/shared/middleware/error-handler";
+import { errorHandler } from "../../src/errors";
 
 function makeApp() {
   const errors: unknown[] = [];
@@ -16,9 +16,9 @@ function makeApp() {
     error: (obj: unknown) => errors.push(obj),
     fatal: () => {},
   };
-  const app = new Hono<AppEnv>();
+  const app = new Hono<HostEnv>();
   app.use("*", (c, next) => {
-    c.set("logger", logger as unknown as AppEnv["Variables"]["logger"]);
+    c.set("host", { logger } as unknown as HostEnv["Variables"]["host"]);
     return next();
   });
   app.get("/throw", (c) => {

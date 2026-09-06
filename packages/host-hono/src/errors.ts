@@ -1,10 +1,11 @@
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import type { AppEnv } from "@/shared/lib/types";
+import type { HostEnv } from "./env";
 import { AppError } from "@gino/host-core";
 import { ZodError } from "zod";
 
-export function errorHandler(err: Error, c: Context<AppEnv>) {
+/** The scaffold error handler — usable as `onError` on any app whose env extends `HostEnv`. */
+export function errorHandler<E extends HostEnv>(err: Error, c: Context<E>) {
   if (err instanceof AppError) {
     return c.json(err.toJSON(), err.statusCode as ContentfulStatusCode);
   }
@@ -32,6 +33,6 @@ export function errorHandler(err: Error, c: Context<AppEnv>) {
     }, 409);
   }
 
-  c.get("logger").error({ err }, "unhandled error");
+  c.var.host.logger.error({ err }, "unhandled error");
   return c.json({ success: false, error: { code: "INTERNAL_ERROR", message: "Internal server error" } }, 500);
 }

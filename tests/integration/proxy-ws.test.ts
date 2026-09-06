@@ -6,6 +6,8 @@ import { resolve } from "node:path";
 import process from "node:process";
 import { createHost } from "@gino/host-core";
 import { hashToken } from "@gino/host-core/domain";
+import { errorHandler } from "@gino/host-hono";
+import { llmRouter } from "@gino/host-proxy/hono";
 import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
 import { agents } from "@gino/host-store-sqlite/schema";
@@ -13,9 +15,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Hono } from "hono";
 import { websocket } from "hono/bun";
 import { loadConfigStrict } from "@/config";
-import { llmRoutes } from "@/edge/llm";
 import { createLogger } from "@/shared/lib/logger";
-import { errorHandler } from "@/shared/middleware/error-handler";
 
 // D-B5w — the `/llm/v1/responses` Codex WS passthrough, proven end-to-end against
 // a LIVE Bun server with a real client WebSocket. The HTTP→WS upgrade reuses the
@@ -83,7 +83,7 @@ beforeAll(() => {
   const host = createHost({ storage: sqliteStorage(db), logger });
 
   // Minimal app: per-request context + the /llm router with the FAKE upstream
-  // factory injected. Production wires `llmRoutes()` (real WebSocket) — only the
+  // factory injected. Production wires `llmRouter()` (real WebSocket) — only the
   // test overrides the upstream so the relay touches no network.
   const api = new Hono<AppEnv>();
   api.use("*", (c, next) => {
@@ -92,7 +92,7 @@ beforeAll(() => {
     c.set("logger", logger);
     return next();
   });
-  api.route("/api/llm", llmRoutes({ wsFactory: fakeFactory, upstreamUrl: UPSTREAM_URL }));
+  api.route("/api/llm", llmRouter(host, { config, basePath: config.BASE_PATH, wsFactory: fakeFactory, upstreamUrl: UPSTREAM_URL }));
   api.onError(errorHandler);
 
   server = Bun.serve({

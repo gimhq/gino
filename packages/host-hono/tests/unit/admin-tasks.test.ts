@@ -1,7 +1,7 @@
 import type { Storage } from "@gino/host-core";
 import type { AppDatabase } from "@gino/host-store-sqlite";
-import type { AppEnv } from "@/shared/lib/types";
-import { createHost } from "@gino/host-core";
+import type { HostEnv } from "../../src/env";
+import { createHost, noopLogger } from "@gino/host-core";
 import { createTask, enrollAgent, getCron, getTask, setPlacement, writeThreadMessage, writeThreadResult } from "@gino/host-core/domain";
 import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
@@ -9,16 +9,14 @@ import { outbox } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { loadConfigStrict } from "@/config";
-import { adminTaskRoutes } from "@/edge/admin/tasks";
-import { createLogger } from "@/shared/lib/logger";
-import { errorHandler } from "@/shared/middleware/error-handler";
+import { adminTaskRoutes } from "../../src/admin/tasks";
+import { errorHandler } from "../../src/errors";
 
 // M4 admin surface — close lifecycle (HOST-M4-01/M4-09), cron addressing
 // (HOST-M4-02/M4-11), live-only interrupt (HOST-M4-03), and the bounded task
 // detail view (HOST-M1M2-16).
 
-const logger = createLogger(loadConfigStrict({ NODE_ENV: "test", GINO_LOG_LEVEL: "error", GINO_LOG_TO_STDOUT: "true" }));
+const logger = noopLogger;
 
 let db: AppDatabase;
 let storage: Storage;
@@ -40,7 +38,7 @@ afterEach(() => {
 
 /** The admin task router with the test host injected (as app.ts does). */
 function taskApp() {
-  const app = new Hono<AppEnv>();
+  const app = new Hono<HostEnv>();
   app.onError(errorHandler);
   app.use("*", (c, next) => {
     c.set("host", host);

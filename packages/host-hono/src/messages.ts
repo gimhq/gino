@@ -1,5 +1,6 @@
-// M6 — `/messages/*` (mounted at `/messages`, behind the channel token). The
-// user-facing I/O surface for channels (§7):
+// M6 — `/messages/*` (mount at `/messages`, behind the embedder's `authorize` —
+// the standalone host checks its channel token there). The user-facing I/O
+// surface for channels (§7):
 //   POST /:channel/send       ingress — route an inbound user message → M4
 //   POST /:channel/webhook    ingress — inbound webhook (same routing, adapter shape)
 //   GET  /:channel/poll       egress  — long-poll new messages (cursor-driven)
@@ -9,17 +10,16 @@
 // transcript (storage ⟂ distribution, §9). Ingress hands the message to M4 via
 // the orchestrator (it writes only `channel_bindings`). Explicit routes only —
 // no catch-all.
-import type { Storage } from "@gino/host-core";
-import type { AppEnv } from "@/shared/lib/types";
+import type { Host, Storage } from "@gino/host-core";
+import type { Authorize, HostEnv } from "./env";
 import { MAX_POLL_LIMIT, pollChannel, requireChannel, routeInbound } from "@gino/host-channels";
 import { AttachmentDescriptor } from "@gino/host-core";
-import { hashToken, safeEqual } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
-import { ok } from "@/shared/lib/api-response";
-import { describeRoute, errors, jsonOk, TAGS, validator } from "@/shared/lib/openapi";
-import { bearerToken, channelTokenAuth } from "@/shared/middleware/auth";
-import { rateLimit } from "@/shared/middleware/rate-limit";
+import { ok } from "./api-response";
+import { requireAuthorized } from "./auth";
+import { bindHost } from "./env";
+import { describeRoute, errors, jsonOk, TAGS, validator } from "./openapi";
 
 /** Long-poll bounds: a poll waits at most this long for new messages, checking every interval. */
 const LONG_POLL_MAX_MS = 30_000;
@@ -107,26 +107,21 @@ async function runPoll(storage: Storage, channelRef: string, params: PollParams)
   return { channel: channel.id, deliveries };
 }
 
-export function messagesRoutes() {
-  const router = new Hono<AppEnv>();
+export interface MessagesRouterOptions {
+  /** The embedder's channel-token check (the user I/O bearer). `null` → 401 on every route. */
+  readonly authorize: Authorize;
+}
 
-  // HOST-M9-02: throttle the channel I/O surface ahead of auth. A VALID
-  // channel bearer drains the principal budget (keyed by token hash, never
-  // the raw secret); an absent or invalid bearer falls back to the client IP,
-  // so brute-force guessing of the shared token cannot rotate keys to evade
-  // the limit.
-  router.use("*", rateLimit({
-    bucket: "messages",
-    limits: config => ({ windowMs: config.RATE_LIMIT_MESSAGES_WINDOW_MS, max: config.RATE_LIMIT_MESSAGES_MAX }),
-    key: (c) => {
-      const expected = c.var.config.HTTP_CHANNEL_TOKEN;
-      const bearer = bearerToken(c);
-      return expected && bearer && safeEqual(bearer, expected) ? `tok:${hashToken(bearer)}` : null;
-    },
-  }));
+export function messagesRouter(host: Host, opts: MessagesRouterOptions) {
+  const router = new Hono<HostEnv>();
 
-  // The channel token (admin/user bearer) guards every channel I/O route (401 without).
-  router.use("*", channelTokenAuth);
+  router.use("*", bindHost(host));
+
+  // HOST-M9-02: the channel I/O throttle (ahead of auth, keyed per verified
+  // principal) is the embedder's middleware, applied before this mount (D10).
+
+  // The embedder's authorize (the channel bearer) guards every channel I/O route (401 without).
+  router.use("*", requireAuthorized(opts.authorize));
 
   // ── Ingress: route an inbound user message → M4 ────────────────────────────
   router.post(

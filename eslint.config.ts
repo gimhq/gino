@@ -35,6 +35,14 @@ export default antfu({
     "src/lode/sdk.ts",
   ],
 }, {
+  // Plain-JS entry points run by `node` directly (the package Node smoke
+  // tests): no type information, so the typed import rule cannot run.
+  files: ["**/*.mjs"],
+  rules: {
+    "ts/consistent-type-imports": "off",
+    "no-console": "off",
+  },
+}, {
   // Test files construct partial fixtures the strict project rules would
   // refuse — relax the most-friction-prone ones to `warn` / `off`.
   files: [
