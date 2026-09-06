@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { memoryStorageForTests } from "../../src/store/memory";
 import { describeStorageConformance } from "./storage.conformance";
 
@@ -9,4 +10,4 @@ describeStorageConformance({
     const { storage, tamperBlob } = memoryStorageForTests();
     return { storage, tamperBlob, close: () => storage.close() };
   },
-});
+}, { describe, test, beforeEach, afterEach, expect });

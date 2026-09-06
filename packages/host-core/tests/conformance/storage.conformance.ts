@@ -1,6 +1,5 @@
-import type { NewAgentRow, NewTaskRow, Storage } from "../../src/host/ports/storage";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { MissingBlobError, sha256Hex, ShaMismatchError } from "../../src/configstore/store";
+import type { NewAgentRow, NewTaskRow, Storage } from "@gino/host-core";
+import { MissingBlobError, sha256Hex, ShaMismatchError } from "@gino/host-core/domain";
 
 // STORAGE CONFORMANCE — the one spec every `Storage` adapter must pass
 // (host-sdk-design §8.3). Each `describe*Conformance(target)` asserts the
@@ -13,8 +12,44 @@ export interface ConformanceTarget {
   open: () => { storage: Storage; tamperBlob: (ref: string) => void; close: () => void };
 }
 
+// Method signatures on purpose (bivariant parameters): both `bun:test`'s
+// `expect` and the npm `expect` package (Jest's implementation, used by the
+// `node --test` runs) must satisfy this surface structurally.
+/* eslint-disable ts/method-signature-style */
+/** The matchers the suite uses — the common subset of bun:test and Jest `expect`. */
+export interface ConformanceMatchers {
+  toBe(expected: unknown): void;
+  toEqual(expected: unknown): void;
+  toMatchObject(expected: object): void;
+  toBeUndefined(): void;
+  toBeNull(): void;
+  toThrow(expected?: unknown): void;
+  toHaveLength(length: number): void;
+  toBeGreaterThan(expected: number): void;
+  readonly not: ConformanceMatchers;
+}
+
+export interface ConformanceExpect {
+  (actual: unknown): ConformanceMatchers;
+  any(constructor: unknown): unknown;
+}
+/* eslint-enable ts/method-signature-style */
+
+/**
+ * The test-runner primitives the suite is written against, so the same file
+ * mounts under `bun test` (`import { … } from "bun:test"`) and under
+ * `node --test` (`node:test` + the `expect` package).
+ */
+export interface ConformanceHarness {
+  readonly describe: (name: string, fn: () => void) => void;
+  readonly test: (name: string, fn: () => void) => void;
+  readonly beforeEach: (fn: () => void) => void;
+  readonly afterEach: (fn: () => void) => void;
+  readonly expect: ConformanceExpect;
+}
+
 /** Per-test lifecycle shared by every repo suite: a fresh storage in `beforeEach`, closed in `afterEach`. */
-function useStorage(target: ConformanceTarget): { s: () => Storage; tamper: (ref: string) => void } {
+function useStorage(target: ConformanceTarget, { beforeEach, afterEach }: ConformanceHarness): { s: () => Storage; tamper: (ref: string) => void } {
   let opened: ReturnType<ConformanceTarget["open"]> | undefined;
   beforeEach(() => {
     opened = target.open();
@@ -47,9 +82,10 @@ function taskRow(id: string, extra: Partial<NewTaskRow> = {}): NewTaskRow {
 
 // ─── AgentRepo ───
 
-export function describeAgentRepoConformance(target: ConformanceTarget): void {
+export function describeAgentRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] AgentRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
 
     test("insert returns the row with defaults applied; get/list round-trip newest first", () => {
       const a = s().agents.insert(agentRow("a1", { createdAt: 100 }));
@@ -189,9 +225,10 @@ export function describeAgentRepoConformance(target: ConformanceTarget): void {
 
 // ─── TaskRepo ───
 
-export function describeTaskRepoConformance(target: ConformanceTarget): void {
+export function describeTaskRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] TaskRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
 
     test("insert/get/list with filters, newest first", () => {
       s().tasks.insert(taskRow("t1", { createdAt: 100, agentId: "a1", status: "active" }));
@@ -237,9 +274,10 @@ export function describeTaskRepoConformance(target: ConformanceTarget): void {
 
 // ─── OutboxRepo ───
 
-export function describeOutboxRepoConformance(target: ConformanceTarget): void {
+export function describeOutboxRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] OutboxRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const frame = (agentId: string, type = "task_upsert") => ({ agentId, type, dataJson: {} });
 
     test("ids are strictly monotonic across interleaved agents and returned on append", () => {
@@ -320,9 +358,10 @@ export function describeOutboxRepoConformance(target: ConformanceTarget): void {
 
 // ─── TranscriptRepo ───
 
-export function describeTranscriptRepoConformance(target: ConformanceTarget): void {
+export function describeTranscriptRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] TranscriptRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const msg = (threadId: string, seq: number, extra: Record<string, unknown> = {}) =>
       ({ taskId: "t1", threadId, seq, kind: "text", content: `m${seq}`, ...extra });
 
@@ -382,9 +421,10 @@ export function describeTranscriptRepoConformance(target: ConformanceTarget): vo
 
 // ─── ThreadRunRepo ───
 
-export function describeThreadRunRepoConformance(target: ConformanceTarget): void {
+export function describeThreadRunRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] ThreadRunRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
 
     test("upsert inserts everything first, then updates only the terminal mirror fields", () => {
       s().threadRuns.upsert({ threadId: "th1", taskId: "t1", cronId: "c1", source: "cron", status: "ok", durationMs: 10, finalSeq: 3, finishedAt: 1_000, createdAt: 900 });
@@ -431,9 +471,10 @@ export function describeThreadRunRepoConformance(target: ConformanceTarget): voi
 
 // ─── CronMirrorRepo ───
 
-export function describeCronRepoConformance(target: ConformanceTarget): void {
+export function describeCronRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] CronMirrorRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const state = (overrides: Record<string, unknown> = {}) => ({
       id: "c1",
       taskId: "t1",
@@ -484,9 +525,10 @@ export function describeCronRepoConformance(target: ConformanceTarget): void {
 
 // ─── AttachmentRepo ───
 
-export function describeAttachmentRepoConformance(target: ConformanceTarget): void {
+export function describeAttachmentRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] AttachmentRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const desc = (id: string, sha256 = "s".repeat(64), extra: Record<string, unknown> = {}) =>
       ({ id, taskId: "t1", threadId: "th1", name: "f.txt", contentType: "text/plain", size: 3, sha256, ref: `f.txt/${sha256.slice(0, 12)}`, direction: "outbound", ...extra });
 
@@ -509,9 +551,10 @@ export function describeAttachmentRepoConformance(target: ConformanceTarget): vo
 
 // ─── ConfigRepo ───
 
-export function describeConfigRepoConformance(target: ConformanceTarget): void {
+export function describeConfigRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] ConfigRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const SHA_A = "a".repeat(64);
     const SHA_B = "b".repeat(64);
     const entry = (name: string, sha256: string, target = name) => ({ name, sha256, target, kind: "file" });
@@ -590,9 +633,10 @@ export function describeConfigRepoConformance(target: ConformanceTarget): void {
 
 // ─── BlobStorePort ───
 
-export function describeBlobStoreConformance(target: ConformanceTarget): void {
+export function describeBlobStoreConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] BlobStorePort`, () => {
-    const { s, tamper } = useStorage(target);
+    const { s, tamper } = useStorage(target, harness);
     const bytes = new TextEncoder().encode("hello blob");
 
     test("put/readVerified round-trip; ref is content-addressed", () => {
@@ -639,9 +683,10 @@ export function describeBlobStoreConformance(target: ConformanceTarget): void {
 
 // ─── ChannelRepo ───
 
-export function describeChannelRepoConformance(target: ConformanceTarget): void {
+export function describeChannelRepoConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] ChannelRepo`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
     const channels = () => {
       const repo = s().channels;
       if (!repo) {
@@ -691,22 +736,23 @@ export function describeChannelRepoConformance(target: ConformanceTarget): void 
 
 // ─── Storage ───
 
-export function describeStorageConformance(target: ConformanceTarget): void {
+export function describeStorageConformance(target: ConformanceTarget, harness: ConformanceHarness): void {
+  const { describe, test, expect } = harness;
   describe(`[${target.name}] Storage`, () => {
-    const { s } = useStorage(target);
+    const { s } = useStorage(target, harness);
 
     test("ping succeeds on an open storage", () => {
       expect(() => s().ping()).not.toThrow();
     });
   });
-  describeAgentRepoConformance(target);
-  describeTaskRepoConformance(target);
-  describeOutboxRepoConformance(target);
-  describeTranscriptRepoConformance(target);
-  describeThreadRunRepoConformance(target);
-  describeCronRepoConformance(target);
-  describeAttachmentRepoConformance(target);
-  describeConfigRepoConformance(target);
-  describeBlobStoreConformance(target);
-  describeChannelRepoConformance(target);
+  describeAgentRepoConformance(target, harness);
+  describeTaskRepoConformance(target, harness);
+  describeOutboxRepoConformance(target, harness);
+  describeTranscriptRepoConformance(target, harness);
+  describeThreadRunRepoConformance(target, harness);
+  describeCronRepoConformance(target, harness);
+  describeAttachmentRepoConformance(target, harness);
+  describeConfigRepoConformance(target, harness);
+  describeBlobStoreConformance(target, harness);
+  describeChannelRepoConformance(target, harness);
 }
