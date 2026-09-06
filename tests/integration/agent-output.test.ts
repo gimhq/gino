@@ -6,15 +6,14 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createTask, getTranscript, setPlacement } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { sql } from "drizzle-orm";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { getTranscript } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
-import { createTask, setPlacement } from "@/tasks";
 
 const REGISTER_TOKEN = "reg-secret-output";
 const dbPath = resolve(tmpdir(), `gino-output-${process.pid}-${Date.now()}.db`);

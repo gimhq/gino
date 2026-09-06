@@ -1,19 +1,17 @@
-import type { SpawnFn } from "@/agents/launchers";
-import type { AppDatabase } from "@/db";
-import type { Storage } from "@/host/ports/storage";
+import type { Storage } from "@gino/host-core";
+import type { SpawnFn } from "@gino/host-core/domain";
+import type { AppDatabase } from "@gino/host-store-sqlite";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { createDockerLauncher, getAgent, hashToken, listAgents, manualLauncher, verifyConnectToken } from "@gino/host-core/domain";
+import { sqliteStorage } from "@gino/host-store-sqlite";
+import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { createDockerLauncher, manualLauncher } from "@/agents/launchers";
-import { getAgent, listAgents, verifyConnectToken } from "@/agents/registry";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { hashToken } from "@/platform";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 // D-B2b — launch + launch↔register nonce correlation (OD17), end-to-end through
 // the HTTP surface. The docker launcher's shell-out is MOCKED (a recording

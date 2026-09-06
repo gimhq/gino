@@ -1,8 +1,8 @@
 import { resolve } from "node:path";
+import { DEFAULT_HOST_OPTIONS, resolveHostOptions } from "@gino/host-core";
 import { describe, expect, it } from "bun:test";
 import { hostOptionsFromConfig } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { DEFAULT_HOST_OPTIONS, resolveHostOptions } from "@/host";
 
 // HOST — HostOptions: the env schema defaults and the SDK defaults must agree,
 // `hostOptionsFromConfig` is the one Config → HostOptions mapping, and the
