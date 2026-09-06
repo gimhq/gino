@@ -1,6 +1,6 @@
+import type { Logger } from "@gino/host-core";
 import type { ModelMap, ProxyProvider } from "./model-map";
 import type { Config } from "@/config";
-import type { Logger } from "@/shared/lib/logger";
 // M7 — proxy config. Projects the host `Config` (env-derived) onto the
 // structured shape the proxy module consumes: per-provider upstream origin +
 // credentials, the static proxy key (H5), the codex OAuth-refresh inputs, and

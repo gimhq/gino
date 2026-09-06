@@ -12,8 +12,8 @@
 // (`agents.getByConnectTokenHash`, no dependency on the M3 registry).
 // Constant-time comparison for the static key; the connect token is matched by
 // its stored sha-256 hash.
-import type { Storage } from "@/host/ports/storage";
-import { hashToken, safeEqual } from "@/platform";
+import type { Storage } from "@gino/host-core";
+import { hashToken, safeEqual } from "@gino/host-core/domain";
 import { extractProxyCredential, isAnthropicPassthroughPath, isAnthropicTempKey } from "./provider";
 
 export interface ProxyAuthOpts {

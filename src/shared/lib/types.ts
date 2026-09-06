@@ -1,6 +1,5 @@
+import type { Host, Logger } from "@gino/host-core";
 import type { Config } from "@/config";
-import type { Host } from "@/host";
-import type { Logger } from "@/shared/lib/logger";
 
 /**
  * Hono environment shared by every route + middleware. The data-plane

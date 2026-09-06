@@ -7,7 +7,7 @@
 
 import type { ProxyProvider } from "./model-map";
 
-export { isPrivateUpstreamHost } from "@/shared/lib/net";
+export { isPrivateUpstreamHost } from "@gino/host-core/domain";
 
 // ─── Allowed upstream subpaths (post `/llm` strip) ───
 // Anthropic-only paths.

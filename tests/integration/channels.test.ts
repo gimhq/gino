@@ -2,15 +2,14 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import process from "node:process";
+import { writeThreadMessage } from "@gino/host-core/domain";
+import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
+import { messages } from "@gino/host-store-sqlite/schema";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { websocket } from "hono/bun";
 import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
-import { createDb } from "@/db";
-import { messages } from "@/db/schema";
-import { writeThreadMessage } from "@/msgstore";
 import { createLogger } from "@/shared/lib/logger";
-import { sqliteStorage } from "@/store/sqlite";
 
 // D-B4 — channels over a LIVE server: register a channel (owner) → ingress routes
 // a new conversation to a new task (owner-stamped, dispatched) and continues it on

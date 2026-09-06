@@ -1,8 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import type { AppEnv } from "@/shared/lib/types";
-import { getAgentByConnectToken } from "@/agents/registry";
-import { safeEqual } from "@/platform";
-import { ForbiddenError, UnauthorizedError } from "@/shared/lib/errors";
+import { ForbiddenError, UnauthorizedError } from "@gino/host-core";
+import { getAgentByConnectToken, safeEqual } from "@gino/host-core/domain";
 
 // ─── Four-token auth (M1 / OD12 / HOST-XC-02) ───
 //
