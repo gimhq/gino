@@ -4,7 +4,7 @@ import { enrollAgent, getTask, grantOwner } from "@gino/host-core/domain";
 import { createDb, sqliteStorage } from "@gino/host-store-sqlite";
 import { messages } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { getBinding, registerChannel, routeInbound } from "@/channels";
+import { getBinding, registerChannel, routeInbound } from "../../src/index";
 
 // M6 ingress (OD9/OD16) — route an inbound message: continue a known conversation
 // or open a NEW task stamped with the CHANNEL's owner, dispatch it, deliver. The

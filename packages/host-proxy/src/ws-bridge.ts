@@ -1,3 +1,6 @@
+// Bun-only (Bun WebSocket types); Node embedders do not get the raw Codex
+// passthrough (host-sdk-design §7.5). Exported via `@gino/host-proxy/bun`.
+//
 // M7 — raw Codex WebSocket relay for `/llm/v1/responses` (the Codex SDK's
 // streaming endpoint). This relay is LIVE and production-reachable: the
 // HTTP→WS upgrade is wired in `src/edge/llm.ts`, which authenticates the

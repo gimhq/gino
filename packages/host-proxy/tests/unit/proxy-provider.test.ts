@@ -8,7 +8,7 @@ import {
   isAnthropicPassthroughPath,
   isAnthropicTempKey,
   isPrivateUpstreamHost,
-} from "@/proxy";
+} from "../../src/index";
 
 const h = (init: Record<string, string>) => new Headers(init);
 

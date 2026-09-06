@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.1.0",
   "private": true,
-  "description": "Gino host — protocol-v2 control plane (Bun + Hono + Drizzle on bun:sqlite). Workspace root.",
+  "description": "Gino host \u2014 protocol-v2 control plane (Bun + Hono + Drizzle on bun:sqlite). Workspace root.",
   "workspaces": [
     "packages/*",
     "apps/*",
@@ -13,12 +13,12 @@
     "dev": "bun --hot src/index.ts",
     "start": "bun dist/index.js",
     "build": "bun build src/index.ts --outdir dist --target bun --minify",
-    "typecheck": "bun run --filter @gino/host-core typecheck && bun run --filter @gino/host-store-sqlite typecheck && tsc --noEmit",
+    "typecheck": "bun run --filter @gino/host-core typecheck && bun run --filter @gino/host-store-sqlite typecheck && bun run --filter @gino/host-channels typecheck && bun run --filter @gino/host-proxy typecheck && tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "bun --env-file=/dev/null test",
     "test:coverage": "bun --env-file=/dev/null test --coverage",
-    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run check:root",
+    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run --filter @gino/host-channels check && bun run --filter @gino/host-proxy check && bun run check:root",
     "check:root": "bun run lint && tsc --noEmit && bun --env-file=/dev/null test ./tests/ && bun run build",
     "package": "bun scripts/package.ts",
     "clean": "bun scripts/clean.ts",
@@ -27,7 +27,9 @@
     "db:studio": "bun run --filter @gino/host-store-sqlite db:studio"
   },
   "dependencies": {
+    "@gino/host-channels": "workspace:*",
     "@gino/host-core": "workspace:*",
+    "@gino/host-proxy": "workspace:*",
     "@gino/host-store-sqlite": "workspace:*",
     "@hono/standard-validator": "0.2.2",
     "@scalar/hono-api-reference": "0.11.5",
