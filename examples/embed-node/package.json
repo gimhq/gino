@@ -1,0 +1,28 @@
+{
+  "name": "@gino/example-embed-node",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gino host SDK embedded in a plain Node process (@hono/node-server + @hono/node-ws + better-sqlite3), round-tripping one task against the real gino-agent runner.",
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run lint && bun run typecheck",
+    "start": "node src/server.ts",
+    "e2e": "bash scripts/roundtrip.sh"
+  },
+  "dependencies": {
+    "@gino/host-core": "workspace:*",
+    "@gino/host-hono": "workspace:*",
+    "@gino/host-store-sqlite": "workspace:*",
+    "@hono/node-server": "1.19.17",
+    "hono": "4.12.26",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "8.18.1",
+    "eslint": "10.5.0",
+    "typescript": "6.0.3"
+  }
+}
