@@ -1,14 +1,9 @@
 {
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "types": ["bun"],
-    "paths": {
-      "@/*": ["./src/*"]
-    }
+    "types": ["bun"]
   },
   "include": [
-    "src/**/*.ts",
-    "tests/**/*.ts",
     "scripts/**/*.ts",
     "eslint.config.ts"
   ]

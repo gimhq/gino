@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
  * ROOT_DIR resolution:
  * 1. ROOT_DIR env var — explicit override
  * 2. Compiled binary (/$bunfs) — process.cwd()
- * 3. Otherwise — one level up from this file (src/) to the repo root
+ * 3. Otherwise — one level up from this file (src/) to the app dir (apps/host)
  *
- * This is a single-root project (no monorepo): `src/` sits at the repo
- * root, so `drizzle/` and `data/` resolve relative to `../`.
+ * The host app lives at `apps/host/` in the workspace: `src/` sits directly
+ * under it, so `data/` resolves relative to `../`. Migrations are embedded in
+ * @gino/host-store-sqlite, so no on-disk `drizzle/` lookup is needed.
  */
 // import.meta.url is always available (works in Bun, Node, Vite).
 const THIS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -32,7 +33,7 @@ function detectRootDir(): string {
     return process.cwd();
   }
 
-  // Dev / test: this file is at <root>/src/dirs.ts → go up one level.
+  // Dev / test: this file is at apps/host/src/dirs.ts → go up one level.
   return resolve(THIS_DIR, "..");
 }
 

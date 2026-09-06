@@ -2,7 +2,7 @@
 # upstream and a test driver — wired on one compose network.
 #
 #   mock-llm  oven/bun        canned Anthropic-ish upstream for the /llm proxy test
-#   host      oven/bun        the protocol-v2 control plane (bun src/index.ts), repo bind-mounted
+#   host      oven/bun        the protocol-v2 control plane (bun apps/host/src/index.ts), repo bind-mounted
 #   agent     Dockerfile.agent  the Rust gino-agent + a fake `claude` engine; dials the host
 #   tester    oven/bun        drives the host HTTP surface end-to-end, exits 0/1
 #
@@ -27,7 +27,7 @@ services:
   host:
     image: oven/bun:1.3.14
     working_dir: /app
-    command: ["bun", "src/index.ts"]
+    command: ["bun", "apps/host/src/index.ts"]
     depends_on:
       mock-llm:
         condition: service_started
@@ -37,7 +37,7 @@ services:
       - /tmp
     environment:
       NODE_ENV: development
-      ROOT_DIR: /app
+      ROOT_DIR: /app/apps/host
       GINO_PORT: "3000"
       GINO_HOST: 0.0.0.0
       GINO_DB_PATH: /tmp/gino/gino.db
