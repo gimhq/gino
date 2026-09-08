@@ -119,6 +119,36 @@ describe("writeThreadMessage → messages (transcript)", () => {
     expect(a?.input).toEqual({ cmd: "ls", args: ["-la"] });
     expect(b?.output).toEqual({ code: 0, lines: 3 });
   });
+
+  it("persists sub-agent attribution ids; their absence means the main agent (NULL)", () => {
+    const taskId = seedTask();
+    const threadId = ulid();
+    writeThreadMessage(storage, {
+      taskId,
+      threadId,
+      data: { seq: 1, kind: "tool_use", tool: "Task", tool_use_id: "toolu_parent" },
+    });
+    writeThreadMessage(storage, {
+      taskId,
+      threadId,
+      data: {
+        seq: 2,
+        kind: "tool_use",
+        tool: "bash",
+        tool_use_id: "toolu_child",
+        parent_tool_use_id: "toolu_parent",
+      },
+    });
+    writeThreadMessage(storage, { taskId, threadId, data: { seq: 3, kind: "assistant_text", content: "main" } });
+
+    const [spawn, inner, main] = getTranscript(storage, threadId);
+    expect(spawn?.toolUseId).toBe("toolu_parent");
+    expect(spawn?.parentToolUseId).toBeNull();
+    expect(inner?.toolUseId).toBe("toolu_child");
+    expect(inner?.parentToolUseId).toBe("toolu_parent");
+    expect(main?.toolUseId).toBeNull();
+    expect(main?.parentToolUseId).toBeNull();
+  });
 });
 
 describe("writeThreadResult → thread_runs (UPSERT by thread_id)", () => {
