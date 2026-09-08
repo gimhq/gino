@@ -1229,6 +1229,8 @@ impl ThreadExecutor {
             tool,
             input: None,
             output: None,
+            tool_use_id: None,
+            parent_tool_use_id: None,
         };
         db.enqueue_outbox_correlated(
             "thread_message",
