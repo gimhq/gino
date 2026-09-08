@@ -133,7 +133,7 @@ agent-architecture); bytes never travel in frames.
 | type | envelope ids | data | meaning |
 |---|---|---|---|
 | `thread_result` | `taskId`, `threadId` | `{status, result?, error?, failure_reason?, engine_session_id?, duration_ms, final_seq, attachments?}` | terminal outcome of one execution (mirror → `thread_runs`) |
-| `thread_message` | `taskId`, `threadId` | `{seq, kind, role?, content?, tool?, input?, output?}` | one ordered transcript event (mirror → `messages`) |
+| `thread_message` | `taskId`, `threadId` | `{seq, kind, role?, content?, tool?, input?, output?, tool_use_id?, parent_tool_use_id?}` | one ordered transcript event (mirror → `messages`) |
 | `cron_state` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity?, next_run?, status?, round_count, skipped_count, last_status?}` | local scheduling-ledger summary (mirror → `crons`) |
 | `heartbeat` | — | `{activeThreads?, …}` | liveness (interval from `config.heartbeatIntervalMs`) |
 | `msg_ack` | (top-level `msgId`) | — | durably stored an inbound message |
@@ -168,6 +168,17 @@ Field semantics:
   `engine_session_id` so the next turn starts fresh.
 - `seq` (`thread_message`) is per-thread monotonic (assigned serially by the runner);
   `final_seq` (`thread_result`) is the last `seq` emitted on the thread (see §6).
+- `tool_use_id` (`thread_message`) is the engine's id for a `tool_use` block, echoed on
+  the matching `tool_result`, so a receiver can pair a call with its return value.
+- `parent_tool_use_id` (`thread_message`) attributes the event to the parent tool call
+  that produced it: it is PRESENT on every event produced INSIDE a sub-agent (a `Task`
+  tool call) and ABSENT for the main agent's own events — absence therefore means "the
+  main agent". It introduces no hierarchy in the task/thread model: `seq` stays a single
+  per-thread monotonic stream across all kinds, and attribution is a per-message property
+  only.
+- `output` on a `tool_result` (`thread_message`) carries `{content, is_error}` —
+  `content` is the engine's `tool_result` block content verbatim (any JSON value) and
+  `is_error` is the block's boolean flag (`false` when the engine omits it).
 - `round_count` / `skipped_count` (`cron_state`) are the runner-local `cron_logs` summary;
   the host derives dispatched counts from its own mirror by `cron_id`.
 - `threadId` (`message`, host→agent) selects continuity. The HOST mints conversation
@@ -389,7 +400,13 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "type": "string"
                 },
                 "input": {},
-                "output": {}
+                "output": {},
+                "tool_use_id": {
+                  "type": "string"
+                },
+                "parent_tool_use_id": {
+                  "type": "string"
+                }
               },
               "required": [
                 "seq",
@@ -1088,7 +1105,13 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
                   "type": "string"
                 },
                 "input": {},
-                "output": {}
+                "output": {},
+                "tool_use_id": {
+                  "type": "string"
+                },
+                "parent_tool_use_id": {
+                  "type": "string"
+                }
               },
               "required": [
                 "seq",
