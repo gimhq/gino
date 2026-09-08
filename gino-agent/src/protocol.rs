@@ -288,7 +288,7 @@ pub(crate) mod v2 {
     /// Transcript-event classification for a [`ThreadMessageData`]
     /// (agent-architecture §10; the host `messages.kind` column). `thinking`/
     /// `status` are config-filterable.
-    #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub(crate) enum MessageKind {
         UserInput,
@@ -298,6 +298,11 @@ pub(crate) mod v2 {
         ToolResult,
         Status,
         Error,
+        /// Any `kind` outside the recognized set, kept verbatim: protocol §5
+        /// requires a receiver to store an unrecognized `kind` opaquely rather
+        /// than reject the frame. Round-trips losslessly.
+        #[serde(untagged)]
+        Unknown(String),
     }
 
     // -----------------------------------------------------------------------
@@ -453,6 +458,12 @@ pub(crate) mod v2 {
 
     /// `data` of a `thread_message` — one ordered transcript event. `seq` is
     /// per-thread monotonic (assigned by the runner).
+    ///
+    /// `parent_tool_use_id` is present on every event produced INSIDE a
+    /// sub-agent (a `Task` tool call) and absent for the main agent's own
+    /// events, so absence means "the main agent"; `tool_use_id` is the engine's
+    /// id for a `tool_use` block, echoed on the matching `tool_result`. Neither
+    /// introduces hierarchy — `seq` stays one per-thread stream.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub(crate) struct ThreadMessageData {
         pub(crate) seq: i64,
@@ -467,6 +478,10 @@ pub(crate) mod v2 {
         pub(crate) input: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) output: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) tool_use_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(crate) parent_tool_use_id: Option<String>,
     }
 
     /// `data` of a `cron_state` — the local scheduling-ledger summary for a cron.
@@ -681,6 +696,8 @@ pub(crate) mod v2 {
                     tool: None,
                     input: None,
                     output: None,
+                    tool_use_id: None,
+                    parent_tool_use_id: None,
                 },
                 outbox_id: Some(43),
             };
@@ -719,6 +736,8 @@ pub(crate) mod v2 {
                     tool: Some("bash".to_owned()),
                     input: Some(json!({ "cmd": "ls" })),
                     output: Some(json!({ "code": 0 })),
+                    tool_use_id: None,
+                    parent_tool_use_id: None,
                 },
                 outbox_id: None,
             };
@@ -1145,6 +1164,67 @@ pub(crate) mod v2 {
             assert_eq!(task_id, "t-1");
             assert_eq!(data.seq, 1);
             assert_eq!(data.kind, MessageKind::Status);
+        }
+
+        #[test]
+        fn sub_agent_attribution_ids_serialize_when_set() {
+            let data = ThreadMessageData {
+                seq: 11,
+                kind: MessageKind::ToolResult,
+                role: None,
+                content: None,
+                tool: Some("Task".to_owned()),
+                input: None,
+                output: Some(json!({ "content": "done", "is_error": false })),
+                tool_use_id: Some("toolu_01".to_owned()),
+                parent_tool_use_id: Some("toolu_parent".to_owned()),
+            };
+            assert_eq!(
+                serde_json::to_value(&data).unwrap(),
+                json!({
+                    "seq": 11,
+                    "kind": "tool_result",
+                    "tool": "Task",
+                    "output": { "content": "done", "is_error": false },
+                    "tool_use_id": "toolu_01",
+                    "parent_tool_use_id": "toolu_parent"
+                })
+            );
+        }
+
+        #[test]
+        fn sub_agent_attribution_ids_are_omitted_when_unset() {
+            // Absence is meaningful: no `parent_tool_use_id` == the main agent.
+            let data = ThreadMessageData {
+                seq: 1,
+                kind: MessageKind::AssistantText,
+                role: None,
+                content: Some("hi".to_owned()),
+                tool: None,
+                input: None,
+                output: None,
+                tool_use_id: None,
+                parent_tool_use_id: None,
+            };
+            let value = serde_json::to_value(&data).unwrap();
+            assert!(value.get("tool_use_id").is_none());
+            assert!(value.get("parent_tool_use_id").is_none());
+        }
+
+        #[test]
+        fn message_kind_round_trips_known_and_unknown() {
+            // Known kind: the snake_case wire name.
+            let known: MessageKind = serde_json::from_value(json!("tool_use")).unwrap();
+            assert_eq!(known, MessageKind::ToolUse);
+            assert_eq!(serde_json::to_value(&known).unwrap(), json!("tool_use"));
+
+            // Unknown kind: stored opaquely (§5) and re-serialized verbatim.
+            let unknown: MessageKind = serde_json::from_value(json!("video_frame")).unwrap();
+            assert_eq!(unknown, MessageKind::Unknown("video_frame".to_owned()));
+            assert_eq!(
+                serde_json::to_value(&unknown).unwrap(),
+                json!("video_frame")
+            );
         }
     }
 }
