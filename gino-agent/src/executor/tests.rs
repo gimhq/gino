@@ -17,8 +17,8 @@ use crate::engine::{
     Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
 };
 use crate::protocol::v2::{
-    AttachmentDescriptor, EntryKind, ProvisioningEntry, ThreadMessageData, ThreadResultData,
-    ThreadStatus,
+    AttachmentDescriptor, EntryKind, MessageKind, ProvisioningEntry, ThreadMessageData,
+    ThreadResultData, ThreadStatus,
 };
 use crate::provisioning::{BlobFetcher, Provisioner, ProvisioningError};
 use crate::scheduler::{now, to_iso};
@@ -84,6 +84,7 @@ fn started(session_id: &str) -> EngineEvent {
 fn out(text: &str) -> EngineEvent {
     EngineEvent::Output {
         text: text.to_owned(),
+        parent_tool_use_id: None,
     }
 }
 
@@ -215,9 +216,11 @@ async fn run_thread_succeeds_streams_ordered_seq_and_keeps_session() {
         started("sess-1"),
         EngineEvent::Output {
             text: "hello".to_owned(),
+            parent_tool_use_id: None,
         },
         EngineEvent::Output {
             text: " world".to_owned(),
+            parent_tool_use_id: None,
         },
         ok_result("done", "sess-1"),
     ];
@@ -290,6 +293,72 @@ async fn empty_assistant_text_is_not_emitted() {
     assert_eq!(msgs[0].content.as_deref(), Some("real content"));
     assert_eq!(msgs[0].seq, 1, "no seq was wasted on the empty chunk");
     assert_eq!(results(&db)[0].final_seq, 1);
+}
+
+/// A sub-agent turn: thinking / tool_use / tool_result stream as their own
+/// transcript kinds on the SINGLE per-thread `seq` stream, carrying the
+/// tool payloads and the `parent_tool_use_id` attribution.
+#[tokio::test]
+async fn transcript_kinds_carry_tool_payloads_and_attribution() {
+    let db = test_db();
+    let script = vec![
+        started("sess-1"),
+        EngineEvent::Thinking {
+            text: "planning".to_owned(),
+            parent_tool_use_id: None,
+        },
+        EngineEvent::ToolUse {
+            tool_use_id: "tu-1".to_owned(),
+            tool: "Bash".to_owned(),
+            input: serde_json::json!({ "command": "ls" }),
+            parent_tool_use_id: Some("tu-parent".to_owned()),
+        },
+        EngineEvent::ToolResult {
+            tool_use_id: "tu-1".to_owned(),
+            output: serde_json::json!({ "content": "a.txt", "is_error": false }),
+            parent_tool_use_id: Some("tu-parent".to_owned()),
+        },
+        ok_result("done", "sess-1"),
+    ];
+    let exec = build(&db, script, false, no_inactivity());
+    lock(&db)
+        .insert_thread(&pending_thread("th-tools", 1))
+        .unwrap();
+
+    let final_row = exec
+        .run_thread(
+            pending_thread("th-tools", 1),
+            "go".to_owned(),
+            Continuity::Isolated,
+        )
+        .await;
+    assert_eq!(final_row.status, "succeeded");
+
+    let msgs = messages(&db);
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(
+        msgs.iter().map(|m| m.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "one monotonic seq stream across all kinds"
+    );
+
+    assert_eq!(msgs[0].kind, MessageKind::Thinking);
+    assert_eq!(msgs[0].content.as_deref(), Some("planning"));
+    assert!(msgs[0].parent_tool_use_id.is_none());
+
+    assert_eq!(msgs[1].kind, MessageKind::ToolUse);
+    assert_eq!(msgs[1].tool.as_deref(), Some("Bash"));
+    assert_eq!(msgs[1].input, Some(serde_json::json!({ "command": "ls" })));
+    assert_eq!(msgs[1].tool_use_id.as_deref(), Some("tu-1"));
+    assert_eq!(msgs[1].parent_tool_use_id.as_deref(), Some("tu-parent"));
+
+    assert_eq!(msgs[2].kind, MessageKind::ToolResult);
+    assert_eq!(
+        msgs[2].output,
+        Some(serde_json::json!({ "content": "a.txt", "is_error": false }))
+    );
+    assert_eq!(msgs[2].tool_use_id.as_deref(), Some("tu-1"));
+    assert_eq!(msgs[2].parent_tool_use_id.as_deref(), Some("tu-parent"));
 }
 
 // -- P2-16: per-message flush poke streams transcript mid-run --------
