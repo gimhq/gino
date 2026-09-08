@@ -9,7 +9,15 @@
 #
 #   1. a `system/init`  line               → runner SessionStarted
 #   2. one `assistant` text block          → runner Output → host thread_message
-#   3. a terminal `result`/success line    → runner Result → host thread_result(succeeded)
+#   3. a sub-agent sequence, so the e2e can assert `tool_use_id` /
+#      `parent_tool_use_id` attribution end to end (protocol §5):
+#        3a. an `assistant` `tool_use` block spawning the `Task` sub-agent, with
+#            NO top-level `parent_tool_use_id` (the MAIN agent spawns it)
+#        3b. an `assistant` text block carrying `parent_tool_use_id` = that
+#            tool-use id (the SUB-AGENT talking)
+#        3c. a `user` `tool_result` block closing the same tool-use id, back on
+#            the main agent (top-level `parent_tool_use_id` null)
+#   4. a terminal `result`/success line    → runner Result → host thread_result(succeeded)
 #
 # It additionally drains stdin to recover the user prompt the runner streams in
 # (control_request `initialize`, `set_permission_mode`, then a `user` turn) and
@@ -51,6 +59,24 @@ reply="gino-e2e ok"
 emit "$(jq -cn --arg t "$reply" \
   '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:$t}]}}')"
 
-# 4) Terminal success result — carries the session id (the resume handle).
+# 4) Sub-agent sequence — a `Task` tool_use spawned by the main agent, the
+#    sub-agent's own text (attributed by parent_tool_use_id) and the tool_result
+#    that returns to the main agent. The tool-use id is fixed so the e2e can pin it.
+TASK_ID="toolu_e2e_task_1"
+
+emit "$(jq -cn --arg id "$TASK_ID" \
+  '{type:"assistant",message:{role:"assistant",content:[
+      {type:"tool_use",id:$id,name:"Task",
+       input:{description:"e2e sub-agent probe",prompt:"say hello"}}]}}')"
+
+emit "$(jq -cn --arg id "$TASK_ID" \
+  '{type:"assistant",parent_tool_use_id:$id,message:{role:"assistant",content:[
+      {type:"text",text:"gino-e2e subagent ok"}]}}')"
+
+emit "$(jq -cn --arg id "$TASK_ID" \
+  '{type:"user",parent_tool_use_id:null,message:{role:"user",content:[
+      {type:"tool_result",tool_use_id:$id,content:"gino-e2e subagent result",is_error:false}]}}')"
+
+# 5) Terminal success result — carries the session id (the resume handle).
 emit "$(jq -cn --arg s "$SID" --arg r "$reply" \
   '{type:"result",subtype:"success",is_error:false,result:$r,session_id:$s}')"
