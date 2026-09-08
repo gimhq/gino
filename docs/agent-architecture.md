@@ -251,13 +251,21 @@ the type-specific business payload only:
 | type | envelope | data |
 |---|---|---|
 | `thread_result` | taskId, threadId | `{status, result?, error?, failure_reason?, engine_session_id?, duration_ms, final_seq, attachments?}` |
-| `thread_message` | taskId, threadId | `{seq, kind, role?, content?, tool?, input?, output?}` |
+| `thread_message` | taskId, threadId | `{seq, kind, role?, content?, tool?, input?, output?, tool_use_id?, parent_tool_use_id?}` |
 | `cron_state` | taskId, cronId | `{kind, schedule_type?, …, round_count, skipped_count, last_status}` |
 | `heartbeat` | — | `{activeThreads?, …}` |
 | `msg_ack` / `ack` | top-level `msgId`/`id` | — |
 
 `kind` ∈ `{user_input, assistant_text, thinking, tool_use, tool_result, status, error}` (`thinking`/`log`
 config-filterable). Bytes never in frames — only descriptors.
+
+The runner emits `assistant_text`, `thinking`, `tool_use`, `tool_result`, `status` and `error`;
+`user_input` is defined but not emitted by the runner. `parent_tool_use_id` is present on every event
+produced inside a sub-agent (a `Task` tool call) and absent for the main agent's own events — absence
+means the main agent. `tool_use_id` is the engine's id for a `tool_use` block, echoed on the matching
+`tool_result`, so a reader can pair a call with its return value; `tool_result.output` carries
+`{content, is_error}`. Attribution introduces **no hierarchy**: `seq` stays a single per-thread monotonic
+stream across all kinds, and there are no sub-threads or parent tasks.
 
 **Multiplexing & ordering (one WS, N parallel threads).** Concurrent threads' frames interleave. The host
 **demuxes by `threadId`**, **orders each thread's transcript by `seq`** (per-thread monotonic, assigned

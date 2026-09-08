@@ -113,17 +113,17 @@ byte channel, and provisioning entry parsing.
 | # | Side | Severity | Gap |
 |---|---|---|---|
 | D4 | agent | P3 | `heartbeat.activeThreads` never populated (fixed `{}` heartbeat); a `config_update` changing `heartbeatIntervalMs` does not re-arm the running transport. |
-| D5 | agent | P3 | Transcript kinds under-emitted: only `assistant_text`/`status`/`error`; `thinking`/`tool_use`/`tool_result`/`user_input` (and `role`/`tool`/`input`/`output`) never leave the runner. |
 | D6 | host | P3 | `thread_result.data.result`/`error` are dropped (no mirror columns); `thread_message` does not derive cron dispatch context (only `thread_result` does). |
 | D7 | host | P3 | No per-task message delivery cursor (`TODO(M4/B3)` in `src/protocol/outbox.ts`); per-row acks only. |
 | D8 | host | P3 | `task_delete` is never emitted (tasks are orphaned on agent removal); the runner implements it as a status-cancel. Documented behavior, no wire use. |
 | D9 | both | P3 | Version negotiation is exact-equality (`=== 2`) on both sides; no range negotiation. |
 
-## Fixed in follow-up (runner-side D1–D3)
+## Fixed in follow-up (D1–D3 runner-side, D5 both sides)
 
-D1–D3 were closed after this branch landed and have been lifted out of the deferred
-table so it stays a list of open work. All three are runner-side; none changed the
-wire.
+D1–D3 and D5 were closed after this branch landed and have been lifted out of the
+deferred table so it stays a list of open work. D1–D3 are runner-side and none of them
+changed the wire; D5 spans both sides and extended the wire additively
+(`protocolVersion` stays 2).
 
 ### D1 (P1) · Task status now gates execution — `32cf9b6`
 
@@ -162,3 +162,39 @@ retry/fatal decision lives in `register_failure_action`, which fails closed: onl
 `invalid_register_token`, `registration_disabled`, `invalid_body`,
 `unsupported_protocol`, the protocol-version gate, and any unrecognized reason still
 abort startup, so a rejection this build has never heard of cannot become a hot loop.
+
+### D5 (P3) · Transcript kinds emitted, with sub-agent attribution — `9aa25ff`, `ac89921`, `015679b`, `4dde419`
+
+The Claude mapper now walks assistant content blocks in order, so the runner emits
+`assistant_text` (all text blocks of one message concatenated into a single event),
+`thinking`, `tool_use` (`tool` = block name, `input` = block input, `tool_use_id` =
+block id) and `tool_result` (from `user` messages carrying `tool_result` blocks:
+`tool_use_id` + `output` = `{content, is_error}`), alongside the `status`/`error`
+events it already produced. `thread_message.data` gained two optional fields:
+`tool_use_id`, the engine's id for a `tool_use` block, echoed on the matching
+`tool_result` so a reader can pair a call with its return value; and
+`parent_tool_use_id`, present on every event produced inside a sub-agent (a `Task` tool
+call) and absent for the main agent's own events, so absence means the main agent. The
+line-level top-level `parent_tool_use_id` is attached to every event derived from that
+line. Attribution introduces no hierarchy — `seq` remains one per-thread monotonic
+stream across all kinds. `MessageKind` also gained a `#[serde(untagged)]
+Unknown(String)` catch-all, so an unrecognized `kind` is stored opaquely instead of
+rejecting the frame. On the host, `messages` gained the `tool_use_id` /
+`parent_tool_use_id` columns (plain additive migration `0006_loud_aqueduct.sql`); the
+transcript writer persists them and `host.transcript.get` / `GET /tasks/:id?thread=`
+expose them as `toolUseId` / `parentToolUseId`.
+
+Verified on the integrated branch: the docker cross-implementation e2e drives a real
+sub-agent sequence and asserts the attribution, **64/64 checks** green, with the
+observed transcript shape (`[seq, kind, tool, toolUseId, parentToolUseId]`):
+
+```
+[1,"assistant_text",null,null,null]
+[2,"tool_use","Task","toolu_e2e_task_1",null]
+[3,"assistant_text",null,null,"toolu_e2e_task_1"]
+[4,"tool_result",null,"toolu_e2e_task_1",null]
+```
+
+Residual (still open, P3): `user_input` is still not emitted by the runner — the host
+seeds the user's own text through its own path — and `role` is still always null on
+runner-emitted rows.
