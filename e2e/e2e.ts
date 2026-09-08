@@ -225,10 +225,39 @@ async function testTaskRoundTrip(): Promise<void> {
     // The task view carries bounded thread SUMMARIES only (HOST-M1M2-16); the
     // transcript itself is paged per thread via `?thread=`.
     const page = await admin("GET", `/tasks/${taskId}?thread=${view.threadId}`);
-    const contents: string[] = (page.json?.data?.messages ?? []).map((m: any) => m.content);
+    const rows: any[] = page.json?.data?.messages ?? [];
+    const contents: string[] = rows.map((m: any) => m.content);
     check("transcript carries the echoed nonce", contents.some(c => typeof c === "string" && c.includes(nonce)), JSON.stringify(contents));
     // eslint-disable-next-line no-console
     console.log(`    transcript=${JSON.stringify(contents)} session=${view.run?.engineSessionId ?? view.run?.engine_session_id}`);
+
+    // Sub-agent attribution (protocol §5): the fake engine emits a `Task`
+    // tool_use, the sub-agent's own text tagged with parent_tool_use_id, and
+    // the tool_result closing the same id back on the main agent.
+    const shape = JSON.stringify(rows.map(r => [r.seq, r.kind, r.tool, r.toolUseId, r.parentToolUseId]));
+    // eslint-disable-next-line no-console
+    console.log(`    subagent-shape=${shape}`);
+
+    const toolUse = rows.find(r => r.kind === "tool_use" && r.tool === "Task" && r.toolUseId === "toolu_e2e_task_1");
+    check("transcript has the Task tool_use", !!toolUse, shape);
+    check("tool_use input preserved", toolUse?.input?.description === "e2e sub-agent probe", JSON.stringify(toolUse?.input));
+    check("tool_use is main-agent attributed", toolUse?.parentToolUseId == null, `parentToolUseId=${JSON.stringify(toolUse?.parentToolUseId)}`);
+
+    const toolResult = rows.find(r => r.kind === "tool_result" && r.toolUseId === "toolu_e2e_task_1");
+    check(
+      "transcript has the matching tool_result",
+      toolResult?.output?.is_error === false && JSON.stringify(toolResult?.output?.content ?? "").includes("gino-e2e subagent result"),
+      JSON.stringify(toolResult?.output),
+    );
+
+    const subText = rows.find(r => r.kind === "assistant_text" && typeof r.content === "string" && r.content.includes("gino-e2e subagent ok"));
+    check("sub-agent text carries parent_tool_use_id", subText?.parentToolUseId === "toolu_e2e_task_1", shape);
+
+    const mainText = rows.find(r => typeof r.content === "string" && r.content.includes(nonce));
+    check("main-agent text is unattributed", mainText != null && mainText.parentToolUseId == null, shape);
+
+    const seqs: number[] = rows.map(r => r.seq);
+    check("seq stays one strictly increasing stream", seqs.every((n, i) => i === 0 || n > seqs[i - 1]!), JSON.stringify(seqs));
   });
 }
 
