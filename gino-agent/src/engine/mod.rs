@@ -115,8 +115,17 @@ pub(crate) struct RunOutcome {
 
 /// An event emitted while a [`Session`] runs (PLAN-003 §5 `EngineEvent`). The
 /// runner forwards these to the orchestrator (mapping `Result` → `output`, the
-/// rest → logs) and persists the session id from `SessionStarted`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// rest → transcript events and logs) and persists the session id from
+/// `SessionStarted`.
+///
+/// The transcript-carrying variants (`Output`, `Thinking`, `ToolUse`,
+/// `ToolResult`) all carry `parent_tool_use_id`: the id of the tool call that
+/// produced them. It is `Some` ONLY for events produced inside a SUB-AGENT (the
+/// engine's `Task` tool); `None` means the main agent. It is attribution only —
+/// it introduces no hierarchy, and `seq` stays one per-thread stream.
+///
+/// `serde_json::Value` payloads mean this type is `PartialEq` but not `Eq`.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum EngineEvent {
     /// The backend reported its session id (Claude `system/init`). The consumer
     /// persists this for resume.
@@ -128,6 +137,35 @@ pub(crate) enum EngineEvent {
     Output {
         /// A chunk of assistant text.
         text: String,
+        /// The sub-agent tool call this text came from, `None` for the main agent.
+        parent_tool_use_id: Option<String>,
+    },
+    /// Streaming assistant reasoning text (an engine `thinking` block).
+    Thinking {
+        /// A chunk of reasoning text.
+        text: String,
+        /// The sub-agent tool call this text came from, `None` for the main agent.
+        parent_tool_use_id: Option<String>,
+    },
+    /// The assistant invoked a tool (an engine `tool_use` block).
+    ToolUse {
+        /// The engine's id for this call, echoed on the matching [`Self::ToolResult`].
+        tool_use_id: String,
+        /// The tool's name.
+        tool: String,
+        /// The call's arguments, verbatim.
+        input: serde_json::Value,
+        /// The sub-agent tool call this call was made inside, `None` for the main agent.
+        parent_tool_use_id: Option<String>,
+    },
+    /// A tool call returned (an engine `tool_result` block).
+    ToolResult {
+        /// The [`Self::ToolUse`] id this result belongs to.
+        tool_use_id: String,
+        /// `{content, is_error}` — the block's content verbatim plus its error flag.
+        output: serde_json::Value,
+        /// The sub-agent tool call this result came from, `None` for the main agent.
+        parent_tool_use_id: Option<String>,
     },
     /// The turn completed (Claude `result`).
     Result(RunOutcome),
