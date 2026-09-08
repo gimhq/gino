@@ -138,6 +138,12 @@ export const messages = sqliteTable(
     tool: text("tool"),
     input: text("input", { mode: "json" }).$type<unknown>(),
     output: text("output", { mode: "json" }).$type<unknown>(),
+    // Sub-agent attribution (protocol §5). `tool_use_id` is the engine's id for
+    // a `tool_use` block, echoed on the matching `tool_result`. NULL
+    // `parent_tool_use_id` means the main agent's own event; non-NULL means the
+    // event was produced inside that sub-agent (`Task`) call.
+    toolUseId: text("tool_use_id"),
+    parentToolUseId: text("parent_tool_use_id"),
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [

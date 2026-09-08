@@ -38,6 +38,8 @@ export function writeThreadMessage(storage: Storage, { taskId, threadId, data }:
     tool: data.tool ?? null,
     input: data.input ?? null,
     output: data.output ?? null,
+    toolUseId: data.tool_use_id ?? null,
+    parentToolUseId: data.parent_tool_use_id ?? null,
   });
 }
 

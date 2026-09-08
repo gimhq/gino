@@ -86,4 +86,20 @@ describe("createHost", () => {
     expect(host.transcript.run("thread-none")).toBeUndefined();
     host.stop();
   });
+
+  it("transcript.get exposes the sub-agent attribution ids as written", () => {
+    const host = makeHost();
+    const write = (row: Parameters<typeof host.storage.transcript.insertIfAbsent>[0]) =>
+      host.storage.transcript.insertIfAbsent(row);
+    write({ taskId: "t1", threadId: "th1", seq: 1, kind: "tool_use", tool: "Task", toolUseId: "toolu_parent" });
+    write({ taskId: "t1", threadId: "th1", seq: 2, kind: "assistant_text", content: "inner", parentToolUseId: "toolu_parent" });
+    write({ taskId: "t1", threadId: "th1", seq: 3, kind: "assistant_text", content: "main" });
+
+    expect(host.transcript.get("th1").map(r => [r.seq, r.toolUseId, r.parentToolUseId])).toEqual([
+      [1, "toolu_parent", null],
+      [2, null, "toolu_parent"],
+      [3, null, null],
+    ]);
+    host.stop();
+  });
 });

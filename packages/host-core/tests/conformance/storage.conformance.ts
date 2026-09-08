@@ -374,6 +374,24 @@ export function describeTranscriptRepoConformance(target: ConformanceTarget, har
       expect(rows[0]).toMatchObject({ content: "first", role: null, input: null, output: null });
     });
 
+    test("sub-agent attribution round-trips; absence stores NULL for both ids", () => {
+      s().transcript.insertIfAbsent(msg("th1", 1, { kind: "tool_use", toolUseId: "tu-1" }));
+      s().transcript.insertIfAbsent(msg("th1", 2, { kind: "assistant_text", toolUseId: "tu-2", parentToolUseId: "tu-1" }));
+      s().transcript.insertIfAbsent(msg("th1", 3));
+      const rows = s().transcript.read("th1", { limit: 10 });
+      expect(rows.map(r => [r.toolUseId, r.parentToolUseId])).toEqual([
+        ["tu-1", null],
+        ["tu-2", "tu-1"],
+        [null, null],
+      ]);
+      // Same shape on the id-ordered tail read the egress cursor uses.
+      expect(s().transcript.readAfterId("t1", 0, 10).map(r => [r.toolUseId, r.parentToolUseId])).toEqual([
+        ["tu-1", null],
+        ["tu-2", "tu-1"],
+        [null, null],
+      ]);
+    });
+
     test("read is ordered by seq (never arrival) and honours afterSeq/limit", () => {
       s().transcript.insertIfAbsent(msg("th1", 3));
       s().transcript.insertIfAbsent(msg("th1", 1));

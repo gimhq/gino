@@ -434,6 +434,8 @@ mod tests {
             tool: None,
             input: None,
             output: None,
+            tool_use_id: None,
+            parent_tool_use_id: None,
         }
     }
 
