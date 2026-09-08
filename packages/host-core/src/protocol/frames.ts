@@ -101,7 +101,15 @@ export const RECOGNIZED_MESSAGE_KINDS: ReadonlySet<string> = new Set([
   "error",
 ]);
 
-/** `thread_message.data` — one ordered transcript event (→ `messages`). */
+/**
+ * `thread_message.data` — one ordered transcript event (→ `messages`).
+ *
+ * Attribution: `parent_tool_use_id` is present on every event produced INSIDE a
+ * sub-agent (a `Task` tool call) and absent for the main agent's own events, so
+ * absence means "the main agent". `tool_use_id` is the engine's id for a
+ * `tool_use` block, echoed on the matching `tool_result`. Neither introduces
+ * hierarchy: `seq` stays a single per-thread monotonic stream.
+ */
 export const ThreadMessageData = z.looseObject({
   seq: z.number().int(),
   kind: z.string(),
@@ -110,6 +118,8 @@ export const ThreadMessageData = z.looseObject({
   tool: z.string().optional(),
   input: z.unknown().optional(),
   output: z.unknown().optional(),
+  tool_use_id: z.string().optional(),
+  parent_tool_use_id: z.string().optional(),
 });
 export type ThreadMessageData = z.infer<typeof ThreadMessageData>;
 
