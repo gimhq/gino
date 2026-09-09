@@ -311,6 +311,30 @@ describe("api surface", () => {
   it("@gino/host-core/domain exports exactly the recorded value list", () => {
     assertSurface("@gino/host-core/domain", Object.keys(domain).sort(), DOMAIN_RUNTIME_EXPORTS);
   });
+
+  // P3 regression: the barrel used to export the PORT `TranscriptReadOptions`
+  // (`limit` REQUIRED) under the name a consumer of `host.transcript.get`
+  // reaches for, so annotating a variable with it failed with TS2741 even
+  // though the API defaults the cap. Nothing caught it because an inline object
+  // literal still matches structurally. `tsc --noEmit` (part of `bun run
+  // check`) is the real gate on the two annotations below.
+  it("the exported `TranscriptReadOptions` is the shape `host.transcript.get` accepts", () => {
+    const opts: PublicApi.TranscriptReadOptions = { afterSeq: 5 };
+
+    // …and it is that method's parameter type, not merely compatible with it.
+    const get: PublicApi.TranscriptApi["get"] = (_threadId, received) => {
+      const forwarded: PublicApi.TranscriptReadOptions | undefined = received;
+      return forwarded?.afterSeq === 5 ? [] : [];
+    };
+
+    // The port keeps the stricter contract: `read` receives an already-clamped
+    // cap, so `limit` stays REQUIRED on `TranscriptReadQuery`.
+    const query: PublicApi.TranscriptReadQuery = { afterSeq: 5, limit: 10 };
+
+    expect(opts.limit).toBeUndefined();
+    expect(get("thread-1", opts)).toEqual([]);
+    expect(query.limit).toBe(10);
+  });
 });
 
 /**
@@ -417,6 +441,7 @@ export type PromisedPublicTypes = [
   PublicApi.ThreadRunRow,
   PublicApi.TranscriptApi,
   PublicApi.TranscriptReadOptions,
+  PublicApi.TranscriptReadQuery,
   PublicApi.TranscriptRepo,
   PublicApi.TranscriptStats,
   PublicApi.Wire,

@@ -2,7 +2,7 @@
 /* eslint-disable no-console */
 /**
  * Generate the machine-checkable JSON Schema for the v2 frame catalog from the
- * zod source of truth (`src/protocol/frames.ts`) and embed it in
+ * zod source of truth (`packages/host-core/src/protocol/frames.ts`) and embed it in
  * `docs/protocol.md` under the trailing section "## 8. Frame JSON Schema
  * (generated)".
  *
@@ -10,14 +10,15 @@
  * the block (never appends), so a second run leaves protocol.md byte-identical.
  * Only §8 is touched — §1–§7 prose/tables are never rewritten.
  *
- * Usage:  bun run gen:frames-schema     (alias of `bun run scripts/gen-frames-schema.ts`)
+ * Usage:  bun run gen:frames-schema     (alias of
+ *         `bun run packages/host-core/scripts/gen-frames-schema.ts`)
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { AgentFrame, AnyFrame, HostFrame } from "@gino/host-core";
 import { z } from "zod";
 
-const PROTOCOL_MD = resolve(import.meta.dir, "../docs/protocol.md");
+const PROTOCOL_MD = resolve(import.meta.dir, "../../../docs/protocol.md");
 export const MARKER = "## 8. Frame JSON Schema (generated)";
 
 /** Build the JSON Schema for the whole catalog plus per-direction sub-schemas. */

@@ -27,6 +27,10 @@ export type { CreateTaskInput, DispatchResult, ListTasksFilter } from "@gino/hos
 export type { CronUpsertInput, CronUpsertResult, MessageInput, MessageResult, SendMessageResult } from "@gino/host-core/domain";
 export type { EnqueuedOutbox } from "@gino/host-core/domain";
 export type { EntryInput, IngestArtifactInput } from "@gino/host-core/domain";
+// `host.transcript.get` — `limit` is OPTIONAL here (it defaults to and is
+// clamped at `TRANSCRIPT_READ_LIMIT`). The port-side shape an adapter receives,
+// with `limit` already resolved and therefore required, is `TranscriptReadQuery`.
+export type { TranscriptReadOptions } from "@gino/host-core/domain";
 
 // `Host` (via `HostContext`) exposes the two per-instance registries, so their
 // classes have to be nameable for a consumer's own `.d.ts` to compile.
@@ -72,7 +76,7 @@ export type {
   StoredBlobRef,
   TaskListFilter,
   ThreadFirstSeen,
-  TranscriptReadOptions,
+  TranscriptReadQuery,
   TranscriptStats,
 } from "@gino/host-core/domain";
 // … and the hand-written row types they store and return (no drizzle types

@@ -279,11 +279,17 @@ export interface OutboxRepo {
 
 // ─── TranscriptRepo (M5: messages) ───
 
-/** Cursor + cap for `TranscriptRepo.read`. */
-export interface TranscriptReadOptions {
+/**
+ * Cursor + cap for `TranscriptRepo.read` — the RESOLVED form, not the caller's
+ * options. The domain (`getTranscript`, `host.transcript.get`) defaults and
+ * clamps the cap before it reaches the port, so `limit` is required here and an
+ * adapter applies it verbatim. The caller-facing shape, with `limit` optional,
+ * is `TranscriptReadOptions`.
+ */
+export interface TranscriptReadQuery {
   /** Only rows with `seq > afterSeq`. */
   readonly afterSeq?: number;
-  /** Row cap (the domain clamps it; the port applies it verbatim). */
+  /** Row cap (already clamped by the domain; the port applies it verbatim). */
   readonly limit: number;
 }
 
@@ -318,7 +324,7 @@ export interface TranscriptRepo {
    */
   insertIfAbsent: (row: NewMessageRow) => boolean;
   /** A thread's rows ORDERED BY `seq` (protocol §6 — never arrival), after `afterSeq` when given, capped at `limit`. */
-  read: (threadId: string, opts: TranscriptReadOptions) => MessageRow[];
+  read: (threadId: string, opts: TranscriptReadQuery) => MessageRow[];
   /** `count(*)` + `max(seq)` for a thread (`getTranscriptStats` / `checkTranscriptCompleteness`). */
   stats: (threadId: string) => TranscriptStats;
   /** Distinct threads of a task with their earliest `createdAt`, ordered by that time (ties in first-insertion order). */
