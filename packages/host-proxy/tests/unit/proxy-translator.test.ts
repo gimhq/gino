@@ -4,7 +4,7 @@ import {
   createTranslatorState,
   isOpenAIModel,
   openAIEventToClaudeSSE,
-} from "../../src/index";
+} from "../../src/translator";
 
 describe("M7 proxy/translator — claudeToOpenAIRequest", () => {
   it("maps system → instructions and sets stream/store/include defaults", () => {
