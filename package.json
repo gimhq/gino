@@ -24,7 +24,7 @@
     "clean": "bun apps/host/scripts/clean.ts",
     "e2e": "bash e2e/run.sh",
     "example:embed-node": "bun run --filter @gino/example-embed-node e2e",
-    "gen:frames-schema": "bun run scripts/gen-frames-schema.ts",
+    "gen:frames-schema": "bun run packages/host-core/scripts/gen-frames-schema.ts",
     "db:generate": "bun run --filter @gino/host-store-sqlite db:generate",
     "db:studio": "bun run --filter @gino/host-store-sqlite db:studio"
   },

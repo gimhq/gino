@@ -3,8 +3,9 @@
 // This module mirrors `docs/protocol.md` §4 (envelope) + §5 (frame catalog) as
 // executable zod. The host and the Rust runner share **no code**; both treat
 // `docs/protocol.md` as the contract, so this file MUST stay in lock-step with
-// it. `scripts/gen-frames-schema.ts` exports these schemas to JSON Schema and
-// embeds the result in protocol.md §8 (the machine-checkable mirror).
+// it. `scripts/gen-frames-schema.ts` (in this package) exports these schemas to
+// JSON Schema and embeds the result in protocol.md §8 (the machine-checkable
+// mirror).
 //
 // Design rules (protocol §1 + §4):
 //   • Envelope vs payload (§4.1): correlation/delivery ids live at the TOP

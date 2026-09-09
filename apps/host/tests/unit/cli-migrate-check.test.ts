@@ -12,17 +12,28 @@ const ENTRIES = [
   { tag: "0001_second", when: 2000, sql: "CREATE TABLE second_t (id integer primary key);" },
 ];
 
-function writeMigrationsFolder(root: string, count: number): string {
-  const folder = join(root, `drizzle-${count}`);
-  mkdirSync(join(folder, "meta"), { recursive: true });
+/**
+ * The embedded-migrations map for the first `count` entries — the shape
+ * `runMigrations` and `listPendingMigrations` both consume.
+ */
+function migrationSet(count: number): Map<string, string> {
   const entries = ENTRIES.slice(0, count);
-  writeFileSync(join(folder, "meta/_journal.json"), JSON.stringify({
+  const map = new Map<string, string>([["meta/_journal.json", JSON.stringify({
     version: "7",
     dialect: "sqlite",
     entries: entries.map((e, idx) => ({ idx, version: "6", when: e.when, tag: e.tag, breakpoints: true })),
-  }));
+  })]]);
   for (const e of entries)
-    writeFileSync(join(folder, `${e.tag}.sql`), e.sql);
+    map.set(`${e.tag}.sql`, e.sql);
+  return map;
+}
+
+/** The same set on disk, so drizzle's own migrator can seed a fixture DB. */
+function writeMigrationsFolder(root: string, count: number): string {
+  const folder = join(root, `drizzle-${count}`);
+  mkdirSync(join(folder, "meta"), { recursive: true });
+  for (const [name, body] of migrationSet(count))
+    writeFileSync(join(folder, name), body);
   return folder;
 }
 
@@ -41,30 +52,29 @@ function applyMigrations(dbPath: string, migrationsFolder: string): void {
 describe("listPendingMigrations (HOST-M9-10)", () => {
   let root: string;
   let dbPath: string;
-  let fullFolder: string;
+  let full: Map<string, string>;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "gino-micheck-"));
     dbPath = join(root, "gino.db");
-    fullFolder = writeMigrationsFolder(root, 2);
+    full = migrationSet(2);
   });
 
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   it("reports every migration pending against a nonexistent DB", () => {
-    expect(listPendingMigrations({ dbPath, migrationsFolder: fullFolder }))
+    expect(listPendingMigrations({ dbPath, migrations: full }))
       .toEqual(["0000_first", "0001_second"]);
   });
 
   it("reports no pending migrations on a fully migrated DB", () => {
-    applyMigrations(dbPath, fullFolder);
-    expect(listPendingMigrations({ dbPath, migrationsFolder: fullFolder })).toEqual([]);
+    applyMigrations(dbPath, writeMigrationsFolder(root, 2));
+    expect(listPendingMigrations({ dbPath, migrations: full })).toEqual([]);
   });
 
   it("reports only the not-yet-applied tail on a partially migrated DB", () => {
-    const partialFolder = writeMigrationsFolder(root, 1);
-    applyMigrations(dbPath, partialFolder);
-    expect(listPendingMigrations({ dbPath, migrationsFolder: fullFolder }))
+    applyMigrations(dbPath, writeMigrationsFolder(root, 1));
+    expect(listPendingMigrations({ dbPath, migrations: full }))
       .toEqual(["0001_second"]);
   });
 
@@ -72,11 +82,11 @@ describe("listPendingMigrations (HOST-M9-10)", () => {
     const sqlite = new Database(dbPath, { create: true });
     sqlite.exec("CREATE TABLE unrelated (id integer primary key)");
     sqlite.close();
-    expect(listPendingMigrations({ dbPath, migrationsFolder: fullFolder }))
+    expect(listPendingMigrations({ dbPath, migrations: full }))
       .toEqual(["0000_first", "0001_second"]);
   });
 
-  it("returns null when the migrations folder cannot be read", () => {
-    expect(listPendingMigrations({ dbPath, migrationsFolder: join(root, "missing") })).toBeNull();
+  it("returns null when the migration set carries no journal", () => {
+    expect(listPendingMigrations({ dbPath, migrations: new Map() })).toBeNull();
   });
 });
