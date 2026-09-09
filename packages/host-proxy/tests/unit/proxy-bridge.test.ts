@@ -1,6 +1,7 @@
 import type { BridgeSocket, ProxyConfig, WsFactory } from "../../src/index";
 import { describe, expect, it } from "bun:test";
-import { bridgeClaudeToOpenAI, CredentialStore } from "../../src/index";
+import { bridgeClaudeToOpenAI } from "../../src/bridge";
+import { CredentialStore } from "../../src/index";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {
