@@ -147,7 +147,8 @@ async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContex
         provisioner,
         engine_config_dir: dir.to_path_buf(),
         config: Mutex::new(config),
-        engine_settings: settings,
+        engine_settings: settings.claude,
+        codex_settings: settings.codex,
     }
 }
 

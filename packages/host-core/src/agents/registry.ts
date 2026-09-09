@@ -17,11 +17,13 @@ import { hashToken, ulid, verifyToken } from "../platform";
 
 export type AgentStatus = "enrolled" | "online" | "offline" | "removed";
 
+/** What an agent can run. `engines` is an open list of engine names — never assume a fixed set. */
 export interface AgentCapabilities {
   engines: string[];
   max_threads?: number;
 }
 
+/** Everything needed to mint an agent identity. */
 export interface EnrollInput {
   name?: string;
   /** How the agent runs (`manual` | `docker` | `vm` | …); defaults to `manual`. */
@@ -39,6 +41,7 @@ export interface EnrollInput {
   registerTokenRef?: string;
 }
 
+/** The enrolled agent plus its connect token — the ONLY time the plaintext token exists. */
 export interface EnrollResult {
   agent: AgentRow;
   /** The plaintext connect token — returned to the agent ONCE; only its hash is stored. */

@@ -34,6 +34,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod fake_claude;
+pub mod fake_codex;
 pub mod stub_host;
 
 use std::path::PathBuf;
@@ -99,13 +100,13 @@ impl Workspace {
     }
 }
 
-/// A booted runner subprocess: the child plus the scripted fake-`claude` dir
+/// A booted runner subprocess: the child plus the engine-fakes dir
 /// (removed on drop). `kill_on_drop` reaps the daemon if a scenario panics before
 /// [`Self::shutdown`]. The serial guard + durable state live in the [`Workspace`]
 /// (owned by this proc in the common case, by the caller for a restart).
 pub struct RunnerProc {
     child: Child,
-    _fake_dir: TempDir,
+    fake_dir: TempDir,
     /// `Some` when this proc owns its (ephemeral) workspace; `None` for a
     /// [`Self::spawn_in`] proc whose workspace the caller keeps across a restart.
     _workspace: Option<Workspace>,
@@ -118,12 +119,38 @@ impl RunnerProc {
     /// await the WS connect.
     pub async fn spawn(host: &StubHost, behavior: &Behavior) -> Self {
         let workspace = Workspace::new().await;
-        let (child, fake_dir) = boot(host, behavior, &workspace);
+        let (child, fake_dir) = boot(host, behavior, &workspace, None);
         Self {
             child,
-            _fake_dir: fake_dir,
+            fake_dir,
             _workspace: Some(workspace),
         }
+    }
+
+    /// Boot with BOTH engine fakes on `PATH`: the scripted fake-`claude` and a
+    /// fake-`codex` announcing `codex_thread_id`. Installing the codex script is
+    /// what makes the runner register the codex backend at all (the probe is a
+    /// stat on `PATH`), so only a scenario that asks for it runs multi-engine.
+    pub async fn spawn_with_codex(
+        host: &StubHost,
+        behavior: &Behavior,
+        codex_thread_id: &str,
+    ) -> Self {
+        let workspace = Workspace::new().await;
+        let (child, fake_dir) = boot(host, behavior, &workspace, Some(codex_thread_id));
+        Self {
+            child,
+            fake_dir,
+            _workspace: Some(workspace),
+        }
+    }
+
+    /// The directory holding the installed engine fakes — where
+    /// [`fake_codex::recorded_argv`] reads the argv the fake `codex` was spawned
+    /// with.
+    #[must_use]
+    pub fn fake_dir(&self) -> &std::path::Path {
+        self.fake_dir.path()
     }
 
     /// Restart-capable: boot against a caller-owned [`Workspace`] (which holds the
@@ -131,10 +158,10 @@ impl RunnerProc {
     /// scenario to relaunch a second daemon on the same db after the first is
     /// killed; the workspace survives because the caller, not this proc, owns it.
     pub fn spawn_in(host: &StubHost, behavior: &Behavior, workspace: &Workspace) -> Self {
-        let (child, fake_dir) = boot(host, behavior, workspace);
+        let (child, fake_dir) = boot(host, behavior, workspace, None);
         Self {
             child,
-            _fake_dir: fake_dir,
+            fake_dir,
             _workspace: None,
         }
     }
@@ -148,11 +175,20 @@ impl RunnerProc {
     }
 }
 
-/// Install the scripted fake-`claude` and boot the daemon against `host` with that
-/// `claude` first on `PATH` and the workspace relocated into `workspace`. Returns
-/// the child and the fake-`claude` temp dir (kept alive for the child's lifetime).
-fn boot(host: &StubHost, behavior: &Behavior, workspace: &Workspace) -> (Child, TempDir) {
+/// Install the scripted fake-`claude` (and, when `codex_thread_id` is set, the
+/// fake-`codex` beside it) and boot the daemon against `host` with that directory
+/// first on `PATH` and the workspace relocated into `workspace`. Returns the child
+/// and the fakes' temp dir (kept alive for the child's lifetime).
+fn boot(
+    host: &StubHost,
+    behavior: &Behavior,
+    workspace: &Workspace,
+    codex_thread_id: Option<&str>,
+) -> (Child, TempDir) {
     let fake_dir = fake_claude::install(behavior);
+    if let Some(thread_id) = codex_thread_id {
+        fake_codex::install_into(fake_dir.path(), thread_id);
+    }
     let path = match std::env::var("PATH") {
         Ok(existing) => format!("{}:{existing}", fake_dir.path().display()),
         Err(_) => fake_dir.path().display().to_string(),

@@ -26,6 +26,13 @@ import { noopMetrics } from "./metrics";
 import { resolveHostOptions } from "./options";
 import { createWire } from "./wire";
 
+/**
+ * The per-instance state a `Host` is built on, and the half of `Host` an
+ * adapter actually needs: the storage port, the live session registry (which
+ * is the `AgentTransport` implementation), the launcher registry, the metrics
+ * sink, the event emitter, the resolved options, the framework-free `wire`,
+ * and the `start` / `stop` lifecycle. Nothing here is process-global.
+ */
 export interface HostContext {
   readonly logger: Logger;
   readonly sessions: SessionRegistry;

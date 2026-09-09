@@ -51,6 +51,7 @@ export class DispatchError extends AppError {
   }
 }
 
+/** How a placement attempt resolved. `placed: false` with `no-permitted-agent` is a normal outcome, not an error. */
 export interface DispatchResult {
   taskId: string;
   placed: boolean;

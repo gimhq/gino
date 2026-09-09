@@ -96,6 +96,7 @@ export function emitTaskUpsert(
   return row;
 }
 
+/** One unit of input for a task. */
 export interface MessageInput {
   text: string;
   attachments?: AttachmentDescriptor[];
@@ -103,6 +104,7 @@ export interface MessageInput {
   newThread?: boolean;
 }
 
+/** What a delivered `message` produced: the queued row and the thread it landed on. */
 export interface MessageResult {
   /** The `message` outbox row (carries the derived `msgId`, acked by `msg_ack`). */
   message: EnqueuedOutbox;
@@ -149,6 +151,7 @@ export function emitMessage(storage: Storage, sender: AgentTransport, task: Task
   return { message, threadId };
 }
 
+/** A `host.tasks.send` outcome; `taskUpsert` is present only on the send that seeded the task. */
 export interface SendMessageResult extends MessageResult {
   /** The `task_upsert` seeded on the first message, if any. */
   taskUpsert?: OutboxRow;
@@ -173,12 +176,14 @@ export function sendTaskMessage(
   return { ...sent, ...(taskUpsert ? { taskUpsert } : {}) };
 }
 
+/** A cron command: omit `cronId` to create, give it to update. */
 export interface CronUpsertInput {
   /** Reuse an existing cron id (update) or omit to mint a new one (create). */
   cronId?: string;
   data: CronUpsertData;
 }
 
+/** The queued `cron_upsert` row and the cron id to address it by later. */
 export interface CronUpsertResult {
   cron: OutboxRow;
   cronId: string;
