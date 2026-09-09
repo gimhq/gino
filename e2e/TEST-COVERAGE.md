@@ -67,7 +67,7 @@ directions (wrong-kind-of-token → 401).
 
 Proves the full bootstrap: `register → connect-token → WS attach → liveness`.
 
-### 4. Task round-trip through the real runner — 7 checks
+### 4. Task round-trip through the real runner — 14 checks
 The core path: `host → outbox → WS → runner → engine → WS → host → admin`.
 | Check | Request | Asserts |
 |-------|---------|---------|
@@ -78,6 +78,13 @@ The core path: `host → outbox → WS → runner → engine → WS → host →
 | threadId returned | same | a thread is opened |
 | thread run succeeded | `GET /admin/tasks/:id` (poll ≤40s) | the runner executed the engine and reported `thread_result:succeeded` |
 | transcript carries the echoed nonce | same | the M5 transcript mirrors the engine output; the unique prompt nonce survived host→runner→engine→host **with content fidelity** |
+| transcript has the Task tool_use | same | the `Task` `tool_use` frame reached the host, keyed by the engine's `tool_use_id` |
+| tool_use input preserved | same | the tool `input` object survived the hop verbatim (`description`) |
+| tool_use is main-agent attributed | same | the opening `Task` call carries **no** `parent_tool_use_id` — the main agent made it |
+| transcript has the matching tool_result | same | the `tool_result` closing the same `tool_use_id`, `{content, is_error:false}` |
+| sub-agent text carries parent_tool_use_id | same | the sub-agent's own `assistant_text` is attributed to the `Task` call that spawned it |
+| main-agent text is unattributed | same | the main agent's reply has no `parent_tool_use_id` — absence means the main agent (protocol §5) |
+| seq stays one strictly increasing stream | same | attribution adds no hierarchy: one per-thread monotonic `seq` across main- and sub-agent frames |
 
 ### 4b. Codex engine round-trip through the real runner — 14 checks
 The SAME runner, the OTHER backend: a task whose `engine` is `codex` is placed on
