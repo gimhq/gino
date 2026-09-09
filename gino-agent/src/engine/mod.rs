@@ -28,16 +28,21 @@
 //! [`claude`].
 
 pub(crate) mod claude;
+/// The Codex backend: one `codex exec --json` child per turn.
+pub(crate) mod codex;
 /// The name → backend map the executor dispatches through; a run picks its
 /// backend by name, and an unknown name falls back to the default rather than
 /// failing.
 pub(crate) mod registry;
 
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use futures_util::stream::BoxStream;
+use futures_util::stream::{BoxStream, Stream};
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 pub(crate) use registry::EngineRegistry;
 
@@ -224,6 +229,34 @@ pub(crate) trait Session: Send + Sync {
     /// the backend exits. Intended to be consumed once; a second call yields an
     /// empty stream.
     fn events(&self) -> BoxStream<'_, EngineEvent>;
+}
+
+/// A [`Stream`] adapter over a session's event receiver, shared by every
+/// backend. Yields until the backend's reader task drops its sender (the child
+/// exited), then ends.
+///
+/// Backends pair this with a take-once `Mutex<Option<Receiver>>` behind
+/// [`Session::events`]: the first call moves the receiver into an `EventStream`,
+/// and a second call yields an empty stream, matching the trait's
+/// consume-once contract.
+#[derive(Debug)]
+pub(crate) struct EventStream {
+    rx: mpsc::UnboundedReceiver<EngineEvent>,
+}
+
+impl EventStream {
+    /// Wrap a session's event receiver.
+    pub(crate) fn new(rx: mpsc::UnboundedReceiver<EngineEvent>) -> Self {
+        Self { rx }
+    }
+}
+
+impl Stream for EventStream {
+    type Item = EngineEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
 }
 
 #[cfg(test)]

@@ -43,6 +43,13 @@ croner = "2"
 # Stream/Sink combinators for the split tokio-tungstenite connection (the WS read
 # half is a Stream, the write half a Sink). `sink` pulls in `SinkExt`/`split`.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# JUSTIFICATION (codex backend): `codex exec` closes its stdin after the prompt, so
+# it has no in-band cancel channel — the only way to interrupt a turn is a SIGINT to
+# the child. This crate forbids `unsafe`, so the raw `libc::kill` FFI call is not
+# available to us; `nix` wraps exactly that syscall in a safe, errno-checked API.
+# Pure Rust (MIT), no C code of its own; `default-features = false` + `signal` keeps
+# it to the one module we use. Used in src/engine/codex/mod.rs.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 # HTTP client for register / config-refresh / output-fallback. rustls + OS roots.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 # JUSTIFICATION (PLAN-003 §7 / PMA-Rust Lock 1): rusqlite `bundled` compiles the

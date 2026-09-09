@@ -23,14 +23,12 @@ mod events;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, Stream};
+use futures_util::stream::BoxStream;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -42,7 +40,7 @@ use uuid::Uuid;
 
 use self::control::ControlAsk;
 use crate::config::Config;
-use crate::engine::{Engine, EngineError, EngineEvent, LogLevel, Session, SessionCfg};
+use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
 /// environment (PLAN-001 §"claude invocation"). Built from the global [`Config`]
@@ -623,7 +621,7 @@ impl Session for ClaudeSession {
     fn events(&self) -> BoxStream<'_, EngineEvent> {
         let taken = self.events.lock().ok().and_then(|mut guard| guard.take());
         match taken {
-            Some(rx) => Box::pin(EventStream { rx }),
+            Some(rx) => Box::pin(EventStream::new(rx)),
             None => Box::pin(futures_util::stream::empty::<EngineEvent>()),
         }
     }
@@ -638,21 +636,6 @@ impl Drop for ClaudeSession {
         if let Ok(mut guard) = self.child.lock() {
             drop(guard.take());
         }
-    }
-}
-
-/// A [`Stream`] adapter over the session's event receiver. Yields until the
-/// reader task drops its sender (child exited).
-#[derive(Debug)]
-struct EventStream {
-    rx: mpsc::UnboundedReceiver<EngineEvent>,
-}
-
-impl Stream for EventStream {
-    type Item = EngineEvent;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
     }
 }
 
