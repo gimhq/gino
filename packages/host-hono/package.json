@@ -3,6 +3,15 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Gino host Hono adapter — the /agent data-plane router over host.wire with injected WebSocket upgrade (hono/bun or @hono/node-ws), the protocol error envelope, and the optional admin + messages routers with injected authorization.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.ds.cc/bkhq/gino.git",
+    "directory": "packages/host-hono"
+  },
+  "publishConfig": {
+    "registry": "https://git.ds.cc/api/packages/bkhq/npm/"
+  },
   "files": [
     "dist",
     "src"
