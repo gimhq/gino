@@ -5,7 +5,7 @@ Status: design proposal. References the **lode** loader (`/srv/lodaer`,
 
 ## 1. Goal
 
-Give the gino **host** (the Bun control plane, `src/`) a first-class
+Give the gino **host** (the Bun control plane, `apps/host`) a first-class
 **verify → launch → supervise → hot-update → rollback** story: ship a generic
 image once, then roll new host versions without rebuilding the image, with
 signed releases, automatic rollback on a bad version, and no loss of the host's
@@ -30,23 +30,23 @@ host becomes a *lode app*: a signed, versioned artifact lode loads and manages.
 
 The host is already a good lode citizen:
 
-- **Bundles to a single JS file** — `bun scripts/package.ts` runs `bun build
+- **Bundles to a single JS file** — `bun apps/host/scripts/package.ts` runs `bun build
   --target bun` (NOT `--compile`), embedding the drizzle migrations
-  (`src/db/embedded-migrations.ts`) and injecting
+  (`packages/host-store-sqlite/src/embedded-migrations.ts`) and injecting
   `BUILD_COMMIT`/`BUILD_TIME`/`BUILD_VERSION`. The output is one portable
-  `dist/gino.js` (~1.2 MB) — a perfect lode asset. We deliberately ship a JS
+  `apps/host/dist/gino.js` (~1.2 MB) — a perfect lode asset. We deliberately ship a JS
   bundle, not a `--compile` standalone binary (~90 MB, embeds the Bun runtime):
   lode downloads/caches `bun` ONCE (`[runtime]`, §5) and reuses it across every
   version, so each release ships only the small bundle.
 - **Auto-detects the loader's data dir** — relative data paths resolve against a
-  persistent base **`DATA_DIR > LODE_DIR > ROOT_DIR`** (`src/dirs.ts`, mirroring
+  persistent base **`DATA_DIR > LODE_DIR > ROOT_DIR`** (`apps/host/src/dirs.ts`, mirroring
   the SDK's `dataDir()`), kept strictly separate from the swappable per-version
   code dir. Under lode (SDK ≥ v0.0.10) the supervisor injects `LODE_DIR` (its own
   dir, holding `state.json` + `versions/`); gino's relative defaults carry a
   `data/` prefix, so the DB / store / logs land in `$LODE_DIR/data/**`
   automatically — no manual `GINO_DB_PATH` needed. The `ROOT_DIR` fallback is the
   stable repo root, only ever reached in dev, never an ephemeral version dir.
-- **Graceful SIGTERM** — `src/index.ts` already drains the server (bounded ~25s),
+- **Graceful SIGTERM** — `apps/host/src/index.ts` already drains the server (bounded ~25s),
   flushes the logger, closes the DB, and `exit(0)`. This *is* lode's required
   stop contract.
 - **Version self-report** — `GET /api/system/version` returns
@@ -83,15 +83,15 @@ or channel is a config change, never an image rebuild.
 
 CI does this on a published GitHub Release (`.github/workflows/release.yml`,
 modelled on `zzci/bithk`). The reusable step is `bun run package`
-(`scripts/package.ts`):
+(`apps/host/scripts/package.ts`):
 
 ```bash
 # build the JS bundle + emit a lode/v1 manifest + checksums
 bun run package --version 0.2.0 \
     --asset-url https://github.com/gimhq/gino/releases/download/v0.2.0/gino.js
-#   → dist/gino.js   (the asset; `.js` ⇒ lode `raw`, lands at versions/<ver>/gino.js)
-#   → dist/manifest.json  (schema lode/v1, name gino-host, stable→0.2.0, run="bun run gino.js")
-#   → dist/checksums.txt
+#   → apps/host/dist/gino.js   (the asset; `.js` ⇒ lode `raw`, lands at versions/<ver>/gino.js)
+#   → apps/host/dist/manifest.json  (schema lode/v1, name gino-host, stable→0.2.0, run="bun run gino.js")
+#   → apps/host/dist/checksums.txt
 ```
 
 The `release` workflow then `gh release upload`s those (plus the agent static
@@ -159,7 +159,7 @@ GINO_LOG_TO_STDOUT = "true"
 live on a **persistent path outside the swappable version directory** (lode swaps
 `current → versions/<ver>` on every update). The host handles this itself — it
 resolves relative data paths against **`DATA_DIR > LODE_DIR > ROOT_DIR`**
-(`src/dirs.ts`, mirroring the SDK's `dataDir()`), **decoupled from the swappable
+(`apps/host/src/dirs.ts`, mirroring the SDK's `dataDir()`), **decoupled from the swappable
 version dir**. So under lode they land in `$LODE_DIR/data/**` (gino's defaults
 carry a `data/` prefix; `LODE_DIR` is lode's own persistent dir, beside
 `state.json`) without any path config, surviving upgrades **and** rollbacks.
@@ -173,10 +173,10 @@ on fatal startup; `/api/system/version`; boot-time migrations.
 
 The integration is **implemented** (aligned to the `zzci/bun-tpl` convention):
 
-   > **Built on the official lode SDK** (`src/lode/sdk.ts`, vendored verbatim from
+   > **Built on the official lode SDK** (`apps/host/src/lode/sdk.ts`, vendored verbatim from
    > `github.com/dotns/lode/sdks/lode.ts` — lint/`ts`-skipped; re-copy to update),
-   > with the app glue split into `src/lode/index.ts` (readiness, the operator
-   > actions, the read-only summary) and `src/lode/config.ts` (parses the operator
+   > with the app glue split into `apps/host/src/lode/index.ts` (readiness, the
+   > operator actions, the read-only summary) and `apps/host/src/lode/config.ts` (parses the operator
    > `lode.toml` for the admin UI). The SDK owns the state.json contract —
    > flock-serialised RMW, field preservation, the phased handshake
    > (`markServing`/`ackPrepared`), `hold`/`release`, and a `watch()` notifier.
@@ -185,7 +185,7 @@ The integration is **implemented** (aligned to the `zzci/bun-tpl` convention):
 1. **Readiness report (`readiness = "state"`).** Once `Bun.serve` is listening,
    `reportLodeServing({ probe })` writes the phase-0 token `state.ready =
    "{instance}-0"` — but only after the DB answers `SELECT 1`, so readiness
-   reflects real health, not just a bound port (`src/index.ts`). Until then lode
+   reflects real health, not just a bound port (`apps/host/src/index.ts`). Until then lode
    won't commit the new version or stop the old one. Writing the phase-0 token
    **opts into the prepare handshake**: `startLodePrepareWatcher` watches for
    lode's prompt (`ready == "{instance}-1"`), then **checkpoints the WAL + flushes
@@ -287,8 +287,8 @@ docker.io/dotns/lode:latest` + the volume + the toml mount.)
 
 ## 11. Rollout plan
 
-1. **JS bundle + CI/release** — `bun scripts/package.ts` → `dist/gino.js` and
-   `bun run package` → bundle + `manifest.json` + checksums (done). CI
+1. **JS bundle + CI/release** — `bun apps/host/scripts/package.ts` → `apps/host/dist/gino.js`
+   and `bun run package` → bundle + `manifest.json` + checksums (done). CI
    (`.github/workflows/ci.yml`: host check + agent fmt/clippy/test + security +
    docker e2e) and release (`.github/workflows/release.yml`: on a published
    Release, upload the host bundle+manifest and the agent musl binary) are in
@@ -296,12 +296,12 @@ docker.io/dotns/lode:latest` + the volume + the toml mount.)
    under the `[runtime]`-provided bun on `zzci/ubase`; wire `LODE_SIGN_KEY` to
    enable signing.
 2. **Persistence** — the host now auto-resolves data under
-   `DATA_DIR > LODE_DIR > ROOT_DIR` (done, `src/dirs.ts`; decoupled from the
+   `DATA_DIR > LODE_DIR > ROOT_DIR` (done, `apps/host/src/dirs.ts`; decoupled from the
    version dir); document the `data_dir` layout and verify a rollback keeps the
    DB/store intact.
 3. **Readiness helper** — `reportLodeServing` (§6.1) writes the phase-0 token
    gated on `readiness=state` + a DB probe; no-op when `LODE_DIR` is unset (dev /
-   docker e2e). Done (`src/index.ts` + `src/lode`).
+   docker e2e). Done (`apps/host/src/index.ts` + `apps/host/src/lode`).
 4. **Operator update surface** (§6.2/6.3) — `/system/lode/*`, behind the channel
    token. Done.
 5. **Migration discipline** — adopt expand-contract + pre-apply DB snapshot.
