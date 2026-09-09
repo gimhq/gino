@@ -133,13 +133,14 @@ Proves the inbound message → task routing → real run → outbound transcript
 
 Proves the OD14 cron model end to end: emit → apply → fire → `cron_state` → mirror.
 
-### 7. Attachments: byte channel + IDOR — 8 checks
+### 7. Attachments: byte channel + IDOR — 9 checks
 Authenticated by the per-agent connect token; authorized by task placement.
 | Check | Request | Asserts |
 |-------|---------|---------|
 | A enrolled / B enrolled | two probe `POST /agent/register` | two connect tokens |
 | assigned to A | `POST /admin/tasks/:id/assign {agent_id}` | force placement on probe A |
 | size matches | `POST /agent/attachments?...` (A's token) | bytes ingested, descriptor returned |
+| resolvable wire ref | same | the descriptor's `ref` is the byte-channel path `/agent/attachments/<id>`, never a host-internal storage path |
 | 200 + bytes (by id) | `GET /agent/attachments/:id` | content-addressed download |
 | x-content-sha256 header | same | integrity header present |
 | 200 + bytes (by sha) | `GET /agent/attachments?sha256=...` | download by digest |
