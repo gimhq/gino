@@ -3,9 +3,19 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Gino host SDK core — protocol, domain, ports; no HTTP framework, no Bun-only API.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.ds.cc/bkhq/gino.git",
+    "directory": "packages/host-core"
+  },
+  "publishConfig": {
+    "registry": "https://git.ds.cc/api/packages/bkhq/npm/"
+  },
   "files": [
     "dist",
-    "src"
+    "src",
+    "tests/conformance/storage.conformance.ts"
   ],
   "exports": {
     ".": {
