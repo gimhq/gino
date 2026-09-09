@@ -1,7 +1,7 @@
 # E2E test coverage
 
 What the docker-compose e2e (`./e2e/run.sh`) actually exercises, check by check.
-Latest run: **56/56 functional checks passed**.
+Latest run: **79/79 functional checks passed**.
 
 The suite is a **black-box integration test**: it drives only the host's public
 HTTP API and observes effects through it, while a **real gino-agent** does the
@@ -34,7 +34,7 @@ the real code path.
 - Liveness is probed by **work** (does a fresh task actually run?), not the `online`
   flag — a dead agent still reads online for the offline-grace window (~3×heartbeat).
 
-## Coverage matrix (56 checks across 11 groups)
+## Coverage matrix (79 checks across 12 groups)
 
 ### 1. Health & version — 3 checks
 | Check | Request | Asserts |
@@ -58,7 +58,7 @@ Covers all four token kinds (register / channel / admin / connect) rejecting
 unauthenticated calls, plus the admin/channel privilege separation in both
 directions (wrong-kind-of-token → 401).
 
-### 3. Real agent enrollment over WebSocket — 2 checks
+### 3. Real agent enrollment over WebSocket — 3 checks
 | Check | Observed via | Asserts |
 |-------|--------------|---------|
 | online=true | `GET /admin/agents` (poll ≤45s) | the runner self-registered (`POST /agent/register`), opened `/agent/ws/:id`, and shows `online` |
