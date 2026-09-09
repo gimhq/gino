@@ -28,20 +28,24 @@ it, the SDK does not promise it).
 
 ## 2. Where the code stands today (measured)
 
-| area | lines | SDK verdict |
-|---|---|---|
-| `protocol/` (M2 codec, inbound, outbox, version, frames) | 1097 | **core** |
-| `agents/` (registry, sessions, liveness, control, launchers, launch-reaper) | 1513 | **core** (docker launcher → plugin) |
-| `tasks/` (store, dispatch, orchestrator, lifecycle) | 760 | **core** |
-| `msgstore/` (transcript, thread_runs, crons, attachments, reads) | 484 | **core** |
-| `configstore/` (blob store, artifacts, entries, gc, serve) | 1014 | **core** |
-| `db/` (schema, drizzle on `bun:sqlite`, migrations, snapshot/lock) | 590 | **core**, driver abstracted |
-| `channels/` (egress cursor tail, ingress routing, webhooks, pump) | 1105 | **optional module** |
-| `edge/` (Hono routers: agent, admin, messages, llm) | 2032 | split: agent router → **adapter**; admin/messages → adapter (optional); llm → proxy package |
-| `proxy/` (LLM credential proxy, OAuth, Claude→OpenAI bridge) | 1591 | **separate optional package** |
-| `shared/` (errors, logger, metrics, ids, middleware, openapi, body-limit, client-ip) | 1394 | split: errors/logger-interface/ids/body-limit → core; middleware/openapi/metrics-render → adapter/app |
-| `lode/`, `modules/` (docs, system routes), `routes/`, `cli.ts`, `index.ts`, `dirs.ts`, `config.ts` + `config/` | ~1650 | **app only** |
-| `platform/` (barrel) | 86 | fold into core barrel |
+This section is the measurement taken against the **pre-split `src/**` tree**, kept as the
+baseline the design argues from. The `as-built` column records where each area landed after the
+P2 workspace split (§6); paths named in the prose below are pre-split ones.
+
+| area | lines | SDK verdict | as-built (P2) |
+|---|---|---|---|
+| `protocol/` (M2 codec, inbound, outbox, version, frames) | 1097 | **core** | `packages/host-core/src/protocol/` |
+| `agents/` (registry, sessions, liveness, control, launchers, launch-reaper) | 1513 | **core** (docker launcher → plugin) | `packages/host-core/src/agents/`; the docker launcher stays there as an opt-in `createDockerLauncher` with an injected `spawn` |
+| `tasks/` (store, dispatch, orchestrator, lifecycle) | 760 | **core** | `packages/host-core/src/tasks/` |
+| `msgstore/` (transcript, thread_runs, crons, attachments, reads) | 484 | **core** | `packages/host-core/src/msgstore/` |
+| `configstore/` (blob store, artifacts, entries, gc, serve) | 1014 | **core** | `packages/host-core/src/configstore/` |
+| `db/` (schema, drizzle on `bun:sqlite`, migrations, snapshot/lock) | 590 | **core**, driver abstracted | `packages/host-store-sqlite/src/` (schema + repositories + migrations); the drivers under `./bun` and `./node`. The `Storage` port and its in-memory implementation are `packages/host-core/src/host/ports/` + `src/store/memory/` |
+| `channels/` (egress cursor tail, ingress routing, webhooks, pump) | 1105 | **optional module** | `packages/host-channels/src/` |
+| `edge/` (Hono routers: agent, admin, messages, llm) | 2032 | split: agent router → **adapter**; admin/messages → adapter (optional); llm → proxy package | logic → `packages/host-core/src/host/wire/`; the agent/admin/messages routers → `packages/host-hono/src/`; `/llm` → `packages/host-proxy/src/hono/`; `apps/host/src/edge/` composes them with the app's rate limits and bearer policy |
+| `proxy/` (LLM credential proxy, OAuth, Claude→OpenAI bridge) | 1591 | **separate optional package** | `packages/host-proxy/src/`; the raw Codex WS relay stays Bun-only under `./bun` |
+| `shared/` (errors, logger, metrics, ids, middleware, openapi, body-limit, client-ip) | 1394 | split: errors/logger-interface/ids/body-limit → core; middleware/openapi/metrics-render → adapter/app | errors/ids/body-limit/net → `packages/host-core/src/shared/lib/`, the logger interface → `packages/host-core/src/logger.ts`, the `Metrics` seam → `packages/host-core/src/host/metrics.ts`; route metadata → `packages/host-hono/src/openapi.ts`; middleware + Prometheus render + client-ip → `apps/host/src/shared/` |
+| `lode/`, `modules/` (docs, system routes), `routes/`, `cli.ts`, `index.ts`, `dirs.ts`, `config.ts` + `config/` | ~1650 | **app only** | `apps/host/src/` (unchanged shape, one level down) |
+| `platform/` (barrel) | 86 | fold into core barrel | `packages/host-core/src/platform/`, re-exported through `@gino/host-core` and `@gino/host-core/domain` |
 
 Things that already work in the SDK's favor (do not redesign):
 

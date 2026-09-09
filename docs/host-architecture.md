@@ -1,6 +1,6 @@
 # Host Architecture
 
-The **host** (`src/**`, TypeScript) is the control plane. It pairs with
+The **host** (TypeScript, a Bun workspace: `packages/host-*` + `apps/host`) is the control plane. It pairs with
 [`agent-architecture.md`](agent-architecture.md) (the data plane) and [`protocol.md`](protocol.md)
 (the wire contract). Host and agent **share no code**; the protocol is their only coupling.
 
@@ -62,37 +62,64 @@ The **host** (`src/**`, TypeScript) is the control plane. It pairs with
                                       Agent (data plane, Rust — gino-agent/**)
 ```
 
-### `src/` layout
+### Workspace layout
+
+The modules ship as SDK packages; `apps/host` is one consumer that composes them into the
+standalone server. Module identity (M1–M9) is unchanged — only its home moved. See
+[`host-sdk-design.md`](host-sdk-design.md) for why the seams fall where they do.
 
 ```
-src/
-  edge/            M1  transport + auth + route mounting (HTTP/WS termination only)
-    register.ts        POST /agent/register            → M3 enroll
-    ws.ts              GET  /agent/ws/:agentId          → M3 session + M2 frame pipe
-    config-http.ts     GET  /agent/config/:agentId      → config pull (mirrors register config)
-    output-http.ts     POST /agent/output/:agentId      → pre-WS thread_result fallback
-    attachments.ts     GET/POST /agent/attachments      → host-proxy byte channel
-    admin/             control API → M3 (agents) + M4 (tasks/crons)
-    ingress.ts         POST /messages/* + webhook ingress → M6
-  protocol/        M2  wire adapter — THE coupling
-    envelope.ts  inbound.ts  outbox.ts  version.ts  frames.ts
-  agents/          M3  AGENT MANAGEMENT
-    registry.ts        agents table (id = agentId): enroll, capabilities, status, capacity
-    sessions.ts        agentId → WS; reconnect + outbox replay
-    liveness.ts        heartbeat → online/offline + active_threads
-    launchers/         types.ts  registry.ts  manual.ts  docker.ts   (start + OOB control)
-    control.ts         launch+correlate · stop/restart/remove/inspect via owning launcher
-  tasks/           M4  TASK MANAGEMENT & DISPATCH
-    store.ts           host-authoritative task/cron identity + definitions + channel binding
-    dispatch.ts        placement: owner → permitted agent (dedicated/public); pin set-once, no migration
-    orchestrator.ts    emit task_upsert/cron_upsert/message/interrupt/close/config_update via M2
-    lifecycle.ts       agent removal → orphan its tasks (mirror kept; no migration); task status user/agent-marked
-  msgstore/        M5  MESSAGE STORE (SINK; storage only): thread_message→messages · thread_result→thread_runs · cron_state→crons · attachments
-  channels/        M6  CHANNELS (distribution & routing): egress tails M5 store by cursor → channels · ingress routes user msg → M4 · HTTP/webhook adapters
-  proxy/           M7  credential proxy @ /llm/* for the engine's LLM calls (Anthropic/OpenAI bridge, model-map, OAuth)
-  configstore/     M8  content-addressed config/skills store + per-scope entries (provisioning source)
-  db/                  schema + queries
-  platform/        M9  env/config, logger(redaction), errors, ids/crypto, persistence, bootstrap, observability
+packages/host-core/       @gino/host-core — the control plane itself. No HTTP framework, no
+  src/                    runtime-specific API, no env. `./domain` is the semi-internal barrel.
+    host/                    createHost + per-instance context, options, events, metrics
+      wire/              M1  the /agent/* data plane as plain functions (no framework):
+        register.ts            POST /agent/register            → M3 enroll
+        socket.ts              WS   /agent/ws/:agentId          → M3 session + M2 frame pipe
+        config.ts              GET  /agent/config/:agentId      → config pull (mirrors register config)
+        output.ts              POST /agent/output/:agentId      → pre-WS thread_result fallback
+        attachments.ts         GET/POST /agent/attachments      → host↔agent byte channel
+      ports/                 the storage + transport interfaces (`storage.ts`, `transport.ts`, `rows.ts`)
+    protocol/            M2  wire adapter — THE coupling
+      envelope.ts  inbound.ts  outbox.ts  version.ts  frames.ts
+    agents/              M3  AGENT MANAGEMENT
+      registry.ts            agents table (id = agentId): enroll, capabilities, status, capacity
+      sessions.ts            agentId → WS; reconnect + outbox replay
+      liveness.ts            heartbeat → online/offline + active_threads
+      launchers/             types.ts  index.ts  manual.ts  docker.ts   (start + OOB control)
+      control.ts             launch+correlate · stop/restart/remove/inspect via owning launcher
+      launch-reaper.ts       expire launches that never registered
+    tasks/               M4  TASK MANAGEMENT & DISPATCH
+      store.ts               host-authoritative task/cron identity + definitions + channel binding
+      dispatch.ts            placement: owner → permitted agent (dedicated/public); pin set-once, no migration
+      orchestrator.ts        emit task_upsert/cron_upsert/message/interrupt/close/config_update via M2
+      lifecycle.ts           agent removal → orphan its tasks (mirror kept; no migration); task status user/agent-marked
+    msgstore/            M5  MESSAGE STORE (SINK; storage only): thread_message→messages · thread_result→thread_runs · cron_state→crons · attachments · reads
+    configstore/         M8  content-addressed config/skills store + per-scope entries (provisioning source)
+    store/memory/            the in-memory Storage implementation (tests, prototypes, conformance)
+    platform/ logger.ts shared/lib/
+                         M9  errors, ids/crypto, the logger seam, body caps, SSRF net helpers
+packages/host-store-sqlite/
+  src/                   M9  the SQLite Storage adapter: drizzle schema + repositories over a
+                             pluggable driver (`./bun`, `./node`), migrations (`embedded-migrations.ts`)
+packages/host-hono/
+  src/                   M1  transport + route mounting (HTTP/WS termination only)
+    agent.ts                 /agent/* — a 1:1 Hono mount over host-core `host/wire`
+    admin/                   /admin/* control API → M3 (agents) + M4 (tasks/crons) + M8 (config)
+    messages.ts              /messages/* + webhook ingress → M6
+    auth.ts errors.ts openapi.ts env.ts   bearer/connect-token helpers, error envelope, route metadata
+    ws/bun.ts ws/node.ts     the injected WebSocket upgrade (Bun · @hono/node-ws)
+packages/host-channels/
+  src/                   M6  CHANNELS (distribution & routing): egress tails M5 store by cursor → channels ·
+                             ingress routes user msg → M4 · registry · webhooks · pump
+packages/host-proxy/
+  src/                   M7  credential proxy for the engine's LLM calls (provider detect, model-map,
+                             OAuth, translator); `./hono` mounts it at /llm/*, `./bun` holds the raw WS relay
+apps/host/
+  src/                       the standalone server — the only place with Bun-specific API, env and
+                             operator policy: app.ts · index.ts · cli.ts · config/ · dirs.ts · lode/ ·
+                             modules/ (docs, system) · routes/ · shared/ (middleware, metrics, logging)
+    edge/index.ts        M1  composes the package routers with the app's rate limits and bearer policy
+examples/embed-node/         a plain Node embedder (no Bun) that round-trips a real agent over the packages
 ```
 
 ## 2. Module details
@@ -288,14 +315,17 @@ config_entries(   scope, name, sha256, target, kind, updated_at,
 ```
 
 ### M9 — Platform
-`db` (schema + Drizzle queries), env/config, logger with secret redaction, ids/crypto (`generateId`, ULID,
-`safeEqual`), persistence, bootstrap sequencing, observability.
+Split across the workspace. `@gino/host-store-sqlite` owns the schema + Drizzle queries behind a
+pluggable SQLite driver and the embedded migrations; `@gino/host-core` owns the cross-cutting
+seams — errors, ids/crypto (`generateId`, ULID, `safeEqual`), the `Logger` interface, body caps;
+`apps/host` owns env/config, the redacting logger implementation, bootstrap sequencing and
+observability.
 
 ## 3. Dispatch design (task → agent)
 
 Placement is **rule-based and owner-pinned**. **An agent is a resource with an access policy**; an **owner
 (user)** is placed on an agent it is **permitted** to use — a `dedicated` agent granted to that owner, or a
-`public` (shared) agent. A task carries `owner_id`; `tasks/dispatch.ts` resolves it to a permitted agent and
+`public` (shared) agent. A task carries `owner_id`; host-core's `tasks/dispatch.ts` resolves it to a permitted agent and
 pins the task there.
 
 **Policy (the rule is pluggable; owner-permission is the default):**
@@ -423,6 +453,7 @@ router_state(    key PK, value )
   it reads M5's `messages` store via a cursor. The store is the only seam between them.
 - All host→agent work flows through the M2 **outbox** (durable, acked). No frame bypasses at-least-once.
 - Only M2 references the wire; only `agents/launchers/` references a runtime; M7 never references agent frames.
+  Runtime-specific API is confined to `apps/host` and the packages' `./bun` / `./node` entries.
 - `messages` idempotent on `(thread_id, seq)`; transcript order is `seq`, never arrival/`outboxId`.
 - A task lives on exactly one agent **for life** — `tasks.agent_id` is set once, never reassigned; "moving
   agents" = a brand-new unrelated task.
@@ -430,5 +461,5 @@ router_state(    key PK, value )
   the agent and resume on reconnect. Task status is user/agent-marked.
 - The host is the **single source of truth for agent config**; the agent materializes only what the host's
   registry declares.
-- The wire frame schemas live in `protocol/frames.ts` (zod), exported to the JSON Schema published in
+- The wire frame schemas live in host-core's `protocol/frames.ts` (zod), exported to the JSON Schema published in
   `protocol.md`, and both the host and `gino-agent` test against it so neither side drifts.
