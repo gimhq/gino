@@ -5,11 +5,17 @@
 // pino-backed `createLogger` satisfies it; embedders pass anything with the
 // same shape, or `noopLogger` to discard everything.
 
+/** One log level: either `(fields, message)` or `(message)`, pino-style. */
 export interface LogFn {
   (obj: object, msg?: string): void;
   (msg: string): void;
 }
 
+/**
+ * The logging sink `createHost` requires. Any pino instance satisfies it
+ * structurally; pass `noopLogger` to discard everything. Core never formats,
+ * levels or transports — it only calls these four methods.
+ */
 export interface Logger {
   readonly debug: LogFn;
   readonly info: LogFn;

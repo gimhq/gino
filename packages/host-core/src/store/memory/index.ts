@@ -15,6 +15,7 @@ import { memoryTaskRepo } from "./tasks";
 import { memoryThreadRunRepo } from "./thread-runs";
 import { memoryTranscriptRepo } from "./transcript";
 
+/** A memory `Storage` plus the hooks the conformance suite needs but no real adapter should expose. */
 export interface MemoryStorageForTests {
   storage: Storage;
   /** Corrupt the bytes behind a blob ref (conformance: `readVerified` must then throw `ShaMismatchError`). */

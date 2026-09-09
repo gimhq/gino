@@ -21,6 +21,7 @@ import { AppError, NotFoundError } from "../shared/lib/errors";
 /** A freshly-created, unplaced task is `pending-assignment` until dispatch pins it (§3). */
 export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
 
+/** The task definition an operator supplies; the host mints the id. */
 export interface CreateTaskInput {
   /** Owner (user identity) → resolved to a permitted agent by dispatch (OD13). */
   ownerId: string;
@@ -87,6 +88,7 @@ export function requireTask(storage: Storage, id: string): TaskRow {
   return task;
 }
 
+/** Equality filter for `host.tasks.list`; omitted keys are unconstrained. */
 export interface ListTasksFilter {
   ownerId?: string;
   agentId?: string;

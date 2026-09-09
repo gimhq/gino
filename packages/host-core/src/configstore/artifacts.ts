@@ -10,6 +10,7 @@ import type { ConfigArtifactRow, Storage } from "../host/ports/storage";
 /** Artifact kinds — a directory bundle (skill) or a single file (instruction/config). */
 export type ArtifactKind = "dir" | "file";
 
+/** Bytes to store content-addressed, plus the metadata indexed alongside them. */
 export interface IngestArtifactInput {
   name: string;
   /** `dir` (skill bundle) | `file` (instruction/config). */
