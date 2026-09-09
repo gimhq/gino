@@ -66,13 +66,6 @@ impl EngineRegistry {
     /// Register another backend under its own [`Engine::name`]; re-registering a
     /// name replaces the backend behind it — including the default, which stays
     /// the same NAME but follows the replacement.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "second-backend wiring lands with the next engine; exercised by tests today"
-        )
-    )]
     pub(crate) fn with_engine(mut self, engine: Arc<dyn Engine>) -> Self {
         if engine.name() == self.default.name() {
             self.default = Arc::clone(&engine);

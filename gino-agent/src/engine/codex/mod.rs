@@ -18,20 +18,13 @@
 //! argv, environment, spawn, the stdout reader, the bounded stderr tail, and the
 //! session lifecycle.
 
-// The backend is complete but deliberately NOT REGISTERED yet — a separate
-// change wires it into the engine registry, config and capabilities, so nothing
-// outside this module constructs it and the non-test build sees every item as
-// dead. This allow goes away with that wiring.
-#![allow(
-    dead_code,
-    reason = "the codex backend is not wired into the engine registry yet"
-)]
-
 mod events;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,6 +33,7 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
@@ -48,11 +42,12 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use self::events::EventMapper;
+use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
 
 /// Everything needed to build the `codex` argv, spawn the child, and resolve its
-/// environment. Tests construct it directly to point at a stub binary; config
-/// plumbing (a `from_config`) is deliberately absent here and owned elsewhere.
+/// environment. Built from the global [`Config`] via [`CodexSettings::from_config`];
+/// tests construct it directly to point at a stub binary.
 ///
 /// DECISION: THE DEFAULTS ARE NON-INTERACTIVE, AND THAT IS MANDATORY.
 /// `--ask-for-approval never` means a turn can never block waiting on an
@@ -113,6 +108,76 @@ impl Default for CodexSettings {
             config_dir: None,
         }
     }
+}
+
+impl CodexSettings {
+    /// Resolve the codex settings from the global [`Config`]'s `engine.codex`
+    /// block. Every field is optional there and an ABSENT field leaves this
+    /// struct's [`Default`] in place — notably `skip_git_repo_check`, where a
+    /// missing value must keep the flag ON rather than silently meaning "off".
+    /// The credential env (`OPENAI_API_KEY` / `OPENAI_BASE_URL`) is materialised
+    /// here, at the secret boundary, exactly as the claude backend does.
+    pub(crate) fn from_config(config: &Config) -> Self {
+        let codex = &config.engine.codex;
+        let defaults = Self::default();
+        let mut env = Vec::new();
+        if let Some(key) = &codex.openai_api_key {
+            env.push(("OPENAI_API_KEY".to_owned(), key.expose_secret().to_owned()));
+        }
+        if let Some(url) = &codex.openai_base_url {
+            env.push(("OPENAI_BASE_URL".to_owned(), url.clone()));
+        }
+        Self {
+            binary: codex.binary.clone().unwrap_or(defaults.binary),
+            self_exe: std::env::current_exe().ok(),
+            model: codex.model.clone(),
+            approval_policy: codex.approval_policy.clone().or(defaults.approval_policy),
+            sandbox_mode: codex.sandbox_mode.clone().or(defaults.sandbox_mode),
+            skip_git_repo_check: codex
+                .skip_git_repo_check
+                .unwrap_or(defaults.skip_git_repo_check),
+            extra_args: codex.extra_args.clone(),
+            env,
+            config_dir: None,
+        }
+    }
+}
+
+/// Whether `binary` names a codex executable this runner could actually spawn: a
+/// path with a separator must itself be an executable file, a bare name is
+/// searched across the `PATH` entries.
+///
+/// DECISION: THE PROBE NEVER EXECUTES THE BINARY. Running the configured program
+/// (a `--version` spawn) at registration time would execute an arbitrary
+/// host-supplied path on every start and config update, which is both slower than
+/// a stat and a strictly worse posture than never running it at all. A stat
+/// answers the only question the caller has: can this be spawned.
+pub(crate) fn is_available(binary: &Path) -> bool {
+    is_available_in(binary, std::env::var_os("PATH").as_deref())
+}
+
+/// [`is_available`] against an explicit `PATH` value, so the search is testable
+/// without mutating the process environment (which no test can do safely while
+/// its siblings run in the same process).
+fn is_available_in(binary: &Path, search_path: Option<&OsStr>) -> bool {
+    // `parent()` is `Some("")` for a bare name and a real directory otherwise.
+    let has_separator = binary
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_separator {
+        return is_executable_file(binary);
+    }
+    let Some(search_path) = search_path else {
+        return false;
+    };
+    std::env::split_paths(search_path).any(|dir| is_executable_file(&dir.join(binary)))
+}
+
+/// Whether `path` is an existing regular file with an executable bit set.
+/// Symlinks are followed ([`std::fs::metadata`]), so a `PATH` shim resolves.
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Build the `codex` argv from [`CodexSettings`] plus the thread id to resume,
@@ -505,8 +570,109 @@ mod tests {
 
     use futures_util::StreamExt as _;
 
-    use super::{CodexEngine, CodexSettings, build_args, config_dir_env, effective_settings};
+    use super::{
+        CodexEngine, CodexSettings, build_args, config_dir_env, effective_settings, is_available_in,
+    };
+    use crate::config::{Config, ConfigOverlay};
     use crate::engine::{Engine, EngineError, EngineEvent, RunStatus, Session, SessionCfg};
+
+    /// Write an executable no-op stub at `path` and return it.
+    fn executable_stub(path: PathBuf) -> PathBuf {
+        let mut file = std::fs::File::create(&path).expect("create stub");
+        file.write_all(b"#!/bin/sh\nexit 0\n").expect("write stub");
+        let mut perms = file.metadata().expect("stub metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod stub");
+        path
+    }
+
+    #[test]
+    fn from_config_keeps_the_backend_defaults_when_the_block_is_empty() {
+        let settings = CodexSettings::from_config(&Config::default());
+        assert_eq!(settings.binary, PathBuf::from("codex"));
+        assert_eq!(settings.approval_policy.as_deref(), Some("never"));
+        assert_eq!(settings.sandbox_mode.as_deref(), Some("danger-full-access"));
+        assert!(
+            settings.skip_git_repo_check,
+            "an absent skipGitRepoCheck must not turn the flag off"
+        );
+        assert!(settings.model.is_none());
+        assert!(settings.extra_args.is_empty());
+        assert!(settings.env.is_empty());
+        assert!(settings.config_dir.is_none());
+    }
+
+    #[test]
+    fn from_config_resolves_the_block_and_the_credential_env() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{
+                    "engine": {
+                        "codex": {
+                            "binary": "/opt/bin/codex",
+                            "model": "gpt-5-codex",
+                            "approvalPolicy": "on-request",
+                            "sandboxMode": "workspace-write",
+                            "skipGitRepoCheck": false,
+                            "extraArgs": ["--profile", "ci"],
+                            "openaiApiKey": "sk-openai",
+                            "openaiBaseUrl": "https://proxy.example.com/v1"
+                        }
+                    }
+                }"#,
+            )
+            .expect("overlay"),
+        );
+
+        let settings = CodexSettings::from_config(&config);
+        assert_eq!(settings.binary, PathBuf::from("/opt/bin/codex"));
+        assert_eq!(settings.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(settings.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(settings.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert!(!settings.skip_git_repo_check);
+        assert_eq!(settings.extra_args, ["--profile", "ci"]);
+        assert_eq!(
+            settings.env,
+            [
+                ("OPENAI_API_KEY".to_owned(), "sk-openai".to_owned()),
+                (
+                    "OPENAI_BASE_URL".to_owned(),
+                    "https://proxy.example.com/v1".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_probe_accepts_only_an_executable_file_at_an_explicit_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let good = executable_stub(dir.path().join("codex"));
+        assert!(is_available_in(&good, None));
+
+        let plain = dir.path().join("not-executable");
+        std::fs::write(&plain, "#!/bin/sh\n").expect("write file");
+        assert!(!is_available_in(&plain, None));
+
+        assert!(!is_available_in(&dir.path().join("missing"), None));
+        // A directory is not a spawnable file, even though it exists.
+        assert!(!is_available_in(dir.path(), None));
+    }
+
+    #[test]
+    fn the_probe_searches_a_bare_name_across_the_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let empty = tempfile::tempdir().expect("temp dir");
+        executable_stub(dir.path().join("codex"));
+
+        let search = std::env::join_paths([empty.path(), dir.path()]).expect("join paths");
+        assert!(is_available_in(Path::new("codex"), Some(&search)));
+
+        let only_empty = std::env::join_paths([empty.path()]).expect("join paths");
+        assert!(!is_available_in(Path::new("codex"), Some(&only_empty)));
+        // No PATH at all: a bare name can never resolve.
+        assert!(!is_available_in(Path::new("codex"), None));
+    }
 
     #[test]
     fn fresh_argv_is_the_non_interactive_default() {
