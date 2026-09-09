@@ -28,12 +28,18 @@
 //! [`claude`].
 
 pub(crate) mod claude;
+/// The name → backend map the executor dispatches through; a run picks its
+/// backend by name, and an unknown name falls back to the default rather than
+/// failing.
+pub(crate) mod registry;
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use thiserror::Error;
+
+pub(crate) use registry::EngineRegistry;
 
 /// Status of a completed engine turn. Engine-agnostic mirror of the host
 /// `output` status (`success`/`error`); the wire mapping lives in the transport
