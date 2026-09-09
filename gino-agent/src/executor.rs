@@ -399,13 +399,6 @@ impl ThreadExecutor {
     /// took. Builder-style so the existing [`Self::new`] call sites stay
     /// unchanged; the registry is rebuilt rather than mutated through its `Arc`,
     /// which is free because the executor still owns it at build time.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "second-backend wiring lands with the next engine; exercised by tests today"
-        )
-    )]
     pub(crate) fn with_engine(mut self, engine: Arc<dyn Engine>) -> Self {
         self.engines = Arc::new(Arc::unwrap_or_clone(self.engines).with_engine(engine));
         self
