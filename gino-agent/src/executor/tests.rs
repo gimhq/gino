@@ -1966,3 +1966,109 @@ async fn drain_window_expiry_kills_the_engine_child() {
         }
     }
 }
+
+// -- Engine registry dispatch ---------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A named backend that records whether it was the one asked to start a
+/// session, so a dispatch test can tell WHICH backend ran.
+struct NamedEngine {
+    name: &'static str,
+    started: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Engine for NamedEngine {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    async fn start_session(&self, _cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        self.started.store(true, Ordering::SeqCst);
+        Ok(Box::new(MockSession {
+            script: vec![
+                started("sess-other"),
+                ok_result("other backend", "sess-other"),
+            ],
+            stall: false,
+        }))
+    }
+}
+
+fn set_task_engine(db: &Arc<Mutex<Db>>, engine: &str) {
+    let guard = lock(db);
+    let mut row = guard.get_task_row("task-1").unwrap().unwrap();
+    row.engine = Some(engine.to_owned());
+    guard.update_task_row(&row).unwrap();
+}
+
+/// The task row's `engine` picks the backend among the registered ones — the
+/// default (`mock`) is registered by `build`, `other` by the builder.
+#[tokio::test]
+async fn task_engine_dispatches_to_the_registered_backend() {
+    let db = test_db();
+    set_task_engine(&db, "other");
+    let other_ran = Arc::new(AtomicBool::new(false));
+    let exec = build(
+        &db,
+        vec![started("sess-1"), ok_result("default backend", "sess-1")],
+        false,
+        no_inactivity(),
+    )
+    .with_engine(Arc::new(NamedEngine {
+        name: "other",
+        started: Arc::clone(&other_ran),
+    }));
+    lock(&db)
+        .insert_thread(&pending_thread("th-other", 1))
+        .unwrap();
+
+    let final_row = exec
+        .run_thread(
+            pending_thread("th-other", 1),
+            "go".to_owned(),
+            Continuity::Isolated,
+        )
+        .await;
+
+    assert!(other_ran.load(Ordering::SeqCst), "the task's engine ran it");
+    assert_eq!(final_row.status, "succeeded");
+    assert_eq!(final_row.result.as_deref(), Some("other backend"));
+}
+
+/// An engine name this build does not ship is a forward-compat signal, not a bad
+/// request: the run falls back to the default backend and settles normally.
+#[tokio::test]
+async fn unknown_task_engine_runs_on_the_default_backend() {
+    let db = test_db();
+    set_task_engine(&db, "definitely-not-an-engine");
+    let other_ran = Arc::new(AtomicBool::new(false));
+    let exec = build(
+        &db,
+        vec![started("sess-1"), ok_result("default backend", "sess-1")],
+        false,
+        no_inactivity(),
+    )
+    .with_engine(Arc::new(NamedEngine {
+        name: "other",
+        started: Arc::clone(&other_ran),
+    }));
+    lock(&db)
+        .insert_thread(&pending_thread("th-unknown", 1))
+        .unwrap();
+
+    let final_row = exec
+        .run_thread(
+            pending_thread("th-unknown", 1),
+            "go".to_owned(),
+            Continuity::Isolated,
+        )
+        .await;
+
+    assert!(
+        !other_ran.load(Ordering::SeqCst),
+        "no backend but the default"
+    );
+    assert_eq!(final_row.status, "succeeded");
+    assert_eq!(final_row.result.as_deref(), Some("default backend"));
+}
