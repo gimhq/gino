@@ -548,7 +548,8 @@ async fn reader_task(
 }
 
 /// Classify one stdout line and act: control requests are auto-answered, control
-/// responses are logged, everything else is mapped to an [`EngineEvent`].
+/// responses are logged, everything else is mapped to its [`EngineEvent`]s and
+/// sent in stream order.
 fn handle_line(
     line: &str,
     events: &mpsc::UnboundedSender<EngineEvent>,
@@ -566,7 +567,7 @@ fn handle_line(
         control::TYPE_CONTROL_REQUEST => answer_control(&value, writer),
         control::TYPE_CONTROL_RESPONSE => trace!("control_response from engine"),
         _ => {
-            if let Some(event) = events::map_line(&value) {
+            for event in events::map_line(&value) {
                 // The receiver lives as long as the session; a send failure just
                 // means the consumer dropped the stream — nothing to recover.
                 let _ = events.send(event);

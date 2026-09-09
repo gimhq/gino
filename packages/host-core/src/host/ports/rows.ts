@@ -171,6 +171,10 @@ export interface MessageRow {
   tool: string | null;
   input: unknown;
   output: unknown;
+  /** Engine id of a `tool_use` block, echoed on the matching `tool_result`. */
+  toolUseId: string | null;
+  /** NULL = the main agent's own event; non-NULL = produced inside that sub-agent (`Task`) call. */
+  parentToolUseId: string | null;
   createdAt: number;
 }
 
@@ -184,6 +188,8 @@ export interface NewMessageRow {
   tool?: string | null;
   input?: unknown;
   output?: unknown;
+  toolUseId?: string | null;
+  parentToolUseId?: string | null;
   createdAt?: number;
 }
 

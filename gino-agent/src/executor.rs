@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -201,6 +202,99 @@ struct ActiveRun {
     thread_id: String,
     session: Arc<dyn Session>,
     cancel: Arc<Cancel>,
+}
+
+/// One transcript event to enqueue as a `thread_message`, minus the `seq` the
+/// emitter assigns. Bundles the optional `data` fields so the kinds that carry
+/// them (`tool_use` carries `tool`/`input`/`tool_use_id`, `tool_result` carries
+/// `output`/`tool_use_id`) share one emitter instead of growing its argument
+/// list. `parent_tool_use_id` attributes the event to the sub-agent tool call
+/// that produced it — see protocol §5.
+struct TranscriptEvent {
+    kind: MessageKind,
+    content: Option<String>,
+    tool: Option<String>,
+    input: Option<Value>,
+    output: Option<Value>,
+    tool_use_id: Option<String>,
+    parent_tool_use_id: Option<String>,
+}
+
+impl TranscriptEvent {
+    /// A bare event of `kind`; callers fill the fields their kind carries via
+    /// struct-update syntax.
+    fn new(kind: MessageKind) -> Self {
+        Self {
+            kind,
+            content: None,
+            tool: None,
+            input: None,
+            output: None,
+            tool_use_id: None,
+            parent_tool_use_id: None,
+        }
+    }
+}
+
+/// Map a streamed [`EngineEvent`] onto the transcript frame it becomes, or
+/// `None` when it produces no frame. An assistant turn can carry an empty text
+/// chunk (audit P3): emitting it would burn an outbox seq on a contentless
+/// frame, so it is suppressed HERE rather than in the engine mapping — the
+/// event still arrives and feeds the inactivity watchdog. `SessionStarted` and
+/// `Result` are handled by the caller and never reach this function.
+fn transcript_event(event: EngineEvent) -> Option<TranscriptEvent> {
+    match event {
+        EngineEvent::Output {
+            text,
+            parent_tool_use_id,
+        } => (!text.is_empty()).then(|| TranscriptEvent {
+            content: Some(text),
+            parent_tool_use_id,
+            ..TranscriptEvent::new(MessageKind::AssistantText)
+        }),
+        EngineEvent::Thinking {
+            text,
+            parent_tool_use_id,
+        } => (!text.is_empty()).then(|| TranscriptEvent {
+            content: Some(text),
+            parent_tool_use_id,
+            ..TranscriptEvent::new(MessageKind::Thinking)
+        }),
+        EngineEvent::ToolUse {
+            tool_use_id,
+            tool,
+            input,
+            parent_tool_use_id,
+        } => Some(TranscriptEvent {
+            tool: Some(tool),
+            input: Some(input),
+            tool_use_id: Some(tool_use_id),
+            parent_tool_use_id,
+            ..TranscriptEvent::new(MessageKind::ToolUse)
+        }),
+        EngineEvent::ToolResult {
+            tool_use_id,
+            output,
+            parent_tool_use_id,
+        } => Some(TranscriptEvent {
+            output: Some(output),
+            tool_use_id: Some(tool_use_id),
+            parent_tool_use_id,
+            ..TranscriptEvent::new(MessageKind::ToolResult)
+        }),
+        EngineEvent::Log { level, message } => {
+            let kind = if matches!(level, LogLevel::Error) {
+                MessageKind::Error
+            } else {
+                MessageKind::Status
+            };
+            Some(TranscriptEvent {
+                content: Some(message),
+                ..TranscriptEvent::new(kind)
+            })
+        }
+        EngineEvent::SessionStarted { .. } | EngineEvent::Result(_) => None,
+    }
 }
 
 /// The out-of-band attachment plane wired onto an executor (PLAN-005, Lane F):
@@ -859,24 +953,6 @@ impl ThreadExecutor {
                 Some(EngineEvent::SessionStarted { session_id: id }) => {
                     session_id = Some(id);
                 }
-                Some(EngineEvent::Output { text }) => {
-                    // A tool-use-only assistant turn maps to an empty text
-                    // chunk (audit P3): emitting it would burn an outbox seq
-                    // on a contentless frame. Suppressed HERE (not in the
-                    // engine mapping) so the event still arrives and feeds
-                    // the inactivity watchdog above.
-                    if !text.is_empty() {
-                        self.stream_message(thread, MessageKind::AssistantText, text);
-                    }
-                }
-                Some(EngineEvent::Log { level, message }) => {
-                    let kind = if matches!(level, LogLevel::Error) {
-                        MessageKind::Error
-                    } else {
-                        MessageKind::Status
-                    };
-                    self.stream_message(thread, kind, message);
-                }
                 Some(EngineEvent::Result(outcome)) => {
                     let resolved = outcome.session_id.or(session_id);
                     return match outcome.status {
@@ -900,6 +976,14 @@ impl ThreadExecutor {
                             }
                         }
                     };
+                }
+                Some(event) => {
+                    // Output/Thinking/ToolUse/ToolResult/Log all become one
+                    // transcript frame; the mapping lives in
+                    // [`transcript_event`] to keep this loop readable.
+                    if let Some(transcript) = transcript_event(event) {
+                        self.stream_message(thread, transcript);
+                    }
                 }
             }
         }
@@ -1067,7 +1151,14 @@ impl ThreadExecutor {
         retry.error = Some(error);
         retry.failure_reason = None;
         self.persist_and_emit(&retry, |db| {
-            Self::emit_message(db, &retry, MessageKind::Status, Some(note), None)
+            Self::emit_message(
+                db,
+                &retry,
+                TranscriptEvent {
+                    content: Some(note),
+                    ..TranscriptEvent::new(MessageKind::Status)
+                },
+            )
         });
         retry
     }
@@ -1190,9 +1281,8 @@ impl ThreadExecutor {
 
     /// Enqueue one streamed transcript message from a live run, logging (not
     /// propagating) a failure — a lost transcript line must not abort the run.
-    fn stream_message(&self, thread: &ThreadRow, kind: MessageKind, content: String) {
-        if let Err(err) = Self::emit_message(&lock_db(&self.db), thread, kind, Some(content), None)
-        {
+    fn stream_message(&self, thread: &ThreadRow, event: TranscriptEvent) {
+        if let Err(err) = Self::emit_message(&lock_db(&self.db), thread, event) {
             warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
         } else {
             // P2-16: ship the frame over the live socket now — without the
@@ -1214,21 +1304,17 @@ impl ThreadExecutor {
     /// `seq`), correlated by `task_id`/`thread_id`, on the caller-held `db`
     /// (a lone lock guard from [`Self::stream_message`], or the open finalize
     /// transaction from [`Self::persist_and_emit`]).
-    fn emit_message(
-        db: &Db,
-        thread: &ThreadRow,
-        kind: MessageKind,
-        content: Option<String>,
-        tool: Option<String>,
-    ) -> DbResult<()> {
+    fn emit_message(db: &Db, thread: &ThreadRow, event: TranscriptEvent) -> DbResult<()> {
         let data = ThreadMessageData {
             seq: Self::next_seq(db, &thread.id)?,
-            kind,
+            kind: event.kind,
             role: None,
-            content,
-            tool,
-            input: None,
-            output: None,
+            content: event.content,
+            tool: event.tool,
+            input: event.input,
+            output: event.output,
+            tool_use_id: event.tool_use_id,
+            parent_tool_use_id: event.parent_tool_use_id,
         };
         db.enqueue_outbox_correlated(
             "thread_message",
