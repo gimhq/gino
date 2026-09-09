@@ -59,7 +59,9 @@ use tracing::{debug, warn};
 
 use crate::attachments::{AttachmentError, AttachmentManager, AttachmentSource};
 use crate::db::{Db, DbResult, ThreadRow};
-use crate::engine::{Engine, EngineEvent, LogLevel, RunStatus, Session, SessionCfg};
+use crate::engine::{
+    Engine, EngineEvent, EngineRegistry, LogLevel, RunStatus, Session, SessionCfg,
+};
 use crate::failure::{
     AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
 };
@@ -105,6 +107,31 @@ fn task_model(db: &Mutex<Db>, task_id: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// The per-task engine override for `task_id` (the host's `task_upsert.data.engine`),
+/// or `None` when the task names none — then the thread's own birth engine, and
+/// finally the registry default, decide. A missing row (task rows are seeded
+/// lazily) and a lookup failure both answer `None`, mirroring [`task_model`]: an
+/// unreadable definition must degrade to the default backend, never fail the run.
+fn task_engine(db: &Mutex<Db>, task_id: &str) -> Option<String> {
+    match lock_db(db).get_task_row(task_id) {
+        Ok(row) => row
+            .and_then(|row| row.engine)
+            .as_deref()
+            .and_then(non_empty),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task engine lookup failed; using the default backend");
+            None
+        }
+    }
+}
+
+/// A stored engine name that actually names something: an empty or whitespace-only
+/// column means "unset", not "a backend called nothing".
+fn non_empty(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 // -- thread.status string values (the engine lifecycle axis) ------------
@@ -312,7 +339,7 @@ struct AttachmentRig {
 /// graceful interrupt). The per-thread `seq` counter is persisted in
 /// `threads.last_seq` so numbering continues across a runner restart.
 pub(crate) struct ThreadExecutor {
-    engine: Arc<dyn Engine>,
+    engines: Arc<EngineRegistry>,
     db: Arc<Mutex<Db>>,
     workspace_dir: PathBuf,
     watchdog: WatchdogCfg,
@@ -339,7 +366,7 @@ pub(crate) struct ThreadExecutor {
 impl std::fmt::Debug for ThreadExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThreadExecutor")
-            .field("engine", &self.engine.name())
+            .field("engines", &self.engines.names())
             .field("workspace_dir", &self.workspace_dir)
             .field("watchdog", &self.watchdog)
             .finish_non_exhaustive()
@@ -356,7 +383,7 @@ impl ThreadExecutor {
         watchdog: WatchdogCfg,
     ) -> Self {
         Self {
-            engine,
+            engines: Arc::new(EngineRegistry::new(engine)),
             db,
             workspace_dir,
             watchdog,
@@ -366,6 +393,15 @@ impl ThreadExecutor {
             shutdown: None,
             flush: None,
         }
+    }
+
+    /// Register an ADDITIONAL backend alongside the default one [`Self::new`]
+    /// took. Builder-style so the existing [`Self::new`] call sites stay
+    /// unchanged; the registry is rebuilt rather than mutated through its `Arc`,
+    /// which is free because the executor still owns it at build time.
+    pub(crate) fn with_engine(mut self, engine: Arc<dyn Engine>) -> Self {
+        self.engines = Arc::new(Arc::unwrap_or_clone(self.engines).with_engine(engine));
+        self
     }
 
     /// Wire the transport flush signal (P2-16): the executor pokes it after
@@ -574,7 +610,20 @@ impl ThreadExecutor {
             model: task_model(&self.db, &thread.task_id),
             ..SessionCfg::default()
         };
-        let session: Arc<dyn Session> = match self.engine.start_session(cfg).await {
+        // Backend selection, in order: the TASK row's `engine` (the host's
+        // `task_upsert.data.engine`), else the thread's own birth engine, else
+        // the registry default. Read HERE, at spawn, for the same reason the
+        // per-task model is — a `task_upsert` that changes the engine reaches the
+        // NEXT run without disturbing the one in flight. The thread row's
+        // `engine` is immutable once born, so it stays the run's fallback rather
+        // than being rewritten to what actually ran. An unregistered name is not
+        // fatal: the registry warns and answers the default (forward-compat with
+        // a newer host, matching `warn_unsupported_engine`).
+        let requested =
+            task_engine(&self.db, &thread.task_id).or_else(|| non_empty(&thread.engine));
+        let (engine_name, engine) = self.engines.resolve(requested.as_deref());
+        debug!(thread = %thread.id, engine = %engine_name, "engine selected");
+        let session: Arc<dyn Session> = match engine.start_session(cfg).await {
             Ok(session) => Arc::from(session),
             Err(err) => {
                 let conclusion = Conclusion::Failure {

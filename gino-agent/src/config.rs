@@ -164,6 +164,35 @@ pub(crate) struct EngineConfig {
     pub(crate) model: Option<String>,
     /// Tools the engine is permitted to use.
     pub(crate) allowed_tools: Vec<String>,
+    /// Settings for the `codex` backend, namespaced under `engine.codex`.
+    pub(crate) codex: CodexConfig,
+}
+
+/// Settings for the `codex` backend (`engine.codex`).
+///
+/// Every field defaults to `None`/empty, which means "the backend's own defaults
+/// stand" — `CodexSettings::default()` keeps its non-interactive argv and its
+/// `codex`-on-`PATH` binary. That is what makes this block purely additive: a
+/// deployment that never sends one behaves exactly as it did before the block
+/// existed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CodexConfig {
+    /// The `codex` executable to spawn; `None` keeps the backend's `codex` default.
+    pub(crate) binary: Option<PathBuf>,
+    /// Model id passed via `--model`.
+    pub(crate) model: Option<String>,
+    /// Approval policy passed via `--ask-for-approval`.
+    pub(crate) approval_policy: Option<String>,
+    /// Sandbox mode passed via `--sandbox`.
+    pub(crate) sandbox_mode: Option<String>,
+    /// Whether to pass `--skip-git-repo-check`; `None` keeps the backend default.
+    pub(crate) skip_git_repo_check: Option<bool>,
+    /// Extra arguments appended verbatim to the `codex` argv.
+    pub(crate) extra_args: Vec<String>,
+    /// `OPENAI_API_KEY`.
+    pub(crate) openai_api_key: Option<SecretString>,
+    /// `OPENAI_BASE_URL` (e.g. a host credential proxy).
+    pub(crate) openai_base_url: Option<String>,
 }
 
 /// Thread-executor limits (agent-architecture §5/§6). These promote the executor's
@@ -322,6 +351,7 @@ impl Config {
             anthropic_base_url,
             model,
             allowed_tools,
+            codex,
         } = engine;
         overlay_secret(&mut self.engine.anthropic_api_key, anthropic_api_key);
         overlay_secret(
@@ -333,6 +363,8 @@ impl Config {
         if let Some(tools) = allowed_tools {
             self.engine.allowed_tools = tools;
         }
+
+        apply_codex_overlay(&mut self.engine.codex, codex);
 
         let ExecutorOverlay {
             dispatched_timeout_secs,
@@ -528,6 +560,20 @@ struct EngineOverlay {
     anthropic_base_url: Option<String>,
     model: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    codex: CodexOverlay,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CodexOverlay {
+    binary: Option<PathBuf>,
+    model: Option<String>,
+    approval_policy: Option<String>,
+    sandbox_mode: Option<String>,
+    skip_git_repo_check: Option<bool>,
+    extra_args: Option<Vec<String>>,
+    openai_api_key: Option<String>,
+    openai_base_url: Option<String>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -683,6 +729,32 @@ impl ConfigOverlay {
     /// the version to apply the reconcile version gate without consuming the overlay.
     pub(crate) fn version(&self) -> Option<i64> {
         self.version
+    }
+}
+
+/// Apply the `engine.codex` overlay under the same omission-preserves rule as the
+/// rest of [`ConfigOverlay::apply`]: an absent field leaves the current value, and
+/// `extra_args` replaces wholesale when present (like `allowed_tools`).
+fn apply_codex_overlay(config: &mut CodexConfig, overlay: CodexOverlay) {
+    let CodexOverlay {
+        binary,
+        model,
+        approval_policy,
+        sandbox_mode,
+        skip_git_repo_check,
+        extra_args,
+        openai_api_key,
+        openai_base_url,
+    } = overlay;
+    overlay_field(&mut config.binary, binary);
+    overlay_field(&mut config.model, model);
+    overlay_field(&mut config.approval_policy, approval_policy);
+    overlay_field(&mut config.sandbox_mode, sandbox_mode);
+    overlay_field(&mut config.skip_git_repo_check, skip_git_repo_check);
+    overlay_secret(&mut config.openai_api_key, openai_api_key);
+    overlay_field(&mut config.openai_base_url, openai_base_url);
+    if let Some(args) = extra_args {
+        config.extra_args = args;
     }
 }
 
@@ -856,6 +928,78 @@ mod tests {
             config.paths.workspace_dir,
             std::path::PathBuf::from("/data/ws")
         );
+    }
+
+    #[test]
+    fn from_json_parses_the_codex_engine_block() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{
+                    "engine": {
+                        "codex": {
+                            "binary": "/opt/bin/codex",
+                            "model": "gpt-5-codex",
+                            "approvalPolicy": "on-request",
+                            "sandboxMode": "workspace-write",
+                            "skipGitRepoCheck": false,
+                            "extraArgs": ["--profile", "ci"],
+                            "openaiApiKey": "sk-openai",
+                            "openaiBaseUrl": "https://proxy.example.com/v1"
+                        }
+                    }
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        let codex = &config.engine.codex;
+        assert_eq!(
+            codex.binary.as_deref(),
+            Some(std::path::Path::new("/opt/bin/codex"))
+        );
+        assert_eq!(codex.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(codex.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(codex.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(codex.skip_git_repo_check, Some(false));
+        assert_eq!(codex.extra_args, ["--profile", "ci"]);
+        // The key is wrapped at the config boundary, so it is redacted in Debug.
+        assert_eq!(secret(codex.openai_api_key.as_ref()), Some("sk-openai"));
+        assert!(!format!("{codex:?}").contains("sk-openai"));
+        assert_eq!(
+            codex.openai_base_url.as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn an_overlay_without_a_codex_block_leaves_the_earlier_one_untouched() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{ "engine": { "codex": { "model": "gpt-5-codex", "extraArgs": ["--profile", "ci"] } } }"#,
+            )
+            .unwrap(),
+        );
+        // A later update that speaks only about claude must not clear codex.
+        config.apply(ConfigOverlay::from_json(r#"{ "engine": { "model": "m" } }"#).unwrap());
+
+        assert_eq!(config.engine.codex.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(config.engine.codex.extra_args, ["--profile", "ci"]);
+        assert_eq!(config.engine.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn codex_defaults_defer_to_the_backend() {
+        let codex = Config::default().engine.codex;
+        assert!(codex.binary.is_none());
+        assert!(codex.model.is_none());
+        assert!(codex.approval_policy.is_none());
+        assert!(codex.sandbox_mode.is_none());
+        assert!(codex.skip_git_repo_check.is_none());
+        assert!(codex.extra_args.is_empty());
+        assert!(codex.openai_api_key.is_none());
+        assert!(codex.openai_base_url.is_none());
     }
 
     #[test]
