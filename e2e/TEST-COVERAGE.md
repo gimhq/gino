@@ -79,13 +79,15 @@ The core path: `host → outbox → WS → runner → engine → WS → host →
 | thread run succeeded | `GET /admin/tasks/:id` (poll ≤40s) | the runner executed the engine and reported `thread_result:succeeded` |
 | transcript carries the echoed nonce | same | the M5 transcript mirrors the engine output; the unique prompt nonce survived host→runner→engine→host **with content fidelity** |
 
-### 4b. Codex engine round-trip through the real runner — 13 checks
-The SAME runner, the OTHER backend: a task whose `engine` is `codex` is routed at
-spawn time onto the codex backend, and its JSONL items mirror as transcript rows.
+### 4b. Codex engine round-trip through the real runner — 14 checks
+The SAME runner, the OTHER backend: a task whose `engine` is `codex` is placed on
+an agent that ADVERTISED codex, then routed at spawn time onto the codex backend,
+and its JSONL items mirror as transcript rows.
 | Check | Request | Asserts |
 |-------|---------|---------|
+| capabilities.engines includes codex | the enrollment group's advertised capabilities | fail-fast precondition: placement matches the task's `engine` against the agent's advertised engines, so an agent without it leaves the task unplaced in `pending_assignment` — an opaque timeout instead of a diagnosis |
 | granted | `POST /admin/agents/:id/grant {owner}` | owner→agent access |
-| dispatch placed | `POST /admin/tasks {engine:"codex"}` | the host's task `engine` is free-form; placement does not filter on it |
+| dispatch placed | `POST /admin/tasks {engine:"codex"}` | the task frame's `engine` is free-form, but its VALUE is matched against `capabilities.engines` at placement; `placed:false, reason:"no-permitted-agent"` here means that match failed |
 | placed on real agent | same | placement chose the online runner |
 | seeded | `POST /admin/tasks/:id/message` | the first message seeds a `task_upsert` carrying `engine: "codex"` |
 | thread run succeeded | `GET /admin/tasks/:id` (poll ≤40s) | the runner drove `codex exec --json` to `turn.completed` |

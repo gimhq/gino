@@ -106,7 +106,7 @@ async function waitFor<T>(label: string, fn: () => Promise<T | null | undefined 
 }
 
 // shared state across groups
-const ctx: { realAgentId?: string } = {};
+const ctx: { realAgentId?: string; realAgentEngines?: string[] } = {};
 
 // ── 1. health & version (public) ─────────────────────────────────────────────
 
@@ -174,6 +174,7 @@ async function testAgentOnline(): Promise<void> {
       return list.find(a => a.name === AGENT_NAME && a.online === true) ?? null;
     }, 45_000);
     ctx.realAgentId = found.id;
+    ctx.realAgentEngines = Array.isArray(found.capabilities?.engines) ? found.capabilities.engines : [];
     check("online=true", found.online === true);
     check("capability claude", Array.isArray(found.capabilities?.engines) && found.capabilities.engines.includes("claude"), JSON.stringify(found.capabilities));
     // The image ships a fake `codex` on PATH, so the runner's probe registers the
@@ -272,6 +273,19 @@ async function testCodexRoundTrip(): Promise<void> {
   const owner = "owner-codex";
   const agentId = ctx.realAgentId;
 
+  // FAIL FAST. Placement matches the task's `engine` against the agent's
+  // advertised `capabilities.engines` (host-core tasks/dispatch: auto placement
+  // skips an agent that did not advertise it, manual assign throws
+  // ENGINE_MISMATCH). An agent missing `codex` does not REJECT the task — the
+  // task lands unplaced in pending_assignment and sits there, so every check
+  // below would degrade into an opaque timeout. Capabilities are computed once,
+  // at register time, from the runner's stat-only probe of the configured codex
+  // binary — which is why the image bakes `fake-codex` in at /usr/local/bin/codex.
+  await step("precondition: the agent advertises the codex engine", async () => {
+    const engines = ctx.realAgentEngines ?? [];
+    check("capabilities.engines includes codex", engines.includes("codex"), `engines=${JSON.stringify(engines)} — without it placement cannot choose this agent`);
+  });
+
   await step("grant owner → real agent", async () => {
     const r = await admin("POST", `/agents/${agentId}/grant`, { owner_id: owner });
     check("granted", r.status === 200 && r.json?.data?.granted === true, `status ${r.status} body ${r.text.slice(0, 160)}`);
@@ -284,6 +298,8 @@ async function testCodexRoundTrip(): Promise<void> {
     const r = await admin("POST", "/tasks", { owner_id: owner, engine: "codex", model: "gpt-5-codex", name: "codex-round-trip" });
     assert(r.status === 201, `status ${r.status} body ${r.text.slice(0, 200)}`);
     taskId = r.json?.data?.task?.id;
+    // `placed: false, reason: "no-permitted-agent"` here means the engine match
+    // failed — the task would otherwise wait in pending_assignment forever.
     check("dispatch placed", r.json?.data?.dispatch?.placed === true, JSON.stringify(r.json?.data?.dispatch));
     check("placed on real agent", r.json?.data?.dispatch?.agentId === agentId, JSON.stringify(r.json?.data?.dispatch));
   });
