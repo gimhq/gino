@@ -8,7 +8,7 @@ import {
   isAnthropicPassthroughPath,
   isAnthropicTempKey,
   isPrivateUpstreamHost,
-} from "../../src/index";
+} from "../../src/provider";
 
 const h = (init: Record<string, string>) => new Headers(init);
 
