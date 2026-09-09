@@ -176,6 +176,9 @@ async function testAgentOnline(): Promise<void> {
     ctx.realAgentId = found.id;
     check("online=true", found.online === true);
     check("capability claude", Array.isArray(found.capabilities?.engines) && found.capabilities.engines.includes("claude"), JSON.stringify(found.capabilities));
+    // The image ships a fake `codex` on PATH, so the runner's probe registers the
+    // codex backend and advertises it alongside claude (a multi-engine agent).
+    check("capability codex", Array.isArray(found.capabilities?.engines) && found.capabilities.engines.includes("codex"), JSON.stringify(found.capabilities));
     // eslint-disable-next-line no-console
     console.log(`    realAgentId=${found.id} status=${found.status}`);
   });
@@ -258,6 +261,82 @@ async function testTaskRoundTrip(): Promise<void> {
 
     const seqs: number[] = rows.map(r => r.seq);
     check("seq stays one strictly increasing stream", seqs.every((n, i) => i === 0 || n > seqs[i - 1]!), JSON.stringify(seqs));
+  });
+}
+
+// ── 4b. codex engine: the same runner runs a task on the OTHER backend ───────
+
+async function testCodexRoundTrip(): Promise<void> {
+  group("codex engine round-trip through the real runner");
+  assert(ctx.realAgentId, "no real agent id (enrollment failed)");
+  const owner = "owner-codex";
+  const agentId = ctx.realAgentId;
+
+  await step("grant owner → real agent", async () => {
+    const r = await admin("POST", `/agents/${agentId}/grant`, { owner_id: owner });
+    check("granted", r.status === 200 && r.json?.data?.granted === true, `status ${r.status} body ${r.text.slice(0, 160)}`);
+  });
+
+  let taskId = "";
+  await step("create task with engine=codex → dispatched to real agent", async () => {
+    // The host's task `engine` is free-form and placement does not filter on it;
+    // the RUNNER is what routes the run onto the codex backend at spawn time.
+    const r = await admin("POST", "/tasks", { owner_id: owner, engine: "codex", model: "gpt-5-codex", name: "codex-round-trip" });
+    assert(r.status === 201, `status ${r.status} body ${r.text.slice(0, 200)}`);
+    taskId = r.json?.data?.task?.id;
+    check("dispatch placed", r.json?.data?.dispatch?.placed === true, JSON.stringify(r.json?.data?.dispatch));
+    check("placed on real agent", r.json?.data?.dispatch?.agentId === agentId, JSON.stringify(r.json?.data?.dispatch));
+  });
+
+  const nonce = `nonce-${Date.now().toString(36)}-cx`;
+  await step("send message (seeds task_upsert carrying engine=codex)", async () => {
+    assert(taskId, "no taskId");
+    const r = await admin("POST", `/tasks/${taskId}/message`, { text: `please echo ${nonce}` });
+    assert(r.status === 200, `status ${r.status} body ${r.text.slice(0, 200)}`);
+    check("seeded", r.json?.data?.seeded === true, JSON.stringify(r.json?.data));
+  });
+
+  await step("runner runs the thread on codex → transcript mirrors the codex items", async () => {
+    assert(taskId, "no taskId");
+    const view = await waitFor("codex thread to succeed", async () => {
+      const r = await admin("GET", `/tasks/${taskId}`);
+      const threads: any[] = r.json?.data?.threads ?? [];
+      const done = threads.find(t => t.run?.status === "succeeded");
+      return done ?? null;
+    }, 40_000);
+    check("thread run succeeded", view.run?.status === "succeeded", JSON.stringify(view.run));
+
+    const page = await admin("GET", `/tasks/${taskId}?thread=${view.threadId}`);
+    const rows: any[] = page.json?.data?.messages ?? [];
+    const shape = JSON.stringify(rows.map(r => [r.seq, r.kind, r.tool, r.toolUseId, r.parentToolUseId]));
+    // eslint-disable-next-line no-console
+    console.log(`    codex-shape=${shape}`);
+
+    const assistant = rows.find(r => r.kind === "assistant_text" && typeof r.content === "string" && r.content.includes(nonce));
+    check("transcript carries the echoed nonce", !!assistant, JSON.stringify(rows.map(r => r.content)));
+
+    check("transcript has a thinking row", rows.some(r => r.kind === "thinking"), shape);
+
+    // The codex mapper forwards the ITEM KIND as the tool name and the whole
+    // item (minus the envelope keys) as the payload — never aliased onto a
+    // claude tool name.
+    const toolUse = rows.find(r => r.kind === "tool_use" && r.toolUseId === "item_e2e_cmd_1");
+    check("transcript has the command_execution tool_use", toolUse?.tool === "command_execution", shape);
+    check("tool_use input preserved", typeof toolUse?.input?.command === "string", JSON.stringify(toolUse?.input));
+
+    const toolResult = rows.find(r => r.kind === "tool_result" && r.toolUseId === "item_e2e_cmd_1");
+    check("transcript has the matching tool_result", toolResult?.output?.is_error === false, JSON.stringify(toolResult?.output));
+
+    // Codex reports no sub-agent linkage, so every row is main-agent attributed.
+    check("no row carries a parent_tool_use_id", rows.every(r => r.parentToolUseId == null), shape);
+
+    const seqs: number[] = rows.map(r => r.seq);
+    check("seq stays one strictly increasing stream", seqs.every((n, i) => i === 0 || n > seqs[i - 1]!), JSON.stringify(seqs));
+
+    // The resume handle came from the fake codex's `thread.started` — the claude
+    // path could never mint it.
+    const session: string = view.run?.engineSessionId ?? view.run?.engine_session_id ?? "";
+    check("engineSessionId is a codex thread id", typeof session === "string" && session.startsWith("codex-e2e"), session);
   });
 }
 
@@ -637,6 +716,7 @@ async function main(): Promise<void> {
   await testAuthGates();
   await testAgentOnline();
   await testTaskRoundTrip();
+  await testCodexRoundTrip();
   await testChannels();
   await testCrons();
   await testAttachments();

@@ -10,6 +10,12 @@
 //!
 //! * `basic_loop` — register → connect → message → ordered `thread_message`×N →
 //!   `thread_result`; `final_seq == N`.
+//! * `codex_engine_task_runs_on_the_codex_backend` — a `task_upsert` naming
+//!   `engine: "codex"` routes the run onto the codex backend (both engine fakes
+//!   on `PATH`): the fake `codex`'s `thread.started` id becomes the thread's
+//!   `engine_session_id`, its reasoning / `command_execution` / `agent_message`
+//!   items mirror as `thinking` → `tool_use` → `tool_result` → `assistant_text`
+//!   with no `parent_tool_use_id`, and the recorded argv is codex's `exec --json`.
 //! * `reconnect_replay_dedup` (§5b #4) — drop the WS mid-flight; replayed unacked
 //!   frames de-dup on `(threadId, seq)` (no dup messages, no re-run).
 //! * `parallel_interleave_ordering` (§5b #5) — ≥2 threads reassembled by
@@ -104,6 +110,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
 use support::fake_claude::{self, Behavior};
+use support::fake_codex;
 use support::stub_host::{CronSpec, StubHost, build_tar, provisioning_entry, sha256_hex};
 use support::{RunnerProc, SETTLE, Workspace, wait_until};
 
@@ -160,6 +167,99 @@ async fn basic_loop_streams_ordered_messages_and_final_seq() {
         host.observed_connect_token().await.as_deref(),
         Some(host.connect_token.as_str()),
         "runner must present the host-minted connect token (x-internal-token)"
+    );
+
+    runner.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Engine registry: a task naming `codex` runs on the codex backend
+// ---------------------------------------------------------------------------
+
+/// The thread id the fake `codex` announces on `thread.started` — the resume
+/// handle the host mirrors as `engine_session_id`.
+const CODEX_THREAD_ID: &str = "codex-thread-1";
+
+#[tokio::test]
+async fn codex_engine_task_runs_on_the_codex_backend() {
+    let host = StubHost::start(json!({})).await;
+    // Both fakes are installed: `claude` stays the registry default (and would
+    // run the turn if selection fell back), and installing `codex` is what makes
+    // the runner register the codex backend at all.
+    let behavior = Behavior::echo_lines("sess-claude-unused", 1);
+    let runner = RunnerProc::spawn_with_codex(&host, &behavior, CODEX_THREAD_ID).await;
+    assert!(host.wait_connected(SETTLE).await, "runner never connected");
+
+    // The task row's `engine` is what the executor reads at spawn time.
+    host.push_task_upsert_with_engine("t-codex", "codex", 1)
+        .await;
+    host.push_message("t-codex", Some("th-codex"), "hello codex", &[], 2)
+        .await;
+
+    let run = host
+        .wait_thread_terminal("th-codex", SETTLE)
+        .await
+        .expect("no thread_result mirrored");
+    assert_eq!(run.status, "succeeded", "run: {run:?}");
+    // Only the codex backend can produce this id: it comes from the fake's
+    // `thread.started`, never from the claude fake's `system/init`.
+    assert_eq!(
+        run.engine_session_id.as_deref(),
+        Some(CODEX_THREAD_ID),
+        "engine_session_id must be the codex thread id: {run:?}"
+    );
+
+    let messages = host.messages_for("t-codex", "th-codex").await;
+    let kinds: Vec<&str> = messages.iter().map(|m| m.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["thinking", "tool_use", "tool_result", ASSISTANT_TEXT],
+        "codex item stream mirrors in order: {messages:?}"
+    );
+    let seqs: Vec<i64> = messages.iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4], "per-thread seq is monotonic from 1");
+
+    assert_eq!(
+        messages[0].content.as_deref(),
+        Some(fake_codex::THINKING),
+        "reasoning item → thinking content"
+    );
+    // The tool name is the codex ITEM KIND, forwarded verbatim (never aliased
+    // onto a claude tool name), and the result joins on the same item id.
+    assert_eq!(messages[1].tool.as_deref(), Some(fake_codex::TOOL));
+    assert_eq!(
+        messages[1].tool_use_id.as_deref(),
+        Some(fake_codex::TOOL_USE_ID)
+    );
+    assert_eq!(
+        messages[2].tool_use_id.as_deref(),
+        Some(fake_codex::TOOL_USE_ID),
+        "tool_result joins its tool_use by id"
+    );
+    let echoed = messages[3].content.clone().unwrap_or_default();
+    assert!(
+        echoed.starts_with(fake_codex::ECHO_PREFIX) && echoed.contains("hello codex"),
+        "assistant text echoes the prompt the runner streamed in: {echoed:?}"
+    );
+
+    // Codex reports no sub-agent linkage, so every row is main-agent attributed.
+    assert!(
+        messages.iter().all(|m| m.parent_tool_use_id.is_none()),
+        "codex events carry no parent_tool_use_id: {messages:?}"
+    );
+
+    // The argv proves WHICH backend spawned the turn: codex's `exec --json`,
+    // with none of the claude engine's flags.
+    let argv = fake_codex::recorded_argv(runner.fake_dir());
+    assert!(
+        argv.iter().any(|a| a == "exec") && argv.iter().any(|a| a == "--json"),
+        "codex argv must carry `exec --json`: {argv:?}"
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions" || a == "--output-format"),
+        "claude flags must not appear in a codex spawn: {argv:?}"
     );
 
     runner.shutdown().await;

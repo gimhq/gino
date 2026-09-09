@@ -128,6 +128,13 @@ pub struct MessageRecord {
     pub kind: String,
     /// Text content, when any.
     pub content: Option<String>,
+    /// Tool name on a `tool_use` row (the engine's own name, forwarded verbatim).
+    pub tool: Option<String>,
+    /// The engine's id for a tool call, echoed on the matching `tool_result`.
+    pub tool_use_id: Option<String>,
+    /// Set only on events produced INSIDE a sub-agent; absence means the main
+    /// agent produced it (protocol §5).
+    pub parent_tool_use_id: Option<String>,
 }
 
 /// A recorded attachment upload (host `attachments` row).
@@ -438,6 +445,20 @@ impl StubHost {
             "taskId": task_id,
             "cronId": cron_id,
             "data": data,
+            "msgId": msg_id,
+        });
+        self.send_raw(&frame.to_string()).await;
+    }
+
+    /// Push a host→agent `task_upsert` naming the backend the task's threads run
+    /// on (`data.engine`, protocol §7). The executor reads it at spawn time, so
+    /// this is the only seeding path a scenario needs to route a run onto a
+    /// non-default engine.
+    pub async fn push_task_upsert_with_engine(&self, task_id: &str, engine: &str, msg_id: i64) {
+        let frame = json!({
+            "type": "task_upsert",
+            "taskId": task_id,
+            "data": { "engine": engine, "status": "active" },
             "msgId": msg_id,
         });
         self.send_raw(&frame.to_string()).await;
@@ -1017,6 +1038,15 @@ async fn handle_frame(text: &str, ctx: &ConnCtx) -> Option<String> {
                     .to_owned(),
                 content: data
                     .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                tool: data.get("tool").and_then(Value::as_str).map(str::to_owned),
+                tool_use_id: data
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                parent_tool_use_id: data
+                    .get("parent_tool_use_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             };
