@@ -1,0 +1,982 @@
+//! The Codex [`Engine`]: one `codex exec --json` child per turn.
+//!
+//! DECISION: ONE TURN PER PROCESS. Unlike the claude backend — a single
+//! long-lived child driven over a bidirectional control protocol — `codex exec`
+//! reads its prompt from stdin, runs exactly one turn, and exits. The runner
+//! therefore spawns a fresh child per turn, writes the prompt, CLOSES stdin so
+//! the child sees EOF, and reads JSONL `ThreadEvent`s off stdout until the
+//! process ends. Continuity comes from the thread id: `thread.started` reports
+//! it, the runner persists it as the session id, and the next turn passes it
+//! back as the trailing `resume <thread_id>` argument. No attempt is made to
+//! keep a session process alive across turns.
+//!
+//! Because stdin is already closed by the time the turn is running, there is no
+//! in-band cancel channel — [`CodexSession::interrupt`] is a SIGNAL, not a
+//! message. See its doc comment.
+//!
+//! The wire format itself is mapped by [`events`]; this module owns the process:
+//! argv, environment, spawn, the stdout reader, the bounded stderr tail, and the
+//! session lifecycle.
+
+mod events;
+
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures_util::stream::BoxStream;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use secrecy::ExposeSecret;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
+
+use self::events::EventMapper;
+use crate::config::Config;
+use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
+
+/// Everything needed to build the `codex` argv, spawn the child, and resolve its
+/// environment. Built from the global [`Config`] via [`CodexSettings::from_config`];
+/// tests construct it directly to point at a stub binary.
+///
+/// DECISION: THE DEFAULTS ARE NON-INTERACTIVE, AND THAT IS MANDATORY.
+/// `--ask-for-approval never` means a turn can never block waiting on an
+/// approval prompt the runner has no way to answer — `codex exec` exposes no
+/// approval channel the runner speaks, so a blocking turn would simply hang
+/// until a watchdog killed it. The flags stay configurable for deployments that
+/// know better, but the DEFAULT must be non-interactive.
+///
+/// DECISION: `--sandbox danger-full-access` BY DEFAULT, for parity with the
+/// claude backend, which already runs `--dangerously-skip-permissions`.
+/// Isolation in this product is the CONTAINER boundary, not the engine's own
+/// sandbox. A narrower default would silently deny the writes and network access
+/// the claude backend allows, so the two backends would not run the same task the
+/// same way — a task that succeeds on one engine would mysteriously fail on the
+/// other. A deployment that wants the engine sandbox on can tighten it through
+/// the config block.
+///
+/// DECISION: `--skip-git-repo-check` BY DEFAULT. `codex exec` refuses to run
+/// outside a git repository, and the runner's per-thread working directory
+/// (`work_dir/project/`) is not one.
+#[derive(Clone, Debug)]
+pub(crate) struct CodexSettings {
+    /// The `codex` executable to spawn (default `codex` on `PATH`).
+    pub(crate) binary: PathBuf,
+    /// Path to *this* `gino-agent` binary, exported as `GINO_RUNNER_BIN` so
+    /// in-engine tooling can re-invoke the runner without a hard-coded path.
+    /// `None` omits the variable (e.g. in tests).
+    pub(crate) self_exe: Option<PathBuf>,
+    /// Model id passed via `--model`.
+    pub(crate) model: Option<String>,
+    /// Approval policy passed via `--ask-for-approval`.
+    pub(crate) approval_policy: Option<String>,
+    /// Sandbox mode passed via `--sandbox`.
+    pub(crate) sandbox_mode: Option<String>,
+    /// Whether to pass `--skip-git-repo-check`.
+    pub(crate) skip_git_repo_check: bool,
+    /// Extra arguments appended verbatim, for flags this struct does not model.
+    pub(crate) extra_args: Vec<String>,
+    /// Environment variables layered onto the child (engine credentials etc.).
+    pub(crate) env: Vec<(String, String)>,
+    /// The provisioned engine config dir. When set, the child is launched with
+    /// both the generic `ENGINE_CONFIG_DIR` and codex's own `CODEX_HOME` pointed
+    /// here, so it reads the instruction file + skills the runner materialized.
+    pub(crate) config_dir: Option<PathBuf>,
+}
+
+impl Default for CodexSettings {
+    fn default() -> Self {
+        Self {
+            binary: PathBuf::from("codex"),
+            self_exe: None,
+            model: None,
+            approval_policy: Some("never".to_owned()),
+            sandbox_mode: Some("danger-full-access".to_owned()),
+            skip_git_repo_check: true,
+            extra_args: Vec::new(),
+            env: Vec::new(),
+            config_dir: None,
+        }
+    }
+}
+
+impl CodexSettings {
+    /// Resolve the codex settings from the global [`Config`]'s `engine.codex`
+    /// block. Every field is optional there and an ABSENT field leaves this
+    /// struct's [`Default`] in place — notably `skip_git_repo_check`, where a
+    /// missing value must keep the flag ON rather than silently meaning "off".
+    /// The credential env (`OPENAI_API_KEY` / `OPENAI_BASE_URL`) is materialised
+    /// here, at the secret boundary, exactly as the claude backend does.
+    pub(crate) fn from_config(config: &Config) -> Self {
+        let codex = &config.engine.codex;
+        let defaults = Self::default();
+        let mut env = Vec::new();
+        if let Some(key) = &codex.openai_api_key {
+            env.push(("OPENAI_API_KEY".to_owned(), key.expose_secret().to_owned()));
+        }
+        if let Some(url) = &codex.openai_base_url {
+            env.push(("OPENAI_BASE_URL".to_owned(), url.clone()));
+        }
+        Self {
+            binary: codex.binary.clone().unwrap_or(defaults.binary),
+            self_exe: std::env::current_exe().ok(),
+            model: codex.model.clone(),
+            approval_policy: codex.approval_policy.clone().or(defaults.approval_policy),
+            sandbox_mode: codex.sandbox_mode.clone().or(defaults.sandbox_mode),
+            skip_git_repo_check: codex
+                .skip_git_repo_check
+                .unwrap_or(defaults.skip_git_repo_check),
+            extra_args: codex.extra_args.clone(),
+            env,
+            config_dir: None,
+        }
+    }
+}
+
+/// Whether `binary` names a codex executable this runner could actually spawn: a
+/// path with a separator must itself be an executable file, a bare name is
+/// searched across the `PATH` entries.
+///
+/// DECISION: THE PROBE NEVER EXECUTES THE BINARY. Running the configured program
+/// (a `--version` spawn) at registration time would execute an arbitrary
+/// host-supplied path on every start and config update, which is both slower than
+/// a stat and a strictly worse posture than never running it at all. A stat
+/// answers the only question the caller has: can this be spawned.
+pub(crate) fn is_available(binary: &Path) -> bool {
+    is_available_in(binary, std::env::var_os("PATH").as_deref())
+}
+
+/// [`is_available`] against an explicit `PATH` value, so the search is testable
+/// without mutating the process environment (which no test can do safely while
+/// its siblings run in the same process).
+fn is_available_in(binary: &Path, search_path: Option<&OsStr>) -> bool {
+    // `parent()` is `Some("")` for a bare name and a real directory otherwise.
+    let has_separator = binary
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_separator {
+        return is_executable_file(binary);
+    }
+    let Some(search_path) = search_path else {
+        return false;
+    };
+    std::env::split_paths(search_path).any(|dir| is_executable_file(&dir.join(binary)))
+}
+
+/// Whether `path` is an existing regular file with an executable bit set.
+/// Symlinks are followed ([`std::fs::metadata`]), so a `PATH` shim resolves.
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Build the `codex` argv from [`CodexSettings`] plus the thread id to resume,
+/// if any. Pure and order-stable so it is unit-testable.
+///
+/// `resume <thread_id>` is a positional SUBCOMMAND argument, so it is appended
+/// LAST — after every flag, including `extra_args` — where no flag can swallow
+/// the id as its value.
+fn build_args(settings: &CodexSettings, resume: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["exec".to_owned(), "--json".to_owned()];
+
+    if let Some(model) = &settings.model {
+        argv.push("--model".to_owned());
+        argv.push(model.clone());
+    }
+    if let Some(policy) = &settings.approval_policy {
+        argv.push("--ask-for-approval".to_owned());
+        argv.push(policy.clone());
+    }
+    if let Some(mode) = &settings.sandbox_mode {
+        argv.push("--sandbox".to_owned());
+        argv.push(mode.clone());
+    }
+    if settings.skip_git_repo_check {
+        argv.push("--skip-git-repo-check".to_owned());
+    }
+    argv.extend(settings.extra_args.iter().cloned());
+    if let Some(thread_id) = resume {
+        argv.push("resume".to_owned());
+        argv.push(thread_id.to_owned());
+    }
+
+    argv
+}
+
+/// The config-dir environment the child inherits: the provisioned engine config
+/// dir exported as both the generic `ENGINE_CONFIG_DIR` (shared across backends)
+/// and codex's own `CODEX_HOME`. Empty when `config_dir` is unset. Pure +
+/// order-stable so it is unit-testable.
+fn config_dir_env(settings: &CodexSettings) -> Vec<(&'static str, String)> {
+    match &settings.config_dir {
+        Some(dir) => {
+            let path = dir.display().to_string();
+            vec![("ENGINE_CONFIG_DIR", path.clone()), ("CODEX_HOME", path)]
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Layer the per-session [`SessionCfg::model`] (the task's model) onto the
+/// configured settings for ONE spawn: present → it wins over the configured
+/// model, absent → the configured model stands untouched (borrowed, so the
+/// common case copies nothing).
+///
+/// DECISION: APPLY-ON-NEXT-SPAWN, matching the claude backend. The override is
+/// read here, at spawn, and never pushed into a child already running — so a
+/// task's model change takes effect on its next run rather than mid-turn. With
+/// one turn per process that boundary is simply the next turn.
+fn effective_settings<'a>(settings: &'a CodexSettings, cfg: &SessionCfg) -> Cow<'a, CodexSettings> {
+    match &cfg.model {
+        Some(model) => {
+            let mut overridden = settings.clone();
+            overridden.model = Some(model.clone());
+            Cow::Owned(overridden)
+        }
+        None => Cow::Borrowed(settings),
+    }
+}
+
+/// The Codex backend. Holds the resolved [`CodexSettings`].
+#[derive(Clone, Debug)]
+pub(crate) struct CodexEngine {
+    settings: CodexSettings,
+}
+
+impl CodexEngine {
+    /// Construct an engine from explicit settings.
+    pub(crate) fn new(settings: CodexSettings) -> Self {
+        Self { settings }
+    }
+}
+
+#[async_trait]
+impl Engine for CodexEngine {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    /// Spawn one `codex exec` child for this turn, resuming
+    /// [`SessionCfg::resume`] when set.
+    ///
+    /// [`SessionCfg::resume_at`] has no codex equivalent — the CLI resumes a
+    /// thread whole, with no way to rewind to a message — so it is IGNORED
+    /// rather than approximated.
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        let settings = effective_settings(&self.settings, &cfg);
+        let session = spawn_session(&settings, &cfg)?;
+        Ok(Box::new(session))
+    }
+}
+
+/// Bounds on the captured stderr tail: enough for a startup/auth error banner,
+/// small enough to embed in a failure message. Same bounds as the claude
+/// backend — the diagnostic serves the same purpose.
+const STDERR_TAIL_MAX_LINES: usize = 32;
+const STDERR_TAIL_MAX_BYTES: usize = 4096;
+/// How long the reader waits for the stderr drain to settle after stdout EOF
+/// (both pipes close on child exit, so this is only a scheduling grace).
+const STDERR_DRAIN_WINDOW: Duration = Duration::from_millis(500);
+/// How long [`CodexSession::interrupt`] lets the child wind down after SIGINT
+/// before escalating to a kill.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
+
+/// A bounded tail of the child's stderr: a startup or auth failure dies before
+/// any JSONL event, so its stderr is the only diagnostic. Shared between the
+/// drain task (writer) and the reader (which surfaces it at EOF).
+#[derive(Clone, Debug, Default)]
+struct StderrTail {
+    lines: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl StderrTail {
+    /// Append a line, dropping oldest lines beyond the line/byte bounds.
+    fn push(&self, line: String) {
+        if let Ok(mut lines) = self.lines.lock() {
+            lines.push_back(line);
+            while lines.len() > STDERR_TAIL_MAX_LINES
+                || lines.iter().map(String::len).sum::<usize>() > STDERR_TAIL_MAX_BYTES
+            {
+                if lines.pop_front().is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The captured tail joined into one block; `None` when nothing arrived.
+    fn snapshot(&self) -> Option<String> {
+        let lines = self.lines.lock().ok()?;
+        if lines.is_empty() {
+            None
+        } else {
+            Some(
+                lines
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+    }
+}
+
+/// Spawn the `codex exec` child, deliver the prompt, and wire the reader tasks.
+///
+/// `task_id`/`thread_id` (when present) are exported to the child as
+/// `GINO_TASK_ID`/`GINO_THREAD_ID`, and the runner's own path as
+/// `GINO_RUNNER_BIN`, so in-engine tooling can self-reference the task and
+/// re-invoke the runner without a hard-coded path.
+fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSession, EngineError> {
+    let argv = build_args(settings, cfg.resume.as_deref());
+
+    let mut command = Command::new(&settings.binary);
+    command
+        .args(&argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Captured: a child that dies at startup (bad args, auth failure) writes
+        // its reason to stderr only — the bounded tail is surfaced as a log event
+        // instead of vanishing into the daemon's inherited stderr.
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !cfg.cwd.as_os_str().is_empty() {
+        command.current_dir(&cfg.cwd);
+    }
+    for (key, value) in &settings.env {
+        command.env(key, value);
+    }
+    // The provisioned engine config dir — both the generic var and codex's own.
+    for (key, value) in config_dir_env(settings) {
+        command.env(key, value);
+    }
+    if let Some(exe) = &settings.self_exe {
+        command.env("GINO_RUNNER_BIN", exe);
+    }
+    if let Some(task_id) = &cfg.task_id {
+        command.env("GINO_TASK_ID", task_id);
+    }
+    if let Some(thread_id) = &cfg.thread_id {
+        command.env("GINO_THREAD_ID", thread_id);
+    }
+
+    let mut child = command.spawn().map_err(EngineError::Spawn)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or(EngineError::MissingPipe("stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(EngineError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(EngineError::MissingPipe("stderr"))?;
+
+    // `codex exec` reads its prompt from stdin and runs exactly one turn, so
+    // stdin is written once and then CLOSED — unconditionally, even with no
+    // prompt to send. A child left waiting on an open stdin would never start.
+    let prompt = cfg.initial_prompt.clone();
+    tokio::spawn(async move {
+        let mut stdin = stdin;
+        if let Some(prompt) = prompt
+            && let Err(err) = write_prompt(&mut stdin, &prompt).await
+        {
+            warn!(error = %err, "codex stdin write failed");
+        }
+        if let Err(err) = stdin.shutdown().await {
+            debug!(error = %err, "closing codex stdin");
+        }
+        drop(stdin);
+    });
+
+    let (events_tx, events_rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let stderr_tail = StderrTail::default();
+    let stderr_handle = tokio::spawn(stderr_task(stderr, stderr_tail.clone()));
+    let reader_handle = tokio::spawn(reader_task(stdout, events_tx, stderr_handle, stderr_tail));
+
+    Ok(CodexSession {
+        events: Mutex::new(Some(events_rx)),
+        child: Arc::new(tokio::sync::Mutex::new(child)),
+        tasks: vec![reader_handle],
+    })
+}
+
+/// Write the turn's prompt, newline-terminated and flushed.
+async fn write_prompt(stdin: &mut tokio::process::ChildStdin, prompt: &str) -> std::io::Result<()> {
+    stdin.write_all(prompt.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await
+}
+
+/// Drain the child's stderr into the bounded tail. Ends on EOF (child exited)
+/// or a read error; each line is also traced for live debugging.
+async fn stderr_task(stderr: ChildStderr, tail: StderrTail) {
+    let mut lines = BufReader::new(stderr).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        debug!(line = %line, "engine stderr");
+        tail.push(line);
+    }
+}
+
+/// Parse the child's stdout JSONL line by line and forward the mapped events.
+///
+/// A line that is not valid JSON is DROPPED with a debug line — never an error,
+/// never an event. `codex exec` interleaves the occasional human-readable banner
+/// with its JSONL, and one unparsable line must not fail an otherwise good turn.
+///
+/// On EOF the captured stderr tail is surfaced as a final error log event, then
+/// the stream ENDS. DECISION: no terminal [`EngineEvent::Result`] is synthesized
+/// here. `executor::drive` already turns a stream that ends without a `Result`
+/// into an `agent.process_failure`; inventing an outcome would both hide the
+/// crash and diverge from the claude backend.
+async fn reader_task(
+    stdout: ChildStdout,
+    events: mpsc::UnboundedSender<EngineEvent>,
+    stderr_drain: JoinHandle<()>,
+    stderr_tail: StderrTail,
+) {
+    let mut mapper = EventMapper::new();
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        debug!(error = %err, "skipping non-JSON codex stdout line");
+                        continue;
+                    }
+                };
+                for event in mapper.map_line(&value) {
+                    // The receiver lives as long as the session; a send failure
+                    // just means the consumer dropped the stream.
+                    let _ = events.send(event);
+                }
+            }
+            Ok(None) => {
+                // Child exited: stderr hits EOF too — give its drain a grace
+                // window so the tail is complete before it is surfaced.
+                let _ = tokio::time::timeout(STDERR_DRAIN_WINDOW, stderr_drain).await;
+                if let Some(tail) = stderr_tail.snapshot() {
+                    let _ = events.send(EngineEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!("engine stderr tail:\n{tail}"),
+                    });
+                }
+                return;
+            }
+            Err(err) => {
+                warn!(error = %err, "engine stdout read failed; stopping reader");
+                return;
+            }
+        }
+    }
+}
+
+/// One `codex exec` turn. Holds the (one-shot) event receiver, the child handle
+/// (`kill_on_drop`, and kept so [`Session::interrupt`] can signal it), and the
+/// reader task handle (aborted on drop).
+#[derive(Debug)]
+pub(crate) struct CodexSession {
+    events: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
+    child: Arc<tokio::sync::Mutex<Child>>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+#[async_trait]
+impl Session for CodexSession {
+    /// Cancel the running turn.
+    ///
+    /// DECISION: THE INTERRUPT IS A SIGNAL, NOT A MESSAGE. `codex exec` reads its
+    /// prompt from stdin and we close that pipe immediately, so there is no
+    /// in-band cancel channel of the kind the claude backend uses. The only way
+    /// to stop a turn is to signal the process: SIGINT first (codex handles it as
+    /// a graceful abort), then a bounded [`INTERRUPT_GRACE`] wait, then
+    /// `start_kill` if it is still alive.
+    ///
+    /// The cancelled turn settles through the EXISTING executor path and needs no
+    /// cancel logic here: the child dies, its stdout hits EOF, the event stream
+    /// ends, and `executor::drain_cancelled` settles the thread `cancelled`.
+    ///
+    /// `Ok(())` even when the child is already gone — interrupting a turn that
+    /// has finished is a no-op, not an error.
+    async fn interrupt(&self) -> Result<(), EngineError> {
+        let mut child = self.child.lock().await;
+        let Some(pid) = child.id() else {
+            // Already reaped: nothing to signal.
+            return Ok(());
+        };
+        match i32::try_from(pid) {
+            Ok(pid) => {
+                if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGINT) {
+                    debug!(error = %err, "SIGINT to codex child failed; it is likely gone");
+                }
+            }
+            Err(err) => warn!(error = %err, "codex child pid does not fit a pid_t"),
+        }
+
+        // Bounded wait: if the child honours SIGINT it exits within the grace
+        // window, otherwise it is killed outright.
+        if tokio::time::timeout(INTERRUPT_GRACE, child.wait())
+            .await
+            .is_err()
+            && let Err(err) = child.start_kill()
+        {
+            debug!(error = %err, "killing codex child after SIGINT grace");
+        }
+        Ok(())
+    }
+
+    fn events(&self) -> BoxStream<'_, EngineEvent> {
+        let taken = self.events.lock().ok().and_then(|mut guard| guard.take());
+        match taken {
+            Some(rx) => Box::pin(EventStream::new(rx)),
+            None => Box::pin(futures_util::stream::empty::<EngineEvent>()),
+        }
+    }
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        // `Child` is `kill_on_drop`, so dropping the last handle terminates the
+        // process; the reader task's abort above releases the other one.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use futures_util::StreamExt as _;
+
+    use super::{
+        CodexEngine, CodexSettings, build_args, config_dir_env, effective_settings, is_available_in,
+    };
+    use crate::config::{Config, ConfigOverlay};
+    use crate::engine::{Engine, EngineError, EngineEvent, RunStatus, Session, SessionCfg};
+
+    /// Write an executable no-op stub at `path` and return it.
+    fn executable_stub(path: PathBuf) -> PathBuf {
+        let mut file = std::fs::File::create(&path).expect("create stub");
+        file.write_all(b"#!/bin/sh\nexit 0\n").expect("write stub");
+        let mut perms = file.metadata().expect("stub metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod stub");
+        path
+    }
+
+    #[test]
+    fn from_config_keeps_the_backend_defaults_when_the_block_is_empty() {
+        let settings = CodexSettings::from_config(&Config::default());
+        assert_eq!(settings.binary, PathBuf::from("codex"));
+        assert_eq!(settings.approval_policy.as_deref(), Some("never"));
+        assert_eq!(settings.sandbox_mode.as_deref(), Some("danger-full-access"));
+        assert!(
+            settings.skip_git_repo_check,
+            "an absent skipGitRepoCheck must not turn the flag off"
+        );
+        assert!(settings.model.is_none());
+        assert!(settings.extra_args.is_empty());
+        assert!(settings.env.is_empty());
+        assert!(settings.config_dir.is_none());
+    }
+
+    #[test]
+    fn from_config_resolves_the_block_and_the_credential_env() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{
+                    "engine": {
+                        "codex": {
+                            "binary": "/opt/bin/codex",
+                            "model": "gpt-5-codex",
+                            "approvalPolicy": "on-request",
+                            "sandboxMode": "workspace-write",
+                            "skipGitRepoCheck": false,
+                            "extraArgs": ["--profile", "ci"],
+                            "openaiApiKey": "sk-openai",
+                            "openaiBaseUrl": "https://proxy.example.com/v1"
+                        }
+                    }
+                }"#,
+            )
+            .expect("overlay"),
+        );
+
+        let settings = CodexSettings::from_config(&config);
+        assert_eq!(settings.binary, PathBuf::from("/opt/bin/codex"));
+        assert_eq!(settings.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(settings.approval_policy.as_deref(), Some("on-request"));
+        assert_eq!(settings.sandbox_mode.as_deref(), Some("workspace-write"));
+        assert!(!settings.skip_git_repo_check);
+        assert_eq!(settings.extra_args, ["--profile", "ci"]);
+        assert_eq!(
+            settings.env,
+            [
+                ("OPENAI_API_KEY".to_owned(), "sk-openai".to_owned()),
+                (
+                    "OPENAI_BASE_URL".to_owned(),
+                    "https://proxy.example.com/v1".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_probe_accepts_only_an_executable_file_at_an_explicit_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let good = executable_stub(dir.path().join("codex"));
+        assert!(is_available_in(&good, None));
+
+        let plain = dir.path().join("not-executable");
+        std::fs::write(&plain, "#!/bin/sh\n").expect("write file");
+        assert!(!is_available_in(&plain, None));
+
+        assert!(!is_available_in(&dir.path().join("missing"), None));
+        // A directory is not a spawnable file, even though it exists.
+        assert!(!is_available_in(dir.path(), None));
+    }
+
+    #[test]
+    fn the_probe_searches_a_bare_name_across_the_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let empty = tempfile::tempdir().expect("temp dir");
+        executable_stub(dir.path().join("codex"));
+
+        let search = std::env::join_paths([empty.path(), dir.path()]).expect("join paths");
+        assert!(is_available_in(Path::new("codex"), Some(&search)));
+
+        let only_empty = std::env::join_paths([empty.path()]).expect("join paths");
+        assert!(!is_available_in(Path::new("codex"), Some(&only_empty)));
+        // No PATH at all: a bare name can never resolve.
+        assert!(!is_available_in(Path::new("codex"), None));
+    }
+
+    #[test]
+    fn fresh_argv_is_the_non_interactive_default() {
+        let argv = build_args(&CodexSettings::default(), None);
+        assert_eq!(
+            argv,
+            [
+                "exec",
+                "--json",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_appends_the_thread_id_last() {
+        let settings = CodexSettings {
+            extra_args: vec!["--color".to_owned(), "never".to_owned()],
+            ..CodexSettings::default()
+        };
+        let argv = build_args(&settings, Some("th-7"));
+        assert_eq!(
+            argv,
+            [
+                "exec",
+                "--json",
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "danger-full-access",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "resume",
+                "th-7",
+            ]
+        );
+    }
+
+    #[test]
+    fn session_model_overrides_the_configured_one_for_this_spawn() {
+        let settings = CodexSettings {
+            model: Some("gpt-configured".to_owned()),
+            ..CodexSettings::default()
+        };
+        let cfg = SessionCfg {
+            model: Some("gpt-per-task".to_owned()),
+            ..SessionCfg::default()
+        };
+        let effective = effective_settings(&settings, &cfg);
+        let argv = build_args(&effective, None);
+        let model = argv.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(argv[model + 1], "gpt-per-task");
+        // The configured settings are untouched — the override is per-spawn.
+        assert_eq!(settings.model.as_deref(), Some("gpt-configured"));
+
+        // No per-task model: the configured one stands, borrowed.
+        let effective = effective_settings(&settings, &SessionCfg::default());
+        let argv = build_args(&effective, None);
+        let model = argv.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(argv[model + 1], "gpt-configured");
+    }
+
+    #[test]
+    fn approval_sandbox_and_extra_args_are_configurable() {
+        let settings = CodexSettings {
+            approval_policy: Some("on-request".to_owned()),
+            sandbox_mode: Some("workspace-write".to_owned()),
+            extra_args: vec!["--profile".to_owned(), "ci".to_owned()],
+            ..CodexSettings::default()
+        };
+        let argv = build_args(&settings, None);
+        let approval = argv.iter().position(|a| a == "--ask-for-approval").unwrap();
+        assert_eq!(argv[approval + 1], "on-request");
+        let sandbox = argv.iter().position(|a| a == "--sandbox").unwrap();
+        assert_eq!(argv[sandbox + 1], "workspace-write");
+        assert_eq!(&argv[argv.len() - 2..], ["--profile", "ci"]);
+    }
+
+    #[test]
+    fn unset_policies_and_disabled_git_check_drop_their_flags() {
+        let settings = CodexSettings {
+            approval_policy: None,
+            sandbox_mode: None,
+            skip_git_repo_check: false,
+            ..CodexSettings::default()
+        };
+        assert_eq!(build_args(&settings, None), ["exec", "--json"]);
+    }
+
+    #[test]
+    fn config_dir_exports_the_generic_and_codex_vars() {
+        let settings = CodexSettings {
+            config_dir: Some(PathBuf::from("/var/lib/gino/engine")),
+            ..CodexSettings::default()
+        };
+        assert_eq!(
+            config_dir_env(&settings),
+            [
+                ("ENGINE_CONFIG_DIR", "/var/lib/gino/engine".to_owned()),
+                ("CODEX_HOME", "/var/lib/gino/engine".to_owned()),
+            ]
+        );
+        assert!(config_dir_env(&CodexSettings::default()).is_empty());
+    }
+
+    /// A stub `codex` that records its argv, echoes the prompt it read from
+    /// stdin, and emits the two JSONL events a minimal turn produces.
+    fn write_fake_codex(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-codex.sh");
+        let script = r#"#!/usr/bin/env bash
+set -u
+# 1. Record exactly what we were spawned with, one argv per line.
+printf '%s\n' "$*" >> "$CODEX_ARGV_LOG"
+# 2. The prompt arrives on stdin, which the runner closes right after writing it.
+prompt=$(cat)
+# 3. Announce the thread, then complete the turn.
+printf '%s\n' '{"type":"thread.started","thread_id":"codex-smoke"}'
+printf '%s\n' "{\"type\":\"turn.completed\",\"prompt\":\"$prompt\"}"
+"#;
+        {
+            let mut file = std::fs::File::create(&path).expect("create stub");
+            file.write_all(script.as_bytes()).expect("write stub");
+            let mut perms = file.metadata().expect("stub metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod stub");
+        }
+        path
+    }
+
+    /// Spawn with the ETXTBSY retry: a concurrently-spawning test child can
+    /// briefly hold the just-written script's fd, failing exec with "text file
+    /// busy".
+    async fn start(engine: &CodexEngine, cfg: SessionCfg) -> Box<dyn Session> {
+        loop {
+            match engine.start_session(cfg.clone()).await {
+                Ok(session) => return session,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        }
+    }
+
+    /// Drain a session to its terminal `Result`, bounded so a hung child can
+    /// never wedge the suite.
+    async fn drain(session: &dyn Session) -> (Option<String>, crate::engine::RunOutcome) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = session.events();
+            let mut started = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    EngineEvent::SessionStarted { session_id } => started = Some(session_id),
+                    EngineEvent::Result(outcome) => return Some((started, outcome)),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await
+        .expect("session timed out")
+        .expect("stream ended without a result")
+    }
+
+    /// A stub `codex` that announces its thread and then hangs, recording that
+    /// it saw SIGINT so the test can tell a handled signal from the kill
+    /// escalation. `sleep` is backgrounded (with its stdout redirected, so it
+    /// cannot hold the pipe open) and waited on, which is what lets bash run the
+    /// trap promptly instead of after a foreground command finishes.
+    fn write_hanging_codex(dir: &Path, marker: &Path) -> PathBuf {
+        let path = dir.join("hanging-codex.sh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -u
+trap 'echo sigint > "{marker}"; exit 0' INT
+printf '%s\n' '{{"type":"thread.started","thread_id":"codex-int"}}'
+sleep 30 >/dev/null 2>&1 &
+wait $!
+"#,
+            marker = marker.display()
+        );
+        {
+            let mut file = std::fs::File::create(&path).expect("create stub");
+            file.write_all(script.as_bytes()).expect("write stub");
+            let mut perms = file.metadata().expect("stub metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod stub");
+        }
+        path
+    }
+
+    /// `interrupt` has no in-band channel to use, so it must actually signal the
+    /// child: the stub records the SIGINT it handled, and the turn settles by the
+    /// stream ending (no synthesized `Result`), which is what
+    /// `executor::drain_cancelled` consumes.
+    #[tokio::test]
+    async fn interrupt_signals_the_child_and_ends_the_stream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("sigint.marker");
+        let fake = write_hanging_codex(dir.path(), &marker);
+        let engine = CodexEngine::new(CodexSettings {
+            binary: fake,
+            ..CodexSettings::default()
+        });
+
+        let session = start(
+            &engine,
+            SessionCfg {
+                cwd: dir.path().to_path_buf(),
+                initial_prompt: Some("hang".to_owned()),
+                ..SessionCfg::default()
+            },
+        )
+        .await;
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = session.events();
+            // Wait until the child is definitely running its turn.
+            let first = stream.next().await;
+            assert!(
+                matches!(first, Some(EngineEvent::SessionStarted { .. })),
+                "expected the thread announcement first, got {first:?}"
+            );
+            session.interrupt().await.expect("interrupt");
+            // The interrupted turn settles by the stream ENDING — no terminal
+            // `Result` is synthesized here.
+            while let Some(event) = stream.next().await {
+                assert!(
+                    !matches!(event, EngineEvent::Result(_)),
+                    "an interrupted turn must not synthesize a result"
+                );
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the interrupted session did not wind down");
+
+        assert!(
+            marker.exists(),
+            "the child must have received and handled SIGINT"
+        );
+        // Interrupting an already-finished turn is a no-op, not an error.
+        session.interrupt().await.expect("second interrupt");
+    }
+
+    #[tokio::test]
+    async fn smoke_turn_reports_the_thread_id_and_resumes_it_next_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fake = write_fake_codex(dir.path());
+        let argv_log = dir.path().join("argv.log");
+        let engine = CodexEngine::new(CodexSettings {
+            binary: fake,
+            env: vec![("CODEX_ARGV_LOG".to_owned(), argv_log.display().to_string())],
+            ..CodexSettings::default()
+        });
+
+        let session = start(
+            &engine,
+            SessionCfg {
+                cwd: dir.path().to_path_buf(),
+                initial_prompt: Some("hi".to_owned()),
+                ..SessionCfg::default()
+            },
+        )
+        .await;
+
+        let (started, outcome) = drain(session.as_ref()).await;
+        assert_eq!(started.as_deref(), Some("codex-smoke"));
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(outcome.session_id.as_deref(), Some("codex-smoke"));
+        assert!(outcome.error.is_none());
+
+        // A second turn resumes the thread the first one reported.
+        let resumed = start(
+            &engine,
+            SessionCfg {
+                cwd: dir.path().to_path_buf(),
+                resume: Some("codex-smoke".to_owned()),
+                initial_prompt: Some("again".to_owned()),
+                ..SessionCfg::default()
+            },
+        )
+        .await;
+        let (_, outcome) = drain(resumed.as_ref()).await;
+        assert_eq!(outcome.status, RunStatus::Success);
+
+        let log = std::fs::read_to_string(&argv_log).expect("argv log");
+        let spawns: Vec<&str> = log.lines().collect();
+        assert_eq!(spawns.len(), 2, "expected two spawns, got: {log}");
+        assert!(
+            !spawns[0].contains("resume"),
+            "a fresh turn must not resume: {}",
+            spawns[0]
+        );
+        assert!(
+            spawns[1].ends_with("resume codex-smoke"),
+            "the resumed turn must end in `resume codex-smoke`: {}",
+            spawns[1]
+        );
+    }
+}

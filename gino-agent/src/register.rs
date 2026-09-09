@@ -30,13 +30,30 @@ use tracing::warn;
 
 use crate::config::{Config, ConfigError, ConfigOverlay};
 use crate::db::{Db, DbError};
+use crate::engine::codex::{self, CodexSettings};
 use crate::protocol::{PROTOCOL_VERSION, Redacted, RegisterRequest, RegisterResponse};
 use crate::transport::http::{HttpClient, HttpError};
 use crate::transport::{Backoff, BackoffConfig};
 
-/// Engine capabilities advertised at registration. The only engine in the plan
-/// (PLAN-001) is the Claude CLI engine; later engine L3s extend this list.
-const CAPABILITIES: &[&str] = &["claude"];
+/// Engine capabilities advertised at registration: the engines this runner can
+/// ACTUALLY run, which is a runtime property rather than a build constant. The
+/// claude engine is always there; `codex` is advertised only when the configured
+/// codex binary is present, under the SAME probe that decides whether the backend
+/// is registered with the executor — so the host is never told the runner can run
+/// an engine it cannot spawn. The order is stable (claude first).
+fn capabilities(config: &Config) -> Vec<String> {
+    let mut capabilities = vec!["claude".to_owned()];
+    let codex_binary = config
+        .engine
+        .codex
+        .binary
+        .clone()
+        .unwrap_or_else(|| CodexSettings::default().binary);
+    if codex::is_available(&codex_binary) {
+        capabilities.push("codex".to_owned());
+    }
+    capabilities
+}
 
 /// The `register_error` reason the host returns when it cannot speak the
 /// agent's `protocolVersion` (docs/protocol.md §1). Triggers a clean exit.
@@ -228,7 +245,7 @@ async fn register(
         register_token: Redacted::new(register_token.expose_secret().to_owned()),
         protocol_version: PROTOCOL_VERSION,
         name: config.agent_name.clone(),
-        capabilities: CAPABILITIES.iter().map(|cap| (*cap).to_owned()).collect(),
+        capabilities: capabilities(config),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         platform: platform_string(),
     };
@@ -405,7 +422,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        FailureAction, RegisterError, load_or_register, register_failure_action,
+        FailureAction, RegisterError, capabilities, load_or_register, register_failure_action,
         register_with_backoff,
     };
     use crate::config::{Config, ConfigOverlay};
@@ -651,6 +668,38 @@ mod tests {
         // protocolVersion stripped ⇒ the overlay parsed and applied.
         assert_eq!(config.engine.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(config.agent_id.as_deref(), Some("agent-9"));
+    }
+
+    /// A config whose `engine.codex.binary` points at an executable stub is the
+    /// only way `codex` reaches the advertised capabilities — the probe is a stat,
+    /// so a stub file with the executable bit is enough.
+    #[test]
+    fn capabilities_advertise_codex_only_when_its_binary_is_there() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // No codex binary configured: today's behavior, unchanged.
+        assert_eq!(capabilities(&Config::default()), ["claude"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("codex");
+        let mut file = std::fs::File::create(&binary).unwrap();
+        file.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = file.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&binary, perms).unwrap();
+
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                &json!({
+                    "engine": { "codex": { "binary": binary } }
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(capabilities(&config), ["claude", "codex"]);
     }
 
     /// Build a well-formed register body for the HTTP-layer probes below.

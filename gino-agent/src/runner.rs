@@ -46,6 +46,7 @@ use crate::chat::{
 use crate::config::{Config, ConfigOverlay, ExecutorConfig};
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
+use crate::engine::codex::{self, CodexEngine, CodexSettings};
 use crate::engine::{Engine, EngineError, Session, SessionCfg};
 use crate::executor::{ThreadExecutor, WatchdogCfg};
 use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
@@ -241,7 +242,7 @@ async fn run_async(
     // the startup global reconcile. A resolved message's inbound descriptors reach
     // the executor through the durable `thread_attachments` snapshot (P1-10b).
     let flush = transport.flush_handle();
-    let (executor, provisioner, settings) = build_execution_plane(
+    let (executor, provisioner, seams) = build_execution_plane(
         &config,
         &http,
         &db,
@@ -293,7 +294,8 @@ async fn run_async(
         provisioner,
         engine_config_dir,
         config: Mutex::new(config),
-        engine_settings: settings,
+        engine_settings: seams.claude,
+        codex_settings: seams.codex,
     };
     serve(&mut transport, &context, &cancel).await;
 
@@ -471,13 +473,11 @@ async fn build_execution_plane(
     engine_config_dir: &Path,
     shutdown: &Arc<Cancel>,
     flush: Arc<Notify>,
-) -> (
-    Arc<ThreadExecutor>,
-    Option<Arc<Provisioner>>,
-    SharedEngineSettings,
-) {
-    let settings: SharedEngineSettings =
-        Arc::new(Mutex::new(engine_settings(config, engine_config_dir)));
+) -> (Arc<ThreadExecutor>, Option<Arc<Provisioner>>, EngineSeams) {
+    let seams = EngineSeams {
+        claude: Arc::new(Mutex::new(engine_settings(config, engine_config_dir))),
+        codex: Arc::new(Mutex::new(codex_settings(config, engine_config_dir))),
+    };
     let manager = build_attachment_manager(config, http);
 
     // The shared content-addressed provisioner over the manager (`impl BlobFetcher
@@ -496,7 +496,7 @@ async fn build_execution_plane(
     let executor = build_executor(
         config,
         Arc::clone(db),
-        &settings,
+        &seams,
         manager,
         provisioner.clone(),
         Arc::clone(shutdown),
@@ -513,7 +513,7 @@ async fn build_execution_plane(
         )
         .await;
     }
-    (executor, provisioner, settings)
+    (executor, provisioner, seams)
 }
 
 /// Build the v2 [`ThreadExecutor`] and (when present) wire its out-of-band
@@ -527,14 +527,14 @@ async fn build_execution_plane(
 fn build_executor(
     config: &Config,
     db: Arc<Mutex<Db>>,
-    settings: &SharedEngineSettings,
+    seams: &EngineSeams,
     manager: Option<Arc<AttachmentManager>>,
     provisioner: Option<Arc<Provisioner>>,
     shutdown: Arc<Cancel>,
     flush: Arc<Notify>,
 ) -> Arc<ThreadExecutor> {
     let engine: Arc<dyn Engine> = Arc::new(ReloadableEngine {
-        settings: Arc::clone(settings),
+        settings: Arc::clone(&seams.claude),
     });
     // The daemon shutdown token (P1-6): a shutdown cancels the active run through
     // the executor's converged cancel path and stops the pending drain. The
@@ -548,6 +548,24 @@ fn build_executor(
     )
     .with_shutdown(shutdown)
     .with_flush(flush);
+    // The second backend, registered ONLY when its binary is actually there.
+    // DECISION: registration and the advertised capability (`register.rs`) are
+    // gated on the SAME probe, so the host is never told this runner can run an
+    // engine it cannot spawn. A task that names `codex` on a runner without the
+    // binary still runs: the registry warns about the unknown name and falls back
+    // to the default backend, which is the existing forward-compat policy rather
+    // than a new failure mode. The probe runs ONCE, here at build time: a later
+    // `config_update` that points codex at a binary this runner does not have yet
+    // reaches the seam but not the registry, so it takes effect on restart.
+    let codex_binary = lock(&seams.codex).binary.clone();
+    if codex::is_available(&codex_binary) {
+        info!(binary = %codex_binary.display(), "codex engine available; registered");
+        executor = executor.with_engine(Arc::new(ReloadableCodexEngine {
+            settings: Arc::clone(&seams.codex),
+        }));
+    } else {
+        debug!(binary = %codex_binary.display(), "codex binary not found; codex engine not registered");
+    }
     if let Some(manager) = manager {
         info!("attachment plane active (host-proxy byte backend)");
         let source: Arc<dyn AttachmentSource> = Arc::new(DbAttachmentSource::new(db));
@@ -616,6 +634,62 @@ impl ReloadableEngine {
     /// A [`ClaudeEngine`] over the settings as they stand right now.
     fn snapshot(&self) -> ClaudeEngine {
         ClaudeEngine::new(lock(&self.settings).clone())
+    }
+}
+
+/// Resolve the Codex engine settings from the config, the codex twin of
+/// [`engine_settings`]: the `engine.codex` block plus the workspace dir
+/// (`GINO_WORKSPACE_DIR`) and the provisioned global config dir, which
+/// [`CodexSettings`] exports as `ENGINE_CONFIG_DIR` + codex's own `CODEX_HOME`
+/// (where the claude side exports `CLAUDE_CONFIG_DIR`). Rebuilt on a live
+/// `config_update` so a rotated `openaiApiKey` reaches the next run.
+fn codex_settings(config: &Config, engine_config_dir: &Path) -> CodexSettings {
+    let mut settings = CodexSettings::from_config(config);
+    settings.env.push((
+        "GINO_WORKSPACE_DIR".to_owned(),
+        config.paths.workspace_dir.display().to_string(),
+    ));
+    settings.config_dir = Some(engine_config_dir.to_path_buf());
+    settings
+}
+
+/// The live codex-settings seam, the codex twin of [`SharedEngineSettings`]: one
+/// seam per backend, both replaced on `config_update`.
+type SharedCodexSettings = Arc<Mutex<CodexSettings>>;
+
+/// Both live engine-settings seams, one per backend, carried together so the
+/// execution plane hands them around as one value.
+#[derive(Clone, Debug)]
+struct EngineSeams {
+    claude: SharedEngineSettings,
+    codex: SharedCodexSettings,
+}
+
+/// An [`Engine`] over the [`SharedCodexSettings`] seam, mirroring
+/// [`ReloadableEngine`]: each spawn snapshots the current settings and delegates
+/// to a [`CodexEngine`] built from that snapshot. Same APPLY-ON-NEXT-RUN
+/// decision — a session already spawned keeps the environment it was born with,
+/// and with one turn per codex process that boundary is simply the next turn.
+#[derive(Debug)]
+struct ReloadableCodexEngine {
+    settings: SharedCodexSettings,
+}
+
+#[async_trait]
+impl Engine for ReloadableCodexEngine {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        self.snapshot().start_session(cfg).await
+    }
+}
+
+impl ReloadableCodexEngine {
+    /// A [`CodexEngine`] over the settings as they stand right now.
+    fn snapshot(&self) -> CodexEngine {
+        CodexEngine::new(lock(&self.settings).clone())
     }
 }
 
@@ -760,6 +834,10 @@ struct ServeContext {
     /// The live engine-settings seam (audit P2-19): replaced on `config_update`,
     /// snapshotted by [`ReloadableEngine`] at every engine spawn.
     engine_settings: SharedEngineSettings,
+    /// The codex twin of [`ServeContext::engine_settings`], snapshotted by
+    /// [`ReloadableCodexEngine`]. Held whether or not the backend was registered,
+    /// so the seam stays in step with the live config either way.
+    codex_settings: SharedCodexSettings,
 }
 
 /// Resolve when a daemon shutdown signal arrives (P1-6): SIGINT (Ctrl-C) and —
@@ -1078,23 +1156,27 @@ fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool 
     }
 }
 
-/// The only engine backend this runner implements (`Engine::name`).
-const SUPPORTED_ENGINE: &str = "claude";
+/// The engine backends this BUILD implements (`Engine::name`). Whether a given
+/// one is actually REGISTERED is a runtime property — the codex backend is wired
+/// in only when its binary is present (see [`build_executor`]) — so this list is
+/// about the build, not about the deployment.
+const SUPPORTED_ENGINES: &[&str] = &["claude", "codex"];
 
-/// Warn once per applied `task_upsert` when the host names an engine this build
-/// cannot run. DECISION: NON-FATAL — an unsupported engine is a forward-compat
-/// signal from a newer host, not a bad request, so the value is still persisted
-/// and the task's threads keep running on [`SUPPORTED_ENGINE`]. Failing them
-/// would strand a whole task on a field the runner is free to ignore.
+/// Warn once per applied `task_upsert` when the host names an engine no backend
+/// in this build implements. DECISION: NON-FATAL — an unsupported engine is a
+/// forward-compat signal from a newer host, not a bad request, so the value is
+/// still persisted and the task's threads keep running on the runner's DEFAULT
+/// engine. Failing them would strand a whole task on a field the runner is free
+/// to ignore.
 fn warn_unsupported_engine(task_id: &str, engine: Option<&str>) {
     if let Some(engine) = engine
-        && engine != SUPPORTED_ENGINE
+        && !SUPPORTED_ENGINES.contains(&engine)
     {
         warn!(
             task = %task_id,
             requested = %engine,
-            fallback = %SUPPORTED_ENGINE,
-            "task_upsert named an unsupported engine; running on the supported one"
+            supported = ?SUPPORTED_ENGINES,
+            "task_upsert named an engine this build does not implement; running on the default one"
         );
     }
 }
@@ -1225,18 +1307,23 @@ async fn apply_config_update(context: &ServeContext, data: &serde_json::Value) {
 
 /// Merge a `config_update` overlay onto the live [`Config`] (the "WS update"
 /// layer — last in the config.rs precedence chain) and rebuild the shared
-/// [`ClaudeSettings`] from the merged result, so the NEXT engine spawn sees the
-/// updated credentials/model/tools (see [`ReloadableEngine`] for the
+/// [`ClaudeSettings`] AND [`CodexSettings`] from the merged result, so the NEXT
+/// engine spawn sees the updated credentials/model/tools (see [`ReloadableEngine`]
+/// for the
 /// apply-on-next-run decision). Fields the engine does not read at spawn time
 /// (heartbeat cadence, paths) are merged too but only take effect where they
 /// are re-read — the transport and DB keep their startup values until restart.
 fn apply_engine_config(context: &ServeContext, overlay: ConfigOverlay) {
-    let rebuilt = {
+    let (rebuilt, rebuilt_codex) = {
         let mut config = lock(&context.config);
         config.apply(overlay);
-        engine_settings(&config, &context.engine_config_dir)
+        (
+            engine_settings(&config, &context.engine_config_dir),
+            codex_settings(&config, &context.engine_config_dir),
+        )
     };
     *lock(&context.engine_settings) = rebuilt;
+    *lock(&context.codex_settings) = rebuilt_codex;
     debug!("config_update merged onto live config; engine settings apply on the next run");
 }
 
