@@ -381,9 +381,12 @@ pub(crate) mod v2 {
         pub(crate) kind: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) status: Option<String>,
-        /// The backend this task's threads run on (protocol.md §7, OD15). Only
-        /// `claude` is implemented; an unknown value is warned about and falls
-        /// back to claude rather than failing the task ([`crate::runner`]).
+        /// The backend this task's threads run on (protocol.md §7, OD15). The
+        /// runner implements `claude` and `codex`, and selects the backend per
+        /// run from this field. An engine this build does not implement — or one
+        /// whose backend is not registered on this runner — is warned about and
+        /// runs on the DEFAULT backend rather than failing the task
+        /// ([`crate::runner`]).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) engine: Option<String>,
         /// Per-task model id overriding `config.engine.model` at the NEXT engine

@@ -219,6 +219,82 @@ by **meta** (engine-agnostic), loaded by **symlink** from one store.
   survive). A *versioned* empty set removes all (authoritative-empty); a *non-versioned / offline* empty set
   never wipes. The task scope is restart-durable already (it persists via `tasks.entries` + `config_entries`).
 
+## 9c. Engine backends (`claude`, `codex`)
+
+The runner holds a **name → backend registry** with a default (`claude`), not one fixed engine. At every
+spawn the executor picks the backend in this order: the **task** row's `engine` (the host's
+`task_upsert.data.engine`), else the **thread** row's `engine`, else the **default**. The task row is read
+at spawn — the same apply-on-next-run policy as the per-task `model` override — so a `task_upsert` that
+changes the engine reaches the *next* run without disturbing the one in flight. An **unregistered engine
+name is not fatal**: the registry warns and answers the default.
+
+**The codex backend.**
+
+- **One `codex exec --json` child per TURN** — unlike claude, a single long-lived child driven over a
+  bidirectional control protocol. The prompt is written to the child's stdin, which is then **closed**, and
+  the runner reads JSONL `ThreadEvent`s off stdout until the process exits.
+- **Continuity is the thread id**: `thread.started` reports it, the runner persists it as the thread's
+  `engine_session_id`, and the next turn passes it back as a trailing positional `resume <thread_id>`.
+  Rewinding to a message has no codex equivalent, so a resume point is ignored rather than approximated.
+- **argv**: `codex exec --json [--model M] [--ask-for-approval P] [--sandbox S] [--skip-git-repo-check]
+  [extra args…] [resume <thread_id>]`, with `cwd` = the thread's `project/` dir (§9b).
+- **The defaults are deliberate** (all three are configurable):
+
+| flag | default | why |
+|---|---|---|
+| `--ask-for-approval` | `never` | a turn must never block on an approval prompt the runner has no way to answer |
+| `--sandbox` | `danger-full-access` | parity with the claude backend's `--dangerously-skip-permissions`; isolation in this product is the **container** boundary, and a narrower default would make the two backends run the same task differently |
+| `--skip-git-repo-check` | on | the per-thread cwd `work_dir/project/` is not a git repository, and `codex exec` refuses to run outside one |
+
+**Event mapping** (codex JSONL → engine-agnostic event → host transcript kind):
+
+| codex event | `EngineEvent` | transcript |
+|---|---|---|
+| `thread.started` (`thread_id`) | `SessionStarted` | — (persisted as the resume handle) |
+| `item.completed` `agent_message` | `Output` | `assistant_text` |
+| `item.completed` `reasoning` | `Thinking` | `thinking` |
+| `item.started` `command_execution` / `file_change` / `mcp_tool_call` / `collab_tool_call` / `web_search` | `ToolUse` | `tool_use` |
+| `item.completed` for those same kinds | `ToolResult` | `tool_result` |
+| `item.completed` `error` | `Log` (error) | a log line — **not** terminal |
+| `turn.completed` | `Result` (success) | `thread_result` succeeded |
+| `turn.failed`, `error` | `Result` (error, `Execution` → `agent.unknown`) | `thread_result` failed |
+| `item.updated`, `todo_list`, anything unknown | — | dropped |
+
+- The tool **name is the codex item kind verbatim** (`command_execution`, `file_change`, …), never aliased
+  onto claude's tool names — aliasing would make the transcript claim codex did something it did not.
+- `input` and the `tool_result` `content` carry the **whole item minus `id`/`item_type`/`type`**, deliberately
+  shape-agnostic: codex item payloads differ per kind and per CLI version, so a hand-picked field list would
+  silently drop fields.
+- **`parent_tool_use_id` is always absent for codex.** Codex reports no parent linkage and the runner does
+  not invent one, so codex transcripts carry no sub-agent attribution (§10).
+
+**Interrupt.** Claude receives an in-band control `interrupt`; codex has no such channel — stdin is already
+closed by the time the turn runs — so the runner **SIGINTs the child**, waits a bounded 2 s grace, then kills
+it. The cancelled turn settles through the existing executor path: the child dies, stdout hits EOF, the event
+stream ends, and `drain_cancelled` settles the thread `cancelled`.
+
+**Config.** The `engine.codex` block — `binary`, `model`, `approvalPolicy`, `sandboxMode`,
+`skipGitRepoCheck`, `extraArgs`, plus `openaiApiKey` / `openaiBaseUrl` (handed to the child as
+`OPENAI_API_KEY` / `OPENAI_BASE_URL`) — is additive: an absent field leaves the backend default in place. The
+provisioned engine config dir (§9b) is exported to a codex child as `ENGINE_CONFIG_DIR` + **`CODEX_HOME`**,
+the way it is `ENGINE_CONFIG_DIR` + `CLAUDE_CONFIG_DIR` for claude.
+
+**Operator-visible constraints.**
+
+- The runner registers the codex backend and advertises the `codex` **capability** only when a **stat-probe**
+  finds the configured binary. The probe never *executes* the binary.
+- **Capabilities are computed once, during the register call.** Installing a codex binary on an
+  already-registered runner does not make it codex-capable until it re-registers; a `config_update` reaches
+  the settings seam but not the registry until restart.
+- The host **matches `task.engine` against the agent's advertised `capabilities.engines` at placement time**
+  (both the auto-ranking and manual-assign paths). So the probe decides **routability**, not just
+  runnability: a task naming an engine no permitted agent advertises is not rejected — it stays unplaced
+  (`no-permitted-agent`) in `pending_assignment`.
+- **Known limitation.** If an agent advertised `codex` at register and the binary later disappears (or config
+  repoints it), the host keeps routing codex tasks there, and the runner's fall-back-to-default rule means the
+  run **completes on claude**; a warning in the agent log is the only signal. That is the trade-off of never
+  failing a task on an engine-name mismatch.
+
 ## 10. Transport & protocol
 
 WS primary (at-least-once via outbox/inbox + ack/msg_ack); HTTP for register/config/output + attachment proxy.

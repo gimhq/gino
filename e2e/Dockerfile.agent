@@ -18,8 +18,9 @@ COPY fake-claude /usr/local/bin/claude
 # The runner PROBES for a codex binary on PATH (a stat, never an exec) and
 # registers the codex backend + advertises the `codex` capability only when it
 # finds one, so shipping this fake is what makes the codex engine exist at all
-# in the e2e — without it a task naming `engine: "codex"` silently falls back to
-# claude.
+# in the e2e — without it the agent never advertises `codex`, so the host does
+# not PLACE a task naming `engine: "codex"` on it at all (`no-permitted-agent`,
+# the task is left in `pending_assignment`).
 COPY fake-codex /usr/local/bin/codex
 COPY agent-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/gino-agent /usr/local/bin/claude /usr/local/bin/codex /app/entrypoint.sh

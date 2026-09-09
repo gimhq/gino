@@ -79,6 +79,10 @@ Rules:
   (`connect.token`) and reuses it on reconnect — no re-register needed.
 - The host is the authority for `config` (credentials/engine settings arrive via the
   config layer; see [`docs/host-architecture.md`](host-architecture.md)).
+- `capabilities` advertises the engines the runner can **actually run** — a runtime property
+  (the agent probes for each engine's binary at registration), not a build constant. The host
+  matches a task's `engine` (§7 `task_upsert`) against that list when **placing** the task, so an
+  engine no permitted agent advertises leaves the task unplaced rather than failing it.
 
 ## 4. WebSocket framing + delivery guarantee
 

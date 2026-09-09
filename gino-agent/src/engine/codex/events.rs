@@ -405,7 +405,8 @@ mod tests {
     #[test]
     fn unknown_and_malformed_lines_are_dropped() {
         let mut mapper = EventMapper::new();
-        // An unmapped type (including the item-level ones a later L3 fills in).
+        // An unmapped type, and an `item.completed` with no `item` object at
+        // all — both drop rather than failing the line.
         assert!(
             mapper
                 .map_line(&json!({"type": "item.completed"}))
