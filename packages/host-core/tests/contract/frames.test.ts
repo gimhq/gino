@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "bun:test";
-import { buildSchema, MARKER, renderSection } from "../../../../scripts/gen-frames-schema";
+import { buildSchema, MARKER, renderSection } from "../../scripts/gen-frames-schema";
 import {
   AgentFrame,
   AnyFrame,

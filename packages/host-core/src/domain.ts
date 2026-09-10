@@ -39,7 +39,7 @@ export * from "./logger";
 export * from "./msgstore/attachments";
 export * from "./msgstore/crons";
 export { getTranscript, getTranscriptStats, TRANSCRIPT_READ_LIMIT, writeThreadMessage } from "./msgstore/messages";
-export type { ThreadMessageWrite } from "./msgstore/messages";
+export type { ThreadMessageWrite, TranscriptReadOptions } from "./msgstore/messages";
 export * from "./msgstore/reads";
 export * from "./msgstore/thread-runs";
 export * from "./platform/crypto";

@@ -3,6 +3,15 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Gino host Storage adapter — drizzle-orm over sqlite (bun:sqlite or better-sqlite3 driver).",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.ds.cc/bkhq/gino.git",
+    "directory": "packages/host-store-sqlite"
+  },
+  "publishConfig": {
+    "registry": "https://git.ds.cc/api/packages/bkhq/npm/"
+  },
   "files": [
     "dist",
     "src"

@@ -3,6 +3,15 @@
   "type": "module",
   "version": "0.1.0",
   "description": "Gino host LLM credential proxy — provider detection, model map, credential store, Claude<->OpenAI translator and HTTP forward path. The raw Codex WS relay is Bun-only behind ./bun; the /llm Hono router (Bun-only, WS bridge) behind ./hono.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.ds.cc/bkhq/gino.git",
+    "directory": "packages/host-proxy"
+  },
+  "publishConfig": {
+    "registry": "https://git.ds.cc/api/packages/bkhq/npm/"
+  },
   "files": [
     "dist",
     "src"

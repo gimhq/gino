@@ -55,6 +55,11 @@ export type * from "./rows";
 // ─── AgentRepo (M3: agents + pending_launches + agent_grants) ───
 
 /** Compare-and-set guard for `AgentRepo.updateStatusIf`. */
+/**
+ * Compare-and-set guard for `AgentRepo.updateStatusIf`. Give `from` for "only
+ * when it is exactly this", `notFrom` for "anything but this"; both may be
+ * omitted, which still refuses to move a `removed` agent.
+ */
 export interface StatusGuard {
   /** Transition only when the current status equals `from`. */
   readonly from?: string;
@@ -62,6 +67,15 @@ export interface StatusGuard {
   readonly notFrom?: string;
 }
 
+/**
+ * Agent identity, liveness, access grants and launch correlation.
+ *
+ * The invariant an adapter MUST keep: status transitions are COMPARE-AND-SET
+ * and `removed` is terminal, so a revoked agent can never come back online.
+ * `launchNonce` is unique across agents, and token lookups never return a
+ * removed agent. The repository stores hashes it is handed — it never hashes,
+ * mints or decides policy itself.
+ */
 export interface AgentRepo {
   /**
    * Persist a new agent row (`registry.enrollAgent`). `createdAt` defaults to
@@ -166,12 +180,22 @@ export interface AgentRepo {
 
 // ─── TaskRepo (M4: tasks) ───
 
+/** Equality filter for `TaskRepo.list`; omitted keys are unconstrained. */
 export interface TaskListFilter {
   readonly ownerId?: string;
   readonly agentId?: string;
   readonly status?: string;
 }
 
+/**
+ * Task rows, their placement and their lifecycle columns.
+ *
+ * The invariant an adapter MUST keep: placement is SET-ONCE — `setPlacementOnce`
+ * is a compare-and-set on `agentId IS NULL` and returns `false` without
+ * changing anything once a task is placed, including on the same agent. That
+ * is what makes one-task-one-agent hold; the domain decides whether a `false`
+ * means "idempotent" or "conflict".
+ */
 export interface TaskRepo {
   /** Persist a new task (`createTask`). `createdAt`/`updatedAt` default to `Date.now()`. Throws `UNIQUE` on a duplicate id. */
   insert: (row: NewTaskRow) => TaskRow;
@@ -204,6 +228,7 @@ export interface TaskRepo {
 
 // ─── OutboxRepo (M2: outbox) ───
 
+/** Type guard for `OutboxRepo.markAcked`. */
 export interface MarkAckedOptions {
   /**
    * Refuse to ack a row of this `type` (the `ack{id}` frame never acks a
@@ -213,6 +238,16 @@ export interface MarkAckedOptions {
   readonly excludeType?: string;
 }
 
+/**
+ * The durable host→agent queue behind at-least-once delivery.
+ *
+ * The invariant an adapter MUST keep: `append` returns a STRICTLY MONOTONIC,
+ * globally unique `id` that is never reused, because that id becomes the wire
+ * `msgId` the runner dedups on. Replay reads unacked rows in ascending id
+ * order, so ordering follows from the same sequence. SQLite gets this from
+ * AUTOINCREMENT; a non-SQL backend needs one global increasing sequence, not a
+ * per-agent counter.
+ */
 export interface OutboxRepo {
   /**
    * Persist a host→agent frame and return the stored row INCLUDING its `id`.
@@ -244,13 +279,21 @@ export interface OutboxRepo {
 
 // ─── TranscriptRepo (M5: messages) ───
 
-export interface TranscriptReadOptions {
+/**
+ * Cursor + cap for `TranscriptRepo.read` — the RESOLVED form, not the caller's
+ * options. The domain (`getTranscript`, `host.transcript.get`) defaults and
+ * clamps the cap before it reaches the port, so `limit` is required here and an
+ * adapter applies it verbatim. The caller-facing shape, with `limit` optional,
+ * is `TranscriptReadOptions`.
+ */
+export interface TranscriptReadQuery {
   /** Only rows with `seq > afterSeq`. */
   readonly afterSeq?: number;
-  /** Row cap (the domain clamps it; the port applies it verbatim). */
+  /** Row cap (already clamped by the domain; the port applies it verbatim). */
   readonly limit: number;
 }
 
+/** Cheap completeness probe for a thread. */
 export interface TranscriptStats {
   messageCount: number;
   /** `max(seq)`, or null when the thread has no rows. */
@@ -263,6 +306,14 @@ export interface ThreadFirstSeen {
   firstAt: number;
 }
 
+/**
+ * The transcript — the durable record the SDK's event hints point at.
+ *
+ * The invariants an adapter MUST keep: `(threadId, seq)` is unique and the
+ * FIRST writer wins, so a redelivered frame is silently dropped rather than
+ * overwriting; `read` orders by `seq` and never by arrival; and `id` is
+ * storage-generated and monotonic, because it is the channels egress cursor.
+ */
 export interface TranscriptRepo {
   /**
    * Persist one transcript event, IDEMPOTENT on `(threadId, seq)`: the FIRST
@@ -273,7 +324,7 @@ export interface TranscriptRepo {
    */
   insertIfAbsent: (row: NewMessageRow) => boolean;
   /** A thread's rows ORDERED BY `seq` (protocol §6 — never arrival), after `afterSeq` when given, capped at `limit`. */
-  read: (threadId: string, opts: TranscriptReadOptions) => MessageRow[];
+  read: (threadId: string, opts: TranscriptReadQuery) => MessageRow[];
   /** `count(*)` + `max(seq)` for a thread (`getTranscriptStats` / `checkTranscriptCompleteness`). */
   stats: (threadId: string) => TranscriptStats;
   /** Distinct threads of a task with their earliest `createdAt`, ordered by that time (ties in first-insertion order). */
@@ -290,6 +341,13 @@ export interface TranscriptRepo {
 
 // ─── ThreadRunRepo (M5: thread_runs) ───
 
+/**
+ * The per-thread terminal-outcome mirror.
+ *
+ * The invariant an adapter MUST keep: `upsert` inserts the whole row once, then
+ * updates ONLY the mutable subset. `taskId`, `cronId`, `source` and the
+ * timestamps are set once, so replaying an identical result is a no-op.
+ */
 export interface ThreadRunRepo {
   /**
    * UPSERT keyed by `threadId`. The FIRST call inserts the whole row
@@ -308,6 +366,7 @@ export interface ThreadRunRepo {
 // ─── CronMirrorRepo (M5: crons) ───
 
 /** The `cron_state` mirror fields (`msgstore/crons.writeCronState`), with `nextRun` already coerced to epoch-ms by the domain. */
+/** The mirror fields of a `cron_state` frame, with `nextRun` already epoch-ms. */
 export interface CronStateUpsert {
   readonly id: string;
   readonly taskId: string;
@@ -324,6 +383,7 @@ export interface CronStateUpsert {
   readonly continuity?: string;
 }
 
+/** The dispatch-owned half of a cron row: the recurring prompt the frame never echoes. */
 export interface CronPromptUpsert {
   readonly id: string;
   readonly taskId: string;
@@ -331,6 +391,14 @@ export interface CronPromptUpsert {
   readonly updatedAt: number;
 }
 
+/**
+ * The read-only cron mirror. Crons live on the agent; nothing here schedules.
+ *
+ * The invariant an adapter MUST keep: the two upserts own DISJOINT column sets.
+ * A state upsert never touches `prompt` or `taskId`, and a prompt upsert never
+ * touches the mirror fields, so the two can arrive in either order without
+ * either erasing the other.
+ */
 export interface CronMirrorRepo {
   /**
    * Mirror a `cron_state`, UPSERT keyed by `id`. INSERT on first sight (with
@@ -356,6 +424,13 @@ export interface CronMirrorRepo {
 
 // ─── AttachmentRepo (M5/M8: attachments) ───
 
+/**
+ * Attachment descriptors — metadata only; the bytes live in `BlobStorePort`.
+ *
+ * The invariant an adapter MUST keep: `insertIfAbsent` is idempotent on `id`,
+ * first writer wins, so re-registering a descriptor from a replayed frame
+ * neither throws nor overwrites.
+ */
 export interface AttachmentRepo {
   /** Persist a descriptor, IDEMPOTENT on `id`: first writer wins (row retained), a duplicate returns `false`. `createdAt` defaults to `Date.now()`. */
   insertIfAbsent: (row: NewAttachmentRow) => boolean;
@@ -368,6 +443,16 @@ export interface AttachmentRepo {
 
 // ─── ConfigRepo (M8: config_artifacts + config_entries + the global version) ───
 
+/**
+ * The artifact index and the per-scope desired sets.
+ *
+ * The invariants an adapter MUST keep: `(name, sha256)` and `(scope, target)`
+ * are unique; and `replaceScope` is the port's ONE atomic operation — it
+ * replaces a scope's rows and, for the global scope, bumps the durable version
+ * in the same all-or-nothing unit. A partial failure must leave both the old
+ * set and the old version intact, because agents reconcile against that
+ * version. There is deliberately no generic `transaction()`.
+ */
 export interface ConfigRepo {
   // artifacts — `(name, sha256)` UNIQUE (content-addressed PK)
 
@@ -422,6 +507,7 @@ export interface ConfigRepo {
 
 // ─── BlobStorePort (M8: the content-addressed bytes) ───
 
+/** What a successful `put` stored: the sanitized name, its digest, size and ref. */
 export interface StoredBlobRef {
   name: string;
   sha256: string;
@@ -473,6 +559,14 @@ export interface BlobStorePort {
 
 // ─── ChannelRepo (M6: channels + channel_bindings + channel_cursors; optional) ───
 
+/**
+ * Channel routing state, used only when `@gino/host-channels` is installed.
+ *
+ * The invariants an adapter MUST keep: `(channelId, conversationRef)` and
+ * `(channelId, taskId)` are unique, and `advanceCursor` is MONOTONIC — a stale
+ * or duplicate position is a no-op, so a redelivered batch cannot rewind
+ * egress and replay messages that were already handed out.
+ */
 export interface ChannelRepo {
   /** Persist a channel (`createdAt` defaults to `Date.now()`); throws `UNIQUE` on a duplicate id. */
   insert: (row: NewChannelRow) => ChannelRow;
@@ -509,6 +603,17 @@ export interface ChannelRepo {
 
 // ─── Storage ───
 
+/**
+ * Everything the host persists, as one object of repositories plus the blob
+ * store. This is the port an adapter implements; `memoryStorage()` and
+ * `@gino/host-store-sqlite` are the two that ship.
+ *
+ * Write a new adapter against the invariants documented on each repository —
+ * they are not inferable from the type signatures — and prove it with the
+ * conformance suite exported from `@gino/host-core/testing`, which asserts
+ * every one of them against your implementation. Methods are synchronous by
+ * design: the whole domain is synchronous.
+ */
 export interface Storage {
   readonly agents: AgentRepo;
   readonly tasks: TaskRepo;

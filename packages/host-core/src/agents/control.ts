@@ -25,6 +25,7 @@ import { AppError, NotFoundError } from "../shared/lib/errors";
 import { manualLauncher } from "./launchers/manual";
 import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess } from "./registry";
 
+/** Which out-of-band control operation a `ControlResult` describes. */
 export type ControlOp = "stop" | "restart" | "remove";
 
 /** How an OOB op was carried out: by the launcher, or via a WS `close` fallback. */
@@ -47,6 +48,7 @@ export interface ControlDeps {
   readonly resolveLauncher?: (kind: string | null | undefined) => Launcher;
 }
 
+/** The outcome of an out-of-band control op: which launcher acted, on which runtime handle, and whether it went through the launcher or degraded to a `close` frame. */
 export interface ControlResult {
   readonly agentId: string;
   readonly op: ControlOp;
@@ -55,6 +57,7 @@ export interface ControlResult {
   readonly ref: string | null;
 }
 
+/** A `remove` outcome, adding how many tasks lost their placement. */
 export interface RemoveResult extends ControlResult {
   readonly op: "remove";
   /** Tasks orphaned (placement cleared; mirror kept as history). */
@@ -278,6 +281,7 @@ export interface LaunchInput {
   readonly access?: "dedicated" | "public";
 }
 
+/** A started launch, before any agent exists: the correlation nonce the agent must echo, and the launcher's runtime handle. */
 export interface LaunchAgentResult {
   readonly launcherKind: string;
   /** The per-launch correlation nonce (OD17) — the agent echoes it in `register`. */

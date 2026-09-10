@@ -13,11 +13,13 @@
 
 // ─── M3 — agents / pending_launches / agent_grants ───
 
+/** What an agent advertises at register: the engines it can run, and an optional thread cap. The engine list is open — a newer agent build may advertise names this host has never heard of. */
 export interface AgentCapabilitiesJson {
   engines: string[];
   max_threads?: number;
 }
 
+/** A stored agent: identity, capabilities, access policy, liveness and its launcher binding. Only the connect token's HASH is ever persisted. */
 export interface AgentRow {
   id: string;
   name: string | null;
@@ -35,6 +37,7 @@ export interface AgentRow {
   createdAt: number;
 }
 
+/** Insert shape for `AgentRepo.insert`; `createdAt` and `activeThreads` default on write. */
 export interface NewAgentRow {
   id: string;
   name?: string | null;
@@ -52,6 +55,7 @@ export interface NewAgentRow {
   createdAt?: number;
 }
 
+/** A launch waiting for its agent to register, keyed by the single-use nonce. */
 export interface PendingLaunchRow {
   nonce: string;
   launcherKind: string;
@@ -60,6 +64,7 @@ export interface PendingLaunchRow {
   createdAt: number;
 }
 
+/** Insert shape for `AgentRepo.recordPending`; `access` defaults to `dedicated`. */
 export interface NewPendingLaunchRow {
   nonce: string;
   launcherKind: string;
@@ -68,6 +73,7 @@ export interface NewPendingLaunchRow {
   createdAt?: number;
 }
 
+/** One owner permitted on one `dedicated` agent. */
 export interface AgentGrantRow {
   agentId: string;
   ownerId: string;
@@ -76,6 +82,7 @@ export interface AgentGrantRow {
 
 // ─── M4 — tasks ───
 
+/** A stored task: its definition, its set-once placement, and the thread a follow-up message continues. */
 export interface TaskRow {
   id: string;
   ownerId: string;
@@ -94,6 +101,7 @@ export interface TaskRow {
   updatedAt: number;
 }
 
+/** Insert shape for `TaskRepo.insert`; both timestamps default on write. */
 export interface NewTaskRow {
   id: string;
   ownerId: string;
@@ -114,6 +122,7 @@ export interface NewTaskRow {
 
 // ─── M5 — read-only mirrors ───
 
+/** The mirrored state of one agent-owned cron, plus the host-owned `prompt`. Read-only — the host schedules nothing. */
 export interface CronRow {
   id: string;
   taskId: string;
@@ -130,6 +139,7 @@ export interface CronRow {
   updatedAt: number;
 }
 
+/** The mirrored outcome of one thread: terminal status, engine session handle, duration and final `seq`. */
 export interface ThreadRunRow {
   threadId: string;
   taskId: string;
@@ -145,6 +155,7 @@ export interface ThreadRunRow {
   createdAt: number;
 }
 
+/** Insert/upsert shape for `ThreadRunRepo.upsert`; only the mutable subset is applied after the first write. */
 export interface NewThreadRunRow {
   threadId: string;
   taskId: string;
@@ -160,6 +171,7 @@ export interface NewThreadRunRow {
   createdAt?: number;
 }
 
+/** One transcript event. `id` is the monotonic egress cursor key; `seq` is the per-thread order the transcript is read by. */
 export interface MessageRow {
   id: number;
   taskId: string;
@@ -178,6 +190,7 @@ export interface MessageRow {
   createdAt: number;
 }
 
+/** Insert shape for `TranscriptRepo.insertIfAbsent`; `id` is storage-generated and `createdAt` defaults on write. */
 export interface NewMessageRow {
   taskId: string;
   threadId: string;
@@ -193,6 +206,7 @@ export interface NewMessageRow {
   createdAt?: number;
 }
 
+/** A stored attachment descriptor: what the bytes are, which task/thread they belong to, and where they live in the blob store. */
 export interface AttachmentRow {
   id: string;
   taskId: string;
@@ -206,6 +220,7 @@ export interface AttachmentRow {
   createdAt: number;
 }
 
+/** Insert shape for `AttachmentRepo.insertIfAbsent`; `createdAt` defaults on write. */
 export interface NewAttachmentRow {
   id: string;
   taskId: string;
@@ -221,6 +236,7 @@ export interface NewAttachmentRow {
 
 // ─── Plumbing — outbox ───
 
+/** One queued host→agent frame. `id` is the wire `msgId`; `ackedAt` is null until the agent confirms it. */
 export interface OutboxRow {
   id: number;
   agentId: string;
@@ -233,6 +249,7 @@ export interface OutboxRow {
   ackedAt: number | null;
 }
 
+/** Insert shape for `OutboxRepo.append`; `id` is storage-generated and must come back on the returned row. */
 export interface NewOutboxRow {
   agentId: string;
   type: string;
@@ -246,6 +263,7 @@ export interface NewOutboxRow {
 
 // ─── M6 — channels / bindings / cursors ───
 
+/** A distribution channel: its type, owner, opaque config and optional message filter. */
 export interface ChannelRow {
   id: string;
   name: string;
@@ -256,6 +274,7 @@ export interface ChannelRow {
   createdAt: number;
 }
 
+/** Insert shape for `ChannelRepo.insert`; `createdAt` defaults on write. */
 export interface NewChannelRow {
   id: string;
   name: string;
@@ -266,6 +285,7 @@ export interface NewChannelRow {
   createdAt?: number;
 }
 
+/** The mapping from one external conversation to the task that serves it. */
 export interface ChannelBindingRow {
   channelId: string;
   conversationRef: string;
@@ -273,6 +293,7 @@ export interface ChannelBindingRow {
   createdAt: number;
 }
 
+/** Insert shape for `ChannelRepo.bindIfAbsent`; `createdAt` defaults on write. */
 export interface NewChannelBindingRow {
   channelId: string;
   conversationRef: string;
@@ -280,6 +301,7 @@ export interface NewChannelBindingRow {
   createdAt?: number;
 }
 
+/** How far one channel has delivered one task's transcript, as a `messages.id` high-water mark. */
 export interface ChannelCursorRow {
   channelId: string;
   taskId: string;
@@ -289,6 +311,7 @@ export interface ChannelCursorRow {
 
 // ─── M8 — config_artifacts / config_entries ───
 
+/** One immutable content-addressed artifact: a skill bundle (`dir`) or a single file. `unreferencedSince` is the GC aging mark. */
 export interface ConfigArtifactRow {
   name: string;
   sha256: string;
@@ -300,6 +323,7 @@ export interface ConfigArtifactRow {
   createdAt: number;
 }
 
+/** Insert shape for `ConfigRepo.upsertArtifact`; a repeat write updates only `kind` and `contentType`. */
 export interface NewConfigArtifactRow {
   name: string;
   sha256: string;
@@ -311,6 +335,7 @@ export interface NewConfigArtifactRow {
   createdAt?: number;
 }
 
+/** One stored desired-set entry: which artifact a scope wants, at which engine-resolved `target`. */
 export interface ConfigEntryRow {
   scope: string;
   name: string;

@@ -19,7 +19,7 @@ it doubles as a wire-compatibility check.
 Two modes:
 
 - **Hermetic (default, `run.sh`)** — fake engine + mock LLM upstream; deterministic,
-  credential-free, 56/56 checks. This file + `TEST-COVERAGE.md`.
+  credential-free; the latest run is 79/79 checks. This file + `TEST-COVERAGE.md`.
 - **Real flow (`run-real.sh`)** — the **real Claude CLI** drives a **real model**
   through the host `/llm` proxy to **real Anthropic**. Needs a credential you supply
   (`GINO_PROXY_ANTHROPIC_API_KEY` or `_OAUTH_TOKEN`). See `REAL-FLOW-REPORT.md`.
@@ -59,7 +59,7 @@ self-registers (`POST /agent/register`), opens its WebSocket, and runs tasks via
 the fake `claude` engine. The host writes its db/store to a tmpfs (the repo is
 bind-mounted read-only), so a run never touches the working tree.
 
-## Coverage (56 checks)
+## Coverage (79 checks, latest run)
 
 See [`TEST-COVERAGE.md`](TEST-COVERAGE.md) for the full check-by-check matrix
 (every request, what it asserts, and the path it proves). Summary:

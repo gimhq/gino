@@ -25,7 +25,7 @@ export interface ResolvedCredential {
   readonly accountId?: string | undefined;
 }
 
-interface CredentialStoreOpts {
+export interface CredentialStoreOpts {
   readonly fetchImpl?: FetchLike;
   readonly logger?: Logger;
   /** Injectable clock for deterministic expiry tests (defaults to Date.now). */

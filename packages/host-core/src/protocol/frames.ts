@@ -3,8 +3,9 @@
 // This module mirrors `docs/protocol.md` §4 (envelope) + §5 (frame catalog) as
 // executable zod. The host and the Rust runner share **no code**; both treat
 // `docs/protocol.md` as the contract, so this file MUST stay in lock-step with
-// it. `scripts/gen-frames-schema.ts` exports these schemas to JSON Schema and
-// embeds the result in protocol.md §8 (the machine-checkable mirror).
+// it. `scripts/gen-frames-schema.ts` (in this package) exports these schemas to
+// JSON Schema and embeds the result in protocol.md §8 (the machine-checkable
+// mirror).
 //
 // Design rules (protocol §1 + §4):
 //   • Envelope vs payload (§4.1): correlation/delivery ids live at the TOP
@@ -202,6 +203,7 @@ export type ConfigUpdateData = z.infer<typeof ConfigUpdateData>;
 
 // ── Frames — agent → host ───────────────────────────────────────────────────
 
+/** `thread_result` — agent→host, one thread reached its terminal state. */
 export const ThreadResultFrame = z.looseObject({
   type: z.literal("thread_result"),
   taskId: CorrelationId,
@@ -210,6 +212,7 @@ export const ThreadResultFrame = z.looseObject({
   data: ThreadResultData,
 });
 
+/** `thread_message` — agent→host, one ordered transcript event. Deduped on `(threadId, data.seq)`. */
 export const ThreadMessageFrame = z.looseObject({
   type: z.literal("thread_message"),
   taskId: CorrelationId,
@@ -218,6 +221,7 @@ export const ThreadMessageFrame = z.looseObject({
   data: ThreadMessageData,
 });
 
+/** `cron_state` — agent→host, the scheduling ledger for one cron. Never carries the prompt. */
 export const CronStateFrame = z.looseObject({
   type: z.literal("cron_state"),
   taskId: CorrelationId,
@@ -226,6 +230,7 @@ export const CronStateFrame = z.looseObject({
   data: CronStateData,
 });
 
+/** `heartbeat` — agent→host liveness at the advertised interval, optionally reporting in-flight threads. */
 export const HeartbeatFrame = z.looseObject({
   type: z.literal("heartbeat"),
   outboxId: DeliveryId.optional(),
@@ -250,6 +255,7 @@ export const AckFrame = z.looseObject({
 // runner dedups inbound frames and acknowledges durable storage by `msgId` +
 // `msg_ack` alone (§4.2) — `outboxId` rides along for compatibility but is
 // never acked by the runner.
+/** `task_upsert` — host→agent, seed or modify a task. Sent once per placement before any work. */
 export const TaskUpsertFrame = z.looseObject({
   type: z.literal("task_upsert"),
   taskId: CorrelationId,
@@ -258,6 +264,7 @@ export const TaskUpsertFrame = z.looseObject({
   data: TaskUpsertData,
 });
 
+/** `task_delete` — host→agent, drop a task and everything scheduled under it. */
 export const TaskDeleteFrame = z.looseObject({
   type: z.literal("task_delete"),
   taskId: CorrelationId,
@@ -265,6 +272,7 @@ export const TaskDeleteFrame = z.looseObject({
   msgId: DeliveryId.optional(),
 });
 
+/** `cron_upsert` — host→agent, create or update a trigger the AGENT then owns and fires. */
 export const CronUpsertFrame = z.looseObject({
   type: z.literal("cron_upsert"),
   taskId: CorrelationId,
@@ -274,6 +282,7 @@ export const CronUpsertFrame = z.looseObject({
   data: CronUpsertData,
 });
 
+/** `cron_delete` — host→agent, remove a trigger. */
 export const CronDeleteFrame = z.looseObject({
   type: z.literal("cron_delete"),
   taskId: CorrelationId,
@@ -282,6 +291,7 @@ export const CronDeleteFrame = z.looseObject({
   msgId: DeliveryId.optional(),
 });
 
+/** `message` — host→agent, user/system input for a task. Acked by `msg_ack` once durably stored. */
 export const MessageFrame = z.looseObject({
   type: z.literal("message"),
   taskId: CorrelationId,
@@ -291,6 +301,7 @@ export const MessageFrame = z.looseObject({
   data: MessageData,
 });
 
+/** `interrupt` — host→agent, cancel the current turn. Live-only: never queued, never replayed. */
 export const InterruptFrame = z.looseObject({
   type: z.literal("interrupt"),
   /**
@@ -303,12 +314,14 @@ export const InterruptFrame = z.looseObject({
   msgId: DeliveryId.optional(),
 });
 
+/** `close` — host→agent, wind the runner down. Not the per-task close; that is an `interrupt` plus a `task_upsert`. */
 export const CloseFrame = z.looseObject({
   type: z.literal("close"),
   outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
 });
 
+/** `config_update` — host→agent, an opaque live-config overlay. */
 export const ConfigUpdateFrame = z.looseObject({
   type: z.literal("config_update"),
   outboxId: DeliveryId.optional(),

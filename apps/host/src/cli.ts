@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 import { embeddedMigrations } from "@gino/host-store-sqlite";
@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import cac from "cac";
 import { consola } from "consola";
 import { BUILD_INFO } from "./build-info";
-import { DATA_DIR, IS_COMPILED, ROOT_DIR } from "./dirs";
+import { DATA_DIR } from "./dirs";
 
 const migrateLog = consola.withTag("migrate");
 
@@ -120,8 +120,8 @@ interface JournalEntry { tag: string; when: number }
  * applied yet, so every bundled migration is pending. Returns `null` when no
  * migration source can be read.
  */
-export function listPendingMigrations(opts: { dbPath: string; migrationsFolder?: string }): string[] | null {
-  const entries = readJournalEntries(opts.migrationsFolder);
+export function listPendingMigrations(opts: { dbPath: string; migrations?: ReadonlyMap<string, string> }): string[] | null {
+  const entries = readJournalEntries(opts.migrations ?? embeddedMigrations);
   if (entries === null)
     return null;
   const lastApplied = readLastAppliedMillis(opts.dbPath);
@@ -130,31 +130,14 @@ export function listPendingMigrations(opts: { dbPath: string; migrationsFolder?:
     .map(e => e.tag);
 }
 
-// Migration source mirrors `runMigrations` (packages/host-store-sqlite/src/db.ts,
-// HOST-M9-13): packaged builds read the embedded set; dev reads the store
-// package's `drizzle/` folder (or an explicit folder, used by tests).
-function readJournalEntries(migrationsFolder?: string): JournalEntry[] | null {
-  if (!migrationsFolder && (IS_COMPILED || embeddedMigrations.size > 0)) {
-    const raw = embeddedMigrations.get("meta/_journal.json");
-    if (!raw)
-      return null;
-    return parseJournal(raw, tag => embeddedMigrations.has(`${tag}.sql`));
-  }
-  const folder = migrationsFolder ?? resolve(ROOT_DIR, "packages/host-store-sqlite/drizzle");
-  const journalPath = resolve(folder, "meta/_journal.json");
-  if (!existsSync(journalPath))
+// Migration source mirrors `runMigrations` (packages/host-store-sqlite/src/migrate.ts,
+// HOST-M9-13) exactly: the committed embedded set is the only source, in every
+// build. Tests inject their own map through the same seam `runMigrations` takes.
+function readJournalEntries(migrations: ReadonlyMap<string, string>): JournalEntry[] | null {
+  const raw = migrations.get("meta/_journal.json");
+  if (!raw)
     return null;
-  try {
-    const knownTags = new Set(
-      readdirSync(folder)
-        .filter(f => f.endsWith(".sql"))
-        .map(f => f.replace(/\.sql$/, "")),
-    );
-    return parseJournal(readFileSync(journalPath, "utf-8"), tag => knownTags.has(tag));
-  }
-  catch {
-    return null;
-  }
+  return parseJournal(raw, tag => migrations.has(`${tag}.sql`));
 }
 
 function parseJournal(raw: string, hasSql: (tag: string) => boolean): JournalEntry[] | null {

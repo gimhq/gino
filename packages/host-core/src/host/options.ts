@@ -8,6 +8,13 @@
 import { OFFLINE_GRACE_MS } from "../agents/liveness";
 import { HEARTBEAT_INTERVAL_MS } from "../protocol/version";
 
+/**
+ * The fully-resolved per-instance settings every domain module reads from the
+ * context. Build one with `resolveHostOptions`; `createHost` does that for you
+ * from its `agents` / `attachments` / `storeDir` / `configGc` / `webhooks`
+ * groups. Every field has a default (`DEFAULT_HOST_OPTIONS`), so nothing here
+ * is required of an embedder.
+ */
 export interface HostOptions {
   /** Root of the content-addressed blob store (config artifacts + attachments). */
   readonly storeDir: string;
@@ -24,6 +31,13 @@ export interface HostOptions {
   readonly webhooks: { readonly timeoutMs: number; readonly maxAttempts: number; readonly retryIntervalMs: number };
 }
 
+/**
+ * The value an embedder that configures nothing gets: blob store under
+ * `data/store`, 64 MiB upload cap, registration enabled but token-less (so
+ * `POST /agent/register` fails closed until a `registerToken` is set), a 30 s
+ * heartbeat, a 90 s offline grace, config GC off, and the channels webhook
+ * retry policy. Mirrors the standalone app's env-schema defaults.
+ */
 export const DEFAULT_HOST_OPTIONS: HostOptions = {
   storeDir: "data/store",
   maxUploadBytes: 64 * 1024 * 1024,
@@ -35,6 +49,7 @@ export const DEFAULT_HOST_OPTIONS: HostOptions = {
   webhooks: { timeoutMs: 10_000, maxAttempts: 5, retryIntervalMs: 15_000 },
 };
 
+/** What a caller may supply: every field optional, the two nested groups partial too. */
 export type HostOptionsInput = Partial<Omit<HostOptions, "configGc" | "webhooks">> & {
   configGc?: Partial<HostOptions["configGc"]>;
   webhooks?: Partial<HostOptions["webhooks"]>;

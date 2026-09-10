@@ -10,6 +10,12 @@
 import type { InspectState, Launcher, LaunchResult } from "./types";
 import { UnsupportedLauncherOp } from "./types";
 
+/**
+ * The default launcher: it starts and controls nothing, so the host never
+ * spawns a runtime it was not explicitly asked to. Every capability is
+ * `false`, which makes stop and restart degrade to a `close` frame and inspect
+ * report `"unknown"`. Use it for agents an operator runs by hand.
+ */
 export const manualLauncher: Launcher = {
   kind: "manual",
   capabilities: { canLaunch: false, canStop: false, canRestart: false, canInspect: false },

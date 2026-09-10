@@ -9,41 +9,59 @@ Design: `docs/host-sdk-design.md`.
 
 Workspace members depend on it as `"@gino/host-core": "workspace:*"`. Publishing
 to the internal registry is a P3 item; until then consume it from this repo.
-Bun resolves the `bun` export condition to `src/`; Node consumers get `dist/`
-(`bun run --filter @gino/host-core build`).
 
-## Minimal host
+```jsonc
+{
+  "dependencies": {
+    "@gino/host-core": "workspace:*"
+  }
+}
+```
+
+Bun resolves the `bun` export condition to `src/`; Node consumers get `dist/`
+(`bun run --filter @gino/host-core build`). Three entries are published: `.`
+(the frozen API below), `./domain` (semi-internal, for the sibling `@gino/host-*`
+packages) and `./testing` (the storage conformance suite).
+
+## Quickstart
 
 ```ts
 import { createHost, memoryStorage, noopLogger } from "@gino/host-core";
 
 const host = createHost({
-  storage: memoryStorage(),                 // repositories + blob store
-  logger: noopLogger,                       // any pino-compatible subset
+  storage: memoryStorage(),                 // required — repositories + blob store
+  logger: noopLogger,                       // required — any pino-compatible subset
   agents: { registerToken: "…", registrationEnabled: true },
   attachments: { maxUploadBytes: 64 << 20 },
 });
 
 host.start();                               // liveness sweep, outbox GC, config GC, launch reaper (unref'd)
-host.stop();                                // closes agent sockets, timers and the storage
 ```
 
-SQLite through `@gino/host-store-sqlite`, with either driver:
+Only `storage` and `logger` are required; every other option has a default (see
+`DEFAULT_HOST_OPTIONS`). Construction is pure — no timer runs and no socket
+opens until `start()`. `stop()` closes agent sockets, stops the timers and
+closes the storage you passed in, in that order.
+
+Drive one task end to end through the namespaces:
 
 ```ts
-import { openDatabase, sqliteStorage } from "@gino/host-store-sqlite";
-import { bunSqliteDriver } from "@gino/host-store-sqlite/bun";    // Bun runtime
-import { nodeSqliteDriver } from "@gino/host-store-sqlite/node";  // Node runtime (better-sqlite3)
+const task = host.tasks.create({ ownerId: "alice", engine: "claude", model: "sonnet" });
+host.tasks.place(task.id);                  // owner → a permitted agent, pinned once
+const { threadId } = host.tasks.send(task.id, { text: "summarise the changelog" });
 
-const db = openDatabase({ driver: nodeSqliteDriver, path: "data/gino.db" }); // migrates on open
-const host = createHost({ storage: sqliteStorage(db, { storeDir: "data/store" }), logger });
+host.events.on("thread.result", (evt) => {
+  if (evt.threadId !== threadId) return;
+  const messages = host.transcript.get(threadId, { limit: 200 });
+  console.log(evt.data.status, messages.length);
+});
 ```
 
-One host per database file. Everything on `host.agents`, `host.tasks`,
-`host.crons`, `host.transcript` and `host.config` takes and returns plain data;
-failures are `AppError` subclasses (`NotFoundError`, `ForbiddenError`,
-`UnauthorizedError`, `ValidationError`, `PayloadTooLargeError`) so an adapter can
-map them to HTTP without the SDK knowing HTTP.
+Everything on `host.agents`, `host.tasks`, `host.crons`, `host.transcript` and
+`host.config` takes and returns plain data; failures are `AppError` subclasses
+(`NotFoundError`, `ForbiddenError`, `UnauthorizedError`, `ValidationError`,
+`PayloadTooLargeError`) so an adapter can map them to HTTP without the SDK
+knowing HTTP. One host per database file.
 
 ## Mounting the data plane
 
@@ -53,6 +71,7 @@ map them to HTTP without the SDK knowing HTTP.
 |---|---|
 | `register(body, { bearer })` | `POST /agent/register` (returns `HttpResult { status, headers?, body }`) |
 | `resolveAgent(connectToken)` | connect-token auth on every other route |
+| `authorizeAgent(agentId, connectToken)` | per-route check when the id comes from the path |
 | `configFor(agentId)` | `GET /agent/config/:agentId` |
 | `ingestHttpFrame(agentId, raw)` | `POST /agent/output/:agentId` |
 | `attachSocket` / `onSocketMessage` / `detachSocket` | WebSocket open / message / close (`WsLike` is `{ send, close }`) |
@@ -60,29 +79,62 @@ map them to HTTP without the SDK knowing HTTP.
 
 The WebSocket lifecycle ordering (attach → online → replay; detach → offline
 only when the current socket was evicted) is protocol-visible: call these three
-in that order and do not re-implement them.
+in that order, always with the same socket handle, and do not re-implement them.
+A `WsLike` whose identity changes per event must expose the stable socket as
+`raw` — the wire compares that.
 
-`@gino/host-hono` is the ready-made mount:
+`@gino/host-hono` is the ready-made mount. Under **Bun**, take the shared
+upgrade pair and register `websocket` on the server:
 
 ```ts
-import { adminRouter, agentRouter, errorHandler, messagesRouter } from "@gino/host-hono";
-import { bunWebSocket } from "@gino/host-hono/bun";      // Bun:  { upgradeWebSocket, websocket }
-import { nodeWebSocket } from "@gino/host-hono/node";    // Node: { upgradeWebSocket, injectWebSocket } over @hono/node-ws
+import type { HostEnv } from "@gino/host-hono";
+import { agentRouter, errorHandler } from "@gino/host-hono";
+import { bunWebSocket } from "@gino/host-hono/bun";
+import { Hono } from "hono";
 
-const { upgradeWebSocket } = bunWebSocket();             // or nodeWebSocket(app)
+const app = new Hono<HostEnv>();
+const { upgradeWebSocket, websocket } = bunWebSocket();
 app.route("/api/agent", agentRouter(host, { upgradeWebSocket }));
-app.route("/api/admin", adminRouter(host, { authorize }));     // authorize: (c) => Principal | null
-app.route("/api/messages", messagesRouter(host, { authorize }));
 app.onError(errorHandler);
+
+Bun.serve({ port: 3000, fetch: app.fetch, websocket });
 ```
 
-Rate limiting, CORS, request ids, logging middleware and bearer-token policy
+Under **Node** the upgrade is bound to the app and injected into the server
+after it is listening:
+
+```ts
+import type { HostEnv } from "@gino/host-hono";
+import { agentRouter, errorHandler } from "@gino/host-hono";
+import { nodeWebSocket } from "@gino/host-hono/node";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+
+const app = new Hono<HostEnv>();
+const { upgradeWebSocket, injectWebSocket } = nodeWebSocket(app);
+app.route("/api/agent", agentRouter(host, { upgradeWebSocket }));
+app.onError(errorHandler);
+
+const server = serve({ fetch: app.fetch, port: 3000, hostname: "127.0.0.1" });
+injectWebSocket(server);
+```
+
+`examples/embed-node` is the working Node reference, including the optional
+operator routes. The admin and channel-facing routers are opt-in and take the
+embedder's own authorization:
+
+```ts
+app.route("/api/admin", adminRouter(host, { authorize }));       // authorize: (c) => Principal | null
+app.route("/api/messages", messagesRouter(host, { authorize }));
+```
+
+Rate limiting, CORS, request ids, logging middleware and the bearer-token policy
 are the embedder's; apply them before the mounts.
 
 ## Events
 
 ```ts
-host.events.on("thread.result", ({ taskId, threadId, data }) => { /* … */ });
+const off = host.events.on("thread.result", ({ taskId, threadId, data }) => { /* … */ });
 ```
 
 | event | payload |
@@ -95,33 +147,91 @@ host.events.on("thread.result", ({ taskId, threadId, data }) => { /* … */ });
 | `task.placed` | `{ taskId, agentId }` |
 | `outbox.acked` | `{ agentId, id, type: "ack" \| "msg_ack" }` |
 
-Events fire synchronously after the durable write. They are at-least-once
-hints, never the record: the store is the source of truth, so re-read through
-`host.transcript.get(threadId, { afterSeq })` rather than relying on a listener
-having seen every message. A throwing listener is logged and never reaches the
-write path. `on` returns the unsubscribe function.
+**Events are hints, never the record.** Each one fires synchronously AFTER the
+durable write it describes, on the writing thread, inside the request that
+produced it — so keep listeners short and push slow work onto your own queue.
+They are at-least-once: the store stays the source of truth, so re-read through
+`host.transcript.get(threadId, { afterSeq })` rather than assuming a listener saw
+every message. Nothing is buffered before you subscribe and nothing is replayed
+after a restart, so a consumer that treats the payload as the record will lose
+data. A throwing listener is logged and never reaches the write path, which also
+means it is never retried. `on` returns the unsubscribe function.
 
 ## Storage adapters
 
-`Storage` (`src/host/ports/storage.ts`) is the port every adapter implements:
-`memoryStorage()` ships here, `sqliteStorage(db)` in `@gino/host-store-sqlite`.
-Any adapter must pass the conformance suite exported as
-`@gino/host-core/testing`; it is runner-agnostic and takes the primitives of
-`bun:test` or `node:test` + `expect`:
+`Storage` (`src/host/ports/storage.ts`) is the port every adapter implements.
+Three ways to get one:
+
+```ts
+import { memoryStorage } from "@gino/host-core";                  // tests, prototypes
+import { openDatabase, sqliteStorage } from "@gino/host-store-sqlite";
+import { bunSqliteDriver } from "@gino/host-store-sqlite/bun";    // Bun runtime (bun:sqlite)
+import { nodeSqliteDriver } from "@gino/host-store-sqlite/node";  // Node runtime (better-sqlite3)
+
+const db = openDatabase({ driver: nodeSqliteDriver, path: "data/gino.db" }); // migrates on open
+const storage = sqliteStorage(db, { storeDir: "data/store" });
+```
+
+The two sqlite drivers are interchangeable — same schema, same migrations, same
+conformance results. `memoryStorage()` keeps everything in Maps and drops it on
+`close()`.
+
+### Writing your own adapter
+
+The invariants an adapter must uphold are documented on each repository method
+and are NOT inferable from the type signatures: monotonic, never-reused outbox
+ids (they become the wire `msgId`), `(threadId, seq)` first-writer-wins on the
+transcript, compare-and-set agent status with `removed` terminal, set-once task
+placement, an atomic `ConfigRepo.replaceScope` that bumps the global version in
+the same unit, and `readVerified` refusing to serve bytes that fail their hash.
+
+Prove your adapter against them with the conformance suite exported as
+`@gino/host-core/testing`. It is runner-agnostic and takes the primitives of
+`bun:test` or `node:test` plus an `expect`:
 
 ```ts
 import { describeStorageConformance } from "@gino/host-core/testing";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-describeStorageConformance({ name: "mine", open: () => ({ storage, tamperBlob, close }) },
-  { describe, test, beforeEach, afterEach, expect });
+describeStorageConformance(
+  { name: "mine", open: () => ({ storage: myStorage(), tamperBlob, close: () => {} }) },
+  { describe, test, beforeEach, afterEach, expect },
+);
 ```
+
+`tamperBlob(ref)` must corrupt the bytes behind a stored ref — it is how the
+suite checks that `readVerified` throws instead of serving them.
+
+## What is NOT in the SDK
+
+Deliberate omissions. Each is the embedder's own stack, not a gap:
+
+- **No HTTP framework opinion.** Core returns `{ status, headers?, body }` and
+  throws `AppError`; `@gino/host-hono` is one mount, not the only one.
+- **No rate limiting, CORS, request ids or logging middleware.** Apply yours
+  ahead of the mounts.
+- **No auth policy and no token storage** beyond the protocol credentials the
+  wire needs (the shared register token and the per-agent connect token hashes).
+  Who may call your admin API is your decision — `adminRouter` takes an injected
+  `authorize`.
+- **No channels in the default install.** Poll and webhook delivery live in the
+  separate `@gino/host-channels`; the primary consumption model is
+  `host.events` plus `host.transcript`.
+- **No engine-specific behaviour.** An agent advertises the engines it can run
+  and the host matches tasks against that list. The set is open — nothing in
+  core enumerates it, and a newer agent build may advertise engines this host
+  has never heard of.
+- **No generic `transaction()` on the storage port**, so a non-SQL adapter stays
+  possible. The one cross-row atomic operation is a named method.
+- **No scheduler.** Crons live on the agent; the host emits commands and mirrors
+  what comes back.
 
 ## `@gino/host-core/domain`
 
 Re-exports the domain modules wholesale for the sibling `@gino/host-*`
-packages. Semi-internal: not part of the frozen API (P3 decides what
-graduates). `dist/index.js` itself re-exports through this entry, so under Node
-there is one copy of every class regardless of which entry you import from.
+packages. Semi-internal: not part of the frozen API. `dist/index.js` itself
+re-exports through this entry, so under Node there is one copy of every class
+regardless of which entry you import from.
 
 ## Example
 

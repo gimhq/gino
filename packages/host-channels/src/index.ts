@@ -11,70 +11,31 @@
 //   egress.ts    tail messages by `(channel, task)` cursor → deliver (poll/long-poll/webhook push)
 //   ingress.ts   route inbound → continue existing OR new conversation = new task → M4
 //   webhooks.ts  outbound webhook delivery, SSRF-guarded
-export const MODULE = "channels" as const;
+//
+// FROZEN as of P3 (docs/host-sdk-design.md §5 step 8). This list is the
+// package's API: an explicit allow-list, no wildcards, so the surface cannot
+// grow by accident when a module gains an export.
+// `tests/unit/api-surface.test.ts` snapshots it — adding or removing a name
+// here fails that test until the snapshot is updated deliberately.
 
-export {
-  ackCursor,
-  advanceCursor,
-  type BoundTask,
-  DEFAULT_POLL_LIMIT,
-  DEFAULT_WEBHOOK_MAX_ATTEMPTS,
-  isTaskOnChannel,
-  listBoundTasks,
-  MAX_POLL_LIMIT,
-  pollChannel,
-  type PollDelivery,
-  type PollOptions,
-  pushChannelWebhooks,
-  readCursor,
-  type TailOptions,
-  type TailResult,
-  tailTask,
-  type WebhookAttemptState,
-  type WebhookPushOptions,
-  type WebhookPushResult,
-} from "./egress";
+// ─── Egress — tail the M5 transcript by a per-channel cursor ───
+export { ackCursor, advanceCursor, DEFAULT_POLL_LIMIT, isTaskOnChannel, listBoundTasks, MAX_POLL_LIMIT, pollChannel, readCursor, tailTask } from "./egress";
+export type { BoundTask, PollDelivery, PollOptions, TailOptions, TailResult } from "./egress";
+export { DEFAULT_WEBHOOK_MAX_ATTEMPTS, pushChannelWebhooks } from "./egress";
+export type { WebhookAttemptState, WebhookPushOptions, WebhookPushResult } from "./egress";
 
-export {
-  bindConversation,
-  type InboundMessage,
-  routeInbound,
-  type RouteResult,
-} from "./ingress";
+// ─── Ingress — route an inbound message to a conversation's task (OD9/OD16) ───
+export { bindConversation, routeInbound } from "./ingress";
+export type { InboundMessage, RouteResult } from "./ingress";
 
-export {
-  DEFAULT_WEBHOOK_RETRY_INTERVAL_MS,
-  startWebhookPump,
-  type WebhookPump,
-  type WebhookPumpDeps,
-} from "./pump";
+// ─── The retrying webhook pump (subscribes to the host events) ───
+export { DEFAULT_WEBHOOK_RETRY_INTERVAL_MS, startWebhookPump } from "./pump";
+export type { WebhookPump, WebhookPumpDeps } from "./pump";
 
-export {
-  addWebhook,
-  type AddWebhookInput,
-  getBinding,
-  getChannel,
-  listChannelBindings,
-  listChannels,
-  listWebhooks,
-  registerChannel,
-  type RegisterChannelInput,
-  removeWebhook,
-  requireChannel,
-  resolveChannel,
-} from "./registry";
+// ─── Registry — channels CRUD, bindings and webhook config ───
+export { addWebhook, getBinding, getChannel, listChannelBindings, listChannels, listWebhooks, registerChannel, removeWebhook, requireChannel, resolveChannel } from "./registry";
+export type { AddWebhookInput, RegisterChannelInput } from "./registry";
 
-export {
-  assertSafeWebhookUrl,
-  assertSafeWebhookUrlResolved,
-  DEFAULT_WEBHOOK_TIMEOUT_MS,
-  type DeliverOptions,
-  deliverWebhook,
-  type DnsResolver,
-  type FetchLike,
-  type FetchResponse,
-  type ResolvedAddress,
-  type WebhookEndpoint,
-  type WebhookPayload,
-  type WebhookResult,
-} from "./webhooks";
+// ─── Outbound webhook delivery, SSRF-guarded ───
+export { assertSafeWebhookUrl, assertSafeWebhookUrlResolved, DEFAULT_WEBHOOK_TIMEOUT_MS, deliverWebhook } from "./webhooks";
+export type { DeliverOptions, DnsResolver, FetchLike, FetchResponse, ResolvedAddress, WebhookEndpoint, WebhookPayload, WebhookResult } from "./webhooks";
