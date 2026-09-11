@@ -187,15 +187,21 @@ fn is_executable_file(path: &Path) -> bool {
 /// LAST — after every flag, including `extra_args` — where no flag can swallow
 /// the id as its value.
 fn build_args(settings: &CodexSettings, resume: Option<&str>) -> Vec<String> {
-    let mut argv = vec!["exec".to_owned(), "--json".to_owned()];
+    // `--ask-for-approval` is a TOP-LEVEL flag: `codex exec` rejects it with
+    // `error: unexpected argument` (verified against codex-cli 0.154.0), so it
+    // must precede the `exec` subcommand. Everything else below is an `exec`
+    // option and follows it.
+    let mut argv = Vec::new();
+    if let Some(policy) = &settings.approval_policy {
+        argv.push("--ask-for-approval".to_owned());
+        argv.push(policy.clone());
+    }
+    argv.push("exec".to_owned());
+    argv.push("--json".to_owned());
 
     if let Some(model) = &settings.model {
         argv.push("--model".to_owned());
         argv.push(model.clone());
-    }
-    if let Some(policy) = &settings.approval_policy {
-        argv.push("--ask-for-approval".to_owned());
-        argv.push(policy.clone());
     }
     if let Some(mode) = &settings.sandbox_mode {
         argv.push("--sandbox".to_owned());
@@ -680,10 +686,10 @@ mod tests {
         assert_eq!(
             argv,
             [
-                "exec",
-                "--json",
                 "--ask-for-approval",
                 "never",
+                "exec",
+                "--json",
                 "--sandbox",
                 "danger-full-access",
                 "--skip-git-repo-check",
@@ -701,10 +707,10 @@ mod tests {
         assert_eq!(
             argv,
             [
-                "exec",
-                "--json",
                 "--ask-for-approval",
                 "never",
+                "exec",
+                "--json",
                 "--sandbox",
                 "danger-full-access",
                 "--skip-git-repo-check",
@@ -751,6 +757,13 @@ mod tests {
         let argv = build_args(&settings, None);
         let approval = argv.iter().position(|a| a == "--ask-for-approval").unwrap();
         assert_eq!(argv[approval + 1], "on-request");
+        // The approval flag is top-level: `codex exec` rejects it as an
+        // unexpected argument, so it MUST come before the subcommand.
+        let exec = argv.iter().position(|a| a == "exec").unwrap();
+        assert!(
+            approval < exec,
+            "approval flag must precede `exec`: {argv:?}"
+        );
         let sandbox = argv.iter().position(|a| a == "--sandbox").unwrap();
         assert_eq!(argv[sandbox + 1], "workspace-write");
         assert_eq!(&argv[argv.len() - 2..], ["--profile", "ci"]);

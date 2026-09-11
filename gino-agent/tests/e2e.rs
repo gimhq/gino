@@ -255,6 +255,16 @@ async fn codex_engine_task_runs_on_the_codex_backend() {
         argv.iter().any(|a| a == "exec") && argv.iter().any(|a| a == "--json"),
         "codex argv must carry `exec --json`: {argv:?}"
     );
+    // `--ask-for-approval` is a TOP-LEVEL flag; codex-cli 0.154.0 exits with
+    // `error: unexpected argument` when it follows the subcommand, so the real
+    // binary would reject any argv that gets this order wrong.
+    if let Some(approval) = argv.iter().position(|a| a == "--ask-for-approval") {
+        let exec = argv.iter().position(|a| a == "exec").expect("exec in argv");
+        assert!(
+            approval < exec,
+            "`--ask-for-approval` must precede `exec`: {argv:?}"
+        );
+    }
     assert!(
         !argv
             .iter()

@@ -31,10 +31,33 @@ set -u
 # reuse the id rather than minting a fresh one (no assertion depends on it; the
 # fake simply must not contradict the real CLI).
 TID="codex-e2e-$$"
+# Mirror the real CLI's ARGUMENT STRICTNESS, not just its output: codex-cli
+# 0.154.0 accepts `--ask-for-approval` only BEFORE the `exec` subcommand and
+# exits with `error: unexpected argument` otherwise. A permissive stub hides
+# exactly that class of bug (it did once), so reject anything the real binary
+# would reject.
+seen_exec=0
 while [ $# -gt 0 ]; do
-  if [ "$1" = "resume" ] && [ $# -ge 2 ]; then
-    TID="$2"
-  fi
+  case "$1" in
+    exec) seen_exec=1 ;;
+    resume)
+      if [ $# -ge 2 ]; then TID="$2"; fi
+      ;;
+    --ask-for-approval)
+      if [ "$seen_exec" = "1" ]; then
+        echo "error: unexpected argument '--ask-for-approval' found" >&2
+        echo "Usage: codex exec [OPTIONS] [PROMPT]" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --json|--skip-git-repo-check|--dangerously-bypass-approvals-and-sandbox) ;;
+    --model|--sandbox|-C|--cd) shift ;;
+    -*)
+      echo "error: unexpected argument '$1' found" >&2
+      exit 2
+      ;;
+  esac
   shift
 done
 
