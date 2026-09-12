@@ -9,16 +9,18 @@
     "apps/*",
     "examples/*"
   ],
-  "trustedDependencies": ["drizzle-kit"],
+  "trustedDependencies": [
+    "drizzle-kit"
+  ],
   "scripts": {
     "dev": "bun run --filter @gino/host dev",
-    "build": "bun run --filter @gino/host-core build && bun run --filter @gino/host-store-sqlite build && bun run --filter @gino/host-channels build && bun run --filter @gino/host-hono build && bun run --filter @gino/host-proxy build && bun run --filter @gino/host build",
-    "typecheck": "bun run --filter @gino/host-core typecheck && bun run --filter @gino/host-store-sqlite typecheck && bun run --filter @gino/host-channels typecheck && bun run --filter @gino/host-hono typecheck && bun run --filter @gino/host-proxy typecheck && bun run --filter @gino/host typecheck && tsc --noEmit",
+    "build": "bun run --filter @gino/host-core build && bun run --filter @gino/host-store-sqlite build && bun run --filter @gino/host-channels build && bun run --filter @gino/host-hono build && bun run --filter @gino/host-serve build && bun run --filter @gino/host-proxy build && bun run --filter @gino/host build",
+    "typecheck": "bun run --filter @gino/host-core typecheck && bun run --filter @gino/host-store-sqlite typecheck && bun run --filter @gino/host-channels typecheck && bun run --filter @gino/host-hono typecheck && bun run --filter @gino/host-serve typecheck && bun run --filter @gino/host-proxy typecheck && bun run --filter @gino/host typecheck && tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "bun --env-file=/dev/null test",
     "test:coverage": "bun --env-file=/dev/null test --coverage",
-    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run --filter @gino/host-channels check && bun run --filter @gino/host-hono check && bun run --filter @gino/host-proxy check && bun run --filter @gino/host check && bun run --filter @gino/example-embed-node check && bun run check:node-resolution",
+    "check": "bun run --filter @gino/host-core check && bun run --filter @gino/host-store-sqlite check && bun run --filter @gino/host-channels check && bun run --filter @gino/host-hono check && bun run --filter @gino/host-serve check && bun run --filter @gino/host-proxy check && bun run --filter @gino/host check && bun run --filter @gino/example-embed-node check && bun run check:node-resolution",
     "check:node-resolution": "bun run scripts/check-node-resolution.ts",
     "package": "bun apps/host/scripts/package.ts",
     "clean": "bun apps/host/scripts/clean.ts",

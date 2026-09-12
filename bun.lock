@@ -126,6 +126,20 @@
         "typescript": "6.0.3",
       },
     },
+    "packages/host-serve": {
+      "name": "@gino/host-serve",
+      "version": "0.1.0",
+      "dependencies": {
+        "@gino/host-core": "workspace:*",
+        "ws": "8.21.3",
+      },
+      "devDependencies": {
+        "@types/bun": "1.3.14",
+        "@types/ws": "8.18.1",
+        "eslint": "10.5.0",
+        "typescript": "6.0.3",
+      },
+    },
     "packages/host-store-sqlite": {
       "name": "@gino/host-store-sqlite",
       "version": "0.1.0",
@@ -261,6 +275,8 @@
     "@gino/host-hono": ["@gino/host-hono@workspace:packages/host-hono"],
 
     "@gino/host-proxy": ["@gino/host-proxy@workspace:packages/host-proxy"],
+
+    "@gino/host-serve": ["@gino/host-serve@workspace:packages/host-serve"],
 
     "@gino/host-store-sqlite": ["@gino/host-store-sqlite@workspace:packages/host-store-sqlite"],
 

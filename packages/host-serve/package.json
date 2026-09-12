@@ -1,0 +1,54 @@
+{
+  "name": "@gino/host-serve",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Gino host serve adapter — the /agent data plane over host.wire with no HTTP framework: a runtime-neutral request handler plus ready-made Bun.serve and node:http + ws servers.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.ds.cc/bkhq/gino.git",
+    "directory": "packages/host-serve"
+  },
+  "publishConfig": {
+    "registry": "https://git.ds.cc/api/packages/bkhq/npm/"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./bun": {
+      "bun": "./src/bun.ts",
+      "types": "./dist/bun.d.ts",
+      "import": "./dist/bun.js"
+    },
+    "./node": {
+      "bun": "./src/node.ts",
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    }
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun --env-file=/dev/null test ./tests/",
+    "test:node": "node tests/node/serve-smoke.mjs",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/bun.ts --outdir dist --target bun --format esm --packages external && bun build src/node.ts --outdir dist --target node --format esm --packages external && tsc -p tsconfig.build.json",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build && bun run test:node"
+  },
+  "dependencies": {
+    "@gino/host-core": "workspace:*",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/ws": "8.18.1",
+    "eslint": "10.5.0",
+    "typescript": "6.0.3"
+  }
+}

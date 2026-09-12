@@ -40,6 +40,7 @@ const RESOLVE_ONLY: Record<string, string> = {
   "@gino/host-core#./testing": "TypeScript source, not built output — Node refuses to strip types under node_modules",
   "@gino/host-store-sqlite#./bun": "Bun-only: imports bun:sqlite",
   "@gino/host-hono#./bun": "Bun-only: Bun.serve WebSocket upgrade",
+  "@gino/host-serve#./bun": "Bun-only: Bun.serve listener",
   "@gino/host-proxy#./bun": "Bun-only: raw Bun socket relay (host-sdk-design §7.5)",
   "@gino/host-proxy#./hono": "Bun-only: /llm router over the Bun WS bridge (host-sdk-design §7.5)",
 };
