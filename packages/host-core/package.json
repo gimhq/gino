@@ -43,7 +43,7 @@
     "test:node": "node --test tests/node/conformance.mts tests/node/identity.mts"
   },
   "dependencies": {
-    "nanoid": "5.1.15",
+    "nanoid": "5.1.16",
     "zod": "4.4.3"
   },
   "devDependencies": {

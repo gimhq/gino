@@ -16,7 +16,7 @@
     "@gino/host-hono": "workspace:*",
     "@gino/host-store-sqlite": "workspace:*",
     "@hono/node-server": "1.19.17",
-    "hono": "4.12.26",
+    "hono": "4.13.5",
     "ws": "8.21.3"
   },
   "devDependencies": {

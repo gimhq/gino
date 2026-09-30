@@ -43,7 +43,7 @@
   "dependencies": {
     "@gino/host-core": "workspace:*",
     "@gino/host-hono": "workspace:*",
-    "hono": "4.12.26",
+    "hono": "4.13.5",
     "zod": "4.4.3"
   },
   "devDependencies": {

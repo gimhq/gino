@@ -16,7 +16,7 @@ name: gino-e2e
 
 services:
   mock-llm:
-    image: oven/bun:1.3.14
+    image: oven/bun:1.4.0
     working_dir: /work
     command: ["bun", "/work/mock-llm.ts"]
     volumes:
@@ -25,7 +25,7 @@ services:
       PORT: "4000"
 
   host:
-    image: oven/bun:1.3.14
+    image: oven/bun:1.4.0
     working_dir: /app
     command: ["bun", "apps/host/src/index.ts"]
     depends_on:
@@ -79,7 +79,7 @@ services:
       RUST_LOG: info
 
   tester:
-    image: oven/bun:1.3.14
+    image: oven/bun:1.4.0
     working_dir: /work
     command: ["bun", "/work/e2e.ts"]
     depends_on:
