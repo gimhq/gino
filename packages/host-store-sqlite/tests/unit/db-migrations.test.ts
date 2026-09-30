@@ -217,7 +217,8 @@ describe("migration lock (HOST-M9-14)", () => {
     try {
       expect(() => createDb(dbPath, { migrationLockTimeoutMs: 0 })).toThrow(/migration lock/);
       // The loser never migrated: the file (created on open) has no tables.
-      const sqlite = new Database(dbPath, { readonly: true });
+      // Read-write, not readonly: the readonly open failed on macOS CI (bun 1.4.0).
+      const sqlite = new Database(dbPath);
       try {
         expect(tableNames(sqlite)).toEqual([]);
       }
