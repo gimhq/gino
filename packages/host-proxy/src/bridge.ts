@@ -14,7 +14,7 @@ import { claudeToOpenAIRequest, createTranslatorState, openAIEventToClaudeSSE } 
 const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const OPENAI_WS_BETA = "responses_websockets=2026-02-06";
 
-// Watchdogs (HOST-M7-04): a stalled upstream must not pin the engine's HTTP
+// Watchdogs: a stalled upstream must not pin the engine's HTTP
 // request forever, and a slow-reading client must not grow the SSE buffer
 // without bound.
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
@@ -109,7 +109,7 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   let opened = false;
   const ws = wsFactory(wsUrl, { headers });
 
-  // Connect + idle watchdogs (HOST-M7-04): a half-open or silent upstream must
+  // Connect + idle watchdogs: a half-open or silent upstream must
   // not leave the SSE response hanging forever.
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,7 +129,7 @@ export async function bridgeClaudeToOpenAI(bodyText: string, targetModel: string
   };
 
   const writeLine = (line: string) => {
-    // Backpressure gate (HOST-M7-04): `desiredSize` ≤ 0 means the client has
+    // Backpressure gate: `desiredSize` ≤ 0 means the client has
     // let ≥ MAX_SSE_BUFFER_BYTES pile up unread — cut the upstream off instead
     // of queueing without bound. (null = stream already errored/released.)
     if (writer.desiredSize !== null && writer.desiredSize <= 0) {

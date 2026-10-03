@@ -45,7 +45,7 @@ describe("M3 registry — verifyConnectToken", () => {
     expect(verifyConnectToken(storage, "no-such-agent", connectToken)).toBeNull();
     expect(verifyConnectToken(storage, agent.id, "")).toBeNull();
 
-    // Removal revokes the token (OD12).
+    // Removal revokes the token.
     setAgentStatus(storage, agent.id, "removed");
     expect(verifyConnectToken(storage, agent.id, connectToken)).toBeNull();
   });
@@ -65,7 +65,7 @@ describe("M3 registry — lifecycle + liveness", () => {
     setAgentStatus(storage, agent.id, "online");
     setAgentStatus(storage, agent.id, "removed");
 
-    // The WS close the remove itself provoked lands afterwards (HOST-M3-01).
+    // The WS close the remove itself provoked lands afterwards.
     setAgentStatus(storage, agent.id, "offline");
     expect(getAgent(storage, agent.id)?.status).toBe("removed");
     setAgentStatus(storage, agent.id, "online");

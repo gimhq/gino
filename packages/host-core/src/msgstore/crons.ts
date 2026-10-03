@@ -1,6 +1,6 @@
 // M5 — `cron_state` → `crons` (READ-ONLY MIRROR) + cron reads.
 //
-// Crons LIVE ON THE AGENT (OD14); the host keeps a mirror written ONLY from
+// Crons LIVE ON THE AGENT; the host keeps a mirror written ONLY from
 // inbound `cron_state` frames — the agent is authoritative for scheduling. The
 // host derives *dispatched* counts from `thread_runs` by `cron_id`; the
 // runner-local `round_count` / `skipped_count` summary is mirrored verbatim.
@@ -27,7 +27,7 @@ const TZ_LESS_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 /**
  * Coerce the wire `next_run` (string: epoch-ms or ISO) to epoch-ms, or null.
  * ECMAScript reads a timezone-less ISO date-time in the host's LOCAL zone, so
- * the stored value would shift with the host `TZ` (HOST-XC-01) — the wire value
+ * the stored value would shift with the host `TZ` — the wire value
  * is UTC, so pin a TZ-less string with an explicit `Z` before parsing.
  */
 function toEpochMs(value: string | undefined): number | null {
@@ -75,7 +75,7 @@ export interface CronPromptWrite {
 /**
  * Persist the dispatch-owned `prompt` when a `cron_upsert` COMMAND is emitted —
  * `cron_state` never carries it, so without this write the mirror column stays
- * empty forever (HOST-M5M6-09). INSERT a stub row when the command precedes the
+ * empty forever. INSERT a stub row when the command precedes the
  * first `cron_state` (the usual order — the host mints the id); on conflict
  * update ONLY `prompt`, leaving every mirror field to `writeCronState`.
  */

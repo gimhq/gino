@@ -17,7 +17,7 @@ import {
   recordPendingLaunch,
 } from "../../src/agents/registry";
 
-// HOST-M3-05 — pending launches get a TTL + reaper (runtime torn down on
+// Pending launches get a TTL + reaper (runtime torn down on
 // expiry, entry dropped) and are PERSISTED so a host restart orphans nothing.
 
 let db: AppDatabase;

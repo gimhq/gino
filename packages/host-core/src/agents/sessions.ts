@@ -57,8 +57,7 @@ export class SessionRegistry implements AgentTransport {
    * Detach the agent's socket. When `ws` is given, only detaches if it is still
    * the current socket — so a late `close` from a superseded socket cannot evict
    * the live reconnect. Returns whether the CURRENT session was evicted, so the
-   * caller can skip status bookkeeping for a superseded socket's close
-   * (HOST-M1M2-05 / HOST-M3-02).
+   * caller can skip status bookkeeping for a superseded socket's close.
    */
   detach(agentId: string, ws?: WsLike): boolean {
     const existing = this.sessions.get(agentId);

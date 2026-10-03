@@ -69,7 +69,7 @@ export function openDatabase(opts: OpenDatabaseOptions): AppDatabase {
   // up the existing DB BEFORE the new code migrates it, so a rollback to the
   // previous version still finds a compatible schema. Then migrate, then record
   // the version that owns the on-disk schema. The whole window is serialized
-  // across processes (HOST-M9-14): a concurrent start waits for the holder to
+  // across processes: a concurrent start waits for the holder to
   // finish migrating, then proceeds against the already-migrated file.
   const version = opts.version ?? DEV_VERSION;
   try {
@@ -150,7 +150,7 @@ export function recordDbVersion(dbPath: string, version: string): void {
 }
 
 /**
- * Cross-process guard around the snapshot + migrate window (HOST-M9-14): an
+ * Cross-process guard around the snapshot + migrate window: an
  * exclusively-created (`O_EXCL`) pidfile beside the DB. A SQLite
  * `BEGIN EXCLUSIVE` on a sidecar file would be the natural choice, but
  * the Bun sqlite binding's VFS does not place OS file locks, so its transactions are

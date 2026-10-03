@@ -35,7 +35,7 @@ export class ShaMismatchError extends ConfigStoreError {
 }
 
 /**
- * Thrown when a `ref` resolves to no physical blob (HOST-M8-12) — a dangling
+ * Thrown when a `ref` resolves to no physical blob — a dangling
  * registry/descriptor row (e.g. a crash between a GC row delete and blob
  * delete). The serve path maps this to a 404, never an unhandled 500.
  */
@@ -115,8 +115,8 @@ export class BlobStore implements BlobStorePort {
   }
 
   /**
-   * Resolve a `ref` to its absolute path, ENFORCING root containment
-   * (HOST-M8-09): the resolved path must be strictly inside the store root, so
+   * Resolve a `ref` to its absolute path, ENFORCING root containment:
+   * the resolved path must be strictly inside the store root, so
    * a traversal-shaped ref (`../../data/gino.db`, an absolute path, …) can
    * never reach the filesystem — regardless of where the ref came from.
    */
@@ -134,7 +134,7 @@ export class BlobStore implements BlobStorePort {
    * descriptor. The write is idempotent: when the content-addressed path
    * already exists AND its bytes still hash to the same sha256 the write is a
    * dedup no-op. When the existing bytes DON'T match (bit rot, tampering, or a
-   * 48-bit prefix collision squatting the leaf — HOST-M8-04) the blob is
+   * 48-bit prefix collision squatting the leaf) the blob is
    * rewritten from the incoming payload (self-heal) instead of no-opping, so a
    * re-ingest of the correct bytes always repairs the store. The write itself
    * is temp-file + rename so a reader never observes a partial blob.
@@ -198,7 +198,7 @@ export class BlobStore implements BlobStorePort {
 
   /**
    * Every physical leaf under the store root — blobs AND leftover `.tmp-*`
-   * files. The filesystem-aware GC input (HOST-M8-05): a leaf no DB row
+   * files. The filesystem-aware GC input: a leaf no DB row
    * references is an orphan the sweep may reclaim; `mtimeMs` is its age guard.
    */
   listLeaves(): StoreLeaf[] {

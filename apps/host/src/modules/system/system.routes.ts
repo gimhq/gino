@@ -28,7 +28,7 @@ function lodeNotActive(): never {
  * System routes — liveness + readiness probes for the orchestrator, the
  * build-version read (with the lode loader's upgrade view), and the lode
  * operator actions (`/system/lode/*`). The probes + version read are public;
- * the mutating lode actions are admin-token guarded per-route (HOST-XC-02;
+ * the mutating lode actions are admin-token guarded per-route (
  * this router is mounted on the public surface, so health stays
  * unauthenticated).
  */

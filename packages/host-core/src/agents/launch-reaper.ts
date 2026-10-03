@@ -1,7 +1,7 @@
-// M3 — PENDING-LAUNCH REAPER (HOST-M3-05).
+// M3 — PENDING-LAUNCH REAPER.
 //
 // `control.launchAgent` records every launch in the persisted
-// `pending_launches` table (keyed by the OD17 nonce) and a successful
+// `pending_launches` table (keyed by the nonce) and a successful
 // registration consumes the row via `correlateLaunch`. When the agent NEVER
 // registers (bad image, crash-loop, network fault), the runtime would keep
 // running forever with `GINO_REGISTER_TOKEN` in its env, invisible to

@@ -1,5 +1,5 @@
 import type { HostEvents, Logger, Storage } from "@gino/host-core";
-// M6 — WEBHOOK PUMP (HOST-M5M6-04): the production driver of outbound webhook
+// M6 — WEBHOOK PUMP: the production driver of outbound webhook
 // egress. Until this landed, `pushChannelWebhooks` had no caller — webhook
 // channels stored endpoints that were never pushed to.
 //
@@ -15,7 +15,7 @@ import type { HostEvents, Logger, Storage } from "@gino/host-core";
 // channel, so two triggers can never race the same `(channel, task)` cursor.
 //
 // Delivery semantics stay cursor-driven (ack on 2xx only, `egress.ts`); the
-// pump owns the bounded-attempt poison state (HOST-M5M6-05), so a batch that
+// pump owns the bounded-attempt poison state, so a batch that
 // keeps failing is eventually dead-lettered (skipped with a log) instead of
 // wedging the channel forever. The attempt state is in-memory: a host restart
 // resets the budget, which only means a poison batch gets retried another

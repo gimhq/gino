@@ -9,7 +9,7 @@ import { getThreadRun, writeCronState } from "../../src/msgstore";
 import { applyFrame, ingestHttpFrame } from "../../src/protocol/inbound";
 import { createTask, setPlacement } from "../../src/tasks";
 
-// HOST-M1M2-06 / HOST-M5M6-06 — `thread_result` dispatch context is derived at
+// `thread_result` dispatch context is derived at
 // write time from the agent's cron-minted thread-id shape
 // (`<cronId>@<scheduled_epoch_millis>` isolated / `<cronId>@shared` shared):
 // a thread whose id prefix names a known cron of the same task lands in

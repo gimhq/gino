@@ -87,7 +87,7 @@ export type ThreadResultData = z.infer<typeof ThreadResultData>;
 
 /**
  * The `kind` values this host build knows about. `kind` is deliberately NOT a
- * closed `z.enum` (HOST-M1M2-04): the protocol is additive-by-design (§1), so
+ * closed `z.enum`: the protocol is additive-by-design (§1), so
  * an agent build that emits a new transcript kind must not produce a frame the
  * host refuses forever. The inbound handler stores any string `kind` and
  * warn-logs values outside this set; readers treat unknown kinds as opaque.
@@ -146,7 +146,7 @@ export type HeartbeatData = z.infer<typeof HeartbeatData>;
 
 // ── `data` payloads — host → agent ──────────────────────────────────────────
 
-/** A desired config/skill entry (M8 / PLAN-007) — engine-resolved `target`. */
+/** A desired config/skill entry (M8) — engine-resolved `target`. */
 export const ConfigEntry = z.looseObject({
   name: z.string(),
   sha256: z.string(),
@@ -177,7 +177,7 @@ export type TaskUpsertData = z.infer<typeof TaskUpsertData>;
  * `cron_upsert.data` — a scheduling COMMAND (`continuity` required here).
  * `prompt` is the recurring instruction the cron runs each fire — REQUIRED:
  * the agent's `CronUpsertData` rejects a promptless command, so the host
- * schema matches it (HOST-M4-10).
+ * schema matches it.
  */
 export const CronUpsertData = z.looseObject({
   kind: z.string(),

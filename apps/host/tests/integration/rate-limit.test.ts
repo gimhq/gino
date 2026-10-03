@@ -1,4 +1,4 @@
-// HOST-M1M2-10 / HOST-M9-02 / HOST-M7-03 — the rate-limit middleware is wired
+// The rate-limit middleware is wired
 // onto the edge: POST /agent/register (register_error{rate_limited}, protocol
 // §3), the /llm/* proxy surface (per-principal keying), and the /messages/*
 // channel-token routes. Each `newApp` call builds a fresh config object, so

@@ -31,7 +31,7 @@ export function sqliteConfigRepo(db: AppDatabase): ConfigRepo {
   return {
     upsertArtifact(row: NewConfigArtifactRow): ConfigArtifactRow {
       // The content address is immutable; the metadata OUTSIDE it — `kind` /
-      // `content_type` — is last-write-wins (HOST-M8-13).
+      // `content_type` — is last-write-wins.
       db
         .insert(configArtifacts)
         .values(row)
@@ -69,7 +69,7 @@ export function sqliteConfigRepo(db: AppDatabase): ConfigRepo {
         .run();
     },
     deleteArtifact(name, sha256) {
-      // Row FIRST (HOST-M8-12): the registry never points at deleted bytes.
+      // Row FIRST: the registry never points at deleted bytes.
       db
         .delete(configArtifacts)
         .where(artifactKey(name, sha256))
@@ -109,7 +109,7 @@ export function sqliteConfigRepo(db: AppDatabase): ConfigRepo {
       return db.select().from(configEntries).orderBy(asc(sql`rowid`)).all();
     },
     clearScope(scope) {
-      // HOST-M8-10: task scopes carry no config version, so nothing is bumped.
+      // Task scopes carry no config version, so nothing is bumped.
       db.delete(configEntries).where(eq(configEntries.scope, scope)).run();
     },
     scopesWithSha(sha256) {

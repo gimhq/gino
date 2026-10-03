@@ -47,7 +47,7 @@ function applyMigrations(dbPath: string, migrationsFolder: string): void {
   }
 }
 
-// HOST-M9-10 — `migrate --check` must report what the next boot would apply,
+// `migrate --check` must report what the next boot would apply,
 // not "every bundled migration, forever".
 describe("listPendingMigrations (HOST-M9-10)", () => {
   let root: string;

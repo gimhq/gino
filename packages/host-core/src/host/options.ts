@@ -25,7 +25,7 @@ export interface HostOptions {
   readonly registrationEnabled: boolean;
   /** Advertised to agents on register/config; also the liveness sweep cadence. */
   readonly heartbeatIntervalMs: number;
-  /** DP4 offline grace (silence before an `online` agent is flipped `offline`). */
+  /** Offline grace (silence before an `online` agent is flipped `offline`). */
   readonly offlineGraceMs: number;
   readonly configGc: { readonly enabled: boolean; readonly intervalMs: number; readonly maxAgeMs: number };
   readonly webhooks: { readonly timeoutMs: number; readonly maxAttempts: number; readonly retryIntervalMs: number };

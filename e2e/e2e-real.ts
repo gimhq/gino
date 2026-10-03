@@ -18,7 +18,7 @@ const TOKEN = "PONG-7Q2";
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 // Every call this driver makes is control-plane (/admin/*), so it authenticates
-// with the ADMIN bearer (HOST-XC-02: the channel token no longer reaches /admin).
+// with the ADMIN bearer (the channel token no longer reaches /admin).
 const bearer = { Authorization: `Bearer ${ADMIN}`, "content-type": "application/json" };
 
 async function http(method: string, path: string, body?: unknown): Promise<{ status: number; json: any; text: string }> {
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
 
   const status = view.run?.status;
   // The task view carries thread SUMMARIES only; the transcript is paged per
-  // thread via `?thread=` (HOST-M1M2-16).
+  // thread via `?thread=`.
   const page = await http("GET", `/admin/tasks/${taskId}?thread=${view.threadId}`);
   const transcript: string[] = (page.json?.data?.messages ?? []).map((m: any) => m.content).filter((c: any) => typeof c === "string");
   const blob = `${JSON.stringify(view.run)} ${transcript.join(" ")}`;

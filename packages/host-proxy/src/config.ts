@@ -103,7 +103,7 @@ function resolveUpstream(rawUrl: string, label: string, allowPrivate: boolean): 
  *
  * Upstream credentials (provider API keys, codex OAuth refresh/access tokens)
  * are held as plaintext in this env-derived config and in the in-memory
- * `CredentialStore` — accepted risk by design (HOST-M7-06): the host process
+ * `CredentialStore` — accepted risk by design: the host process
  * is the trust boundary, secrecy relies on host env/process isolation, and the
  * proxy modules never write these values to logs or disk.
  */

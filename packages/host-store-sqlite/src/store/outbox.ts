@@ -43,7 +43,7 @@ export function sqliteOutboxRepo(db: AppDatabase): OutboxRepo {
         .get() != null;
     },
     purge(agentId) {
-      // HOST-M3-12: unacked rows only — acked history is retention GC's business.
+      // Unacked rows only — acked history is retention GC's business.
       return db
         .delete(outbox)
         .where(and(eq(outbox.agentId, agentId), isNull(outbox.ackedAt)))

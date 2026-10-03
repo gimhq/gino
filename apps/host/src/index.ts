@@ -11,7 +11,7 @@ import { captureLodeConfigBaseline, reportLodeServing, startLodePrepareWatcher }
     process.exit(subcommandExit);
   }
 
-  // Bootstrap failures (config, DB open, the HOST-M9-14 migration lock held by
+  // Bootstrap failures (config, DB open, the migration lock held by
   // a concurrent starter) surface as a clean one-line fatal, not an unhandled
   // rejection — the logger does not exist yet at this point.
   let boot: ReturnType<typeof bootstrap>;

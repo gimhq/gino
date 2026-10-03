@@ -28,7 +28,7 @@ const LONG_POLL_INTERVAL_MS = 250;
 const sendBody = z.object({
   conversation_ref: z.string().min(1),
   text: z.string().min(1),
-  // HOST-M1M2-12: descriptors are validated against the wire schema
+  // Descriptors are validated against the wire schema
   // (protocol §5) BEFORE they are forwarded into `message.data.attachments` —
   // the host never emits a frame violating its own published contract.
   attachments: z.array(AttachmentDescriptor).optional(),
@@ -47,7 +47,7 @@ const pollBody = z.object({
   wait: z.number().int().nonnegative().optional(),
 });
 
-// HOST-M1M2-17: the GET variant enforces the SAME numeric contract as the POST
+// The GET variant enforces the SAME numeric contract as the POST
 // body (coerced from query strings) — garbage like `?after=latest` is a 422,
 // never a silently degraded poll (`after: NaN` / a collapsed long-poll wait).
 const pollQuery = z.object({
@@ -76,7 +76,7 @@ function sleep(ms: number): Promise<void> {
  * Run a (possibly long-)poll: tail immediately, then re-tail until messages
  * appear or `waitMs` elapses.
  *
- * Delivery semantics — AT-LEAST-ONCE (HOST-M5M6-01). A poll read NEVER
+ * Delivery semantics — AT-LEAST-ONCE. A poll read NEVER
  * advances the stored per-(channel, task) cursor, so a batch the client never
  * received (dropped response, crash mid-flush) is simply re-delivered on the
  * next poll. The client confirms receipt by passing `ack` = the `cursor` of a
@@ -117,7 +117,7 @@ export function messagesRouter(host: Host, opts: MessagesRouterOptions) {
 
   router.use("*", bindHost(host));
 
-  // HOST-M9-02: the channel I/O throttle (ahead of auth, keyed per verified
+  // The channel I/O throttle (ahead of auth, keyed per verified
   // principal) is the embedder's middleware, applied before this mount (D10).
 
   // The embedder's authorize (the channel bearer) guards every channel I/O route (401 without).

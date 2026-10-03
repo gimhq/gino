@@ -17,7 +17,7 @@ import type { BridgeSocket, WsFactory } from "./bridge";
 import type { CredentialStore } from "./credentials";
 import { CODEX_WS_URL } from "./bridge";
 
-// Cap on client frames buffered before the upstream opens (HOST-M7-04): a
+// Cap on client frames buffered before the upstream opens: a
 // client streaming into a slow upstream dial must not grow memory unbounded.
 const MAX_PREOPEN_BUFFER_BYTES = 1 << 20; // 1 MiB
 
@@ -118,7 +118,7 @@ export function createCodexRelay(client: ClientSocket, deps: CodexRelayDeps): Co
       upstream.send(typeof data === "string" ? data : new TextDecoder().decode(data));
       return;
     }
-    // Bounded pre-open queue (HOST-M7-04): overflow tears the relay down
+    // Bounded pre-open queue: overflow tears the relay down
     // instead of buffering without limit while the upstream dial is slow.
     const size = typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
     if (bufferedBytes + size > MAX_PREOPEN_BUFFER_BYTES) {

@@ -49,7 +49,7 @@ export function adminConfigRoutes() {
         return c.json({ success: false, error: { code: "BAD_REQUEST", message: "kind must be 'file' or 'dir'" } }, 400);
       }
       const contentType = c.req.query("content_type") ?? c.req.header("content-type");
-      // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
+      // Bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
       const host = c.get("host");
       const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);

@@ -60,7 +60,7 @@ export interface TranscriptCompleteness {
 
 /**
  * Compare the stored transcript against `thread_result.final_seq` (protocol §6:
- * the host verifies it received `1..=final_seq`) — HOST-M1M2-13. `(thread_id,
+ * the host verifies it received `1..=final_seq`). `(thread_id,
  * seq)` is unique, so `COUNT(*) == final_seq && MAX(seq) == final_seq` holds
  * exactly when every seq in `1..=final_seq` is present (seq ≥ 1 per §6).
  * Diagnostic only — the caller logs/flags a gap, it never blocks the ack.

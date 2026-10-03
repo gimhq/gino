@@ -1,4 +1,4 @@
-// HOST-M9-03 — logger redaction must cover the host's own secret vocabulary
+// Logger redaction must cover the host's own secret vocabulary
 // (register/connect tokens, the connect header, proxy credential config
 // keys), not just generic names like `password`/`token`.
 import { describe, expect, it } from "bun:test";

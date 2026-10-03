@@ -23,9 +23,9 @@ export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
 
 /** The task definition an operator supplies; the host mints the id. */
 export interface CreateTaskInput {
-  /** Owner (user identity) → resolved to a permitted agent by dispatch (OD13). */
+  /** Owner (user identity) → resolved to a permitted agent by dispatch. */
   ownerId: string;
-  /** OD15 — a task carries `engine` + `model` + `workdir?` + `meta?`. */
+  /** A task carries `engine` + `model` + `workdir?` + `meta?`. */
   engine: string;
   model: string;
   workdir?: string;
@@ -133,7 +133,7 @@ export function setPlacement(storage: Storage, taskId: string, agentId: string):
   return requireTask(storage, taskId);
 }
 
-/** Set the task's status (user/agent-marked; the host never auto-terminals, DP4). */
+/** Set the task's status (user/agent-marked; the host never auto-terminals). */
 export function setStatus(storage: Storage, taskId: string, status: string): TaskRow {
   const task = storage.tasks.setStatus(taskId, status, Date.now());
   if (!task) {
@@ -155,7 +155,7 @@ export function markSeeded(storage: Storage, taskId: string): void {
 /**
  * Track the conversation's ongoing thread (`current_thread_id`, the resume
  * target). The orchestrator advances this when it opens a thread for a message
- * (a continue reuses it; a new conversation is a new task, OD7+OD9).
+ * (a continue reuses it; a new conversation is a new task).
  */
 export function setCurrentThread(storage: Storage, taskId: string, threadId: string): TaskRow {
   const task = storage.tasks.setCurrentThread(taskId, threadId, Date.now());
@@ -166,7 +166,7 @@ export function setCurrentThread(storage: Storage, taskId: string, threadId: str
 }
 
 /**
- * Read the cron mirror for a task (READ-ONLY — crons live on the agent, OD14;
+ * Read the cron mirror for a task (READ-ONLY — crons live on the agent;
  * M5 writes this from `cron_state`). Used by the `/admin/tasks/:id/crons` list;
  * this module never writes the `crons` table.
  */

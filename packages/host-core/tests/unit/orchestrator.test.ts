@@ -55,7 +55,7 @@ beforeEach(() => {
   sender = new FakeSender();
   agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
   sender.online.add(agentId);
-  // Register the shas the config-entry tests declare (write-time validation, HOST-M8-07).
+  // Register the shas the config-entry tests declare (write-time validation).
   db
     .insert(configArtifacts)
     .values({ name: "seed", sha256: "a".repeat(64), kind: "file", size: 1, storeRef: `seed/${"a".repeat(12)}` })

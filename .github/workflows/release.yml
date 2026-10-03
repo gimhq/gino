@@ -122,8 +122,7 @@ jobs:
             ~/.cargo/git
           key: cargo-release-${{ hashFiles('gino-agent/Cargo.lock') }}
 
-      # Fully static, non-PIE musl binary — runs on any base (PLAN-001 / deny.toml
-      # crt-static lock), the portable lode asset for the agent.
+      # Fully static, non-PIE musl binary — runs on any base, the portable lode asset for the agent.
       - name: Build (static musl)
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc

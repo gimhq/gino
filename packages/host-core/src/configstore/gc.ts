@@ -1,14 +1,14 @@
-// M8 — REFCOUNT / GC (the sweep backing BOTH stores; disabled by default, OD11).
+// M8 — REFCOUNT / GC (the sweep backing BOTH stores; disabled by default).
 //
 // A blob `(name, sha256)` is droppable when NOTHING references its `sha256` —
 // neither a `config_entries` desired-set row, NOR an `attachments` descriptor,
-// NOR an in-flight (unacked) outbox frame naming the sha (HOST-M8-06) — AND it
+// NOR an in-flight (unacked) outbox frame naming the sha — AND it
 // has stayed unreferenced for a grace period. Aging runs from the moment the
 // sweep FIRST observed the artifact unreferenced (`unreferenced_since`), never
 // from `created_at`, so a just-swapped-out artifact survives a rollback window.
-// The sweep is also filesystem-aware (HOST-M8-05): store leaves no DB row
+// The sweep is also filesystem-aware: store leaves no DB row
 // references (crash orphans, stale `.tmp-*` files) are reclaimed once aged.
-// Per OD11 the sweep is a GUARDED no-op by default: it computes the droppable
+// the sweep is a GUARDED no-op by default: it computes the droppable
 // set but DELETES NOTHING unless explicitly `enabled` — so normal operation
 // never auto-evicts.
 import type { Storage } from "../host/ports/storage";
@@ -42,7 +42,7 @@ function entryShasOf(data: unknown): string[] {
 /**
  * The LIVE set: every `sha256` referenced by the desired set (`config_entries`),
  * an attachment descriptor (`attachments`), OR an in-flight UNACKED outbox frame
- * whose payload names entries (HOST-M8-06 — a replayable `task_upsert` still
+ * whose payload names entries (a replayable `task_upsert` still
  * owed to an offline agent pins its shas). An artifact whose `sha256` is in
  * this set is pinned and never droppable.
  */
@@ -74,7 +74,7 @@ export interface GcOptions {
  * grace — the droppable set. Reconciles the `unreferenced_since` marks as a
  * side effect: a row first observed unreferenced is stamped `now` (aging
  * starts), a re-referenced row is cleared (aging resets) — so droppability
- * always ages from the LAST un-reference, never from `created_at` (HOST-M8-06).
+ * always ages from the LAST un-reference, never from `created_at`.
  */
 export function findDroppable(storage: Storage, opts: GcOptions = {}): DroppableArtifact[] {
   const now = opts.now ?? Date.now();
@@ -102,7 +102,7 @@ export function findDroppable(storage: Storage, opts: GcOptions = {}): Droppable
 
 export interface SweepOptions extends GcOptions {
   /**
-   * GUARD (OD11): when false/omitted the sweep is a DRY RUN — it reports the
+   * GUARD: when false/omitted the sweep is a DRY RUN — it reports the
    * droppable set but deletes nothing. Only `enabled: true` evicts.
    */
   enabled?: boolean;
@@ -131,16 +131,16 @@ function referencedRefs(storage: Storage): Set<string> {
 
 /**
  * Refcount/LRU sweep over BOTH the registry and the physical store. By default
- * (OD11) a DRY RUN: it reports the droppable/orphan counts and deletes nothing.
+ * a DRY RUN: it reports the droppable/orphan counts and deletes nothing.
  * With `enabled: true`:
  *
- * - Each droppable artifact is evicted ROW-FIRST, blob second (HOST-M8-12): a
+ * - Each droppable artifact is evicted ROW-FIRST, blob second: a
  *   crash between the two leaves an orphan BLOB the next sweep reclaims —
  *   never a dangling registry row that would 404/500 on serve. The blob is
  *   only removed when no surviving row still points at the same leaf.
  * - Aged filesystem orphans — leaves without any `config_artifacts.store_ref`
- *   or `attachments.ref`, plus stale `.tmp-*` files — are reclaimed
- *   (HOST-M8-05). A recent leaf (inside the grace window) counts as in-flight
+ *   or `attachments.ref`, plus stale `.tmp-*` files — are reclaimed.
+ * A recent leaf (inside the grace window) counts as in-flight
  *   and is left alone, as is any blob whose leaf name matches a live sha.
  */
 export function sweep(storage: Storage, opts: SweepOptions = {}): SweepResult {
@@ -153,7 +153,7 @@ export function sweep(storage: Storage, opts: SweepOptions = {}): SweepResult {
   let dropped = 0;
   if (opts.enabled) {
     for (const a of droppable) {
-      // Row FIRST (HOST-M8-12): the registry never points at deleted bytes.
+      // Row FIRST: the registry never points at deleted bytes.
       storage.config.deleteArtifact(a.name, a.sha256);
       // Same leaf may back another row (12-hex prefix reuse) — keep it then.
       if (!referencedRefs(storage).has(a.storeRef)) {
@@ -163,7 +163,7 @@ export function sweep(storage: Storage, opts: SweepOptions = {}): SweepResult {
     }
   }
 
-  // Filesystem pass (HOST-M8-05): reclaim aged leaves nothing references.
+  // Filesystem pass: reclaim aged leaves nothing references.
   const liveRefs = referencedRefs(storage);
   const livePrefixes = new Set([...referencedShas(storage)].map(sha => sha.slice(0, SHA_PREFIX_LEN)));
   const orphans = store.listLeaves().filter((leaf) => {
@@ -190,7 +190,7 @@ export function sweep(storage: Storage, opts: SweepOptions = {}): SweepResult {
 export interface ConfigStoreGcDeps {
   readonly storage: Storage;
   readonly logger?: Logger;
-  /** OD11 guard — false/omitted keeps every periodic pass a DRY RUN. */
+  /** Guard — false/omitted keeps every periodic pass a DRY RUN. */
   readonly enabled?: boolean;
   /** Grace after un-reference (and FS-orphan age guard) in ms. Defaults to 7d. */
   readonly maxAgeMs?: number;
@@ -208,10 +208,10 @@ export interface ConfigStoreGcHandle {
 }
 
 /**
- * Start the periodic config-store GC sweep (HOST-M8-11 — the production caller
+ * Start the periodic config-store GC sweep (the production caller
  * the documented reclamation was missing). The timer is `unref`'d so it never
  * keeps the process alive on its own; `stop()` clears it. A failing pass is
- * logged and swallowed so the loop survives a transient DB/FS error. Per OD11
+ * logged and swallowed so the loop survives a transient DB/FS error.
  * the pass stays a DRY RUN (observability only) unless `enabled` is set.
  */
 export function startConfigStoreGc(deps: ConfigStoreGcDeps): ConfigStoreGcHandle {

@@ -26,7 +26,7 @@ export function coarsenPath(path: string): string {
     .replace(RE_MIXED_TOKEN, "/:id");
 }
 
-// Bound metrics label cardinality (HOST-M9-04). Unmatched requests (404s —
+// Bound metrics label cardinality. Unmatched requests (404s —
 // arbitrary attacker-chosen paths) collapse into a single "other" label, and
 // a defensive cap on distinct route labels stops any residual growth: the
 // registry has no eviction, so each surviving label is a permanent

@@ -69,7 +69,7 @@ function appWith<E extends HostEnv>(mw: MiddlewareHandler<E>, config: Config = T
   return app;
 }
 
-// Register-token validation moved INTO the register handler (HOST-M1M2-14) so
+// Register-token validation moved INTO the register handler so
 // failures render the protocol §3 `register_error` envelope — covered by
 // tests/unit/edge-input-hardening.test.ts. The connect-token middleware lives
 // in @gino/host-hono (packages/host-hono/tests/unit/auth.test.ts).

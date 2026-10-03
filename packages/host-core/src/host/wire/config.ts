@@ -19,7 +19,7 @@ export function agentConfig(agentId: string, heartbeatIntervalMs: number) {
 
 /**
  * M8 — the resolved GLOBAL desired set covering ALL the agent's declared
- * engines (HOST-M8-03 — a multi-engine agent lands every engine's targets, not
+ * engines (a multi-engine agent lands every engine's targets, not
  * just its first capability's) plus the host-assigned monotonic `version`,
  * delivered on register / `GET /agent/config` (additive; the agent reconciles
  * only when the version advances — agent-architecture §9b). Empty entries when

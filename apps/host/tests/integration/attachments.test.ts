@@ -32,7 +32,7 @@ const config = loadConfigStrict({
   GINO_STORE_DIR: storeDir,
   GINO_REGISTER_TOKEN: REGISTER,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",

@@ -7,10 +7,10 @@
 //   • task_upsert   — seed/modify the task (engine/model/workdir/meta + M8 config entries)
 //   • message       — deliver user/system input (carries `msgId`; acked by `msg_ack`)
 //   • cron_upsert    /  cron_delete — scheduling COMMANDS (the agent owns + fires + persists
-//                     the cron; the host schedules nothing, OD14 — it only mirrors `cron_state`)
+//                     the cron; the host schedules nothing — it only mirrors `cron_state`)
 //   • interrupt / close / config_update — control
 //
-// Threading (OD7+OD9): a task IS a conversation. The FIRST message opens the
+// Threading: a task IS a conversation. The FIRST message opens the
 // conversation's one ongoing thread (`tasks.current_thread_id`); continuing
 // appends to it (the engine `--resume`s its session). A brand-new conversation
 // is a brand-new task (not handled here). A new thread WITHIN a task is the
@@ -52,7 +52,7 @@ export function hasSeededTask(storage: Storage, taskId: string): boolean {
 }
 
 /**
- * Seed/modify the task on its agent (`task_upsert`). Carries the OD15 payload
+ * Seed/modify the task on its agent (`task_upsert`). Carries the payload
  * (engine/model/workdir/meta) from the host `tasks` row plus the task-scope M8
  * config `entries` — resolved from `config_entries WHERE scope = task.id` for
  * the task's engine (B6 fills B3's passthrough seam). An explicit `opts.entries`
@@ -113,7 +113,7 @@ export interface MessageResult {
 }
 
 /**
- * Deliver input to a task (`message`). Resolves the target thread per OD7+OD9:
+ * Deliver input to a task (`message`). Resolves the target thread:
  * continue the task's `current_thread_id`, or open a fresh thread (first message
  * on the task, or an explicit `newThread`) and record it as current. The
  * `message` frame carries a `msgId` (the outbox row id); the agent replies
@@ -127,7 +127,7 @@ export function emitMessage(storage: Storage, sender: AgentTransport, task: Task
 
   let threadId = task.currentThreadId ?? null;
   if (threadId == null || input.newThread) {
-    // The HOST mints conversation thread ids (§5, HOST-M1M2-02/HOST-M4-04): the
+    // The HOST mints conversation thread ids (§5): the
     // agent creates-on-first-sight, so the binding is recorded durable BEFORE
     // the frame is emitted — a crash between the two re-sends under the same id.
     threadId = ulid();
@@ -190,15 +190,15 @@ export interface CronUpsertResult {
 }
 
 /**
- * Emit a `cron_upsert` COMMAND. The cron then LIVES ON THE AGENT (OD14): the
+ * Emit a `cron_upsert` COMMAND. The cron then LIVES ON THE AGENT: the
  * agent owns, fires, and persists it; the host schedules nothing and keeps only
  * the `cron_state` mirror. `data` carries the schedule + `continuity` (+ the
  * `prompt` work command — required, the agent rejects a promptless command).
  * The host mints the `cronId` on create so it can address later upsert/delete
  * commands. The `prompt` is persisted into the `crons` mirror here — the
- * `cron_state` frame never echoes it (HOST-M5M6-09). Like the first message,
+ * `cron_state` frame never echoes it. Like the first message,
  * the first cron SEEDS a never-seeded task (`task_upsert` before the command)
- * so the agent has the task row the cron FK-references (HOST-M4-02).
+ * so the agent has the task row the cron FK-references.
  */
 export function emitCronUpsert(storage: Storage, sender: AgentTransport, task: TaskRow, input: CronUpsertInput): CronUpsertResult {
   const agentId = requirePlacement(task);
@@ -217,7 +217,7 @@ export function emitCronUpsert(storage: Storage, sender: AgentTransport, task: T
   return { cron, cronId };
 }
 
-/** Emit a `cron_delete` COMMAND — remove a trigger from the agent (OD14). */
+/** Emit a `cron_delete` COMMAND — remove a trigger from the agent. */
 export function emitCronDelete(storage: Storage, sender: AgentTransport, task: TaskRow, cronId: string): OutboxRow {
   const agentId = requirePlacement(task);
   return enqueue(storage, sender, { agentId, type: "cron_delete", taskId: task.id, cronId });
@@ -227,9 +227,9 @@ export function emitCronDelete(storage: Storage, sender: AgentTransport, task: T
  * Emit an `interrupt` — graceful cancel of the task's current turn (the engine
  * stays alive). Carries `taskId`, which §5 makes NORMATIVE: the agent cancels
  * only if this task owns the in-flight turn, so another task's work is never
- * killed (HOST-M1M2-03). The signal is LIVE-ONLY: it requires the agent online
+ * killed. The signal is LIVE-ONLY: it requires the agent online
  * (409 otherwise) and is never replayed on reconnect — a stale cancel must not
- * fire against an arbitrary future turn (HOST-M4-03).
+ * fire against an arbitrary future turn.
  */
 export function emitInterrupt(storage: Storage, sender: AgentTransport, task: TaskRow): OutboxRow {
   const agentId = requirePlacement(task);
@@ -262,7 +262,7 @@ export function emitConfigUpdate(storage: Storage, sender: AgentTransport, task:
 /**
  * Re-push the GLOBAL desired set live after a global config change (M8
  * delivery): a `config_update` carrying the resolved `entries` (covering ALL
- * the agent's declared engines, HOST-M8-03) + the new monotonic `version` to
+ * the agent's declared engines) + the new monotonic `version` to
  * every ONLINE agent — the agent's §9b version gate makes the apply
  * idempotent. Offline agents converge on their next `GET /agent/config` pull
  * (which carries the same version), so no frame is queued for them. Returns

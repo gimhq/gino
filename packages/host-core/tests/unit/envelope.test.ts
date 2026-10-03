@@ -66,7 +66,7 @@ describe("M2 envelope — encode", () => {
     expect(frame).toEqual({ type: "task_upsert", msgId: 5, outboxId: 5, taskId: "t-1", data: { name: "job" } });
   });
 
-  // HOST-M1M2-07 / HOST-M4-07: the delivery id is DERIVED from the row id at
+  // The delivery id is DERIVED from the row id at
   // encode time (there is no stored msg_id column), so every durable message
   // row encodes to an ackable frame.
   it("a message frame carries msgId = row id (acked by msg_ack), not outboxId", () => {

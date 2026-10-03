@@ -60,8 +60,8 @@ export function sqliteTranscriptRepo(db: AppDatabase): TranscriptRepo {
         ?.taskId;
     },
     readAfterId(taskId, afterId, limit) {
-      // The tail WINDOW is selected by `id` so a capped batch is contiguous
-      // (HOST-M5M6-03); the caller re-sorts for delivery.
+      // The tail WINDOW is selected by `id` so a capped batch is contiguous;
+      // the caller re-sorts for delivery.
       return db
         .select()
         .from(messages)

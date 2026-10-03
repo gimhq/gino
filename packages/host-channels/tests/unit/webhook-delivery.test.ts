@@ -3,12 +3,12 @@ import { describe, expect, it } from "bun:test";
 import { deliverWebhook } from "../../src/index";
 
 // M6 webhook delivery hardening —
-//   HOST-M5M6-05: every request carries an abort timeout, and a transport
+//   Every request carries an abort timeout, and a transport
 //     failure (timeout / connection error) fails the delivery instead of
 //     hanging the push loop or throwing out of it.
-//   HOST-M5M6-11: a 3xx is a delivery failure — the signed payload and the
+//   A 3xx is a delivery failure — the signed payload and the
 //     shared secret are never re-sent to a `Location` target.
-//   HOST-M5M6-07: for plain-http targets the request is PINNED to the
+//   For plain-http targets the request is PINNED to the
 //     resolved-and-validated IP (Host header preserved), so fetch's own DNS
 //     lookup cannot be rebound into private space between the SSRF check and
 //     the connect; https targets keep the hostname URL (TLS certificate

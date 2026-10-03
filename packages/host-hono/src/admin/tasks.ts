@@ -8,7 +8,7 @@
 //   POST   /tasks/:id/message         deliver input → task_upsert (if first) + message
 //   POST   /tasks/:id/interrupt       task-scoped cancel of the current turn (live-only)
 //   POST   /tasks/:id/close           mark closed + task-scoped interrupt (runner stays alive)
-//   GET    /tasks/:id/crons           list the cron mirror (read-only, OD14)
+//   GET    /tasks/:id/crons           list the cron mirror (read-only)
 //   POST   /tasks/:id/crons           create a trigger → cron_upsert command
 //   PUT    /tasks/:id/crons/:cronId   modify a trigger → cron_upsert command
 //   DELETE /tasks/:id/crons/:cronId   remove a trigger → cron_delete command
@@ -78,14 +78,14 @@ const assignBody = z.object({ agent_id: z.string().min(1).optional() });
 
 const messageBody = z.object({
   text: z.string().min(1),
-  // HOST-M1M2-12: descriptors are validated against the wire schema
+  // Descriptors are validated against the wire schema
   // (protocol §5) BEFORE they are forwarded into `message.data.attachments`.
   attachments: z.array(AttachmentDescriptor).optional(),
   new_thread: z.boolean().optional(),
 });
 
 // Create requires `prompt` (the wire `cron_upsert.data.prompt` is required —
-// the agent rejects a promptless command, HOST-M4-10); update may omit it to
+// the agent rejects a promptless command); update may omit it to
 // keep the cron's existing prompt.
 const updateCronBody = z.object({
   kind: z.string().min(1),
@@ -111,7 +111,7 @@ function cronData(body: z.infer<typeof updateCronBody>, prompt: string): CronUps
   };
 }
 
-/** The cron mirror row for `cronId` under `taskId`, or 404 (HOST-M4-11). */
+/** The cron mirror row for `cronId` under `taskId`, or 404. */
 function requireCron(storage: Storage, taskId: string, cronId: string): CronRow {
   const cron = getCron(storage, cronId);
   if (!cron || cron.taskId !== taskId) {
@@ -120,7 +120,7 @@ function requireCron(storage: Storage, taskId: string, cronId: string): CronRow 
   return cron;
 }
 
-/** Default page size for the task detail transcript read (HOST-M1M2-16); the hard cap is `TRANSCRIPT_READ_LIMIT`. */
+/** Default page size for the task detail transcript read; the hard cap is `TRANSCRIPT_READ_LIMIT`. */
 const TRANSCRIPT_PAGE_LIMIT = 200;
 
 const detailQuery = z.object({
@@ -198,7 +198,7 @@ export function adminTaskRoutes() {
       const q = c.req.valid("query");
       const threadIds = getTaskThreads(storage, id);
 
-      // Transcript page (HOST-M1M2-16): a bounded seq-cursor read of ONE
+      // Transcript page: a bounded seq-cursor read of ONE
       // thread, never the full transcript of every thread.
       if (q.thread != null) {
         if (!threadIds.includes(q.thread)) {
@@ -306,12 +306,12 @@ export function adminTaskRoutes() {
       const id = c.req.param("id");
       const task = requireTask(storage, id);
       // Never-placed: no agent to command — just record the terminal status
-      // instead of 409ing on placement (HOST-M4-09).
+      // instead of 409ing on placement.
       if (task.agentId == null) {
         const closed = transitionTaskStatus(storage, id, TASK_STATUS.closed);
         return c.json(ok({ task: serializeTask(closed), outboxId: null }));
       }
-      // The interrupt is a live-only signal (HOST-M4-03): best-effort while the
+      // The interrupt is a live-only signal: best-effort while the
       // agent is online; an offline agent still learns the terminal status from
       // the durable task_upsert below.
       const interrupt = host.sessions.isOnline(task.agentId) ? emitInterrupt(storage, host.sessions, task) : null;
@@ -369,8 +369,8 @@ export function adminTaskRoutes() {
       const task = requireTask(storage, c.req.param("id"));
       const cronId = c.req.param("cronId");
       // Update addresses an EXISTING trigger only — an unknown id must 404, not
-      // silently create a second cron (HOST-M4-11). Omitted prompt → keep the
-      // cron's current one (the wire field is required, HOST-M4-10).
+      // silently create a second cron. Omitted prompt → keep the
+      // cron's current one (the wire field is required).
       const existing = requireCron(storage, task.id, cronId);
       const b = c.req.valid("json");
       const { cron } = emitCronUpsert(storage, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
@@ -390,7 +390,7 @@ export function adminTaskRoutes() {
       const host = c.get("host");
       const task = requireTask(storage, c.req.param("id"));
       const cronId = c.req.param("cronId");
-      requireCron(storage, task.id, cronId); // 404 on an unknown id (HOST-M4-11)
+      requireCron(storage, task.id, cronId); // 404 on an unknown id
       const row = emitCronDelete(storage, host.sessions, task, cronId);
       return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
     },

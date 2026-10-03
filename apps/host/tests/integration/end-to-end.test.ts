@@ -26,7 +26,7 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
@@ -197,7 +197,7 @@ describe("D-B3 end-to-end — create → pin → send → run → mirror", () =>
     await waitFor(conn.received, f => f.type === "ack" && f.id === 1002, "ack thread_result");
 
     // 7. M5 stored it; /admin/tasks/:id MIRRORS the thread as a SUMMARY
-    //    (HOST-M1M2-16) and pages the transcript via ?thread=.
+    // and pages the transcript via ?thread=.
     const getRes = await admin(`/tasks/${taskId}`);
     expect(getRes.status).toBe(200);
     const view = await getRes.json() as {

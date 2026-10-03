@@ -32,7 +32,7 @@ export function isAllowedUpstreamPath(pathname: string): boolean {
 // Anthropic (which validates it). Everywhere else — the OAuth exchange, the
 // OpenAI endpoints, the Codex WS relay — the host injects its OWN credential,
 // so a bare `sk-ant-` prefix must never count as authentication there
-// (HOST-M7-01: a forged key would spend the host's credentials).
+// (a forged key would spend the host's credentials).
 const ANTHROPIC_PASSTHROUGH_PREFIXES = ["/v1/messages", "/v1/models"];
 
 /** True if `pathname` forwards a client Anthropic temp key as-is (never injects host credentials). */
@@ -44,7 +44,7 @@ export function isAnthropicPassthroughPath(pathname: string): boolean {
  * Detect which upstream a request targets, given the `/llm`-stripped path and
  * the request headers. Provider-exclusive paths win outright; the `x-api-key`
  * heuristic only decides shared paths, so an OpenAI-only endpoint reached with
- * an `x-api-key` header is not misrouted to anthropic (HOST-M7-05):
+ * an `x-api-key` header is not misrouted to anthropic:
  *   - an Anthropic-only path → anthropic
  *   - an OpenAI-only path → openai
  *   - shared paths: `x-api-key` header → anthropic, else openai

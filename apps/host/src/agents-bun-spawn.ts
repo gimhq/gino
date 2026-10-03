@@ -13,7 +13,7 @@ export const bunSpawn: SpawnFn = async (cmd: readonly string[], opts?: SpawnOpti
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
-    // Extra env (secrets, HOST-M3-11) merged over the host env so the docker
+    // Extra env (secrets) merged over the host env so the docker
     // CLI keeps PATH/DOCKER_HOST while the values stay off its argv.
     ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
   });

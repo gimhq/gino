@@ -8,7 +8,7 @@
 //   DELETE /channels/:id/webhooks/:hookId  remove an outbound webhook
 //   POST   /channels/:id/bindings          bind a conversation_ref → an existing task
 //
-// A channel carries an owner (OD16): the external system did user→owner; the host
+// A channel carries an owner: the external system did user→owner; the host
 // stores it verbatim. M6 never writes the transcript — these routes touch only
 // `channels` / `channel_bindings`. Responses use the shared `{ success, data }`
 // envelope. Webhook secrets are never returned.
@@ -80,7 +80,7 @@ export function adminChannelRoutes() {
     },
   );
 
-  // ── Register (OD16: carries owner_id + optional filter) ─────────────────────
+  // ── Register (carries owner_id + optional filter) ─────────────────────
   router.post(
     "/",
     describeRoute({

@@ -59,7 +59,7 @@ export function agentRouter(host: Host, opts: AgentRouterOptions) {
   // ── Enrollment (M3) — register token; version-gated; mints the connect token.
   router.post(
     "/register",
-    // HOST-M1M2-10 / HOST-M9-02: the per-IP enrollment throttle (ahead of the
+    // The per-IP enrollment throttle (ahead of the
     // token check; over-limit → protocol §3 `register_error{rate_limited}`) is
     // the embedder's middleware, applied before this mount (D10).
     describeRoute({
@@ -191,7 +191,7 @@ export function agentRouter(host: Host, opts: AgentRouterOptions) {
       responses: { 201: { description: "Stored (returns the descriptor)" }, ...errors(400, 401, 413) },
     }),
     async (c) => {
-      // HOST-M1M2-11: bounded ingest — declared Content-Length AND actual
+      // Bounded ingest — declared Content-Length AND actual
       // streamed size are capped (413 via PayloadTooLargeError) before hashing.
       const bytes = await readBodyCapped(c.req.raw, maxUploadBytes);
       return toResponse(c, host.wire.attachments.ingest(c.get("agentId"), {

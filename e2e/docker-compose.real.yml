@@ -38,7 +38,7 @@ services:
       GINO_LOG_LEVEL: info
       GINO_REGISTER_TOKEN: e2e-register-secret
       GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
-      # Distinct control-plane bearer for /admin/* (HOST-XC-02: no fallback to
+      # Distinct control-plane bearer for /admin/* (no fallback to
       # the channel token; unset fails closed).
       GINO_HTTP_ADMIN_TOKEN: e2e-admin-secret
       # REAL upstream. The proxy injects whichever credential the user provided

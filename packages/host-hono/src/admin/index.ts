@@ -10,7 +10,7 @@ import { adminTaskRoutes } from "./tasks";
 
 export interface AdminRouterOptions {
   /**
-   * The embedder's control-plane authorization (HOST-XC-02 — the standalone
+   * The embedder's control-plane authorization (the standalone
    * host checks its admin bearer here; a channel credential must NOT be
    * admitted). `null` → 401 on every admin route.
    */

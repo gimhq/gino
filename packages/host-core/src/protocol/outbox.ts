@@ -69,7 +69,7 @@ export function enqueue(storage: Storage, sender: AgentTransport, input: Enqueue
  * normal outbox path (uniform encode + audit trail) but is stamped acked
  * immediately, so it is NEVER replayed on reconnect: a cancel signal is only
  * meaningful against the turn that is running right now — replaying a stale
- * one would kill an arbitrary future turn (HOST-M4-03). Delivery is the live
+ * one would kill an arbitrary future turn. Delivery is the live
  * push or nothing.
  */
 export function enqueueLiveOnly(storage: Storage, sender: AgentTransport, input: EnqueueInput): OutboxRow {
@@ -104,7 +104,7 @@ export function ackMessage(storage: Storage, agentId: string, msgId: number): vo
 }
 
 /**
- * TTL for durable `close` control frames (HOST-M3-13) — 15 minutes. A `close`
+ * TTL for durable `close` control frames — 15 minutes. A `close`
  * queued by a stop/restart fallback while the agent was offline expresses a
  * NOW intent, not a standing order: replaying it weeks later would kill a
  * deliberate later start. Past the TTL the frame is skipped (and retired) on
@@ -125,7 +125,7 @@ export interface ReplayOptions {
  * agent dedupes by id, so re-sending an already-processed-but-not-yet-acked
  * frame is safe. Returns the number of frames pushed.
  *
- * HOST-M3-13: a `close` frame older than its TTL is STALE — it is retired
+ * A `close` frame older than its TTL is STALE — it is retired
  * (marked acked so it never rescans) and logged instead of sent, so a stop
  * issued while the agent was offline cannot kill a deliberate later start.
  */
@@ -153,7 +153,7 @@ export function replayUnacked(storage: Storage, sender: AgentTransport, agentId:
 }
 
 /**
- * Purge an agent's UNACKED outbox rows (HOST-M3-12). Called on remove: the
+ * Purge an agent's UNACKED outbox rows. Called on remove: the
  * agent's connect token is revoked, so it can never reconnect to replay or ack
  * — the rows are undeliverable by construction and would otherwise be immortal
  * (retention GC only touches acked rows). Returns the number of rows deleted.

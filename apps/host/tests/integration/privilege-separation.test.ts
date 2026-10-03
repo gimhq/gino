@@ -1,4 +1,4 @@
-// HOST-XC-02 — privilege separation between the channel token (user message
+// Privilege separation between the channel token (user message
 // I/O on /messages/*) and the admin token (control plane: /admin/*,
 // /system/lode/*, GET /metrics). A channel credential must never reach the
 // control plane, the admin credential does not grant message I/O (unless the

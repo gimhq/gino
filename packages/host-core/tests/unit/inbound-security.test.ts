@@ -18,7 +18,7 @@ import { createTask, setPlacement } from "../../src/tasks";
 // envelope ids. The fix authorizes every store-write against `tasks.agent_id`
 // (set-once placement) AND binds the supplied thread/cron id to that same task
 // (a thread/cron belongs to exactly one task): a denied frame is DROPPED — never
-// written. A denial is PERMANENT, so under the poison policy (HOST-M1M2-04) the
+// written. A denial is PERMANENT, so under the poison policy the
 // drop is ACKED — the sender stops replaying it, but nothing ever reaches the
 // store.
 
@@ -62,7 +62,7 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
     const victimTask = placedTask("owner-V", victim);
 
     // The IDOR: attacker forges the victim's taskId → must be dropped. The
-    // denial is permanent, so the drop is acked (poison policy, HOST-M1M2-04).
+    // denial is permanent, so the drop is acked (poison policy).
     const denied = apply(attacker, { type: "thread_message", outboxId: 9, taskId: victimTask, threadId: "thr-V", data: tmsg(1, "injected") });
     expect(denied).toEqual({ type: "ack", id: 9 }); // acked-and-dropped
     expect(getTranscript(storage, "thr-V")).toHaveLength(0); // not written

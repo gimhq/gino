@@ -62,7 +62,7 @@ export function createProxyHandler(deps: ProxyHandlerDeps): ProxyHandler {
     // Claude Messages → OpenAI Responses bridge. A caller presenting a real
     // Anthropic temp key is only pass-through-authenticated (Anthropic itself
     // validates the key) — it must never reach the bridge, which injects the
-    // host's OpenAI credentials (HOST-M7-01). Such a request stays on the
+    // host's OpenAI credentials. Such a request stays on the
     // direct anthropic forward below, key passed through as-is.
     if (pathname === "/v1/messages" && req.method === "POST" && hasBody && mapping?.provider === "openai"
       && !isAnthropicTempKey(req.headers)) {

@@ -27,22 +27,22 @@ export const agents = sqliteTable("agents", {
   id: text("id").primaryKey(), // == wire agentId (ULID)
   name: text("name"),
   source: text("source").notNull(), // manual | docker | vm | ...
-  access: text("access").notNull(), // 'dedicated' (granted owners) | 'public' (any owner) — OD13
-  connectTokenHash: text("connect_token_hash").notNull(), // per-agent connect token; revoked on remove (OD12)
+  access: text("access").notNull(), // 'dedicated' (granted owners) | 'public' (any owner)
+  connectTokenHash: text("connect_token_hash").notNull(), // per-agent connect token; revoked on remove
   registerTokenRef: text("register_token_ref"), // which shared register token enrolled it
   capabilities: text("capabilities", { mode: "json" })
     .$type<{ engines: string[]; max_threads?: number }>()
-    .notNull(), // { engines:[…], max_threads } (max_threads host-overridable, DP3)
+    .notNull(), // { engines:[…], max_threads } (max_threads host-overridable)
   status: text("status").notNull(), // enrolled | online | offline | removed
   launcherKind: text("launcher_kind"), // OOB routing
   launchRef: text("launch_ref"),
-  launchNonce: text("launch_nonce").unique(), // OD17 idempotency key: a register RETRY with the same nonce reuses this row (HOST-M3-06)
+  launchNonce: text("launch_nonce").unique(), // Idempotency key: a register RETRY with the same nonce reuses this row
   activeThreads: integer("active_threads").default(0),
   lastSeen: integer("last_seen"),
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
 });
 
-// Launch↔register correlation (OD17), PERSISTED (HOST-M3-05): a pending launch
+// Launch↔register correlation, PERSISTED: a pending launch
 // must survive a host restart so a late registration still binds its
 // `launcher_kind`/`launch_ref`, and so the TTL reaper can tear down a runtime
 // whose agent never registered (the in-memory map lost both on restart).
@@ -50,7 +50,7 @@ export const pendingLaunches = sqliteTable("pending_launches", {
   nonce: text("nonce").primaryKey(), // the per-launch GINO_LAUNCH_NONCE
   launcherKind: text("launcher_kind").notNull(),
   launchRef: text("launch_ref"), // runtime handle (container id); null if the launcher started nothing
-  access: text("access").notNull().default("dedicated"), // admin-allowlisted access applied at correlate (HOST-M3-09)
+  access: text("access").notNull().default("dedicated"), // admin-allowlisted access applied at correlate
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
 });
 
@@ -70,14 +70,14 @@ export const agentGrants = sqliteTable(
 
 export const tasks = sqliteTable("tasks", {
   id: text("id").primaryKey(),
-  ownerId: text("owner_id").notNull(), // owner (user identity) → permitted agent (OD13)
-  engine: text("engine").notNull(), // OD15: task carries engine + model + workdir + meta
+  ownerId: text("owner_id").notNull(), // owner (user identity) → permitted agent
+  engine: text("engine").notNull(), // Task carries engine + model + workdir + meta
   model: text("model").notNull(),
   workdir: text("workdir"),
   meta: text("meta", { mode: "json" }).$type<Record<string, unknown>>(),
   name: text("name"),
   kind: text("kind"),
-  status: text("status").notNull(), // user/agent-marked (no auto-terminal, DP4)
+  status: text("status").notNull(), // user/agent-marked (no auto-terminal)
   agentId: text("agent_id").references(() => agents.id), // placement, SET ONCE; NULL = pending-assignment
   currentThreadId: text("current_thread_id"), // ongoing thread (resume target)
   assignedAt: integer("assigned_at"),
@@ -124,7 +124,7 @@ export const threadRuns = sqliteTable("thread_runs", {
 export const messages = sqliteTable(
   "messages",
   {
-    // Stable store position (the M6 egress cursor key, HOST-M5M6-03). An
+    // Stable store position (the M6 egress cursor key). An
     // explicit INTEGER PRIMARY KEY is a rowid alias, so VACUUM never renumbers
     // it; AUTOINCREMENT additionally forbids value reuse after deletes, so a
     // persisted cursor can never silently point at a different row.
@@ -191,7 +191,7 @@ export const channels = sqliteTable("channels", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   type: text("type").notNull(),
-  ownerId: text("owner_id").notNull(), // OD16: registered with an owner (external system)
+  ownerId: text("owner_id").notNull(), // Registered with an owner (external system)
   config: text("config", { mode: "json" }).$type<Record<string, unknown>>(),
   msgFilter: text("msg_filter", { mode: "json" }).$type<Record<string, unknown>>(),
   createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
@@ -202,7 +202,7 @@ export const channelBindings = sqliteTable(
   {
     channelId: text("channel_id").notNull().references(() => channels.id),
     conversationRef: text("conversation_ref").notNull(),
-    taskId: text("task_id").notNull().references(() => tasks.id), // OD9: conversation → task
+    taskId: text("task_id").notNull().references(() => tasks.id), // Conversation → task
     createdAt: integer("created_at").notNull().$defaultFn(() => Date.now()),
   },
   t => [primaryKey({ columns: [t.channelId, t.conversationRef] })],
@@ -217,7 +217,7 @@ export const configArtifacts = sqliteTable(
     size: integer("size").notNull(),
     contentType: text("content_type"),
     storeRef: text("store_ref").notNull(),
-    // When the GC first observed this artifact unreferenced (HOST-M8-06):
+    // When the GC first observed this artifact unreferenced:
     // droppability ages from THIS timestamp (grace after un-reference), never
     // from created_at. NULL = referenced (or not yet observed unreferenced).
     unreferencedSince: integer("unreferenced_since"),

@@ -22,9 +22,9 @@ import {
   tailTask,
 } from "../../src/index";
 
-// M6 egress (OD10) — tail the M5 store by a per-(channel, task) cursor: deliver
+// M6 egress — tail the M5 store by a per-(channel, task) cursor: deliver
 // all kinds by default at-least-once (the cursor advances only on ack, never on
-// read — HOST-M5M6-01), re-read idempotently from a stale cursor, honour an
+// read), re-read idempotently from a stale cursor, honour an
 // optional kind filter, and push to webhooks cursor-driven.
 
 const OWNER = "owner-egress";

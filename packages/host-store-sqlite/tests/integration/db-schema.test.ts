@@ -24,7 +24,7 @@ import {
 } from "../../src/schema";
 
 // The 14 §6 tables (docs/host-v2-design.md) plus `pending_launches`
-// (HOST-M3-05: the persisted launch↔register correlation set). The schema is
+// (the persisted launch↔register correlation set). The schema is
 // "clean v2": no v1 legacy tables (scheduled_tasks / task_run_logs / sessions
 // / registered_groups).
 const EXPECTED_TABLES = [
@@ -253,7 +253,7 @@ describe("v2 host schema (§6)", () => {
     ) as { name: string }[];
     const names = new Set(rows.map(r => r.name));
     expect(names.has("outbox_agent_unacked_idx")).toBe(true);
-    // msgId is derived from the row id (HOST-M1M2-07 follow-up): no stored
+    // msgId is derived from the row id: no stored
     // msg_id column, no msg_ack index.
     expect(names.has("outbox_msg_ack_idx")).toBe(false);
   });

@@ -7,7 +7,7 @@ import { messages } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { getBinding, registerChannel, routeInbound } from "../../src/index";
 
-// M6 ingress (OD9/OD16) — route an inbound message: continue a known conversation
+// M6 ingress — route an inbound message: continue a known conversation
 // or open a NEW task stamped with the CHANNEL's owner, dispatch it, deliver. The
 // host never writes the transcript (storage ⟂ distribution).
 
@@ -52,7 +52,7 @@ describe("M6 ingress — new vs continue", () => {
     expect(result.dispatch?.agentId).toBe(agentId);
     expect(result.msgId).not.toBeNull();
 
-    // The task carries the CHANNEL's owner (OD16) + engine/model from config.
+    // The task carries the CHANNEL's owner + engine/model from config.
     const task = getTask(storage, result.taskId)!;
     expect(task.ownerId).toBe(OWNER);
     expect(task.engine).toBe("claude");
@@ -83,7 +83,7 @@ describe("M6 ingress — new vs continue", () => {
   it("stamps the channel owner regardless of any per-message hint", () => {
     permittedAgent();
     const ch = chatChannel();
-    // Even if a caller tried to influence the owner, the channel owner wins (OD16).
+    // Even if a caller tried to influence the owner, the channel owner wins.
     const result = routeInbound(storage, sender, ch, { conversationRef: "c", text: "hi", meta: { user: "someone-else" } });
     expect(getTask(storage, result.taskId)!.ownerId).toBe(OWNER);
   });

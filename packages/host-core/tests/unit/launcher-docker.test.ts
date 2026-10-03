@@ -56,7 +56,7 @@ describe("M3 docker launcher — launch (docker run -d + injected env)", () => {
     const cmd = calls[0]!;
     expect(cmd[0]).toBe("docker");
     expect(cmd.slice(1, 3)).toEqual(["run", "-d"]);
-    // Bootstrap env named via value-less `-e KEY` (HOST-M3-11); the values
+    // Bootstrap env named via value-less `-e KEY`; the values
     // ride the spawn seam's `env` option, off the argv.
     for (const key of ["GINO_HOST_URL", "GINO_REGISTER_TOKEN", "GINO_LAUNCH_NONCE", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "EXTRA"]) {
       expect(cmd).toContain(key);

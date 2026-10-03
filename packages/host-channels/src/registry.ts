@@ -1,6 +1,6 @@
 // M6 — CHANNEL REGISTRY (channels CRUD + bindings + webhook config).
 //
-// A channel is registered WITH an owner (OD16): the external system did the
+// A channel is registered WITH an owner: the external system did the
 // user→owner assignment; the host never computes it. A `channels` row holds
 // `{ name, type, owner_id, config?, msg_filter? }`. M6 owns the `channels`,
 // `channel_bindings`, and `channel_cursors` tables — and ONLY those (it never
@@ -27,11 +27,11 @@ export function requireChannels(storage: Storage): ChannelRepo {
 export interface RegisterChannelInput {
   name: string;
   type: string;
-  /** OD16 — the external system's user→owner assignment; the host stores it verbatim. */
+  /** The external system's user→owner assignment; the host stores it verbatim. */
   ownerId: string;
   /** Opaque per-channel config (e.g. default `engine`/`model` for new conversations, webhooks). */
   config?: Record<string, unknown>;
-  /** Optional egress kind filter (`{ kinds: [...] }`); absent → deliver all kinds (OD10). */
+  /** Optional egress kind filter (`{ kinds: [...] }`); absent → deliver all kinds. */
   filter?: Record<string, unknown>;
 }
 

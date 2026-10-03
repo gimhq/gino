@@ -6,7 +6,7 @@
 // of a frame never duplicates a row and never errors. Order is by `seq`
 // (per-thread monotonic) — NEVER by arrival or `outboxId` (protocol §6).
 //
-// Retention (HOST-M5M6-08): transcript rows are append-only here — there is
+// Retention: transcript rows are append-only here — there is
 // deliberately NO delete path in the store module. Reclamation belongs to the
 // unified store GC alongside attachments/config artifacts (a documented no-op
 // today); what this module DOES enforce is that every single-query read is
@@ -43,7 +43,7 @@ export function writeThreadMessage(storage: Storage, { taskId, threadId, data }:
   });
 }
 
-/** Per-query row cap on transcript reads (HOST-M5M6-08) — page with `afterSeq` for longer threads. */
+/** Per-query row cap on transcript reads — page with `afterSeq` for longer threads. */
 export const TRANSCRIPT_READ_LIMIT = 1000;
 
 export interface TranscriptReadOptions {

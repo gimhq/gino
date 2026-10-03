@@ -2,13 +2,13 @@
 //
 // Placement is rule-based and owner-pinned (§3). An agent is a RESOURCE with an
 // access policy; an owner (user) is placed on an agent it is PERMITTED to use —
-// a `dedicated` agent granted to that owner, or a `public` (shared) agent
-// (OD13). The chosen agent must also hold the task's `engine` capability.
+// a `dedicated` agent granted to that owner, or a `public` (shared) agent.
+// The chosen agent must also hold the task's `engine` capability.
 //
 // Hard rules (§3):
 //   • One task : one agent, for life — `tasks.agent_id` is SET ONCE, never
 //     reassigned (no migration). `setPlacement` enforces this.
-//   • Capacity (DP3) is a PREFERENCE among candidates and back-pressure WITHIN
+//   • Capacity is a PREFERENCE among candidates and back-pressure WITHIN
 //     the chosen agent — it NEVER spills a task to a different agent. So a busy
 //     permitted agent is still pinned (the agent queues the thread); capacity
 //     only breaks ties / orders candidates.
@@ -28,7 +28,7 @@ export const STATUS_PENDING_ASSIGNMENT = "pending-assignment" as const;
  * Statuses from which placement may flip a task `active`. Anything else
  * (`closed`, `failed`, …) is user/agent-marked lifecycle state that a
  * placement or a retried assign must never resurrect (the host never
- * auto-terminals and never auto-revives, DP4).
+ * auto-terminals and never auto-revives).
  */
 const ASSIGNABLE_STATUSES: readonly string[] = [STATUS_PENDING_ASSIGNMENT, STATUS_ACTIVE];
 
@@ -77,7 +77,7 @@ interface Candidate {
 /**
  * Resolve `task.owner_id` → the candidate agents it may use, scored for
  * preference. A candidate is: not `removed`, holds the task's `engine`, and the
- * owner is permitted on it (OD13). Sorted dedicated-before-public, then
+ * owner is permitted on it. Sorted dedicated-before-public, then
  * spare-capacity, then least-loaded, then online, then stable by `created_at`.
  */
 function rankCandidates(storage: Storage, task: TaskRow): Candidate[] {

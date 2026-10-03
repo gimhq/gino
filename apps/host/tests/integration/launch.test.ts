@@ -13,7 +13,7 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
-// D-B2b — launch + launch↔register nonce correlation (OD17), end-to-end through
+// D-B2b — launch + launch↔register nonce correlation, end-to-end through
 // the HTTP surface. The docker launcher's shell-out is MOCKED (a recording
 // `spawn`) and registered into the kind→launcher registry, so the real
 // `/admin/agents/launch` → `control.launchAgent` → docker launcher path runs
@@ -28,7 +28,7 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
@@ -117,7 +117,7 @@ describe("D-B2b /admin/agents/launch — auth + wiring", () => {
 
     // The launcher shelled out `docker run -d` with the host-generated nonce
     // and the host-authoritative bootstrap env (NEVER the client's register
-    // token). Values ride the spawn env, not the argv (HOST-M3-11): the argv
+    // token). Values ride the spawn env, not the argv: the argv
     // only names the keys via value-less `-e`.
     expect(spawnCalls).toHaveLength(1);
     const { cmd, env } = spawnCalls[0]!;

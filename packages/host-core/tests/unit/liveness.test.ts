@@ -10,7 +10,7 @@ import { OFFLINE_GRACE_MS, sweepLiveness } from "../../src/agents/liveness";
 import { enrollAgent, getAgent, setAgentStatus, touchLiveness } from "../../src/agents/registry";
 import { SessionRegistry } from "../../src/agents/sessions";
 
-// M3 liveness — the offline-grace sweep (DP4). Marks the AGENT offline; NEVER
+// M3 liveness — the offline-grace sweep. Marks the AGENT offline; NEVER
 // touches its tasks/crons.
 
 let db: AppDatabase;
@@ -53,7 +53,7 @@ describe("M3 liveness sweep", () => {
     expect(count).toBe(1);
     expect(getAgent(storage, agentId)?.status).toBe("offline");
 
-    // DP4: the task survives — same placement, same status, not deleted.
+    // The task survives — same placement, same status, not deleted.
     const task = db.select().from(tasks).where(eq(tasks.id, "task-1")).get();
     expect(task).toBeDefined();
     expect(task?.agentId).toBe(agentId);

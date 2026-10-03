@@ -2,13 +2,13 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { Authorize, HostEnv } from "./env";
 import { ForbiddenError, UnauthorizedError } from "@gino/host-core";
 
-// ─── Protocol credentials (M1 / OD12 / HOST-XC-02) ───
+// ─── Protocol credentials (M1) ───
 //
 // register token  — shared, long-lived bootstrap secret on POST /agent/register
 //                   (carried in the request body per protocol §3). Validated IN
 //                   the register handler (`host.wire.register`), not here, so
 //                   every failure renders the protocol §3 `register_error`
-//                   envelope (HOST-M1M2-14).
+//                   envelope.
 // connect token   — per-agent secret on the WS + HTTP data plane, header
 //                   `x-internal-token`, resolved to its owning agent by
 //                   `agents.connect_token_hash` (`host.wire.resolveAgent`).

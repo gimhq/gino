@@ -9,11 +9,11 @@ import type { HostEvents } from "../host/events";
 // now if online, replayed on reconnect otherwise).
 //
 // `remove` additionally does the durable bookkeeping (registry.removeAgent):
-// revoke the connect token (OD12) and ORPHAN the agent's tasks (DP4 — the
+// revoke the connect token and ORPHAN the agent's tasks (the
 // mirror is kept as history; nothing is deleted or migrated). `launch` is a
 // later phase (B2b) — it is a stub here.
 //
-// Grant/revoke manage the OD13 access policy (`agent_grants`) via the registry.
+// Grant/revoke manage the access policy (`agent_grants`) via the registry.
 import type { AgentRow, Storage } from "../host/ports/storage";
 import type { AgentTransport } from "../host/ports/transport";
 import type { Logger } from "../logger";
@@ -36,7 +36,7 @@ export interface ControlDeps {
   /** The live host→agent push surface (the M3 `SessionRegistry`). */
   readonly sender: AgentTransport;
   /**
-   * The session registry's force-close surface (HOST-M3-07): remove severs the
+   * The session registry's force-close surface: remove severs the
    * live socket host-side so a non-cooperating agent loses its authenticated
    * pipe. Optional — callers without a live registry (some tests) skip it.
    */
@@ -73,7 +73,7 @@ function requireAgent(storage: Storage, agentId: string): AgentRow {
 }
 
 /**
- * Like `requireAgent`, but a `removed` agent is a 410 (HOST-M3-12): its token
+ * Like `requireAgent`, but a `removed` agent is a 410: its token
  * is revoked and it can never reconnect, so stop/restart/grant would only feed
  * undeliverable frames (or grant access to a dead resource). Remove itself
  * stays idempotent and does NOT use this gate.
@@ -87,7 +87,7 @@ function requireActiveAgent(storage: Storage, agentId: string): AgentRow {
 }
 
 /**
- * Force-close the agent's live session host-side (HOST-M3-07): revocation must
+ * Force-close the agent's live session host-side: revocation must
  * not depend on the agent honouring a `close` frame — a non-cooperating
  * (compromised) agent would otherwise keep its authenticated pipe until a
  * network drop. Best-effort: the socket may already be gone.
@@ -125,7 +125,7 @@ function closeViaWs(deps: ControlDeps, agentId: string, reason: ControlOp): void
  * OOB stop: if the launcher can stop the runtime and we hold a `launch_ref`,
  * delegate; otherwise fall back to a WS `close`. The agent's `online`/`offline`
  * state follows from the resulting WS close (`onClose`) — we don't force it
- * here. Tasks/crons are untouched (DP4): a stopped agent resumes them on
+ * here. Tasks/crons are untouched: a stopped agent resumes them on
  * reconnect.
  */
 export async function stopAgent(deps: ControlDeps, agentId: string): Promise<ControlResult> {
@@ -146,7 +146,7 @@ export async function stopAgent(deps: ControlDeps, agentId: string): Promise<Con
 /**
  * OOB restart: delegate when the launcher can restart + we hold a `ref`;
  * otherwise fall back to a WS `close` — best-effort, the agent's own supervisor
- * (or the operator, for `manual`) brings it back. Tasks/crons survive (DP4).
+ * (or the operator, for `manual`) brings it back. Tasks/crons survive.
  */
 export async function restartAgent(deps: ControlDeps, agentId: string): Promise<ControlResult> {
   const agent = requireActiveAgent(deps.storage, agentId);
@@ -166,13 +166,13 @@ export async function restartAgent(deps: ControlDeps, agentId: string): Promise<
 /**
  * OOB remove: tear down the runtime (launcher.remove when capable + we hold a
  * `ref`, else a WS `close`), THEN the durable bookkeeping — revoke the connect
- * token (OD12), orphan the agent's tasks (DP4, mirror kept), purge its now
- * undeliverable outbox rows (HOST-M3-12), and force-close any live session
- * (HOST-M3-07). A launcher's runtime control is gated on `canStop` (a launcher
+ * token, orphan the agent's tasks (mirror kept), purge its now
+ * undeliverable outbox rows, and force-close any live session.
+ * A launcher's runtime control is gated on `canStop` (a launcher
  * that can stop a runtime can remove it). The close is sent BEFORE the token
  * is revoked so it can still go out on the live socket.
  *
- * HOST-M3-04: the bookkeeping runs UNCONDITIONALLY — a launcher failure
+ * The bookkeeping runs UNCONDITIONALLY — a launcher failure
  * (including `DockerOpTimeoutError` on a wedged daemon) degrades to the
  * WS-close path instead of aborting, and a runtime that is already gone
  * ("no such container") counts as launcher success. Remove is idempotent:
@@ -234,21 +234,21 @@ export async function inspectAgent(deps: ControlDeps, agentId: string): Promise<
   return "unknown";
 }
 
-/** Grant an owner access to an agent (OD13). 404 if unknown; 410 if `removed` (HOST-M3-12). */
+/** Grant an owner access to an agent. 404 if unknown; 410 if `removed`. */
 export function grantAgentOwner(deps: ControlDeps, agentId: string, ownerId: string): void {
   requireActiveAgent(deps.storage, agentId);
   grantOwner(deps.storage, agentId, ownerId);
 }
 
-/** Revoke an owner's access to an agent (OD13). 404 if the agent is unknown. */
+/** Revoke an owner's access to an agent. 404 if the agent is unknown. */
 export function revokeAgentOwner(deps: ControlDeps, agentId: string, ownerId: string): void {
   requireAgent(deps.storage, agentId);
   revokeOwner(deps.storage, agentId, ownerId);
 }
 
 /**
- * Set an agent's access policy (OD13) — the ADMIN-ONLY mutation that makes an
- * agent `public` (HOST-M3-09; enrollment never honours a client-supplied
+ * Set an agent's access policy — the ADMIN-ONLY mutation that makes an
+ * agent `public` (enrollment never honours a client-supplied
  * `access`). 404 if unknown; 410 if `removed` (like grant).
  */
 export function setAgentAccessControl(deps: ControlDeps, agentId: string, access: "dedicated" | "public"): void {
@@ -263,7 +263,7 @@ export interface LaunchInput {
   readonly kind: string;
   /** Where the launched agent dials back to register (injected as `GINO_HOST_URL`). */
   readonly hostUrl: string;
-  /** The shared register token (OD12) the agent presents to enroll (`GINO_REGISTER_TOKEN`). */
+  /** The shared register token the agent presents to enroll (`GINO_REGISTER_TOKEN`). */
   readonly registerToken: string;
   /** Launcher-specific image (docker); forwarded via `resources.image`. */
   readonly image?: string;
@@ -274,7 +274,7 @@ export interface LaunchInput {
   /** Launcher-specific resource hints (cpu/mem/image/…). */
   readonly resources?: Record<string, unknown>;
   /**
-   * Access policy the launched agent enrolls with (HOST-M3-09): the launch is
+   * Access policy the launched agent enrolls with: the launch is
    * an ADMIN request, so `public` may be allowlisted here — applied at
    * correlate time, never taken from the agent's register body.
    */
@@ -284,19 +284,19 @@ export interface LaunchInput {
 /** A started launch, before any agent exists: the correlation nonce the agent must echo, and the launcher's runtime handle. */
 export interface LaunchAgentResult {
   readonly launcherKind: string;
-  /** The per-launch correlation nonce (OD17) — the agent echoes it in `register`. */
+  /** The per-launch correlation nonce — the agent echoes it in `register`. */
   readonly nonce: string;
   /** The launcher's runtime handle (e.g. a container id); null if it started nothing. */
   readonly ref: string | null;
 }
 
-/** Mint a per-launch correlation nonce (OD17) — high-entropy, single-use. */
+/** Mint a per-launch correlation nonce — high-entropy, single-use. */
 function mintLaunchNonce(): string {
   return randomBytes(24).toString("hex");
 }
 
 /**
- * Launch + correlate (config-driven, B2b — OD17). Pick the launcher by `kind`,
+ * Launch + correlate (config-driven, B2b). Pick the launcher by `kind`,
  * mint a per-launch nonce, inject it (`GINO_LAUNCH_NONCE`) alongside the
  * caller's env, and start the runtime via `launcher.launch`. The pending launch
  * is recorded by nonce so the agent's later `POST /agent/register` (echoing the
@@ -325,8 +325,8 @@ export async function launchAgent(deps: ControlDeps, input: LaunchInput): Promis
     resources,
   });
 
-  // Record the pending launch so the matching registration correlates (OD17).
-  // Persisted (HOST-M3-05): survives a host restart and is TTL-reaped when the
+  // Record the pending launch so the matching registration correlates.
+  // Persisted: survives a host restart and is TTL-reaped when the
   // agent never registers (see launch-reaper.ts).
   recordPendingLaunch(deps.storage, nonce, { launcherKind: launcher.kind, launchRef: ref, ...(input.access ? { access: input.access } : {}) });
   deps.logger?.info({ launcher: launcher.kind, ref, taskId: input.workload?.taskId }, "agent launch (awaiting registration)");

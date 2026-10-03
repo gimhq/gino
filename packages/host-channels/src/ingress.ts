@@ -1,12 +1,12 @@
-// M6 — INGRESS (route, OD9/OD16). Route an inbound user message to a conversation
+// M6 — INGRESS (route). Route an inbound user message to a conversation
 // and hand it to M4. Channels NEVER write the transcript — ingress only resolves
 // `channel_bindings` and calls the M4 orchestrator; the agent's reply lands in M5
 // later and egress tails it back out (storage ⟂ distribution, §9).
 //
-// Routing (OD9): a `(channel, conversation_ref)` binding maps a conversation to a
+// Routing: a `(channel, conversation_ref)` binding maps a conversation to a
 // task. Continuing a known conversation → its existing task (continue its ongoing
-// thread). A NEW conversation → a NEW task (OD9) stamped with the CHANNEL's
-// `owner_id` (OD16 — the host never computes user→owner; the external system
+// thread). A NEW conversation → a NEW task stamped with the CHANNEL's
+// `owner_id` (the host never computes user→owner; the external system
 // supplied it at registration) → M4 dispatch (owner-pinned, §3) → deliver the
 // message. The old "group" delivery role is dissolved into this routing.
 import type { AgentTransport, AttachmentDescriptor, ChannelRow, HostEvents, Storage } from "@gino/host-core";
@@ -71,7 +71,7 @@ function resolveNewTaskShape(channel: ChannelRow, input: InboundMessage): NewTas
 }
 
 /**
- * Route an inbound message (OD9/OD16). Continuing a known conversation delivers
+ * Route an inbound message. Continuing a known conversation delivers
  * to its existing task; a new conversation creates a task stamped with the
  * channel owner, binds the conversation, dispatches to a permitted agent, and
  * delivers. If no agent is permitted the new task stays `pending-assignment` and
@@ -85,7 +85,7 @@ export function routeInbound(storage: Storage, sender: AgentTransport, channel: 
 
   const existing = requireChannels(storage).getBinding(channel.id, input.conversationRef);
   if (existing) {
-    // CONTINUE — the conversation already maps to a task (OD9).
+    // CONTINUE — the conversation already maps to a task.
     const task = requireTask(storage, existing.taskId);
     const sent = sendTaskMessage(storage, sender, task, {
       text: input.text,
@@ -101,7 +101,7 @@ export function routeInbound(storage: Storage, sender: AgentTransport, channel: 
     };
   }
 
-  // NEW conversation → NEW task stamped with the channel owner (OD16).
+  // NEW conversation → NEW task stamped with the channel owner.
   const shape = resolveNewTaskShape(channel, input);
   const task = createTask(storage, {
     ownerId: channel.ownerId,

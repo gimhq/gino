@@ -13,14 +13,14 @@ import { applyFrame, handleInboundFrame, ingestHttpFrame, MalformedFrameError } 
 import { createTask, setPlacement } from "../../src/tasks";
 
 // Inbound frame lifecycle regressions:
-//   HOST-M1M2-04 — poison policy: a PERMANENTLY unprocessable frame
+//   Poison policy: a PERMANENTLY unprocessable frame
 //     (schema-invalid data, missing correlation ids, authorize denial) is
 //     acked-and-dropped so the agent stops replaying it forever; a TRANSIENT
 //     storage failure stays un-acked so the agent replays.
-//   HOST-M1M2-09 — `ingestHttpFrame` throws the tagged `MalformedFrameError`
+//   `ingestHttpFrame` throws the tagged `MalformedFrameError`
 //     only for an undecodable frame; a storage failure propagates untagged
 //     (the route maps only the tag to 400 — everything else is a 5xx retry).
-//   HOST-M1M2-13 — `thread_result` ingest verifies the stored transcript
+//   `thread_result` ingest verifies the stored transcript
 //     covers `1..=final_seq` and warn-logs a gap; it never blocks the ack.
 
 let db: AppDatabase;

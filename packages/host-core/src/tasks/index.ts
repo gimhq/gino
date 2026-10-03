@@ -1,10 +1,10 @@
 // M4 — TASK MANAGEMENT & DISPATCH ★ (task identity + placement; emits work as
-// commands). A task ≈ a conversation/session (OD7+OD9).
+// commands). A task ≈ a conversation/session.
 //
 //   store.ts         host-authoritative task identity + placement (set-once) + the conversation binding
 //   dispatch.ts      placement: owner → permitted agent (dedicated preferred, public fallback; no migration)
 //   orchestrator.ts  emit task_upsert/message/cron_upsert/cron_delete/interrupt/close/config_update via M2
-//   lifecycle.ts     user/agent-marked status transitions (no auto-terminal, DP4; migration = a new task)
+//   lifecycle.ts     user/agent-marked status transitions (no auto-terminal; migration = a new task)
 export const MODULE = "tasks" as const;
 
 export {

@@ -8,7 +8,7 @@ import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
-// HOST-M5M6-04 regression — outbound webhook egress is WIRED. Pre-fix,
+// Regression: outbound webhook egress is WIRED. Pre-fix,
 // `pushChannelWebhooks` had no production caller: webhook channels stored
 // endpoints that were never pushed to. Now a `thread_message` landing through
 // the M2 inbound path triggers the webhook pump, which pushes the new

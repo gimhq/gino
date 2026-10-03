@@ -27,7 +27,7 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
@@ -120,7 +120,7 @@ describe("D-B4 channels — ingress routing", () => {
     expect(r1.dispatch?.placed).toBe(true);
     expect(r1.dispatch?.agentId).toBe(agentId);
 
-    // The task carries the channel owner (OD16).
+    // The task carries the channel owner.
     const task = await (await authed(`/admin/tasks/${r1.taskId}`)).json() as { data: { ownerId: string; agentId: string } };
     expect(task.data.ownerId).toBe(OWNER);
     expect(task.data.agentId).toBe(agentId);
@@ -153,7 +153,7 @@ describe("D-B4 channels — ingress routing", () => {
     expect(d1.deliveries[0]!.taskId).toBe(r1.taskId);
     expect(d1.deliveries[0]!.messages.map(m => m.seq)).toEqual([1, 2, 3]); // all kinds, seq order
 
-    // Unacked → at-least-once: a second poll re-delivers the same batch (HOST-M5M6-01).
+    // Unacked → at-least-once: a second poll re-delivers the same batch.
     const poll2 = await authed(`/messages/${channelId}/poll`, { method: "POST", body: JSON.stringify({ conversation_ref: "c1" }) });
     const d2 = (await poll2.json() as { data: { deliveries: Array<{ messages: unknown[] }> } }).data;
     expect(d2.deliveries[0]!.messages).toHaveLength(3);

@@ -1,7 +1,7 @@
 // M4 — LIFECYCLE (task status transitions; the no-migration / no-auto-terminal
 // rules made explicit).
 //
-// Task status is USER/AGENT-MARKED. The host NEVER auto-terminates a task (DP4):
+// Task status is USER/AGENT-MARKED. The host NEVER auto-terminates a task:
 // an agent going `offline` is an AGENT state — its tasks/crons survive on the
 // agent and resume on reconnect. There is therefore no host-driven terminal
 // transition; `transitionTaskStatus` simply records the externally-decided
@@ -28,7 +28,7 @@ export const TASK_STATUS = {
   pendingAssignment: "pending-assignment",
   /** Placed on an agent and live. */
   active: "active",
-  /** Wound down by the user/admin (`/close`). NOT host-auto — DP4. */
+  /** Wound down by the user/admin (`/close`). NOT host-auto. */
   closed: "closed",
 } as const;
 
@@ -36,11 +36,11 @@ export type TaskStatus = (typeof TASK_STATUS)[keyof typeof TASK_STATUS];
 
 /**
  * Record a user/agent-decided status transition. This is the ONLY status writer
- * the admin surface uses; the host never forces a terminal state on its own
- * (DP4). Returns the updated task (404 if unknown).
+ * the admin surface uses; the host never forces a terminal state on its own.
+ * Returns the updated task (404 if unknown).
  *
- * A transition to `closed` also drops the task's scope from the M8 desired set
- * (HOST-M8-10): its `config_entries` rows stop pinning artifacts in the GC
+ * A transition to `closed` also drops the task's scope from the M8 desired set:
+ * its `config_entries` rows stop pinning artifacts in the GC
  * root set. Re-opening a task does not resurrect them — re-declare if needed.
  */
 export function transitionTaskStatus(storage: Storage, taskId: string, status: string): TaskRow {

@@ -13,14 +13,14 @@ import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
 // Edge input hardening regressions:
-//   HOST-M1M2-11 — byte-ingest endpoints enforce MAX_UPLOAD_BYTES (413), on the
+//   Byte-ingest endpoints enforce MAX_UPLOAD_BYTES (413), on the
 //                  declared Content-Length AND the actual streamed size.
-//   HOST-M1M2-12 — `attachments` validated against the wire AttachmentDescriptor
+//   `attachments` validated against the wire AttachmentDescriptor
 //                  schema at both message-bearing edges (422 on mismatch).
-//   HOST-M1M2-14 — every register failure renders the protocol §3
+//   Every register failure renders the protocol §3
 //                  `register_error` envelope (all five reasons reachable;
 //                  `rate_limited` is additionally covered by rate-limit.test.ts).
-//   HOST-M1M2-17 — GET /:channel/poll validates its query with the same zod
+//   GET /:channel/poll validates its query with the same zod
 //                  contract as the POST body (garbage → 422, never NaN).
 
 const REGISTER = "reg-secret-hardening";
@@ -39,7 +39,7 @@ function makeApp(env: Record<string, string> = {}) {
     GINO_STORE_DIR: storeDir,
     GINO_REGISTER_TOKEN: REGISTER,
     GINO_HTTP_CHANNEL_TOKEN: CHANNEL,
-    // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+    // Explicit same-secret reuse so one bearer drives both surfaces in this test.
     GINO_HTTP_ADMIN_TOKEN: CHANNEL,
     GINO_LOG_LEVEL: "error",
     GINO_LOG_TO_STDOUT: "true",
@@ -87,7 +87,7 @@ function channelHeaders() {
   return { "authorization": `Bearer ${CHANNEL}`, "content-type": "application/json" };
 }
 
-// ── HOST-M1M2-14 — register_error envelope on every failure path ─────────────
+// ── register_error envelope on every failure path ─────────────
 
 describe("HOST-M1M2-14 — register failures use the protocol §3 register_error envelope", () => {
   it("401 register_error{invalid_register_token} on a wrong token", async () => {
@@ -144,7 +144,7 @@ describe("HOST-M1M2-14 — register failures use the protocol §3 register_error
   });
 });
 
-// ── HOST-M1M2-11 — upload size cap on the byte-ingest endpoints ───────────────
+// ── upload size cap on the byte-ingest endpoints ───────────────
 
 describe("HOST-M1M2-11 — POST /agent/attachments enforces MAX_UPLOAD_BYTES", () => {
   let connectToken: string;
@@ -219,7 +219,7 @@ describe("HOST-M1M2-11 — POST /admin/config/artifacts enforces MAX_UPLOAD_BYTE
   });
 });
 
-// ── HOST-M1M2-12 — attachment descriptors validated at both edges ────────────
+// ── attachment descriptors validated at both edges ────────────
 
 const VALID_DESCRIPTOR = {
   id: "att_1",
@@ -280,7 +280,7 @@ describe("HOST-M1M2-12 — attachments validated against the wire schema", () =>
   });
 });
 
-// ── HOST-M1M2-17 — GET poll query validation ──────────────────────────────────
+// ── GET poll query validation ──────────────────────────────────
 
 describe("HOST-M1M2-17 — GET /:channel/poll rejects non-numeric query params", () => {
   function poll(query: string) {

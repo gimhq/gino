@@ -89,14 +89,14 @@ export interface AgentRepo {
   list: () => AgentRow[];
   /**
    * The agent whose `connectTokenHash` equals `hash`, EXCLUDING `removed`
-   * agents (their token is revoked, OD12) — the token→identity resolver for
+   * agents (their token is revoked) — the token→identity resolver for
    * the connect-token gate and the M7 proxy credential lookup. The caller
    * hashes the presented token; the port never sees plaintext.
    */
   getByConnectTokenHash: (hash: string) => AgentRow | undefined;
   /**
-   * The non-`removed` agent bound to a launch nonce (`reEnrollByLaunchNonce`,
-   * HOST-M3-06). A `removed` agent is never resurrected → `undefined`.
+   * The non-`removed` agent bound to a launch nonce (`reEnrollByLaunchNonce`).
+   * A `removed` agent is never resurrected → `undefined`.
    */
   getByLaunchNonce: (nonce: string) => AgentRow | undefined;
   /**
@@ -106,7 +106,7 @@ export interface AgentRepo {
    * guard — when the current status is `removed` (`removed` is TERMINAL: the
    * only way in is `setRemoved`, and nothing leads out). Today's callers:
    *   • `setAgentStatus`  → `{ notFrom: "removed" }`
-   *   • `touchLiveness`   → `{ from: "offline" }` to `online` (HOST-M3-03)
+   *   • `touchLiveness`   → `{ from: "offline" }` to `online`
    */
   updateStatusIf: (agentId: string, guard: StatusGuard, to: string) => boolean;
   /**
@@ -116,12 +116,12 @@ export interface AgentRepo {
    */
   touchLiveness: (agentId: string, now: number, activeThreads?: number) => void;
   /**
-   * Set the OD13 access policy. Skipped (no-op) when the agent is `removed`
+   * Set the access policy. Skipped (no-op) when the agent is `removed`
    * (mirrors `WHERE status != 'removed'`).
    */
   setAccess: (agentId: string, access: string) => void;
   /**
-   * Permanent removal bookkeeping (`registry.removeAgent`, OD12): flip
+   * Permanent removal bookkeeping (`registry.removeAgent`): flip
    * `status` to `removed` AND overwrite `connectTokenHash` with the caller's
    * revoked (unmatchable) hash, unconditionally — repeating it on a removed
    * agent re-applies the same state. Orphaning tasks is `TaskRepo.orphanByAgent`.
@@ -133,7 +133,7 @@ export interface AgentRepo {
    */
   setConnectTokenHash: (agentId: string, hash: string) => AgentRow | undefined;
   /**
-   * Offline-grace sweep (`liveness.sweepLiveness`, DP4): flip EVERY agent that
+   * Offline-grace sweep (`liveness.sweepLiveness`): flip EVERY agent that
    * is `online` AND has a non-null `lastSeen < before` to `offline`, in one
    * pass. Agents that never connected (`lastSeen` null), already `offline`,
    * `enrolled`, or `removed` are untouched. Returns the transitioned ids in
@@ -141,7 +141,7 @@ export interface AgentRepo {
    */
   sweepSilent: (before: number) => string[];
 
-  // grants (OD13)
+  // grants
 
   /** Grant an owner access — idempotent on `(agentId, ownerId)`; `createdAt` defaults to `Date.now()`. */
   grant: (agentId: string, ownerId: string) => void;
@@ -152,7 +152,7 @@ export interface AgentRepo {
   /** Whether a grant row exists (the `dedicated` half of `isOwnerPermitted`; the `public` short-circuit stays in the domain). */
   hasGrant: (agentId: string, ownerId: string) => boolean;
 
-  // launch↔register correlation (OD17, HOST-M3-05)
+  // launch↔register correlation
 
   /**
    * Record a pending launch keyed by its nonce. `access` defaults to
@@ -219,7 +219,7 @@ export interface TaskRepo {
   /** Set `seededAt = now` ONLY when it is still null (set once; re-placement clears it via `setPlacementOnce`). */
   markSeeded: (taskId: string, now: number) => void;
   /**
-   * Agent removal (DP4): clear `agentId` on every task placed on `agentId`
+   * Agent removal: clear `agentId` on every task placed on `agentId`
    * (rows are kept as history), stamping `updatedAt = now`. Returns the
    * orphaned task ids in insertion order.
    */
@@ -262,7 +262,7 @@ export interface OutboxRepo {
   append: (row: NewOutboxRow) => OutboxRow;
   /** Unacked rows (`ackedAt IS NULL`) of ONE agent, ascending by `id` (replay order). */
   listUnacked: (agentId: string) => OutboxRow[];
-  /** Every unacked row across all agents, ascending by `id` (the GC root-set scan, HOST-M8-06). */
+  /** Every unacked row across all agents, ascending by `id` (the GC root-set scan). */
   listAllUnacked: () => OutboxRow[];
   /**
    * Set `ackedAt = now` on row `id` — SCOPED to `agentId`'s own rows (ids are
@@ -271,7 +271,7 @@ export interface OutboxRepo {
    * already-acked row re-stamps it. Returns `true` iff a row was updated.
    */
   markAcked: (agentId: string, id: number, now: number, opts?: MarkAckedOptions) => boolean;
-  /** Delete an agent's UNACKED rows only (HOST-M3-12); acked history stays. Returns the count deleted. */
+  /** Delete an agent's UNACKED rows only; acked history stays. Returns the count deleted. */
   purge: (agentId: string) => number;
   /** Retention GC: delete rows that are ACKED with `ackedAt < before`; unacked rows are NEVER deleted. Returns the count. */
   gc: (before: number) => number;
@@ -319,8 +319,8 @@ export interface TranscriptRepo {
    * Persist one transcript event, IDEMPOTENT on `(threadId, seq)`: the FIRST
    * writer wins and its row is retained unchanged; a later write for the same
    * key is ignored and returns `false` (never overwrites, never throws). `id`
-   * is storage-generated and strictly monotonic (the M6 egress cursor key,
-   * HOST-M5M6-03). `createdAt` defaults to `Date.now()`.
+   * is storage-generated and strictly monotonic (the M6 egress cursor key).
+   * `createdAt` defaults to `Date.now()`.
    */
   insertIfAbsent: (row: NewMessageRow) => boolean;
   /** A thread's rows ORDERED BY `seq` (protocol §6 — never arrival), after `afterSeq` when given, capped at `limit`. */
@@ -410,7 +410,7 @@ export interface CronMirrorRepo {
    */
   upsertState: (input: CronStateUpsert) => void;
   /**
-   * Persist the dispatch-owned `prompt` (HOST-M5M6-09), UPSERT keyed by `id`.
+   * Persist the dispatch-owned `prompt`, UPSERT keyed by `id`.
    * INSERT a stub (`kind = ""`, `continuity = ""`, every other mirror column
    * null/default) when the command precedes the first `cron_state`; on
    * conflict update ONLY `prompt` + `updatedAt` — every mirror field and
@@ -458,7 +458,7 @@ export interface ConfigRepo {
 
   /**
    * Ingest index write (`artifacts.ingestArtifact`): INSERT the row, or on an
-   * existing `(name, sha256)` update ONLY `kind` + `contentType` (HOST-M8-13);
+   * existing `(name, sha256)` update ONLY `kind` + `contentType`;
    * `size`, `storeRef`, `unreferencedSince`, `createdAt` stay as first
    * written. Returns the stored row.
    */
@@ -468,9 +468,9 @@ export interface ConfigRepo {
   getArtifactBySha: (sha256: string) => ConfigArtifactRow | undefined;
   /** Every artifact, newest first (`createdAt` desc; ties in insertion order). */
   listArtifacts: () => ConfigArtifactRow[];
-  /** Set the GC aging mark (`null` = referenced again, a timestamp = first observed unreferenced; HOST-M8-06). */
+  /** Set the GC aging mark (`null` = referenced again, a timestamp = first observed unreferenced). */
   setUnreferencedSince: (name: string, sha256: string, value: number | null) => void;
-  /** Delete one artifact row (GC eviction, row-first — HOST-M8-12). Idempotent. */
+  /** Delete one artifact row (GC eviction, row-first). Idempotent. */
   deleteArtifact: (name: string, sha256: string) => void;
 
   // entries — `(scope, target)` UNIQUE
@@ -493,7 +493,7 @@ export interface ConfigRepo {
   entriesFor: (scope: string) => ConfigEntryRow[];
   /** Every scope's rows, in insertion order (the GC root-set scan over `sha256`). */
   listAllEntries: () => ConfigEntryRow[];
-  /** Drop a scope's set WITHOUT touching the version (task lifecycle cleanup, HOST-M8-10). Idempotent. */
+  /** Drop a scope's set WITHOUT touching the version (task lifecycle cleanup). Idempotent. */
   clearScope: (scope: string) => void;
   /**
    * The distinct scopes whose desired set names `sha256` (the byte-channel
@@ -516,7 +516,7 @@ export interface StoredBlobRef {
   ref: string;
 }
 
-/** One physical leaf in the store (the filesystem-aware GC input, HOST-M8-05). */
+/** One physical leaf in the store (the filesystem-aware GC input). */
 export interface BlobLeaf {
   ref: string;
   mtimeMs: number;
@@ -536,7 +536,7 @@ export interface BlobStorePort {
   /**
    * Hash + persist `bytes` under `refFor(name, sha256(bytes))`. Idempotent
    * when the same content is already stored; a leaf holding DIFFERENT bytes
-   * is rewritten from the payload (HOST-M8-04 self-heal). Returns the
+   * is rewritten from the payload (self-heal). Returns the
    * descriptor `{ name, sha256, size, ref }`.
    */
   put: (name: string, bytes: Uint8Array) => StoredBlobRef;

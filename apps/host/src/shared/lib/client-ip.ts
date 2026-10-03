@@ -41,7 +41,7 @@ export function getClientIp(c: Context, config?: ClientIpConfig): string {
   // from letting any caller forge a client IP.
   const proxyAllowList = parseProxyAllowList(config.TRUSTED_PROXY_IPS);
   if (proxyAllowList.length > 0) {
-    // Fail CLOSED (HOST-M9-05): when the peer address cannot be resolved we
+    // Fail CLOSED: when the peer address cannot be resolved we
     // cannot verify it against the allow-list, so forwarding headers must
     // not be trusted — otherwise any request path that doesn't thread the
     // peer IP lets a direct client forge X-Forwarded-For.

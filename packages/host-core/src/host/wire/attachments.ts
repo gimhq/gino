@@ -53,11 +53,11 @@ function ifNoneMatchHits(header: string | undefined, etag: string): boolean {
 /**
  * Serve a resolved blob from the unified store, integrity-checked against the
  * full sha256 (B6 byte channel). A missing blob 404s — including a dangling
- * registry/descriptor row whose bytes are gone (HOST-M8-12), never a 500; a
+ * registry/descriptor row whose bytes are gone, never a 500; a
  * stored-bytes/sha256 mismatch is a 409 (the host never serves corrupt/
  * tampered bytes). Responses are content-addressed and immutable, so they
  * carry `Cache-Control: private, immutable` + a strong sha256 `ETag`, and a
- * matching `If-None-Match` short-circuits to a bodyless 304 (HOST-M8-14).
+ * matching `If-None-Match` short-circuits to a bodyless 304.
  */
 function serveBlob(ctx: WireContext, sel: { id?: string; sha256?: string }, ifNoneMatch: string | undefined): HttpResult {
   const resolved = resolveBlobRef(ctx.storage, sel);
@@ -141,7 +141,7 @@ function serveBySha(ctx: WireContext, requesterId: string, sha256: string, opts:
 /**
  * Ingest bytes → unified store + an `attachments` descriptor. A declared
  * `sha256` that does not match the computed digest is rejected (the host
- * stores nothing). The adapter has already capped the body (HOST-M1M2-11).
+ * stores nothing). The adapter has already capped the body.
  */
 function ingest(ctx: WireContext, requesterId: string, input: AttachmentIngestInput): HttpResult {
   const { name, taskId, threadId, contentType, direction, declaredSha, bytes } = input;

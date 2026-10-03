@@ -1,4 +1,4 @@
-// M6 — EGRESS (distribute, OD10). Tail the M5 `messages` store by a per-channel
+// M6 — EGRESS (distribute). Tail the M5 `messages` store by a per-channel
 // cursor and deliver. Distribution is DECOUPLED from storage: egress only READS
 // `messages` and writes `channel_cursors` — it NEVER writes the transcript
 // (storage ⟂ distribution, §9).
@@ -10,9 +10,9 @@
 // monotonic insertion position — `messages.id`, an INTEGER PRIMARY KEY
 // AUTOINCREMENT that is globally increasing by arrival, total-orders every
 // message of a task across its threads, survives VACUUM, and is never reused
-// after a delete (HOST-M5M6-03; a raw rowid has none of those guarantees).
+// after a delete (a raw rowid has none of those guarantees).
 //
-// Delivery contract — AT-LEAST-ONCE (HOST-M5M6-01). A read NEVER advances the
+// Delivery contract — AT-LEAST-ONCE. A read NEVER advances the
 // stored cursor: the same batch is re-delivered until the consumer confirms
 // receipt (`ack` on a poll, or a 2xx on the webhook push path). `> last_seq`
 // tails forward; a stale (lower) cursor simply re-reads — distribution is
@@ -22,7 +22,7 @@
 // contiguous and the cursor can advance past it without skipping rows), but the
 // batch is DELIVERED ordered by `(thread_id, seq)` — the protocol §6 transcript
 // order — so an out-of-order arrival (reconnect replay) inside the window is
-// re-sorted before delivery (HOST-M5M6-10).
+// re-sorted before delivery.
 
 import type { ChannelRow, Logger, MessageRow, Storage } from "@gino/host-core";
 import type { DnsResolver, FetchLike } from "./webhooks";
@@ -30,12 +30,12 @@ import { NotFoundError } from "@gino/host-core";
 import { listWebhooks, requireChannels } from "./registry";
 import { deliverWebhook } from "./webhooks";
 
-/** Batch bounds (HOST-M5M6-08): rows scanned per task per poll — default when the caller omits `limit`, hard cap otherwise. */
+/** Batch bounds: rows scanned per task per poll — default when the caller omits `limit`, hard cap otherwise. */
 export const DEFAULT_POLL_LIMIT = 200;
 export const MAX_POLL_LIMIT = 1000;
 
 /**
- * Authorize a caller-supplied taskId against a channel (IDOR guard, OD16). A
+ * Authorize a caller-supplied taskId against a channel (IDOR guard). A
  * channel may tail a task only if the task is BOUND to the channel
  * (`channel_bindings`) OR it shares the channel's owner. Any other taskId is
  * treated as not-found, so a channel-token holder cannot read an ARBITRARY task's
@@ -51,7 +51,7 @@ export function isTaskOnChannel(storage: Storage, channel: ChannelRow, taskId: s
   return task != null && task.ownerId === channel.ownerId;
 }
 
-/** A channel's optional kind filter (`msg_filter.kinds`). Absent/empty → deliver ALL kinds (OD10). */
+/** A channel's optional kind filter (`msg_filter.kinds`). Absent/empty → deliver ALL kinds. */
 function allowedKinds(channel: ChannelRow): Set<string> | null {
   const filter = channel.msgFilter as { kinds?: unknown } | null | undefined;
   if (filter && Array.isArray(filter.kinds) && filter.kinds.length > 0) {
@@ -155,7 +155,7 @@ export interface PollDelivery {
 }
 
 /**
- * Poll a channel for new messages — AT-LEAST-ONCE (HOST-M5M6-01). Resolves the
+ * Poll a channel for new messages — AT-LEAST-ONCE. Resolves the
  * target task(s) — an explicit `taskId`, a `conversationRef` (via binding), or
  * ALL bound conversations — and tails each by its `(channel, task)` cursor. The
  * read NEVER advances the stored cursor: an unconfirmed batch is re-delivered
@@ -215,7 +215,7 @@ export interface WebhookPushResult {
   ok: boolean;
 }
 
-/** Default bounded attempt budget before a persistently failing batch is dead-lettered (HOST-M5M6-05). */
+/** Default bounded attempt budget before a persistently failing batch is dead-lettered. */
 export const DEFAULT_WEBHOOK_MAX_ATTEMPTS = 5;
 
 /** Failed-push state for one `(channel, task)` batch: how often the SAME cursor position has failed. */
@@ -231,7 +231,7 @@ export interface WebhookPushOptions {
   /** Per-request delivery timeout (ms), passed through to `deliverWebhook`. */
   timeoutMs?: number;
   /**
-   * Poison policy (HOST-M5M6-05): attempt state keyed `"<channelId>:<taskId>"`,
+   * Poison policy: attempt state keyed `"<channelId>:<taskId>"`,
    * owned by the caller (the pump) so it survives across pushes. When the SAME
    * batch (same cursor) has failed `maxAttempts` times, the batch is
    * dead-lettered — logged and SKIPPED (cursor advanced past it) — so one
@@ -293,7 +293,7 @@ export async function pushChannelWebhooks(
       opts.attempts?.delete(attemptKey);
     }
     else if (opts.attempts) {
-      // HOST-M5M6-05 — bounded retries: count failures of this exact batch (a
+      // Bounded retries: count failures of this exact batch (a
       // moved cursor means new rows → a fresh budget). At the budget, skip the
       // poison batch so later messages still flow.
       const prev = opts.attempts.get(attemptKey);

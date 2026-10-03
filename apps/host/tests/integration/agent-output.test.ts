@@ -1,7 +1,7 @@
-// HOST-M1M2-09 — `POST /agent/output/:agentId` HTTP retry semantics: only an
+// `POST /agent/output/:agentId` HTTP retry semantics: only an
 // UNDECODABLE frame maps to 400 BAD_FRAME (permanently bad — the agent drops
 // it); a TRANSIENT storage failure surfaces as a 5xx so the agent retries; a
-// decodable-but-poison frame is acked-and-dropped with a 2xx (HOST-M1M2-04).
+// decodable-but-poison frame is acked-and-dropped with a 2xx.
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";

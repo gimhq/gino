@@ -139,7 +139,7 @@ export class CredentialStore {
 
 /**
  * Reduce a token-endpoint error body to its standard OAuth `error` code for
- * logging. The raw body is never logged (HOST-M7-06) — it is secret-adjacent
+ * logging. The raw body is never logged — it is secret-adjacent
  * and could echo request material.
  */
 function oauthErrorCode(body: string): string {

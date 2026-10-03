@@ -11,7 +11,7 @@
 //   4. acked — but ONLY after the write succeeds, so a failed store is not
 //      acked and the agent replays it.
 //
-// Failure policy (HOST-M1M2-04) — the ack decision separates two classes:
+// Failure policy — the ack decision separates two classes:
 //   • PERMANENT (schema-invalid `data`, missing correlation ids, authorize
 //     denial): replaying can never succeed, so the frame is POISON — logged
 //     loudly, counted (`inbound_poison_frames_total`), and ACKED-AND-DROPPED
@@ -51,7 +51,7 @@ export interface InboundDeps {
   /**
    * Host event emitter: each durable write (and each outbox ack) is announced
    * AFTER it lands — e.g. `transcript.message` is what the webhook pump
-   * subscribes to (HOST-M5M6-04). Purely a scheduling hint — delivery itself
+   * subscribes to. Purely a scheduling hint — delivery itself
    * stays cursor-driven (consumers re-read the store), so a missed/failed
    * notification loses nothing.
    */
@@ -66,7 +66,7 @@ function ackFor(decoded: DecodedFrame): Record<string, unknown> | null {
 }
 
 /**
- * PERMANENT-failure sink (HOST-M1M2-04): a frame that can never be processed —
+ * PERMANENT-failure sink: a frame that can never be processed —
  * schema-invalid `data`, missing correlation ids, or an authorize denial — is
  * acked-and-dropped so the agent's at-least-once outbox stops replaying it
  * forever. Logged at error level + counted so poison is loud, never silent.
@@ -98,7 +98,7 @@ function poisonDrop(deps: InboundDeps, decoded: DecodedFrame, reason: string, de
  *
  * Returns `true` to proceed with the write; `false` to DROP it (no write) after
  * logging the denial. A denial is PERMANENT — replaying can never make it pass —
- * so the caller acks-and-drops it under the poison policy (HOST-M1M2-04): the
+ * so the caller acks-and-drops it under the poison policy: the
  * frame is still never written, and a compromised agent can neither inject into
  * nor overwrite another agent's task state.
  */
@@ -136,8 +136,8 @@ function authorizeWrite(
 }
 
 /**
- * Derive the dispatch context of a thread from its id (HOST-M1M2-06 /
- * HOST-M5M6-06). The `thread_result` frame does not carry `source`/`cronId`
+ * Derive the dispatch context of a thread from its id.
+ * The `thread_result` frame does not carry `source`/`cronId`
  * (protocol §4.1), but the agent mints cron-fired thread ids deterministically
  * (agent scheduler, agent-architecture §4): `<cronId>@<scheduled_epoch_millis>`
  * for isolated fires and `<cronId>@shared` for shared continuity. When the
@@ -168,7 +168,7 @@ function deriveDispatchContext(storage: Storage, taskId: string, threadId: strin
  * not acked. THROWS only if a storage write fails (TRANSIENT) — the caller must
  * then NOT ack so the agent replays; the store is idempotent, so a replay after
  * a partial failure re-runs cleanly. PERMANENT failures never throw: they are
- * acked-and-dropped inside (`poisonDrop`, HOST-M1M2-04).
+ * acked-and-dropped inside (`poisonDrop`).
  */
 export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<string, unknown> | null {
   const { storage, agentId } = deps;
@@ -186,7 +186,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         return poisonDrop(deps, decoded, "schema_invalid", parsed.error.issues);
       }
       const data = parsed.data;
-      // `kind` is an open string (HOST-M1M2-04 — additive protocol, §1): an
+      // `kind` is an open string (additive protocol, §1): an
       // unrecognized value is stored opaquely, never refused, but flagged so
       // version drift is visible to operators.
       if (!RECOGNIZED_MESSAGE_KINDS.has(data.kind)) {
@@ -211,8 +211,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       }
       const data = parsed.data;
       // `source`/`cronId` are dispatch context the frame does not carry
-      // (protocol §4.1) — derived here from the cron-minted thread-id shape
-      // (HOST-M1M2-06 / HOST-M5M6-06).
+      // (protocol §4.1) — derived here from the cron-minted thread-id shape.
       const dispatch = deriveDispatchContext(storage, decoded.taskId, decoded.threadId);
       writeThreadResult(storage, { taskId: decoded.taskId, threadId: decoded.threadId, data, ...dispatch });
       // Register the run's outbound attachment descriptors (protocol §5 /
@@ -223,7 +222,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
         writeAttachmentDescriptors(storage, { taskId: decoded.taskId, threadId: decoded.threadId, descriptors: data.attachments });
       }
       deps.events?.emit("thread.result", { agentId, taskId: decoded.taskId, threadId: decoded.threadId, ...dispatch, data });
-      // HOST-M1M2-13: verify the transcript is exactly `1..=final_seq`
+      // Verify the transcript is exactly `1..=final_seq`
       // (protocol §6). Diagnostic only — a gap is flagged, never blocks the ack.
       const completeness = checkTranscriptCompleteness(storage, decoded.threadId, data.final_seq);
       if (!completeness.complete) {
@@ -285,7 +284,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
  * WS entry point: decode → dispatch → send the ack back over the live socket.
  * An undecodable/unknown frame is ignored; a TRANSIENT storage failure is
  * logged and NOT acked (so the agent replays); a PERMANENT failure is
- * acked-and-dropped by `applyFrame` (poison policy, HOST-M1M2-04). Never
+ * acked-and-dropped by `applyFrame` (poison policy). Never
  * throws to the socket loop.
  */
 export function handleInboundFrame(deps: InboundDeps, raw: string | ArrayBuffer | Uint8Array): void {
@@ -309,8 +308,8 @@ export function handleInboundFrame(deps: InboundDeps, raw: string | ArrayBuffer 
 }
 
 /**
- * The one error class the `/agent/output` route maps to `400 BAD_FRAME`
- * (HOST-M1M2-09): the request body is not a decodable frame envelope, so a
+ * The one error class the `/agent/output` route maps to `400 BAD_FRAME`:
+ * the request body is not a decodable frame envelope, so a
  * retry can never succeed and a conforming agent must drop it. Every OTHER
  * throw out of `ingestHttpFrame` is a transient storage failure and must
  * surface as a 5xx so the agent retries.
@@ -326,10 +325,10 @@ export class MalformedFrameError extends Error {
  * HTTP `/agent/output` fallback (protocol §2): decode + dispatch a single frame
  * and RETURN the ack body instead of sending it over a socket. Throws
  * `MalformedFrameError` on an undecodable frame (→ 400, do not retry) and lets
- * a TRANSIENT storage failure propagate untagged (→ 5xx, the agent retries) —
- * HOST-M1M2-09. PERMANENT failures return the poison ack (2xx) like the WS path.
+ * a TRANSIENT storage failure propagate untagged (→ 5xx, the agent retries).
+ * PERMANENT failures return the poison ack (2xx) like the WS path.
  * The deps carry the optional `events` emitter (the webhook pump's
- * `transcript.message` trigger, HOST-M5M6-04) exactly like the WS path.
+ * `transcript.message` trigger) exactly like the WS path.
  */
 export function ingestHttpFrame(deps: Omit<InboundDeps, "sender">, raw: string | ArrayBuffer | Uint8Array): Record<string, unknown> {
   const decoded = decodeFrame(raw);

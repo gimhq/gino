@@ -14,17 +14,17 @@
 //      resolution — every resolved A/AAAA must be public. This defeats
 //      DNS-rebinding / CNAMEs into private space (a host that passed the string
 //      check at registration can resolve into private space at delivery time).
-//      For plain-http targets the request is PINNED to the vetted address
-//      (HOST-M5M6-07): the fetch connects to the resolved-and-validated IP with
+//      For plain-http targets the request is PINNED to the vetted address:
+// the fetch connects to the resolved-and-validated IP with
 //      the Host header preserved, so fetch's own DNS lookup can never be rebound
 //      between validation and connect. https targets keep the hostname URL —
 //      TLS server-certificate validation binds the connection to the registered
 //      host (a rebound private endpoint cannot present a valid certificate for
 //      it), and connecting by IP would break SNI/certificate matching.
-//      Delivery never follows redirects (`redirect: "manual"`, HOST-M5M6-11): a
+//      Delivery never follows redirects (`redirect: "manual"`): a
 //      3xx is a delivery failure, so the shared secret and transcript payload
 //      are never re-sent to a `Location` target that was never registered. Every
-//      request is bounded by a timeout (AbortSignal, HOST-M5M6-05).
+//      request is bounded by a timeout (AbortSignal).
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { AppError, ValidationError } from "@gino/host-core";
@@ -125,7 +125,7 @@ interface VettedTarget {
   addresses: ResolvedAddress[] | null;
 }
 
-/** The implementation behind `assertSafeWebhookUrlResolved`, keeping the vetted addresses so delivery can pin one (HOST-M5M6-07). */
+/** The implementation behind `assertSafeWebhookUrlResolved`, keeping the vetted addresses so delivery can pin one. */
 async function vetWebhookTarget(raw: string, resolver: DnsResolver): Promise<VettedTarget> {
   const url = assertSafeWebhookUrl(raw);
   const host = guardHost(url);
@@ -163,7 +163,7 @@ export interface DeliverOptions {
   timeoutMs?: number;
 }
 
-/** Default per-request delivery timeout (HOST-M5M6-05): a hung endpoint can never stall the push loop indefinitely. */
+/** Default per-request delivery timeout: a hung endpoint can never stall the push loop indefinitely. */
 export const DEFAULT_WEBHOOK_TIMEOUT_MS = 10_000;
 
 /**
@@ -171,11 +171,11 @@ export const DEFAULT_WEBHOOK_TIMEOUT_MS = 10_000;
  * The target is re-validated WITH DNS resolution before the request; for a
  * plain-http target the request is issued to the vetted resolved IP with the
  * Host header preserved, so fetch's independent DNS lookup can never be rebound
- * into private space between validation and connect (HOST-M5M6-07 — https
+ * into private space between validation and connect (https
  * targets keep the hostname URL: certificate validation pins the identity).
  * Redirects are never followed — a 3xx is a delivery failure, so the shared
- * secret and payload are never re-sent to an unregistered `Location` target
- * (HOST-M5M6-11). Every request carries an abort timeout (HOST-M5M6-05).
+ * secret and payload are never re-sent to an unregistered `Location` target.
+ * Every request carries an abort timeout.
  * Returns the HTTP status and whether it was a 2xx — the caller (egress) uses
  * `ok` to decide whether to advance the cursor. An SSRF-blocked / unresolvable /
  * timed-out / unreachable target fails the delivery (`ok: false`, status 0 for
@@ -202,7 +202,7 @@ export async function deliverWebhook(
     ...(endpoint.secret ? { "x-webhook-secret": endpoint.secret } : {}),
   };
 
-  // HOST-M5M6-07 — pin the vetted address for http targets (see module header).
+  // Pin the vetted address for http targets (see module header).
   let requestUrl = target.url.toString();
   const pin = target.addresses?.[0];
   if (target.url.protocol === "http:" && pin) {
@@ -226,7 +226,7 @@ export async function deliverWebhook(
     return { ok: false, status: 0 }; // timeout / network error → failed delivery, never a thrown push
   }
 
-  // HOST-M5M6-11 — a 3xx is a failure: the secret + transcript are never re-sent
+  // A 3xx is a failure: the secret + transcript are never re-sent
   // to a Location target (only "is it public" could ever be checked, not "is it
   // the registered endpoint").
   return { ok: res.status >= 200 && res.status < 300, status: res.status };

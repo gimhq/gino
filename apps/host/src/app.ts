@@ -127,7 +127,7 @@ function resolveCorsOrigin(config: Config): string | string[] {
  * Bun.serve). The data-plane middleware + routers land here as M1–M8 ship.
  */
 export function createApp({ config, host }: AppDeps) {
-  // HOST-M9-08 — surface the spoofable proxy configuration at composition
+  // Surface the spoofable proxy configuration at composition
   // time: TRUST_PROXY without an allow-list means any direct client can
   // forge X-Forwarded-For and evade every IP-keyed control.
   if (isSpoofableProxyConfig(config)) {
@@ -158,8 +158,8 @@ export function createApp({ config, host }: AppDeps) {
   // time, so routes registered below are included in the spec.
   mountDocs(api, config);
 
-  // HOST-M9-09 — Prometheus scrape endpoint for the in-process registry.
-  // Guarded by the admin bearer (same credential as /admin/*, HOST-XC-02); an
+  // Prometheus scrape endpoint for the in-process registry.
+  // Guarded by the admin bearer (same credential as /admin/*); an
   // unconfigured token fails closed, so this is never an open surface. The
   // logging middleware's SKIP_METRICS_RE keeps scrapes out of the metrics.
   api.get("/metrics", adminTokenAuth, c => c.text(renderPrometheus()));
@@ -238,13 +238,13 @@ export function bootstrap(): BootstrapResult {
 
   // Background loops start here (not in `createApp`) so tests that build the
   // app directly never spin a background timer. `host.start()` owns the core
-  // loops — M3 liveness sweep (DP4), M2 outbox retention GC, M3 pending-launch
-  // reaper (HOST-M3-05), M8 store GC (HOST-M8-11) — every timer `unref`'d so
+  // loops — M3 liveness sweep, M2 outbox retention GC, M3 pending-launch
+  // reaper, M8 store GC — every timer `unref`'d so
   // none holds the process open; `host.stop()` (index.ts) halts them, closes
   // the live sockets and then the DB.
   host.start();
 
-  // M6 webhook egress pump (HOST-M5M6-04) — the production driver of outbound
+  // M6 webhook egress pump — the production driver of outbound
   // webhook delivery: pushed on the `transcript.message` host event, retried
   // on a tick. App-owned, so it is registered with the host and stopped first.
   host.registerService(startWebhookPump({

@@ -1,5 +1,5 @@
-// HOST-M9-09 — /metrics serves the in-process registry, gated by the admin
-// bearer (HOST-XC-02: NOT the channel token). HOST-M9-08 — createApp warns at
+// /metrics serves the in-process registry, gated by the admin
+// bearer (NOT the channel token). createApp warns at
 // composition time when the proxy config is spoofable (TRUST_PROXY without
 // TRUSTED_PROXY_IPS).
 import { rmSync } from "node:fs";

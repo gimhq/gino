@@ -26,8 +26,8 @@ import {
 //   FINDING 2 (SSRF): deliverWebhook auto-followed redirects (a public URL could
 //     3xx into private space) and assertSafeWebhookUrl checked only the hostname
 //     string (DNS-rebind / CNAME bypass). The fix uses redirect:"manual" and
-//     resolves DNS, rejecting any private/loopback IP. HOST-M5M6-11 tightened
-//     this further: a 3xx is now a delivery FAILURE — the secret + transcript
+//     resolves DNS, rejecting any private/loopback IP. A 3xx is
+//     additionally a delivery FAILURE — the secret + transcript
 //     are never re-sent to a Location target, public or not.
 
 const THREAD = "thread-sec-1";
@@ -86,7 +86,7 @@ describe("M6 security — FINDING 1: explicit-taskId IDOR (cross-tenant transcri
 
   it("allows an explicit taskId that shares the channel's owner", () => {
     const ch = channel("owner-A");
-    const mine = task("owner-A"); // same owner → authorized (OD16)
+    const mine = task("owner-A"); // same owner → authorized
     seed(mine);
 
     expect(isTaskOnChannel(storage, ch, mine)).toBe(true);

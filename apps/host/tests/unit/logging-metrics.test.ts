@@ -1,4 +1,4 @@
-// HOST-M9-04 — metrics label cardinality must be bounded: unmatched (404)
+// Metrics label cardinality must be bounded: unmatched (404)
 // paths collapse into a single "other" label and a defensive cap stops
 // distinct-label growth, so unauthenticated path spraying cannot grow the
 // no-eviction registry without bound.

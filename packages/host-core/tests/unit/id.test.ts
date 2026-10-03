@@ -18,7 +18,7 @@ describe("ulid", () => {
 });
 
 describe("nanoid", () => {
-  // HOST-M9-11 — 16 chars (~82.7 bits) so row-volume ids (attachments) stay
+  // 16 chars (~82.7 bits) so row-volume ids (attachments) stay
   // collision-free; the old 8-char form hit 50 % collision odds at ~1.7 M ids.
   it("produces 16-char lowercase alphanumeric ids", () => {
     const id = nanoid();

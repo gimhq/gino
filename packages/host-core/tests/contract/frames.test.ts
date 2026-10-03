@@ -170,7 +170,7 @@ describe("protocol v2 frame contract", () => {
       expect(r.success).toBe(false);
     });
 
-    // HOST-M4-10: the agent's CronUpsertData requires `prompt`; the host
+    // The agent's CronUpsertData requires `prompt`; the host
     // schema must reject a promptless command instead of emitting one the
     // agent cannot parse.
     it("missing required data field (cron_upsert.prompt)", () => {
@@ -183,7 +183,7 @@ describe("protocol v2 frame contract", () => {
       expect(r.success).toBe(false);
     });
 
-    // `kind` is an OPEN string (HOST-M1M2-04): an unrecognized value parses —
+    // `kind` is an OPEN string: an unrecognized value parses —
     // the writer stores it opaquely and flags it — so version drift on this
     // additive field can never poison a frame.
     it("unrecognized thread_message.kind still parses (open string, HOST-M1M2-04)", () => {

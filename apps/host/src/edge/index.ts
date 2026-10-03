@@ -32,7 +32,7 @@ export function edgeRoutes({ config, host }: EdgeDeps) {
 
   // ── Rate limits (app policy, ahead of every mount) ──────────────────────────
 
-  // HOST-M1M2-10 / HOST-M9-02: throttle enrollment per client IP BEFORE the
+  // Throttle enrollment per client IP BEFORE the
   // token check, so shared-secret brute force and register-retry loops are
   // bounded. Over-limit renders the protocol §3 `register_error{rate_limited}`
   // envelope (Retry-After is set by the middleware).
@@ -42,7 +42,7 @@ export function edgeRoutes({ config, host }: EdgeDeps) {
     onLimit: c => c.json(registerError("rate_limited"), 429),
   }));
 
-  // HOST-M9-02: throttle the channel I/O surface ahead of auth. A VALID
+  // Throttle the channel I/O surface ahead of auth. A VALID
   // channel bearer drains the principal budget (keyed by token hash, never
   // the raw secret); an absent or invalid bearer falls back to the client IP,
   // so brute-force guessing of the shared token cannot rotate keys to evade
@@ -57,7 +57,7 @@ export function edgeRoutes({ config, host }: EdgeDeps) {
     },
   }));
 
-  // HOST-M7-03: throttle the whole /llm surface ahead of auth. A VERIFIED
+  // Throttle the whole /llm surface ahead of auth. A VERIFIED
   // proxy credential drains its own per-principal budget (keyed by token
   // hash, never the raw secret) so agents sharing a NAT don't collide; an
   // absent or invalid credential falls back to the client IP, so failed-auth

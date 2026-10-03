@@ -112,7 +112,7 @@ function resolveDbPath(): string {
 interface JournalEntry { tag: string; when: number }
 
 /**
- * List the migrations the next boot would actually apply (HOST-M9-10):
+ * List the migrations the next boot would actually apply:
  * bundled journal entries whose `when` is newer than the last applied
  * `created_at` row in the target DB's `__drizzle_migrations` table — the
  * exact predicate drizzle's bun-sqlite migrator uses. The DB is opened
@@ -130,8 +130,8 @@ export function listPendingMigrations(opts: { dbPath: string; migrations?: Reado
     .map(e => e.tag);
 }
 
-// Migration source mirrors `runMigrations` (packages/host-store-sqlite/src/migrate.ts,
-// HOST-M9-13) exactly: the committed embedded set is the only source, in every
+// Migration source mirrors `runMigrations` (packages/host-store-sqlite/src/migrate.ts)
+// exactly: the committed embedded set is the only source, in every
 // build. Tests inject their own map through the same seam `runMigrations` takes.
 function readJournalEntries(migrations: ReadonlyMap<string, string>): JournalEntry[] | null {
   const raw = migrations.get("meta/_journal.json");

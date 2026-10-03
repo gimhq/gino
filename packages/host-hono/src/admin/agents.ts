@@ -6,9 +6,9 @@
 //   POST   /agents/:id/stop       OOB stop  (launcher | WS close)
 //   POST   /agents/:id/restart    OOB restart (launcher | WS close)
 //   POST   /agents/:id/remove     OOB remove (revoke token + orphan tasks)
-//   POST   /agents/:id/grant      grant {owner_id} access  (OD13)
-//   POST   /agents/:id/access     set access policy {access} (OD13, HOST-M3-09)
-//   POST   /agents/:id/revoke     revoke {owner_id} access (OD13)
+//   POST   /agents/:id/grant      grant {owner_id} access
+//   POST   /agents/:id/access     set access policy {access}
+//   POST   /agents/:id/revoke     revoke {owner_id} access
 //
 // Every response uses the shared `{ success, data }` envelope. The stored
 // connect-token hash is NEVER serialized.
@@ -53,7 +53,7 @@ const launchBody = z.object({
   taskId: z.string().min(1).optional(),
   env: z.record(z.string(), z.string()).optional(),
   resources: z.record(z.string(), z.unknown()).optional(),
-  // HOST-M3-09: the launch is an ADMIN request, so `public` may be allowlisted
+  // The launch is an ADMIN request, so `public` may be allowlisted
   // here — applied when the launched agent's registration correlates. The
   // agent's own register body can never set it.
   access: z.enum(["dedicated", "public"]).optional(),
@@ -86,7 +86,7 @@ export function adminAgentRoutes() {
   // ── Launch (B2b — config-driven launcher) ──────────────────────────────────
   // Declared BEFORE `/:id` style routes so `launch` is never read as an `:id`.
   // The shared register token is server-side (config) — never accepted from the
-  // client; the launch↔register nonce (OD17) is host-generated in control.
+  // client; the launch↔register nonce is host-generated in control.
   router.post(
     "/launch",
     describeRoute({
@@ -184,7 +184,7 @@ export function adminAgentRoutes() {
     },
   );
 
-  // ── Access policy: grant / revoke {owner_id} (OD13) ────────────────────────
+  // ── Access policy: grant / revoke {owner_id} ────────────────────────
   router.post(
     "/:id/grant",
     describeRoute({
@@ -201,7 +201,7 @@ export function adminAgentRoutes() {
     },
   );
 
-  // HOST-M3-09: making an agent `public` (or back `dedicated`) is an
+  // Making an agent `public` (or back `dedicated`) is an
   // admin-only mutation — enrollment always lands `dedicated` regardless of
   // what the register body claims.
   router.post(

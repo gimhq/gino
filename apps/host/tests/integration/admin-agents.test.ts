@@ -25,7 +25,7 @@ const config = loadConfigStrict({
   GINO_DB_PATH: dbPath,
   GINO_REGISTER_TOKEN: REGISTER_TOKEN,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL_TOKEN,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL_TOKEN,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
@@ -166,7 +166,7 @@ describe("HOST-M3-09 /admin/agents/:id/access — admin-only access mutation", (
   }
 
   it("flips a dedicated agent public and back", async () => {
-    const { agentId } = await enroll(); // always lands dedicated (HOST-M3-09)
+    const { agentId } = await enroll(); // always lands dedicated
     let get = await admin(`/agents/${agentId}`);
     expect(((await get.json()) as { data: { access: string } }).data.access).toBe("dedicated");
 

@@ -12,9 +12,9 @@ import { Hono } from "hono";
 import { adminTaskRoutes } from "../../src/admin/tasks";
 import { errorHandler } from "../../src/errors";
 
-// M4 admin surface — close lifecycle (HOST-M4-01/M4-09), cron addressing
-// (HOST-M4-02/M4-11), live-only interrupt (HOST-M4-03), and the bounded task
-// detail view (HOST-M1M2-16).
+// M4 admin surface — close lifecycle, cron addressing,
+// live-only interrupt, and the bounded task
+// detail view.
 
 const logger = noopLogger;
 

@@ -25,7 +25,7 @@ export interface IngestArtifactInput {
  * version is a new `sha256`, hence a new row) but the metadata OUTSIDE it —
  * `kind` / `content_type` — is last-write-wins: a repeat ingest of identical
  * `(name, sha256)` updates them to the caller's values instead of silently
- * discarding the request (HOST-M8-13 — e.g. re-uploading a bundle wrongly
+ * discarding the request (e.g. re-uploading a bundle wrongly
  * ingested as `kind:file` with `kind:dir` corrects the row).
  */
 export function ingestArtifact(storage: Storage, input: IngestArtifactInput): ConfigArtifactRow {

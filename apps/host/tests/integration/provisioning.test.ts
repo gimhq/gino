@@ -29,7 +29,7 @@ const config = loadConfigStrict({
   GINO_STORE_DIR: storeDir,
   GINO_REGISTER_TOKEN: REGISTER,
   GINO_HTTP_CHANNEL_TOKEN: CHANNEL,
-  // HOST-XC-02: explicit same-secret reuse so one bearer drives both surfaces in this test.
+  // Explicit same-secret reuse so one bearer drives both surfaces in this test.
   GINO_HTTP_ADMIN_TOKEN: CHANNEL,
   GINO_LOG_LEVEL: "error",
   GINO_LOG_TO_STDOUT: "true",
@@ -66,7 +66,7 @@ function uploadArtifact(name: string, kind: string, bytes: string, contentType?:
   return app.fetch(new Request(`http://local/api/admin/config/artifacts?${q}`, { method: "POST", headers: admin, body: bytes }));
 }
 
-/** Upload an artifact and return its real content sha256 (entries validate against the registry, HOST-M8-07). */
+/** Upload an artifact and return its real content sha256 (entries validate against the registry). */
 async function uploadSha(name: string, kind: string, bytes: string): Promise<string> {
   const res = await uploadArtifact(name, kind, bytes);
   expect(res.status).toBe(201);
@@ -135,7 +135,7 @@ describe("global delivery — register / GET /agent/config carry config.entries"
       { name: "reviewer", sha256: skSha, kind: "dir" },
     ]);
     expect(put.status).toBe(200);
-    // A GLOBAL write mints a monotonic version (HOST-M8-01) and reports it.
+    // A GLOBAL write mints a monotonic version and reports it.
     const putBody = await put.json() as { data: { version: number } };
     expect(putBody.data.version).toBeGreaterThan(0);
 

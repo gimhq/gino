@@ -35,7 +35,7 @@ import { createCodexRelay } from "../ws-bridge";
  * so an unauthenticated handshake is rejected and no socket opens. A plain
  * (non-Upgrade) GET gets a clean `426 Upgrade Required`.
  *
- * Rate limiting (HOST-M7-03, per verified principal) is the embedder's
+ * Rate limiting (per verified principal) is the embedder's
  * middleware, applied ahead of this mount (D10).
  */
 export interface LlmRouterOptions {
@@ -69,7 +69,7 @@ export function llmRouter(host: Host, opts: LlmRouterOptions) {
   /**
    * Validate the engine's proxy credential; 401 (UnauthorizedError) on failure.
    * Auth is path-aware: an Anthropic temp key only clears the pass-through
-   * paths, never the host-credential-injecting ones (HOST-M7-01).
+   * paths, never the host-credential-injecting ones.
    */
   const proxyAuth: MiddlewareHandler<HostEnv> = async (c, next) => {
     const { pathname } = stripLlmPrefix(c.req.url, basePath);

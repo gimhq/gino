@@ -4,7 +4,7 @@
 // validated against `agents.connect_token_hash`; OR with a configured static
 // proxy key. A real Anthropic temp key (`sk-ant-...`, from a prior OAuth
 // exchange) is accepted ONLY on Anthropic pass-through paths, where it is
-// forwarded as-is and Anthropic itself validates it (HOST-M7-01: the host
+// forwarded as-is and Anthropic itself validates it (the host
 // cannot verify a temp key, so it must never gate a path that injects the
 // host's own credentials).
 //

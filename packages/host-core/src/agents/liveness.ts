@@ -1,7 +1,7 @@
 import type { HostEvents } from "../host/events";
 import type { Storage } from "../host/ports/storage";
 import type { Logger } from "../logger";
-// M3 — LIVENESS (offline-grace sweep; DP4).
+// M3 — LIVENESS (offline-grace sweep).
 //
 // `heartbeat` (every `config.heartbeatIntervalMs`) bumps `last_seen` via the
 // registry's `touchLiveness` (B1b). This sweep is the backstop: an `online`
@@ -9,7 +9,7 @@ import type { Logger } from "../logger";
 // WS close (a half-open connection or a crashed agent) — is flipped to
 // `offline`.
 //
-// DP4 invariant: `offline` is an AGENT state, NOT a task state. The sweep NEVER
+// Invariant: `offline` is an AGENT state, NOT a task state. The sweep NEVER
 // reaps, terminates, or migrates a task or cron — the agent owns its work
 // durably and resumes it on reconnect (the WS `onOpen` flips it back `online`
 // and replays the unacked outbox; a resumed heartbeat on a still-live socket
@@ -18,7 +18,7 @@ import type { Logger } from "../logger";
 import type { SessionRegistry } from "./sessions";
 import { HEARTBEAT_INTERVAL_MS } from "../protocol/version";
 
-/** DP4 grace = N × heartbeat interval. N missed beats of silence → `offline`. */
+/** Grace = N × heartbeat interval. N missed beats of silence → `offline`. */
 export const OFFLINE_GRACE_MULTIPLIER = 3;
 
 /** Default offline-grace window (ms): 3 × the advertised heartbeat interval. */
@@ -28,7 +28,7 @@ export interface LivenessDeps {
   readonly storage: Storage;
   readonly logger?: Logger;
   /**
-   * Live-session registry (HOST-M3-14): when provided, the sweep also closes +
+   * Live-session registry: when provided, the sweep also closes +
    * detaches a swept agent's zombie socket so `sessions.isOnline` converges
    * with `agents.status` instead of answering `true` for a dead pipe.
    */
@@ -54,7 +54,7 @@ export interface LivenessHandle {
  * One offline-grace pass: flip every `online` agent whose `last_seen` is older
  * than the grace to `offline`, in a single UPDATE. Agents that never connected
  * (`last_seen` null, still `enrolled`), already `offline`, or `removed` are
- * left untouched. Tasks/crons are NEVER touched (DP4). Returns the count
+ * left untouched. Tasks/crons are NEVER touched. Returns the count
  * transitioned (for logging + tests).
  */
 export function sweepLiveness(deps: LivenessDeps): number {
@@ -64,7 +64,7 @@ export function sweepLiveness(deps: LivenessDeps): number {
 
   const transitioned = deps.storage.agents.sweepSilent(cutoff);
 
-  // HOST-M3-14: evict the half-open zombie socket for every swept agent. The
+  // Evict the half-open zombie socket for every swept agent. The
   // detach runs first so the close's own `onClose` (detach + offline write) is
   // a guarded no-op; unacked outbox rows stay put and replay on reconnect.
   if (deps.sessions) {

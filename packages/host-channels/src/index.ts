@@ -1,9 +1,9 @@
 // M6 — CHANNELS (distribution & routing; user I/O).
 //
 // The host's DISTRIBUTION + ROUTING layer, fully decoupled from storage. Egress
-// TAILS the M5 `messages` store by a per-channel cursor and delivers (OD10);
+// TAILS the M5 `messages` store by a per-channel cursor and delivers;
 // ingress ROUTES an inbound user message to a conversation → continue its task or
-// open a NEW task stamped with the channel's owner (OD9/OD16) → hand to M4.
+// open a NEW task stamped with the channel's owner → hand to M4.
 // Channels NEVER write the transcript (storage ⟂ distribution, §9): M6 reads M5
 // by cursor and writes only `channels` / `channel_bindings` / `channel_cursors`.
 //
@@ -24,7 +24,7 @@ export type { BoundTask, PollDelivery, PollOptions, TailOptions, TailResult } fr
 export { DEFAULT_WEBHOOK_MAX_ATTEMPTS, pushChannelWebhooks } from "./egress";
 export type { WebhookAttemptState, WebhookPushOptions, WebhookPushResult } from "./egress";
 
-// ─── Ingress — route an inbound message to a conversation's task (OD9/OD16) ───
+// ─── Ingress — route an inbound message to a conversation's task ───
 export { bindConversation, routeInbound } from "./ingress";
 export type { InboundMessage, RouteResult } from "./ingress";
 

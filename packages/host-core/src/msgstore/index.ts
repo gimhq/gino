@@ -12,7 +12,7 @@
 //
 // One dispatch-side exception (called by M4, not inbound): `writeCronPrompt`
 // persists the `cron_upsert` command's `prompt` into the `crons` mirror —
-// `cron_state` never carries it (HOST-M5M6-09).
+// `cron_state` never carries it.
 //
 // Read helpers (for M6 egress / admin, later stages):
 //   getTranscript · getThreadRun · getTaskThreads · getCron

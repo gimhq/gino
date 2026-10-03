@@ -26,7 +26,7 @@ import { closeTask, createTask, setTaskEntries, transitionTaskStatus } from "../
 let db: AppDatabase;
 let storage: Storage;
 
-/** Register a `config_artifacts` row so a sha passes write-time validation (HOST-M8-07). */
+/** Register a `config_artifacts` row so a sha passes write-time validation. */
 function seedArtifact(sha: string, name = `seed-${sha.slice(0, 8)}`): void {
   db
     .insert(configArtifacts)

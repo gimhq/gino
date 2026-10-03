@@ -1,14 +1,14 @@
 import type { AgentGrantRow, AgentRow, Storage } from "../host/ports/storage";
 // M3 — AGENT REGISTRY (identity, enrollment, the per-agent connect token).
 //
-// Agents are host resources with an access policy (OD13). The registry owns the
+// Agents are host resources with an access policy. The registry owns the
 // `agents` table: enroll on `POST /agent/register` (version-gated upstream),
-// mint a per-agent connect token (store ONLY its hash — protocol §3 / OD12,
+// mint a per-agent connect token (store ONLY its hash — protocol §3,
 // revoked on remove), persist capabilities/source/access, and drive the
 // `enrolled → online ⇄ offline → removed` lifecycle. It NEVER touches the wire
 // or parses frame `data` — that is M2's job.
 //
-// It also owns `agent_grants` (the OD13 access policy) + the capacity (DP3) and
+// It also owns `agent_grants` (the access policy) + the capacity and
 // removal helpers the control layer (M3 `control.ts`) builds on. Storage goes
 // through the `Storage` port (`storage.agents` / `storage.tasks`); the token
 // hashing, id minting and status policy stay here.
@@ -29,8 +29,8 @@ export interface EnrollInput {
   /** How the agent runs (`manual` | `docker` | `vm` | …); defaults to `manual`. */
   source?: string;
   /**
-   * Access policy (OD13): `dedicated` (granted owners only) | `public`.
-   * TRUSTED CALLERS ONLY (HOST-M3-09) — the register edge must NEVER forward
+   * Access policy: `dedicated` (granted owners only) | `public`.
+   * TRUSTED CALLERS ONLY — the register edge must NEVER forward
    * the request body's `access` here: a register-token holder would otherwise
    * self-declare `public` and become a dispatch target for every owner.
    * `public` is set by the admin access mutation or an admin launch allowlist.
@@ -90,7 +90,7 @@ export function listAgents(storage: Storage): AgentRow[] {
 /**
  * Verify a presented connect token against the agent's stored hash (constant
  * time, via platform `verifyToken`). Returns the agent on success, else `null`
- * — an unknown agent, a `removed` agent (token revoked, OD12), or a bad token
+ * — an unknown agent, a `removed` agent (token revoked), or a bad token
  * all fail closed.
  */
 export function verifyConnectToken(storage: Storage, agentId: string, token: string): AgentRow | null {
@@ -109,7 +109,7 @@ export function verifyConnectToken(storage: Storage, agentId: string, token: str
  * sha-256 against `connect_token_hash` (the at-rest form — the plaintext is never
  * stored). This is the token→identity resolver the connect-token gate uses so the
  * requesting agent is taken from the TOKEN, never a client-supplied param (the
- * IDOR fix). A `removed` agent (token revoked, OD12) and an unmatched token both
+ * IDOR fix). A `removed` agent (token revoked) and an unmatched token both
  * return `null` — fail closed. Mirrors the M7 proxy credential lookup idiom.
  */
 export function getAgentByConnectToken(storage: Storage, token: string): AgentRow | null {
@@ -135,7 +135,7 @@ export function setAgentStatus(storage: Storage, agentId: string, status: AgentS
  * and, when reported, `active_threads`. The full offline-grace sweep that flips
  * a silent agent to `offline` is B2 — this is the light update it builds on.
  *
- * HOST-M3-03: a frame from an `offline` agent proves the socket is alive
+ * A frame from an `offline` agent proves the socket is alive
  * (sweep-marked offline during heartbeat starvation, socket never dropped), so
  * restore `online`. The transition is a guarded CAS out of `offline` ONLY —
  * `removed` stays terminal and `enrolled` is untouched.
@@ -145,7 +145,7 @@ export function touchLiveness(storage: Storage, agentId: string, activeThreads?:
   storage.agents.updateStatusIf(agentId, { from: "offline" }, "online");
 }
 
-// ─── Access policy (OD13) — agent_grants ───
+// ─── Access policy — agent_grants ───
 
 /**
  * Grant an owner access to a `dedicated` agent (idempotent — a repeat grant is
@@ -162,7 +162,7 @@ export function revokeOwner(storage: Storage, agentId: string, ownerId: string):
 }
 
 /**
- * Set an agent's access policy (OD13). ADMIN-ONLY mutation (HOST-M3-09) —
+ * Set an agent's access policy. ADMIN-ONLY mutation —
  * routed like grant/revoke through the control layer; enrollment itself always
  * lands `dedicated` (or the launch config's admin allowlist via
  * `correlateLaunch`), never a register-body value.
@@ -177,7 +177,7 @@ export function listGrants(storage: Storage, agentId: string): AgentGrantRow[] {
 }
 
 /**
- * OD13 access check used by M4 dispatch + the admin API: a `public` agent is
+ * Access check used by M4 dispatch + the admin API: a `public` agent is
  * usable by ANY owner; a `dedicated` agent only by owners present in
  * `agent_grants`. An unknown or `removed` agent is permitted to no one (fails
  * closed).
@@ -193,7 +193,7 @@ export function isOwnerPermitted(storage: Storage, agentId: string, ownerId: str
   return storage.agents.hasGrant(agentId, ownerId);
 }
 
-// ─── Capacity (DP3) ───
+// ─── Capacity ───
 
 export interface AgentCapacity {
   /** Agent-reported in-flight threads (from `heartbeat`). */
@@ -205,7 +205,7 @@ export interface AgentCapacity {
 }
 
 /**
- * DP3 capacity: agent-reported `active_threads` vs declared `max_threads`
+ * Capacity: agent-reported `active_threads` vs declared `max_threads`
  * (host-overridable). `max_threads` unset = unbounded. Returns null for an
  * unknown agent.
  */
@@ -223,7 +223,7 @@ export function getCapacity(storage: Storage, agentId: string): AgentCapacity | 
   };
 }
 
-// ─── Removal (OD12 + DP4) ───
+// ─── Removal ───
 
 export interface RemoveAgentResult {
   /** Number of tasks orphaned (placement cleared; rows kept as history). */
@@ -232,10 +232,10 @@ export interface RemoveAgentResult {
 
 /**
  * Permanently remove an agent (admin OOB). Two host-side effects:
- *   1. REVOKE the connect token (OD12): rotate `connect_token_hash` to a fresh,
+ *   1. REVOKE the connect token: rotate `connect_token_hash` to a fresh,
  *      unmatchable value and flip `status` to `removed`, so any presented token
  *      now fails (`verifyConnectToken` also fails closed on `removed`).
- *   2. ORPHAN its tasks (DP4 / no-migration): clear `tasks.agent_id` so the
+ *   2. ORPHAN its tasks (no migration): clear `tasks.agent_id` so the
  *      mirror is KEPT AS HISTORY — tasks/crons/messages are NOT deleted.
  *      Continuing the work becomes a NEW task on another agent.
  * The runtime teardown (launcher.remove / a WS `close`) is the control layer's
@@ -250,9 +250,9 @@ export function removeAgent(storage: Storage, agentId: string): RemoveAgentResul
   return { orphanedTasks: orphaned.length };
 }
 
-// ─── Launch↔register correlation (OD17) ───
+// ─── Launch↔register correlation ───
 //
-// The register token is shared + long-lived (OD12), so a registration cannot by
+// The register token is shared + long-lived, so a registration cannot by
 // itself say WHICH launch produced it. `control.launchAgent` mints a per-launch
 // nonce, injects it into the launch env (`GINO_LAUNCH_NONCE`) and records the
 // pending launch here keyed by that nonce; the agent echoes the nonce in `POST
@@ -260,7 +260,7 @@ export function removeAgent(storage: Storage, agentId: string): RemoveAgentResul
 // (`launcher_kind` + `launch_ref`) so OOB control (M3 `control.ts`) routes to
 // the owning launcher.
 //
-// HOST-M3-05: the pending set is PERSISTED (`pending_launches`) — a host
+// The pending set is PERSISTED (`pending_launches`) — a host
 // restart must neither orphan a running container (the TTL reaper in
 // `launch-reaper.ts` still finds the row and tears the runtime down) nor break
 // a late registration's correlation. The launch→register window stays short:
@@ -270,7 +270,7 @@ export interface PendingLaunch {
   readonly launcherKind: string;
   /** The launcher's runtime handle (e.g. a container id); null if it started nothing. */
   readonly launchRef: string | null;
-  /** Admin-allowlisted access applied at correlate (HOST-M3-09); defaults to `dedicated`. */
+  /** Admin-allowlisted access applied at correlate; defaults to `dedicated`. */
   readonly access?: string;
 }
 
@@ -290,11 +290,11 @@ export function recordPendingLaunch(storage: Storage, nonce: string, pending: Pe
 }
 
 /**
- * Correlate a registering agent to its launch by nonce (OD17). When the nonce
+ * Correlate a registering agent to its launch by nonce. When the nonce
  * matches a pending launch, bind the agent (`launcher_kind` + `launch_ref` +
- * the nonce itself, the HOST-M3-06 idempotency key) and CONSUME the entry;
+ * the nonce itself, the idempotency key) and CONSUME the entry;
  * returns the bound launch. The launch's admin-allowlisted `access` is applied
- * here (HOST-M3-09) — never taken from the register body. An unknown/absent
+ * here — never taken from the register body. An unknown/absent
  * nonce returns `null` and changes nothing — so a register WITHOUT a nonce
  * (manual enroll) is entirely unaffected (backward-compatible).
  */
@@ -313,7 +313,7 @@ export function hasPendingLaunch(storage: Storage, nonce: string): boolean {
 
 /**
  * Pending launches recorded before `cutoff` (epoch ms) — launches whose agent
- * never registered inside the TTL. Read by the reaper (HOST-M3-05), which
+ * never registered inside the TTL. Read by the reaper, which
  * tears down each runtime and then `deletePendingLaunch`es the row.
  */
 export function listExpiredPendingLaunches(storage: Storage, cutoff: number): ExpiredPendingLaunch[] {
@@ -328,7 +328,7 @@ export function deletePendingLaunch(storage: Storage, nonce: string): void {
 }
 
 /**
- * Idempotent re-enroll (HOST-M3-06): a register RETRY carrying a launch nonce
+ * Idempotent re-enroll: a register RETRY carrying a launch nonce
  * that already correlated (the response was lost in transit — the retrying
  * agent never saw its token) returns the EXISTING agent row instead of minting
  * a duplicate. The connect token is ROTATED and returned fresh: only its hash

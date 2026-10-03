@@ -675,7 +675,7 @@ export function describeBlobStoreConformance(target: ConformanceTarget, harness:
       const stored = s().blobs.put("skill", bytes);
       tamper(stored.ref);
       expect(() => s().blobs.readVerified(stored.ref, stored.sha256)).toThrow(ShaMismatchError);
-      // A re-put of the correct bytes self-heals (HOST-M8-04).
+      // A re-put of the correct bytes self-heals.
       s().blobs.put("skill", bytes);
       expect(s().blobs.readVerified(stored.ref, stored.sha256)).toEqual(bytes);
     });

@@ -8,7 +8,7 @@ import { agentConfig, globalConfig } from "./config";
 /**
  * Normalise the register body's `capabilities` into the stored shape. Protocol
  * §3 sends an engine-name array (`["claude", …]`); the design stores
- * `{ engines, max_threads? }` (DP3 — `max_threads` host-overridable). Both the
+ * `{ engines, max_threads? }` (`max_threads` host-overridable). Both the
  * array form and an object form are accepted.
  */
 function normalizeCapabilities(raw: unknown, maxThreads?: unknown): AgentCapabilities {
@@ -32,7 +32,7 @@ function isPlainObject(body: unknown): body is Record<string, unknown> {
 
 /** Enrollment (M3) — register token; version-gated; mints the connect token. */
 export function register(ctx: WireContext, rawBody: unknown, auth: { bearer: string | null }): HttpResult {
-  // HOST-M1M2-14: EVERY register failure renders the protocol §3
+  // EVERY register failure renders the protocol §3
   // `register_error` envelope (an agent parses `reason` to decide between
   // "exit permanently" and "retry") — token validation lives here, in the
   // handler, so a bad token never falls through to the scaffold's generic
@@ -61,7 +61,7 @@ export function register(ctx: WireContext, rawBody: unknown, auth: { bearer: str
   const storage = ctx.storage;
   const launchNonce = typeof body.launchNonce === "string" && body.launchNonce.length > 0 ? body.launchNonce : null;
 
-  // HOST-M3-06: registration is IDEMPOTENT per launch. A retry carrying a
+  // Registration is IDEMPOTENT per launch. A retry carrying a
   // nonce that already correlated (the response was lost — the agent never
   // saw its token) reuses the existing row with a ROTATED connect token
   // instead of minting a duplicate whose launch binding lands on a ghost.
@@ -74,7 +74,7 @@ export function register(ctx: WireContext, rawBody: unknown, auth: { bearer: str
     }
   }
 
-  // HOST-M3-09: the body's `access` is IGNORED — a register-token holder
+  // The body's `access` is IGNORED — a register-token holder
   // never self-declares `public`. Enrollment always lands `dedicated`; a
   // host launch's admin allowlist applies at correlate, and flipping an
   // agent `public` later is the admin-only access mutation.
@@ -82,12 +82,12 @@ export function register(ctx: WireContext, rawBody: unknown, auth: { bearer: str
     ...(typeof body.name === "string" ? { name: body.name } : {}),
     source: typeof body.source === "string" ? body.source : "manual",
     capabilities: normalizeCapabilities(body.capabilities, body.maxThreads),
-    // HOST-M3-15 provenance: which register token enrolled it — the
+    // Provenance: which register token enrolled it — the
     // sha-256 at-rest form (the shared plaintext is never stored).
     registerTokenRef: hashToken(ctx.options.registerToken),
   });
 
-  // OD17 launch↔register correlation (OPTIONAL, backward-compatible): when
+  // Launch↔register correlation (OPTIONAL, backward-compatible): when
   // the agent echoes the per-launch nonce it was launched with, bind it to
   // that launch (launcher_kind + launch_ref). No nonce → unchanged: a manual
   // enroll never touches the pending-launch set.

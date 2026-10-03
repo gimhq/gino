@@ -30,7 +30,7 @@ export function sqliteCronMirrorRepo(db: AppDatabase): CronMirrorRepo {
         .run();
     },
     upsertPrompt(input: CronPromptUpsert) {
-      // HOST-M5M6-09: INSERT a stub row when the command precedes the first
+      // INSERT a stub row when the command precedes the first
       // `cron_state`; on conflict update ONLY `prompt`, leaving every mirror
       // field to `upsertState`.
       const { id, taskId, prompt, updatedAt } = input;

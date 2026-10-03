@@ -11,8 +11,8 @@ import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { createDb } from "../../src/drivers/bun";
 import { sqliteStorage } from "../../src/store";
 
-// Migration 0003 drops the vestigial `outbox.msg_id` column (HOST-M1M2-07
-// follow-up: the delivery id is derived from the row id, never stored) and the
+// Migration 0003 drops the vestigial `outbox.msg_id` column (the
+// delivery id is derived from the row id, never stored) and the
 // `outbox_msg_ack_idx` partial index. This test proves the drop is SAFE on a
 // legacy-shaped DB: rows written under the old schema — msg_id populated
 // (pre-fix enqueue back-filled it) or NULL (the pre-fix crash window) —

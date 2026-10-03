@@ -114,8 +114,7 @@ const RE_DRIVE_PREFIX = /^[a-z]:/i;
 /**
  * True iff `target` is a safe RELATIVE landing path: no absolute / drive / UNC
  * shapes, no backslashes, and no `.` / `..` / empty segments — so the
- * agent-side join `<project dir>/<target>` can never escape the project root
- * (HOST-M8-08).
+ * agent-side join `<project dir>/<target>` can never escape the project root.
  */
 function isSafeTarget(target: string): boolean {
   if (target.length === 0 || target.includes("\\") || RE_DRIVE_PREFIX.test(target)) {
@@ -125,7 +124,7 @@ function isSafeTarget(target: string): boolean {
 }
 
 /**
- * Write-time validation of a scope's desired set (HOST-M8-07 / HOST-M8-08):
+ * Write-time validation of a scope's desired set:
  * `scope` must be `'global'` or an existing task id; every entry must carry a
  * safe single-segment `name`, a safe relative `target`, and a canonical sha256
  * that an ingested `config_artifacts` row actually holds. The host never
@@ -176,8 +175,8 @@ export function getGlobalConfigVersion(storage: Storage): number {
  * ONE atomic unit (`ConfigRepo.replaceScope`) — a crash or insert error can
  * never leave the scope wiped (all-or-nothing). A GLOBAL write also bumps the
  * monotonic config version in the same unit, so the version advances iff the
- * set actually changed durably. Every write is validated first (HOST-M8-07 /
- * HOST-M8-08) — an unknown scope, an undeclarable sha256, or a
+ * set actually changed durably. Every write is validated first —
+ * an unknown scope, an undeclarable sha256, or a
  * traversal-shaped name/target is rejected with a 422 before anything is
  * touched. Returns the persisted set.
  */
@@ -194,8 +193,8 @@ export function getEntries(storage: Storage, scope: string): ConfigEntryRow[] {
 }
 
 /**
- * Drop a scope's desired set entirely — the task lifecycle cleanup
- * (HOST-M8-10): a closed task's `config_entries` rows leave the desired set so
+ * Drop a scope's desired set entirely — the task lifecycle cleanup:
+ * a closed task's `config_entries` rows leave the desired set so
  * they stop pinning artifacts in the GC root set. Task scopes carry no config
  * version, so nothing is bumped.
  */
@@ -225,7 +224,7 @@ export function isShaInAgentDesiredSet(storage: Storage, agentId: string, sha256
  * The desired set for a scope, filtered to a set of engines — the DELIVERY
  * shape handed to an agent (register/config `config.entries`, live
  * `config_update`). A multi-engine agent receives the UNION of all its
- * declared engines' targets (HOST-M8-03), never just its first capability.
+ * declared engines' targets, never just its first capability.
  * Engine-agnostic targets are delivered to every engine; an engine-owned
  * target only when the agent declared that engine. An empty list falls back to
  * the default engine.

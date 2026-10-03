@@ -146,10 +146,10 @@ describe("M3 control — remove", () => {
 
     expect(res.via).toBe("ws-close");
     expect(res.orphanedTasks).toBe(1);
-    // Token revoked (OD12): the old connect token no longer authenticates.
+    // Token revoked: the old connect token no longer authenticates.
     expect(verifyConnectToken(storage, agentId, connectToken)).toBeNull();
     expect(db.select().from(agents).where(eq(agents.id, agentId)).get()?.status).toBe("removed");
-    // DP4: the task survives as history — row kept, placement cleared.
+    // The task survives as history — row kept, placement cleared.
     const task = db.select().from(tasks).where(eq(tasks.id, "t-1")).get();
     expect(task).toBeDefined();
     expect(task?.agentId).toBeNull();

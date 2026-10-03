@@ -30,16 +30,16 @@ export const configSchema = z.object({
   // attachments (`store/<name>/<sha256[:12]>`). Defaulted under the runtime
   // `data/` dir (gitignored) so existing token-less config still constructs.
   STORE_DIR: z.string().default("data/store"),
-  // Store GC sweep (HOST-M8-11, OD11). The periodic sweep always RUNS (it
+  // Store GC sweep. The periodic sweep always RUNS (it
   // reconciles un-reference marks + reports droppable/orphan counts) but only
-  // DELETES when CONFIG_GC_ENABLED=true — dry-run by default, per OD11.
+  // DELETES when CONFIG_GC_ENABLED=true — dry-run by default.
   // CONFIG_GC_MAX_AGE_MS is the grace after un-reference (and the FS-orphan
   // age guard) before anything is reclaimable.
   CONFIG_GC_ENABLED: z.enum(["true", "false"]).default("false").transform(v => v === "true"),
   CONFIG_GC_INTERVAL_MS: z.coerce.number().int().min(1000).default(60 * 60 * 1000),
   CONFIG_GC_MAX_AGE_MS: z.coerce.number().int().min(1).default(7 * 24 * 60 * 60 * 1000),
 
-  // Token auth secrets (M1 / OD12 / HOST-XC-02). REGISTER_TOKEN — the shared,
+  // Token auth secrets (M1). REGISTER_TOKEN — the shared,
   // long-lived bootstrap secret for POST /agent/register. HTTP_CHANNEL_TOKEN —
   // the user I/O bearer for /messages/*. HTTP_ADMIN_TOKEN — the control-plane
   // bearer for /admin/*, /system/lode/*, and GET /metrics; a DISTINCT secret
@@ -54,13 +54,13 @@ export const configSchema = z.object({
   REGISTER_TOKEN: z.string().default(""),
   HTTP_CHANNEL_TOKEN: z.string().default(""),
   HTTP_ADMIN_TOKEN: z.string().default(""),
-  // Operator kill-switch for enrollment (HOST-M1M2-14). When false, POST
+  // Operator kill-switch for enrollment. When false, POST
   // /agent/register rejects every attempt with the protocol §3
   // `register_error{registration_disabled}` envelope.
   REGISTER_ENABLED: z.enum(["true", "false"]).default("true").transform(v => v === "true"),
 
   // Max accepted request-body size for the byte-ingest endpoints (POST
-  // /agent/attachments, POST /admin/config/artifacts) — HOST-M1M2-11. Both the
+  // /agent/attachments, POST /admin/config/artifacts). Both the
   // declared Content-Length and the actual streamed bytes are checked; over
   // the cap → 413 and nothing is hashed or stored.
   MAX_UPLOAD_BYTES: z.coerce.number().int().min(1).default(64 * 1024 * 1024),
@@ -82,7 +82,7 @@ export const configSchema = z.object({
   // means "any peer is trusted".
   TRUSTED_PROXY_IPS: z.string().default(""),
 
-  // ─── Edge rate limits (HOST-M1M2-10 / HOST-M9-02 / HOST-M7-03) ───
+  // ─── Edge rate limits ───
   // Fixed-window budgets enforced by `src/shared/middleware/rate-limit.ts`.
   // Keyed per verified principal where one exists (connect/channel token),
   // otherwise per client IP. Defaults are deliberately generous — they bound
@@ -94,7 +94,7 @@ export const configSchema = z.object({
   RATE_LIMIT_MESSAGES_MAX: z.coerce.number().int().min(1).default(300),
   RATE_LIMIT_MESSAGES_WINDOW_MS: z.coerce.number().int().min(1).default(60_000),
 
-  // ─── M6 — outbound webhook egress (HOST-M5M6-04/05) ───
+  // ─── M6 — outbound webhook egress ───
   // Per-request delivery timeout, the bounded attempt budget before a
   // persistently failing batch is dead-lettered (skipped with a log), and the
   // pump's retry-tick cadence for failed/backlogged pushes.

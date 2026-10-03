@@ -1,4 +1,4 @@
-// HOST-M9-12 — the error handler must classify SQLite constraint failures by
+// The error handler must classify SQLite constraint failures by
 // the structured error code, not message text: only uniqueness codes are a
 // 409 conflict; FK / NOT NULL / CHECK violations (host data bugs) and
 // non-database errors that merely quote constraint text stay logged 500s.

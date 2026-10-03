@@ -1,4 +1,4 @@
-// HOST-M1M2-11 — bounded reads for the byte-ingest endpoints. The declared
+// Bounded reads for the byte-ingest endpoints. The declared
 // Content-Length is rejected up front, and the body is streamed with a running
 // cap so a lying (or absent) Content-Length can never balloon host memory: the
 // read aborts the moment the cap is crossed, before any hashing or storing.

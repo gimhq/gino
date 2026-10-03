@@ -68,7 +68,7 @@ async function http(method: string, path: string, opts: { headers?: Record<strin
 }
 
 const jsonHeaders = { "content-type": "application/json" };
-// Two DISTINCT bearers (HOST-XC-02): the channel token authenticates only the
+// Two DISTINCT bearers: the channel token authenticates only the
 // user I/O plane (/messages/*); the admin token only the control plane
 // (/admin/*, /system/lode/*, /api/metrics). Neither falls back to the other.
 const channelBearer = { Authorization: `Bearer ${CHAN}` };
@@ -139,7 +139,7 @@ async function testAuthGates(): Promise<void> {
     const r = await http("GET", "/admin/agents");
     check("401", r.status === 401, `status ${r.status}`);
   });
-  // HOST-XC-02 privilege separation: the wrong KIND of valid token is rejected —
+  // Privilege separation: the wrong KIND of valid token is rejected —
   // the channel token must not reach the control plane, and vice versa.
   await step("admin w/ CHANNEL token → 401 (no fallback)", async () => {
     const r = await http("GET", "/admin/agents", { headers: channelBearer });
@@ -226,7 +226,7 @@ async function testTaskRoundTrip(): Promise<void> {
       return done ?? null;
     }, 40_000);
     check("thread run succeeded", view.run?.status === "succeeded", JSON.stringify(view.run));
-    // The task view carries bounded thread SUMMARIES only (HOST-M1M2-16); the
+    // The task view carries bounded thread SUMMARIES only; the
     // transcript itself is paged per thread via `?thread=`.
     const page = await admin("GET", `/tasks/${taskId}?thread=${view.threadId}`);
     const rows: any[] = page.json?.data?.messages ?? [];
@@ -442,7 +442,7 @@ async function testCrons(): Promise<void> {
     // existence proves nothing. The scheduling fields + roundCount are filled
     // in ONLY from an inbound `cron_state`, which the agent emits when the
     // cron FIRES — so waiting for roundCount ≥ 1 proves the full
-    // emit→apply→fire→cron_state→mirror round-trip (OD14: crons live on the agent).
+    // emit→apply→fire→cron_state→mirror round-trip (crons live on the agent).
     const cron = await waitFor("cron_state mirror shows a fire", async () => {
       const r = await admin("GET", `/tasks/${taskId}/crons`);
       const crons: any[] = r.json?.data ?? [];
@@ -462,7 +462,7 @@ async function testCrons(): Promise<void> {
     // Create a task and schedule a cron WITHOUT ever messaging it. This used
     // to fail silently (the agent's crons FK-referenced a task row that only a
     // first message would seed); the agent now seeds a minimal task row when a
-    // cron arrives before its task_upsert (P2-19), so the cron must apply AND
+    // cron arrives before its task_upsert, so the cron must apply AND
     // fire. The host-seeded mirror row alone proves nothing — wait for a real
     // fire (roundCount ≥ 1).
     const owner2 = "owner-cron-probe";

@@ -109,7 +109,7 @@ describe("M7 proxy/bridge — Claude→OpenAI Messages→Responses", () => {
     expect(await res.json()).toMatchObject({ error: { type: "invalid_request_error" } });
   });
 
-  // HOST-M7-04 — connect/idle watchdogs and SSE backpressure.
+  // Connect/idle watchdogs and SSE backpressure.
   it("errors the stream and closes the WS when the upstream never opens (connect timeout)", async () => {
     const ws = fakeWs();
     const store = new CredentialStore(makeConfig());

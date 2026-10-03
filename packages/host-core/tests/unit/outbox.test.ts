@@ -137,7 +137,7 @@ describe("M2 outbox — ack stops replay", () => {
   });
 });
 
-// HOST-M1M2-07 / HOST-M4-07: a `message` row's delivery id is its row id,
+// A `message` row's delivery id is its row id,
 // assigned by the single INSERT — there is no insert-then-update window in
 // which a durable row exists without an ackable id.
 describe("M2 outbox — atomic message delivery id", () => {

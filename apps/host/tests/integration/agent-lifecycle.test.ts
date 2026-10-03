@@ -12,8 +12,8 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
-// M3 agent status lifecycle against a LIVE server (HOST-M1M2-05 / HOST-M3-02 /
-// HOST-M3-08): a dirty reconnect's superseded-socket close must not clobber the
+// M3 agent status lifecycle against a LIVE server:
+// a dirty reconnect's superseded-socket close must not clobber the
 // live session's `online` status, and `onOpen` must stamp `last_seen` so a
 // fresh connection is never insta-swept before its first heartbeat.
 

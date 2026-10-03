@@ -1,4 +1,4 @@
-// HOST-M9-05 — with a proxy allow-list configured, an unresolvable peer
+// With a proxy allow-list configured, an unresolvable peer
 // address must fail CLOSED (ignore forwarding headers), not fall through to
 // trusting X-Forwarded-For from an unverified peer.
 import type { Context } from "hono";

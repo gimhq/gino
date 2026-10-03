@@ -15,8 +15,8 @@ import { createTask, setPlacement } from "../../src/tasks";
 
 // HOST WIRE — the framework-free `/agent/*` data plane (host-sdk-design §3.2).
 // Exercises `host.wire` directly against a fresh context: register envelopes,
-// the audited WS lifecycle ordering (HOST-M3-02/08), the HTTP frame fallback
-// (HOST-M1M2-09) and the byte channel's 403/404/304 policy (HOST-M8-14).
+// the WS lifecycle ordering, the HTTP frame fallback
+// and the byte channel's 403/404/304 policy.
 
 const REGISTER = "reg-secret-wire";
 const logger = noopLogger;

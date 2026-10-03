@@ -21,10 +21,10 @@ import {
   sweep,
 } from "../../src/configstore";
 
-// M8 — refcount/LRU GC backing BOTH stores. DISABLED by default (OD11): the
+// M8 — refcount/LRU GC backing BOTH stores. DISABLED by default: the
 // sweep computes the droppable set but auto-deletes nothing unless `enabled`.
-// Droppability ages from UN-REFERENCE time (HOST-M8-06), the sweep is
-// filesystem-aware (HOST-M8-05), and eviction is row-first (HOST-M8-12).
+// Droppability ages from UN-REFERENCE time, the sweep is
+// filesystem-aware, and eviction is row-first.
 
 const enc = new TextEncoder();
 let storeDir: string;
@@ -198,7 +198,7 @@ describe("sweep — guarded, disabled by default (OD11)", () => {
     expect(store.exists(orphan.storeRef)).toBe(false);
     expect(store.exists(kept.storeRef)).toBe(true);
     expect(findDroppable(storage, { now: future })).toHaveLength(0);
-    // Row-first eviction (HOST-M8-12): no dangling registry row survives.
+    // Row-first eviction: no dangling registry row survives.
     expect(db.select().from(configArtifacts).all().map(a => a.name)).toEqual(["CLAUDE.md"]);
   });
 
@@ -286,7 +286,7 @@ describe("startConfigStoreGc — the periodic production caller (HOST-M8-11)", (
       handle.sweep(); // marks un-referenced
       const second = handle.sweep();
       expect(second.droppable).toBe(1);
-      expect(second.dropped).toBe(0); // OD11: not enabled → nothing deleted
+      expect(second.dropped).toBe(0); // Not enabled → nothing deleted
       expect(store.exists(orphan.storeRef)).toBe(true);
     }
     finally {

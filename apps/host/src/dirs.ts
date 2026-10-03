@@ -18,8 +18,7 @@ const THIS_DIR = dirname(fileURLToPath(import.meta.url));
 /**
  * True when running inside a compiled binary (`bun build --compile`), where
  * modules live in Bun's virtual filesystem. Consumers must not trust
- * cwd-relative code assets (e.g. a `drizzle/` tree) in this mode — see
- * HOST-M9-13.
+ * cwd-relative code assets (e.g. a `drizzle/` tree) in this mode.
  */
 export const IS_COMPILED = THIS_DIR.startsWith("/$bunfs");
 

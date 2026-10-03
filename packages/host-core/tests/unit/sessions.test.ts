@@ -3,7 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { SessionRegistry } from "../../src/agents/sessions";
 
 // M3 sessions — the supersede/detach contract the WS `onClose` status guard
-// builds on (HOST-M1M2-05 / HOST-M3-02): a superseded socket's late close must
+// builds on: a superseded socket's late close must
 // report "not evicted" so the caller skips the `offline` write.
 
 function fakeWs(): WsLike & { closed: Array<{ code?: number | undefined; reason?: string | undefined }> } {

@@ -7,7 +7,7 @@ import { describe, expect, it } from "bun:test";
 import { bunSpawn } from "@/agents-bun-spawn";
 
 // The app's `Bun.spawn` shell-out adapter behind `createDockerLauncher({ spawn })`:
-// the launcher's per-op abort signal must kill the REAL child (HOST-M3-10).
+// the launcher's per-op abort signal must kill the REAL child.
 
 describe("bunSpawn — docker launcher deadline (real child process)", () => {
   it("kills the REAL child process at the deadline (the app's Bun.spawn seam)", async () => {

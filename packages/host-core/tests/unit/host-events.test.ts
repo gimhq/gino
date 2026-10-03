@@ -134,7 +134,7 @@ describe("createHostEvents — emission sites", () => {
 
   it("placeTask emits task.placed once — not on the already-placed replay", () => {
     const agentId = enrollAgent(storage, { capabilities: { engines: ["claude"] } }).agent.id;
-    grantOwner(storage, agentId, "owner"); // a dedicated agent must be granted to the task's owner (OD13)
+    grantOwner(storage, agentId, "owner"); // a dedicated agent must be granted to the task's owner
     const taskId = createTask(storage, { ownerId: "owner", engine: "claude", model: "sonnet" }).id;
     const events = createHostEvents();
     const placed: HostEventMap["task.placed"][] = [];
