@@ -108,6 +108,10 @@ packages/host-hono/
     messages.ts              /messages/* + webhook ingress → M6
     auth.ts errors.ts openapi.ts env.ts   bearer/connect-token helpers, error envelope, route metadata
     ws/bun.ts ws/node.ts     the injected WebSocket upgrade (Bun · @hono/node-ws)
+packages/host-serve/
+  src/                   M1  the same /agent/* data plane with no HTTP framework: a runtime-neutral
+                             request handler (`handler.ts`) plus `Bun.serve` (`./bun`) and
+                             `node:http` + `ws` (`./node`) listeners
 packages/host-channels/
   src/                   M6  CHANNELS (distribution & routing): egress tails M5 store by cursor → channels ·
                              ingress routes user msg → M4 · registry · webhooks · pump
@@ -125,6 +129,10 @@ examples/embed-node/         a plain Node embedder (no Bun) that round-trips a r
 ## 2. Module details
 
 ### M1 — Edge (transport + auth)
+The description below is the standalone server (`apps/host`), which mounts the `host-hono` routers.
+An embedder that does not use Hono mounts the same `host.wire` functions through `host-serve`; the
+`/agent/*` behavior is identical.
+
 One `OpenAPIHono` app on `GINO_PORT`. Owns transport, auth, rate-limit, SSRF guard, structured errors —
 then delegates. Routes are **fully explicit prefixes, no catch-all**: `/agent/*` data-plane (→ M2/M3),
 `/admin/*` control (`HTTP_ADMIN_TOKEN` bearer → M3/M4), `/messages/*` + webhooks (`HTTP_CHANNEL_TOKEN`

@@ -3,7 +3,7 @@
 This document is the **single coupling point** between the two otherwise-independent
 architectures:
 
-- **Host** (control plane) — `src/**`, TypeScript. Orchestration, launchers, storage, UI.
+- **Host** (control plane) — `packages/host-*` + `apps/host`, TypeScript. Orchestration, launchers, storage, UI.
 - **Agent / runner** (data plane) — `gino-agent/**`, Rust. Executes work via engines.
 
 They share **no code**. Each implements this protocol independently and is versioned and
