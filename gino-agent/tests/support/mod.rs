@@ -1,5 +1,4 @@
-//! Shared **e2e harness** for the §5b deterministic full-loop tests (PLAN-006
-//! Lane I).
+//! Shared **e2e harness** for the §5b deterministic full-loop tests.
 //!
 //! The runner exposes only `gino_agent::run()` publicly — its `Engine`/`Session`
 //! traits, `protocol::v2` frames and `db` read models are all `pub(crate)`, so an

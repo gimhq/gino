@@ -1,4 +1,4 @@
-//! The Claude [`Engine`] (PLAN-001): one long-lived `claude` child driven over
+//! The Claude [`Engine`]: one long-lived `claude` child driven over
 //! the bkd control protocol.
 //!
 //! [`ClaudeEngine::start_session`] spawns a single `claude -p` child speaking
@@ -43,7 +43,7 @@ use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
-/// environment (PLAN-001 §"claude invocation"). Built from the global [`Config`]
+/// environment. Built from the global [`Config`]
 /// via [`ClaudeSettings::from_config`]; tests construct it directly to point at a
 /// stub binary.
 #[derive(Clone, Debug)]
@@ -67,7 +67,7 @@ pub(crate) struct ClaudeSettings {
     pub(crate) max_turns: Option<u32>,
     /// Environment variables layered onto the child (engine credentials etc.).
     pub(crate) env: Vec<(String, String)>,
-    /// The provisioned engine config dir (PLAN-007 §6). When set, the child is
+    /// The provisioned engine config dir. When set, the child is
     /// launched with both the generic `ENGINE_CONFIG_DIR` and claude's
     /// `CLAUDE_CONFIG_DIR` pointed here, so it reads the global instruction file +
     /// skills the runner materialized. `None` exports neither (tests / no
@@ -168,8 +168,8 @@ impl SessionArgs {
     }
 }
 
-/// Build the `claude` argv from [`ClaudeSettings`] and the per-run [`SessionArgs`]
-/// (PLAN-001 §"claude invocation"). Pure and order-stable so it is unit-testable.
+/// Build the `claude` argv from [`ClaudeSettings`] and the per-run [`SessionArgs`].
+/// Pure and order-stable so it is unit-testable.
 fn build_args(settings: &ClaudeSettings, session_args: &SessionArgs) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-p".to_owned(),
@@ -239,7 +239,7 @@ fn build_args(settings: &ClaudeSettings, session_args: &SessionArgs) -> Vec<Stri
     argv
 }
 
-/// The config-dir environment the child inherits (PLAN-007 §6): the provisioned
+/// The config-dir environment the child inherits: the provisioned
 /// engine config dir exported as both the generic `ENGINE_CONFIG_DIR` (future
 /// engines) and claude's own `CLAUDE_CONFIG_DIR`, so the child resolves the
 /// runner-materialized global instruction file + skills from there. Empty when
@@ -268,7 +268,7 @@ fn precompact_settings_json(settings: &ClaudeSettings) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
-/// Layer the per-session [`SessionCfg::model`] (the task's `model`, OD15) onto
+/// Layer the per-session [`SessionCfg::model`] (the task's `model`) onto
 /// the configured settings for ONE spawn: present → it wins over
 /// `config.engine.model`, absent → the configured model stands untouched
 /// (borrowed, so the common case copies nothing).
@@ -300,7 +300,7 @@ pub(crate) struct ClaudeEngine {
 }
 
 impl ClaudeEngine {
-    /// Construct an engine from explicit settings (used by tests and L3-5).
+    /// Construct an engine from explicit settings (used by tests and the registry).
     pub(crate) fn new(settings: ClaudeSettings) -> Self {
         Self { settings }
     }
@@ -407,7 +407,7 @@ fn spawn_session(
     for (key, value) in &settings.env {
         command.env(key, value);
     }
-    // The provisioned engine config dir (PLAN-007 §6) — both the generic var and
+    // The provisioned engine config dir — both the generic var and
     // claude's own, so the child reads the global instruction file + skills.
     for (key, value) in config_dir_env(settings) {
         command.env(key, value);
@@ -761,7 +761,7 @@ mod tests {
         assert_eq!(&argv[tools + 1..], ["Bash", "Read"]);
     }
 
-    /// D2/OD15: the per-task `model` on the session config wins over the
+    /// D2: the per-task `model` on the session config wins over the
     /// configured `config.engine.model` for that spawn's `--model`, and a
     /// session without one leaves the configured model in place.
     #[test]

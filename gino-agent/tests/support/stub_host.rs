@@ -1,4 +1,4 @@
-//! In-process **stub host** speaking protocol v2 (PLAN-006 §5b).
+//! In-process **stub host** speaking protocol v2.
 //!
 //! A single TCP listener serves both the HTTP enrollment/attachment endpoints and
 //! the persistent WebSocket the runner connects on (the runner derives the WS URL
@@ -230,7 +230,7 @@ struct Model {
     /// served config (both `/agent/register` and `GET /agent/config/:id`) is this
     /// object with the monotonic `config_version` injected as `version`.
     register_config: Value,
-    /// The host-owned, monotonic GLOBAL config version (PLAN-007 §6). Served as
+    /// The host-owned, monotonic GLOBAL config version. Served as
     /// `version` on the config the runner fetches; bumped via
     /// [`StubHost::bump_config_version`] so a restart sees an advanced version.
     config_version: i64,
@@ -281,7 +281,7 @@ impl StubHost {
         let addr = listener.local_addr().expect("stub host local addr");
         let model = Arc::new(Mutex::new(Model {
             register_config: config,
-            // The host assigns a monotonic GLOBAL config version (PLAN-007 §6); it
+            // The host assigns a monotonic GLOBAL config version; it
             // starts at 1 and a restart-bump scenario advances it.
             config_version: 1,
             ..Model::default()
@@ -501,14 +501,14 @@ impl StubHost {
     /// `ConfigOverlay` payload — carry the new desired global `entries` set AND its
     /// advanced `version` here, since the runner gates the live re-reconcile on the
     /// version). The runner re-reconciles the global scope: add / repoint / remove
-    /// converge `engine-config/` without an engine restart (PLAN-007 §6).
+    /// converge `engine-config/` without an engine restart.
     pub async fn push_config_update(&self, config: Value) {
         let frame = json!({ "type": "config_update", "data": config });
         self.send_raw(&frame.to_string()).await;
     }
 
-    /// Monotonically bump the served GLOBAL config version and return the new value
-    /// (PLAN-007 §6). Used by a restart-bump scenario: after the bump, the runner's
+    /// Monotonically bump the served GLOBAL config version and return the new value.
+    /// Used by a restart-bump scenario: after the bump, the runner's
     /// startup `GET /agent/config` sees an advanced version and re-reconciles.
     pub async fn bump_config_version(&self) -> i64 {
         let mut model = self.model.lock().await;
@@ -534,7 +534,7 @@ impl StubHost {
     /// Push a `task_upsert` carrying `data.entries` (task-scope provisioning: the
     /// task instruction file + task skills). The runner persists them onto the
     /// `tasks` row and materializes them per-thread into `<work_dir>/project/`
-    /// (scope = thread id) on the next run (PLAN-007 §3/§5).
+    /// (scope = thread id) on the next run.
     pub async fn push_task_upsert_with_entries(
         &self,
         task_id: &str,
@@ -904,8 +904,8 @@ async fn route_http(req: &HttpRequest, ctx: &ConnCtx) -> Vec<u8> {
             }
         }
         ("GET", _) if path.starts_with("/agent/config/") => {
-            // The runner fetches the AUTHORITATIVE config here at startup (PLAN-007
-            // §6, version gate). Serve the SAME versioned config the register response
+            // The runner fetches the AUTHORITATIVE config here at startup
+            // (version gate). Serve the SAME versioned config the register response
             // carries — version + entries — so a restart re-acquires the desired set.
             let model = ctx.model.lock().await;
             if model.config_offline {
@@ -1136,7 +1136,7 @@ async fn handle_frame(text: &str, ctx: &ConnCtx) -> Option<String> {
 
 /// The config the host serves on `/agent/register` and `GET /agent/config/:id`:
 /// the base `register_config` with the monotonic `config_version` injected as
-/// `version` (PLAN-007 §6). A non-object base is served verbatim (defensive; the
+/// `version`. A non-object base is served verbatim (defensive; the
 /// scenarios always pass an object).
 fn served_config(model: &Model) -> Value {
     let mut config = model.register_config.clone();

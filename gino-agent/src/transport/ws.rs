@@ -1,10 +1,10 @@
-//! Reconnecting WebSocket client (PLAN-003 §2, PLAN-001 `ws.rs`).
+//! Reconnecting WebSocket client.
 //!
 //! A Rust port of the TypeScript runner's [`ws.ts`](../../../container/gino-agent/src/ws.ts):
 //! outbox-backed at-least-once delivery, inbox dedup/replay, capped-backoff
-//! reconnect (the delay is bounded, the attempts never are — P0-2), and (new
-//! here) a periodic heartbeat plus read-liveness detection of half-open sockets
-//! (P2-16). The connection is **outbound only** — the runner always dials the
+//! reconnect (the delay is bounded, the attempts never are), and (new
+//! here) a periodic heartbeat plus read-liveness detection of half-open sockets.
+//! The connection is **outbound only** — the runner always dials the
 //! orchestrator, never the reverse.
 //!
 //! ## Authentication
@@ -23,7 +23,7 @@
 //!   data, outboxId}` envelope from the columns via [`build_envelope`],
 //!   byte-identical to the live send. Between reconnects a flush poke transmits
 //!   only the rows **not yet sent on this connection** (a per-connection
-//!   watermark — P2-16: flushing under ack lag must not retransmit the whole
+//!   watermark: flushing under ack lag must not retransmit the whole
 //!   backlog every time); rows whose acks stall for a full ack window are
 //!   retransmitted in bulk. The host's `ack {id}` marks a row acked.
 //! * **Inbound** — every frame (bar `ack`, and unknown forward-compat frames) is
@@ -77,7 +77,7 @@ pub(crate) const MAX_OUTBOX_RETRIES: i64 = 10;
 /// `tokio::time::interval`, and an absurdly large value would silence liveness.
 const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_HEARTBEAT: Duration = Duration::from_hours(1);
-/// Per-attempt dial bound (P2-16): a black-holed TCP connect (or a peer that
+/// Per-attempt dial bound: a black-holed TCP connect (or a peer that
 /// accepts but never completes the WS handshake) must not stall a reconnect
 /// attempt indefinitely — the backoff loop moves on to the next attempt.
 pub(super) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,7 +118,7 @@ pub(crate) enum WsError {
 }
 
 /// Dial `ws_url`, authenticating with `connect_token` in the `x-internal-token`
-/// header, bounded by `timeout` per attempt (P2-16: a black-holed connect must
+/// header, bounded by `timeout` per attempt (a black-holed connect must
 /// not stall the reconnect loop). Used for both the initial connection and
 /// every reconnect, with [`DIAL_TIMEOUT`].
 pub(super) async fn dial(
@@ -142,8 +142,7 @@ pub(super) async fn dial(
 // ---------------------------------------------------------------------------
 
 /// Owns the connection lifecycle. Built by [`super::Transport::open`] and run on
-/// a spawned task; it never returns until cancelled — reconnect never gives up
-/// (P0-2).
+/// a spawned task; it never returns until cancelled — reconnect never gives up.
 #[derive(Debug)]
 pub(super) struct WsDriver {
     pub(super) ws_url: String,
@@ -202,14 +201,14 @@ impl WsDriver {
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat.tick().await; // consume the immediate first tick
 
-        // Ack-progress check (P2-16): if the oldest transmitted-but-unacked row
+        // Ack-progress check: if the oldest transmitted-but-unacked row
         // is unchanged across two consecutive ticks, retransmit the backlog.
         let mut ack_check = tokio::time::interval(clamp_period(self.ack_timeout));
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ack_check.tick().await;
         let mut stalled_oldest: Option<i64> = None;
 
-        // Read-liveness (P2-16): every heartbeat also sends a WS ping, so a live
+        // Read-liveness: every heartbeat also sends a WS ping, so a live
         // peer produces at least pong traffic; a window with nothing received at
         // all means a half-open socket — tear down instead of waiting for the
         // ~15-minute TCP retransmit timeout.
@@ -334,7 +333,7 @@ impl WsDriver {
 /// Transmit the unacked outbox rows with id above `after_id`, oldest-first,
 /// bumping each transmitted row's retry counter. `after_id = 0` is the full
 /// replay (reconnect / ack-stall retransmit); a flush passes the connection's
-/// send watermark so only fresh rows ship (P2-16). Returns the new watermark —
+/// send watermark so only fresh rows ship. Returns the new watermark —
 /// the highest row id considered. DB read/write errors are logged and skipped;
 /// only a socket send failure propagates (the caller reconnects).
 async fn replay_outbox(
@@ -406,7 +405,7 @@ fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i6
     (envelopes, watermark)
 }
 
-/// Whether ack progress has stalled (P2-16): `stalled` carries the oldest
+/// Whether ack progress has stalled: `stalled` carries the oldest
 /// transmitted-but-unacked row id observed on the previous check; seeing the
 /// SAME id again means the host acked nothing for a full ack window, so the
 /// caller retransmits the backlog. Any progress (a different oldest, or no
@@ -797,7 +796,7 @@ mod tests {
         assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
     }
 
-    /// P2-16 regression: `after_id` makes replay incremental — rows at or below
+    /// Regression: `after_id` makes replay incremental — rows at or below
     /// the send watermark are not rebuilt (so a flush cannot retransmit them),
     /// and the returned watermark advances to the highest row considered.
     #[test]
@@ -834,7 +833,7 @@ mod tests {
         assert_eq!(watermark, 3);
     }
 
-    /// P2-16: the ack-progress check trips only when the SAME oldest
+    /// The ack-progress check trips only when the SAME oldest
     /// transmitted-but-unacked row survives two consecutive checks; acked
     /// progress or untransmitted rows never trip it.
     #[test]
@@ -975,7 +974,7 @@ mod tests {
         assert_eq!(HEARTBEAT_FRAME, r#"{"type":"heartbeat","data":{}}"#);
     }
 
-    /// P1-12 regression: a host-supplied `heartbeatIntervalMs: 0` (or an absurd
+    /// Regression: a host-supplied `heartbeatIntervalMs: 0` (or an absurd
     /// value) is clamped, never handed to `tokio::time::interval` (which panics
     /// on zero).
     #[test]
@@ -989,7 +988,7 @@ mod tests {
         );
     }
 
-    /// P2-16: the read-liveness window is clamped and never drops below two
+    /// The read-liveness window is clamped and never drops below two
     /// heartbeat periods (the guaranteed pong cadence).
     #[test]
     fn read_window_never_undercuts_the_pong_cadence() {
@@ -1017,7 +1016,7 @@ mod tests {
     const MESSAGE_FRAME: &str =
         r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hi"},"msgId":7}"#;
 
-    /// P0-3 regression: delivering the same `msgId` twice stores exactly ONE
+    /// Regression: delivering the same `msgId` twice stores exactly ONE
     /// inbox row and delivers ONE frame; the duplicate is only re-acked (so a
     /// lost `msg_ack` cannot run the same prompt twice).
     #[test]
@@ -1051,7 +1050,7 @@ mod tests {
     const CONFIG_UPDATE_FRAME: &str =
         r#"{"type":"config_update","data":{"engine":{"anthropicApiKey":"sk-new"}},"msgId":11}"#;
 
-    /// P2-19 regression: a `config_update` flows through the SAME at-least-once
+    /// Regression: a `config_update` flows through the SAME at-least-once
     /// pipeline as every other inbound frame — persisted verbatim under its wire
     /// type, acked, and deduped by `msg_id` (a redelivery is re-acked without a
     /// second row) — instead of being silently dropped at the WS layer.
@@ -1085,7 +1084,7 @@ mod tests {
         );
     }
 
-    /// P2-19: a malformed `config_update` (missing its required `data`) follows
+    /// A malformed `config_update` (missing its required `data`) follows
     /// the established dead-letter policy — acked away, never queued — so it
     /// cannot head-of-line-block the stream.
     #[test]
@@ -1112,7 +1111,7 @@ mod tests {
         ));
     }
 
-    /// P1-12 regression: a KNOWN-type frame with a malformed body is acked away
+    /// Regression: a KNOWN-type frame with a malformed body is acked away
     /// (dead-lettered) rather than left unpersisted+unacked, where the host
     /// would resend it forever and head-of-line-block the stream.
     #[test]
@@ -1141,7 +1140,7 @@ mod tests {
         ));
     }
 
-    /// P2-16: a peer that accepts TCP but never completes the WS handshake must
+    /// A peer that accepts TCP but never completes the WS handshake must
     /// not stall a dial attempt past the per-attempt bound.
     #[tokio::test]
     async fn dial_times_out_when_the_handshake_stalls() {

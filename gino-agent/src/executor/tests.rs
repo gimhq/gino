@@ -24,7 +24,7 @@ use crate::provisioning::{BlobFetcher, Provisioner, ProvisioningError};
 use crate::scheduler::{now, to_iso};
 use crate::transport::http::UploadedAttachment;
 
-// -- Deterministic stub engine (PLAN-006 §5b) -----------------------
+// -- Deterministic stub engine -----------------------
 
 /// A scripted engine: each session replays `script` then, if `stall`,
 /// pends forever (drives the inactivity watchdog).
@@ -361,7 +361,7 @@ async fn transcript_kinds_carry_tool_payloads_and_attribution() {
     assert_eq!(msgs[2].parent_tool_use_id.as_deref(), Some("tu-parent"));
 }
 
-// -- P2-16: per-message flush poke streams transcript mid-run --------
+// -- per-message flush poke streams transcript mid-run --------
 
 /// An engine whose session emits one message, BLOCKS until `gate` is
 /// notified, then emits a second message and the result. The test
@@ -406,7 +406,7 @@ impl Session for GatedSession {
     }
 }
 
-/// P2-16 regression: transcript frames reach the host DURING a
+/// Regression: transcript frames reach the host DURING a
 /// multi-message run. Without the executor's per-message flush poke the
 /// first frame would sit in the outbox until after the drain, the gate
 /// would never open, and this test would time out.
@@ -504,7 +504,7 @@ async fn claim_then_running_walk_the_state_machine() {
         "dispatched"
     );
 
-    // P2-18 CAS regression: a second claim on the same (now dispatched)
+    // CAS regression: a second claim on the same (now dispatched)
     // thread loses — exactly one claimer ever drives a pending row.
     assert!(
         exec.claim(&thread).unwrap().is_none(),
@@ -555,7 +555,7 @@ async fn runner_failure_retries_while_attempts_remain() {
 
 #[tokio::test]
 async fn success_prose_is_never_classified() {
-    // P2-14 regression: a successful turn whose text happens to contain
+    // Regression: a successful turn whose text happens to contain
     // error-looking prose ("took 1500ms", "400") stays a success — the
     // classifier never sees result text.
     let db = test_db();
@@ -618,7 +618,7 @@ async fn agent_failure_does_not_retry() {
 
 #[tokio::test]
 async fn prose_false_positives_no_longer_poison_the_session() {
-    // P2-14 regression: error prose containing "400" (or timing text
+    // Regression: error prose containing "400" (or timing text
     // like "took 1500ms") used to substring-classify as
     // runner.invalid_request / agent.provider_server_error, discarding
     // a healthy engine_session_id. With no structured cause the reason
@@ -981,7 +981,7 @@ async fn interrupt_settles_the_running_thread_cancelled() {
     let row = handle.await.unwrap();
     assert_eq!(row.status, "cancelled");
     assert!(row.failure_reason.is_none(), "cancel is not a failure");
-    // P2-17 policy: the engine never settled, so the turn was hard-killed
+    // Policy: the engine never settled, so the turn was hard-killed
     // and the unverified resume handle is dropped.
     assert!(
         row.engine_session_id.is_none(),
@@ -992,7 +992,7 @@ async fn interrupt_settles_the_running_thread_cancelled() {
     assert_eq!(res[0].status, ThreadStatus::Cancelled);
 }
 
-/// P2-17: a cancelled turn whose engine settles gracefully (its own
+/// A cancelled turn whose engine settles gracefully (its own
 /// `result` arrives inside the post-cancel drain window) KEEPS the
 /// verified resume handle instead of dropping it.
 #[tokio::test]
@@ -1087,7 +1087,7 @@ async fn cancelled_turn_that_settles_gracefully_keeps_the_resume_handle() {
     );
 }
 
-/// P1-6 regression: a daemon shutdown while a run is active cancels the
+/// Regression: a daemon shutdown while a run is active cancels the
 /// run through the same path as a host interrupt (bounded drain — no
 /// `running_timeout` wait) and stops the pending drain from starting new
 /// runs (the still-pending threads re-run on the next boot).
@@ -1151,7 +1151,7 @@ async fn shutdown_cancels_the_active_run_and_stops_the_drain() {
     );
 }
 
-/// P2-19 regression: with the inactivity watchdog DISABLED (config 0) a
+/// Regression: with the inactivity watchdog DISABLED (config 0) a
 /// silent engine must still be bounded by the total-time watchdog on wall
 /// clock — the old code only evaluated it on event arrival, wedging the
 /// serial execution plane forever.
@@ -1213,7 +1213,7 @@ async fn seq_continues_across_runs_via_persisted_last_seq() {
         false,
         no_inactivity(),
     );
-    // Claim is a CAS on `pending` (P2-18), and the drain plane only
+    // Claim is a CAS on `pending`, and the drain plane only
     // ever runs pending rows — a shared re-fire re-pends first (the
     // scheduler's repend_shared_thread), mirrored here.
     let mut resumed = lock(&db).get_thread("th-seq").unwrap().unwrap();
@@ -1232,7 +1232,7 @@ async fn seq_continues_across_runs_via_persisted_last_seq() {
     );
 }
 
-/// P1-8 regression: finalize commits the terminal thread row and its
+/// Regression: finalize commits the terminal thread row and its
 /// `thread_result` outbox frame in ONE transaction — they appear
 /// together or not at all. A failure enqueuing the frame (forced by
 /// dropping the outbox table) must roll the terminal persist back too,
@@ -1256,7 +1256,7 @@ async fn finalize_commits_thread_state_and_result_frame_atomically() {
     assert_eq!(returned.status, "succeeded", "the run itself concluded");
 
     // NOT terminal in the DB: the terminal persist rolled back with the
-    // failed enqueue (previously it committed alone — the P1-8 defect).
+    // failed enqueue (previously it committed alone — the defect).
     let persisted = lock(&db).get_thread("th-atomic").unwrap().unwrap();
     assert_eq!(
         persisted.status, "running",
@@ -1429,7 +1429,7 @@ async fn attachments_round_trip_onto_thread_result_without_bytes_in_frames() {
     assert_eq!(atts[0].sha256, sha256_hex(&output_bytes));
     assert_eq!(atts[0].reference, "/agent/attachments/att-0");
 
-    // CRITICAL (PLAN-005 risk 1): bytes NEVER ride a frame. No outbox
+    // CRITICAL: bytes NEVER ride a frame. No outbox
     // payload (thread_message or thread_result) contains the raw bytes.
     for row in lock(&db).list_unacked_outbox().unwrap() {
         assert!(
@@ -1445,7 +1445,7 @@ async fn attachments_round_trip_onto_thread_result_without_bytes_in_frames() {
     }
 }
 
-// -- Per-task model override (align-2026-08 D2, OD15) ---------------
+// -- Per-task model override (align-2026-08 D2) ---------------
 
 /// An engine that logs the per-session model of every spawn, then replays a
 /// trivial successful run. Lets a test assert what `run_thread` hands the
@@ -1521,7 +1521,7 @@ async fn task_model_overrides_the_configured_model_at_spawn() {
     );
 }
 
-// -- Per-thread task provisioning (PLAN-007 §3/§6) ------------------
+// -- Per-thread task provisioning ------------------
 
 /// An engine that records the `cwd` it is launched with, then replays a
 /// trivial successful run. Lets a test assert where `run_thread` points the
@@ -1579,7 +1579,7 @@ impl BlobFetcher for OneBlob {
 
 /// Build an executor + provisioning rig over one desired `task-1` entry
 /// (`task-claude` → `CLAUDE.md` with `bytes`), returning the handles the
-/// P1-11 regression tests inspect.
+/// Regression tests inspect.
 fn provisioning_rig(
     db: &Arc<Mutex<Db>>,
     ws: &std::path::Path,
@@ -1612,7 +1612,7 @@ fn provisioning_rig(
 }
 
 /// With the provisioning rig wired, a run materializes the task scope into
-/// `work_dir/project/` (scope = task id, P1-11), creates the isolated
+/// `work_dir/project/` (scope = task id), creates the isolated
 /// `project/workspace/` git area, and launches the engine with cwd=`project/`.
 #[tokio::test]
 async fn provisioned_run_materializes_task_scope_in_project_dir() {
@@ -1682,13 +1682,13 @@ async fn provisioned_run_materializes_task_scope_in_project_dir() {
         "CLAUDE.md must be a symlink into the store"
     );
     assert_eq!(std::fs::read(&link).unwrap(), bytes);
-    // P1-11: nothing is scoped by thread id, and the isolated run's terminal
+    // Nothing is scoped by thread id, and the isolated run's terminal
     // cleanup already released the task scope — the manifest is empty.
     assert!(lock(&db).list_config_entries("th-prov").unwrap().is_empty());
     assert!(lock(&db).list_all_config_entries().unwrap().is_empty());
 }
 
-/// P1-11 regression (accumulation): two successive isolated fires of the
+/// Regression (accumulation): two successive isolated fires of the
 /// same task reconcile and then release the SAME task-id scope — no
 /// `config_entries` rows pile up (the old thread-id scoping left one
 /// immortal row set per fire), and the second fire hits the store instead
@@ -1714,7 +1714,7 @@ async fn successive_isolated_fires_do_not_accumulate_config_entries() {
     assert_eq!(blob.fetch_count(), 1, "store hit must skip the re-fetch");
 }
 
-/// P1-11 regression (replace semantics): rows are keyed by TASK id — a
+/// Regression (replace semantics): rows are keyed by TASK id — a
 /// shared thread parks `active` (non-terminal), so its scope survives —
 /// and a later fire of the same task repoints the one row per target
 /// (`UNIQUE(scope, target)`) at its fresh `project/` tree instead of
@@ -1761,7 +1761,7 @@ async fn task_scope_rows_replace_across_fires() {
     );
 }
 
-/// P1-11 regression (terminal cleanup unroots repair + GC): once a thread
+/// Regression (terminal cleanup unroots repair + GC): once a thread
 /// is terminal its scope rows are gone, so startup repair does NOT rebuild
 /// the dead thread's symlink tree (no re-fetch either) and a subsequent GC
 /// removes the now-unreferenced store entry.
@@ -1850,9 +1850,9 @@ async fn unprovisioned_run_keeps_cwd_at_work_dir() {
     );
 }
 
-// -- Shutdown/cancel child-kill path (P1-6) --------------------------
+// -- Shutdown/cancel child-kill path --------------------------
 
-/// P1-6 regression, against the REAL Claude engine plumbing: an engine
+/// Regression, against the REAL Claude engine plumbing: an engine
 /// child that ignores the graceful interrupt is killed once the
 /// post-cancel drain window expires — it must not keep executing past the
 /// cancelled turn. Linux-only: child liveness is observed via `/proc`.

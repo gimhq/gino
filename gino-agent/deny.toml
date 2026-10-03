@@ -1,8 +1,7 @@
 # cargo-deny supply-chain policy for `gino-agent`.
 #
-# rustls-only TLS posture (PLAN-003 / PMA-Rust Lock 1 & 2): openssl and
-# native-tls are banned outright so no later change can pull a C TLS stack into
-# the tree. Security advisories are denied by default.
+# TLS is rustls-only: openssl and native-tls are banned. Security advisories are
+# denied by default.
 
 [advisories]
 # A transiently-yanked transitive crate should not flake CI; real advisories are
@@ -14,8 +13,7 @@ ignore = []
 # This crate is unpublished (`publish = false`); skip the license check for it.
 private = { ignore = true }
 confidence-threshold = 0.93
-# The allow-list is intentionally a permissive superset so later changes can add
-# dependencies without editing policy; don't warn on as-yet-unused entries.
+# The allow-list is a permissive superset; unused entries do not warn.
 unused-allowed-license = "allow"
 # Permissive licenses only. Add a new entry only after a deliberate review.
 allow = [
@@ -38,10 +36,10 @@ allow = [
 multiple-versions = "warn"
 wildcards = "deny"
 deny = [
-    { name = "openssl", reason = "rustls only (PLAN-003 / Lock 1)" },
-    { name = "openssl-sys", reason = "rustls only (PLAN-003 / Lock 1)" },
-    { name = "native-tls", reason = "rustls only (PLAN-003 / Lock 1)" },
-    { name = "native-tls-sys", reason = "rustls only (PLAN-003 / Lock 1)" },
+    { name = "openssl", reason = "rustls only" },
+    { name = "openssl-sys", reason = "rustls only" },
+    { name = "native-tls", reason = "rustls only" },
+    { name = "native-tls-sys", reason = "rustls only" },
 ]
 
 [sources]

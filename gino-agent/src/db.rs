@@ -1,4 +1,4 @@
-//! Local persistence layer — v2 data model (PLAN-006 §2/§3-A, agent-architecture §3).
+//! Local persistence layer — v2 data model (A, agent-architecture §3).
 //!
 //! A single SQLite database (rusqlite, bundled) holding the runner's durable
 //! state. The path is **configurable** — it comes from [`crate::config`]
@@ -22,7 +22,7 @@
 //! (routing); the `payload` stays an opaque JSON blob (agent-architecture §8).
 //! `identity` is unchanged.
 //!
-//! ## v1 strangler removal (PLAN-006 §4)
+//! ## v1 strangler removal
 //!
 //! The v1 strangler surface is gone now that v2 is the only live path: the
 //! `session_state` table (the engine session id moved to
@@ -32,9 +32,9 @@
 //! (`prompt`/`schedule_type`/`schedule_value`/`context_mode`/`next_run`/
 //! `last_run`/`last_result`/`dirty`) and the `TaskRecord` CRUD that drove them — is
 //! gone too: it existed only for the cancelled in-runner tool server, superseded by
-//! skills provisioning (PLAN-007, campaign l1-03ce6ctr). The `tasks` table now
+//! skills provisioning (campaign l1-03ce6ctr). The `tasks` table now
 //! holds the v2 entity columns (`id`, `name`, `kind`, `status`, `created_at`,
-//! `updated_at`) plus the `entries` provisioning column (PLAN-007 §5), driven by
+//! `updated_at`) plus the `entries` provisioning column, driven by
 //! [`TaskRow`] + the `set_task_entries`/`get_task_entries` accessors.
 //!
 //! The module keeps a `#[allow(dead_code)]` at its `mod db;` site in `lib.rs` for
@@ -68,7 +68,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
-// Schema migration ladder (audit P2-18)
+// Schema migration ladder
 // ---------------------------------------------------------------------------
 //
 // The schema is versioned through `PRAGMA user_version` and [`Db::migrate`]
@@ -77,7 +77,7 @@ use thiserror::Error;
 // atomically, so a crash mid-ladder resumes at the incomplete step. The former
 // single CREATE-IF-NOT-EXISTS blob could not evolve an existing DB — a column
 // added to a CREATE TABLE (`inbox.msg_id`, `thread_attachments`) simply never
-// appeared in a pre-existing file and every read/write of it broke (P2-18).
+// appeared in a pre-existing file and every read/write of it broke.
 //
 // DECISION: an unversioned DB (`user_version = 0`) that already has tables is
 // treated as the v1 baseline — the last CREATE-only shape (pre-campaign).
@@ -282,8 +282,8 @@ CREATE TABLE IF NOT EXISTS thread_attachments (
 
 /// Step v2 → v3: drop legacy thread-scoped provisioning-manifest rows.
 ///
-/// `config_entries.scope` re-keyed from `<thread_id>` to `<task_id>` (audit
-/// P1-11); rows written under the old scoping are dead — no reconcile or GC
+/// `config_entries.scope` re-keyed from `<thread_id>` to `<task_id>`;
+/// rows written under the old scoping are dead — no reconcile or GC
 /// path ever matches them again. DECISION: delete rather than translate — the
 /// manifest is rebuildable provisioning state (the next fire's reconcile
 /// re-materializes its scope from the desired set), and the old thread-scoped
@@ -292,7 +292,7 @@ CREATE TABLE IF NOT EXISTS thread_attachments (
 const MIGRATE_V3_SCOPE_CLEANUP: &str = "DELETE FROM config_entries WHERE scope <> 'global';";
 
 /// Step v3 → v4: the task-definition columns the host has always sent on
-/// `task_upsert` (protocol.md §7 `{engine?, model?, workdir?, meta?}`, OD15) and
+/// `task_upsert` (protocol.md §7 `{engine?, model?, workdir?, meta?}`) and
 /// the runner used to discard (align-2026-08 D2). All four are nullable with no
 /// default, so existing rows migrate to "unset" and the omission-preserves rule
 /// in `apply_task_def` reads NULL as "the host never told us".
@@ -314,12 +314,12 @@ const MIGRATIONS: [&str; 4] = [
 /// The per-connection pragma preamble. WAL for concurrent read/write; a busy
 /// timeout to ride out brief locks; `foreign_keys` because SQLite ships FK
 /// enforcement OFF per connection while this schema declares — and the code
-/// assumes — live REFERENCES (audit P2-19). (On an in-memory DB the WAL pragma
+/// assumes — live REFERENCES. (On an in-memory DB the WAL pragma
 /// simply reports `memory`; it is a harmless no-op there.)
 const PRAGMAS: &str =
     "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 3000; PRAGMA foreign_keys = ON;";
 
-/// `config_meta` key holding the last APPLIED global config version (PLAN-007 §6).
+/// `config_meta` key holding the last APPLIED global config version.
 const APPLIED_GLOBAL_VERSION_KEY: &str = "applied_global_config_version";
 
 /// Errors raised by the persistence layer.
@@ -431,7 +431,7 @@ pub(crate) struct InboxRow {
 /// "session" is not here; per-execution state lives on [`ThreadRow`].
 ///
 /// `engine`/`model`/`workdir`/`meta` are the host-authored task DEFINITION
-/// (protocol.md §7 `task_upsert`, OD15). All four are `Option` because the host
+/// (protocol.md §7 `task_upsert`). All four are `Option` because the host
 /// may push a partial definition and because rows predating the v4 ladder step
 /// carry NULL; `None` therefore means "never told", not "cleared".
 #[derive(Clone, Debug, PartialEq)]
@@ -543,8 +543,8 @@ pub(crate) struct CronLogRow {
 }
 
 /// A `config_entries` row — the **installed manifest + store-refcount index**
-/// for one provisioned config/skill artifact (agent-architecture §3/§9b,
-/// PLAN-007 §4). It records *what is materialized where*, not the bytes: the
+/// for one provisioned config/skill artifact (agent-architecture §3/§9b).
+/// It records *what is materialized where*, not the bytes: the
 /// content lives in the filesystem store and the desired set lives in config
 /// (global) / `tasks.entries` (task). `id` is auto-assigned by SQLite.
 #[derive(Clone, Debug, PartialEq)]
@@ -570,7 +570,7 @@ pub(crate) struct ConfigEntryRow {
     pub(crate) installed_at: String,
 }
 
-/// The persisted runner identity (PLAN-003 §2.1). The token is held as a
+/// The persisted runner identity. The token is held as a
 /// `SecretString` so it is redacted in `Debug`/log output.
 #[derive(Clone, Debug)]
 pub(crate) struct Identity {
@@ -585,7 +585,7 @@ pub(crate) struct Identity {
 /// The runner's SQLite store. Owns one connection; all access is through cached
 /// prepared statements.
 ///
-/// DECISION (P2-15, execution placement): every rusqlite call on this type runs
+/// DECISION (execution placement): every rusqlite call on this type runs
 /// inline on the calling thread — often a tokio async worker — rather than
 /// through `spawn_blocking`. This is deliberate. Current posture: statements
 /// are short point-indexed reads/writes on a WAL database with a single writer
@@ -611,7 +611,7 @@ impl Db {
     /// Open (creating if absent) the database at `path` and migrate it to
     /// [`SCHEMA_VERSION`] — the **daemon** open path.
     ///
-    /// DECISION (P2-18 open-path split): this migrating open is reserved for
+    /// DECISION (open-path split): this migrating open is reserved for
     /// the daemon startup (which holds the single-instance lock); short-lived
     /// CLI invocations go through [`Self::open_existing`], which never
     /// migrates, so a mismatched CLI binary cannot rewrite the schema under a
@@ -724,7 +724,7 @@ impl Db {
     /// Run `f` inside one `BEGIN IMMEDIATE` transaction on the shared connection:
     /// every write `f` makes commits atomically, and any error rolls the whole
     /// batch back (the [`rusqlite::Transaction`] drop is a rollback). This is the
-    /// result-plane atomicity primitive (P1-8/P2-13): the scheduler wraps a whole
+    /// result-plane atomicity primitive: the scheduler wraps a whole
     /// cron fire in it and the executor wraps the terminal persist+enqueue pair.
     ///
     /// The caller must hold the global DB mutex for the duration of the call
@@ -1129,7 +1129,7 @@ impl Db {
     /// scheduling columns (`next_run`, `last_fired_at`, `run_count`, `status`,
     /// `updated_at`), guarded by `status = 'active'` so a `cron_delete` /
     /// `cron_upsert` that landed after the scheduler's tick-read is never
-    /// overwritten by stale full-row state (P2-13 — a deleted cron must not be
+    /// overwritten by stale full-row state (a deleted cron must not be
     /// resurrected). Returns `false` when the guard rejected the advance (the
     /// cron is gone or no longer active).
     pub(crate) fn advance_cron(
@@ -1290,7 +1290,7 @@ impl Db {
         Ok(())
     }
 
-    /// CAS-claim a pending thread (audit P2-18): `pending → dispatched`,
+    /// CAS-claim a pending thread: `pending → dispatched`,
     /// stamping the attempt's `started_at` and the assigned `work_dir`, guarded
     /// by `status = 'pending'`. Returns `false` when the guard rejected the
     /// claim — the row is gone, already claimed (a concurrent claimer won), or
@@ -1634,7 +1634,7 @@ impl Db {
     // -- Task entries (v2 task DESIRED provisioning set) -------------------
 
     /// Set (or clear, with `None`) a task's `entries` column — the JSON array of
-    /// its desired provisioning entries (PLAN-007 §5). Kept off [`TaskRow`] so the
+    /// its desired provisioning entries. Kept off [`TaskRow`] so the
     /// existing v2 task CRUD sites stay untouched; the host pushes this via
     /// `task_upsert.data.entries`.
     pub(crate) fn set_task_entries(
@@ -1694,7 +1694,7 @@ impl Db {
         Ok(json)
     }
 
-    // -- Queue GC (retention sweep, audit P1-9) ------------------------------
+    // -- Queue GC (retention sweep) ------------------------------
     //
     // Each method deletes ONE bounded batch (`LIMIT` inside an `id IN (…)`
     // subquery — SQLite's portable DELETE…LIMIT form) so a caller can sweep a
@@ -1780,7 +1780,7 @@ impl Db {
         Ok(deleted)
     }
 
-    // -- Identity (PLAN-003 §2.1) ------------------------------------------
+    // -- Identity ------------------------------------------
 
     /// Persist (or replace) the runner identity: the host-generated `agent_id`
     /// and the negotiated connect token. The token crosses in as a
@@ -1816,7 +1816,7 @@ impl Db {
         }))
     }
 
-    // -- Config meta (applied-config bookkeeping, PLAN-007 §6) --------------
+    // -- Config meta (applied-config bookkeeping) --------------
 
     /// Upsert a `config_meta` KV entry (durable across restarts).
     pub(crate) fn set_config_meta(&self, key: &str, value: &str) -> DbResult<()> {
@@ -1840,8 +1840,8 @@ impl Db {
     }
 
     /// Persist the APPLIED global config version — the desired-set version the
-    /// startup/`config_update` reconcile last converged the global scope to
-    /// (PLAN-007 §6). The version gate compares the host's served version against
+    /// startup/`config_update` reconcile last converged the global scope to.
+    /// The version gate compares the host's served version against
     /// this to decide reconcile (advanced) vs. repair-only (unchanged).
     pub(crate) fn set_applied_global_version(&self, version: i64) -> DbResult<()> {
         self.set_config_meta(APPLIED_GLOBAL_VERSION_KEY, &version.to_string())
@@ -2037,7 +2037,7 @@ mod tests {
         assert!(db.get_task_row("t-1").unwrap().is_some());
     }
 
-    /// P2-18 regression: a legacy unversioned DB (pre-campaign shape) used to
+    /// Regression: a legacy unversioned DB (pre-campaign shape) used to
     /// break on every read/write of the later-added `inbox.msg_id` column and
     /// `thread_attachments` table. The ladder must step it to latest with its
     /// data intact, after which the daemon paths work.
@@ -2088,8 +2088,8 @@ mod tests {
         assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 2);
     }
 
-    /// The v3 data step: `config_entries.scope` re-keyed thread-id → task-id
-    /// (P1-11), so legacy thread-scoped manifest rows are dead scopes and are
+    /// The v3 data step: `config_entries.scope` re-keyed thread-id → task-id,
+    /// so legacy thread-scoped manifest rows are dead scopes and are
     /// removed by the migration; the global scope survives.
     #[test]
     fn migration_removes_legacy_thread_scoped_config_entries() {
@@ -2114,7 +2114,7 @@ mod tests {
         assert_eq!(rows[0].scope, "global");
     }
 
-    /// P2-19 regression: SQLite ships `PRAGMA foreign_keys` OFF per connection;
+    /// Regression: SQLite ships `PRAGMA foreign_keys` OFF per connection;
     /// every open path must switch it on so the schema's REFERENCES (which the
     /// code assumes are live) are actually enforced.
     #[test]
@@ -2206,7 +2206,7 @@ mod tests {
         assert_eq!(db.list_tasks().unwrap(), vec![row]);
     }
 
-    /// P2-18: the daemon refuses a database written by a newer binary rather
+    /// The daemon refuses a database written by a newer binary rather
     /// than corrupting a schema it does not understand.
     #[test]
     fn daemon_open_refuses_a_newer_schema() {
@@ -2224,7 +2224,7 @@ mod tests {
         ));
     }
 
-    /// P2-18: the CLI open path ([`Db::open_existing`]) neither creates nor
+    /// The CLI open path ([`Db::open_existing`]) neither creates nor
     /// migrates — a missing file and a version mismatch both fail fast, and a
     /// mismatched file is left byte-identical (only the daemon migrates).
     #[test]
@@ -2258,7 +2258,7 @@ mod tests {
         assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
     }
 
-    /// P2-18 regression: claiming a pending thread is a CAS — of two claims on
+    /// Regression: claiming a pending thread is a CAS — of two claims on
     /// one pending row, exactly one wins.
     #[test]
     fn claim_pending_thread_is_a_cas() {
@@ -2394,7 +2394,7 @@ mod tests {
         assert!(db.list_active_crons().unwrap().is_empty());
     }
 
-    /// P2-13 regression: advancing a fired cron is a targeted UPDATE guarded on
+    /// Regression: advancing a fired cron is a targeted UPDATE guarded on
     /// `status = 'active'` — a cron deleted (soft-cancelled) or completed after
     /// the scheduler's tick-read is left untouched, never resurrected.
     #[test]
@@ -2457,7 +2457,7 @@ mod tests {
 
     /// The transactional-plane primitive: writes inside
     /// [`Db::immediate_transaction`] commit together, and an error inside the
-    /// closure rolls every one of them back (P1-8/P2-13).
+    /// closure rolls every one of them back.
     #[test]
     fn immediate_transaction_commits_together_or_not_at_all() {
         let db = Db::open_in_memory().unwrap();
@@ -2949,7 +2949,7 @@ mod tests {
         assert_eq!(db.list_inbox_by_type("message").unwrap().len(), 1);
     }
 
-    /// P0-3 regression: the `msg_id` UNIQUE column dedups an at-least-once
+    /// Regression: the `msg_id` UNIQUE column dedups an at-least-once
     /// redelivery — the second insert of the same delivery id is a no-op
     /// (`None`), leaving exactly ONE row; frames without a `msg_id` are never
     /// deduped (multiple NULLs allowed).
@@ -3041,7 +3041,7 @@ mod tests {
         assert!(db.list_inbox_by_type("user_message").unwrap().is_empty());
     }
 
-    // -- Queue GC (retention sweep, audit P1-9) -----------------------------
+    // -- Queue GC (retention sweep) -----------------------------
 
     /// Rewrite a DB-defaulted timestamp column so the row is `days` old.
     fn age_row(db: &Db, table: &str, column: &str, id: i64, days: u32) {
@@ -3271,7 +3271,7 @@ mod tests {
         assert_eq!(rotated.connect_token.expose_secret(), "rotated-secret");
     }
 
-    // -- v2: config meta (applied global version, PLAN-007 §6) -------------
+    // -- v2: config meta (applied global version) -------------
 
     #[test]
     fn applied_global_version_persists_and_upserts_across_reopen() {
@@ -3302,7 +3302,7 @@ mod tests {
         assert_eq!(db.get_config_meta("nope").unwrap().as_deref(), Some("yes"));
     }
 
-    // -- file permission hardening (P1-7) -----------------------------------
+    // -- file permission hardening -----------------------------------
 
     #[cfg(unix)]
     fn mode_of(path: &std::path::Path) -> u32 {

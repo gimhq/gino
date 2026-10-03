@@ -1,4 +1,4 @@
-//! Outbound transport (PLAN-003 §2, PLAN-001 `ws.rs`).
+//! Outbound transport.
 //!
 //! The runner dials *out* — to be NAT/firewall friendly the orchestrator never
 //! connects to us. This module owns that outbound side:
@@ -7,8 +7,8 @@
 //!   `GET /agent/config/:id`, and the `POST /agent/output/:id` fallback.
 //! * [`ws`] — the reconnecting `tokio-tungstenite` client with outbox-backed
 //!   at-least-once delivery, inbox dedup/replay, capped-backoff reconnect (the
-//!   delay is bounded, the attempts are not — P0-2), a periodic heartbeat, and
-//!   read-liveness detection of half-open sockets (P2-16).
+//!   delay is bounded, the attempts are not), a periodic heartbeat, and
+//!   read-liveness detection of half-open sockets.
 //!
 //! [`Transport`] is the engine-agnostic facade over the WS side: it works purely
 //! on [`crate::protocol::v2`] frames and the [`crate::db`] outbox/inbox, so the
@@ -59,11 +59,11 @@ use self::ws::WsDriver;
 /// Default liveness ping cadence. The TS runner sent no heartbeat; the Rust
 /// runner adds one so a silently dead half-open socket is noticed promptly.
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
-/// Default read-liveness window (P2-16): three heartbeat periods with nothing
+/// Default read-liveness window: three heartbeat periods with nothing
 /// received (each heartbeat also sends a WS ping, so a live peer's pongs keep
 /// arriving even when the host has no frames to send).
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(90);
-/// Default ack-progress window (P2-16): transmitted outbox rows that see no ack
+/// Default ack-progress window: transmitted outbox rows that see no ack
 /// progress for a full window are retransmitted over the live socket.
 const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -73,7 +73,7 @@ const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Reconnect backoff schedule: exponential from `base`, capped at `max`. The
 /// TS runner gave up after 60 consecutive failures; this runner never does
-/// (P0-2, spec §1: the daemon must outlive any host outage) — only the delay
+/// (spec §1: the daemon must outlive any host outage) — only the delay
 /// is bounded, never the attempts.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BackoffConfig {
@@ -107,12 +107,12 @@ impl BackoffConfig {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TransportConfig {
     pub(crate) heartbeat: Duration,
-    /// Read-liveness window (P2-16): when nothing at all (data or pong) arrives
+    /// Read-liveness window: when nothing at all (data or pong) arrives
     /// within it, the connection is treated as dead and redialed. The effective
     /// window never drops below two heartbeat periods, so a slow-heartbeat
     /// configuration cannot starve itself of the pongs it solicits.
     pub(crate) read_timeout: Duration,
-    /// Ack-progress window (P2-16): already-transmitted outbox rows whose acks
+    /// Ack-progress window: already-transmitted outbox rows whose acks
     /// make no progress for a full window are retransmitted on the live socket
     /// (flushes alone never resend them — see [`Transport::flush_handle`]).
     pub(crate) ack_timeout: Duration,
@@ -164,7 +164,7 @@ impl Transport {
     /// `x-internal-token` header) **in the background**, drains the outbox, dedups
     /// the inbox, reconnects with capped backoff, and heartbeats. Returns
     /// immediately — the daemon boots and serves local work while the host is
-    /// unreachable (P0-2); outbound frames queue durably in the outbox and replay
+    /// unreachable; outbound frames queue durably in the outbox and replay
     /// once a connection is up.
     pub(crate) fn open(
         ws_url: String,
@@ -200,7 +200,7 @@ impl Transport {
     /// rows **not yet sent on the current connection**. The executor/scheduler
     /// enqueue result-plane frames straight to the durable outbox and poke this so
     /// those frames stream out promptly instead of waiting for the next reconnect.
-    /// A flush never resends already-transmitted rows (P2-16: flushing under ack
+    /// A flush never resends already-transmitted rows (flushing under ack
     /// lag used to be O(n²)); full retransmission happens only on reconnect or
     /// when ack progress stalls for a whole ack window — the host dedups on
     /// `(thread_id, seq)` either way.
@@ -209,7 +209,7 @@ impl Transport {
     }
 
     /// Await the next inbound frame. Returns `None` once the manager task has
-    /// stopped — which reconnect never causes (P0-2); only shutdown (or an
+    /// stopped — which reconnect never causes; only shutdown (or an
     /// unexpected task death) closes the channel.
     pub(crate) async fn recv(&mut self) -> Option<Inbound> {
         self.inbound_rx.recv().await
@@ -227,7 +227,7 @@ impl Transport {
 /// The manager task body: dial the *first* connection here — in the background,
 /// retrying forever with capped backoff — then hand it to the driver's
 /// serve/reconnect loop. Only a shutdown cancel ends the task; an unreachable
-/// host never does (P0-2), so the daemon boots and runs regardless.
+/// host never does, so the daemon boots and runs regardless.
 async fn run_manager(mut driver: WsDriver) {
     let initial = loop {
         let dialed = tokio::select! {
@@ -353,7 +353,7 @@ impl Cancel {
 // ---------------------------------------------------------------------------
 
 /// Stateful reconnect backoff. [`Self::next_delay`] yields the delay before the
-/// next attempt — always `Some`, since the retry ceiling was removed (P0-2:
+/// next attempt — always `Some`, since the retry ceiling was removed (
 /// reconnect never gives up; the `Option` shape is kept for the driver's call
 /// sites). [`Self::reset`] is called after a successful (re)connect.
 #[derive(Debug)]
@@ -405,7 +405,7 @@ mod tests {
 
     // -- pure helpers ------------------------------------------------------
 
-    /// P0-2 regression: the delay schedule keeps the TS shape (exponential,
+    /// Regression: the delay schedule keeps the TS shape (exponential,
     /// 10 s cap) but never exhausts — the old `max_retries: 60` ceiling turned
     /// a ~10 min host outage into a daemon exit.
     #[test]
@@ -731,7 +731,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P0-3 regression, end to end: the host redelivers the same `msgId` (as it
+    /// Regression, end to end: the host redelivers the same `msgId` (as it
     /// does after a lost `msg_ack`) — both deliveries are msg_acked, but exactly
     /// ONE inbox row exists and exactly ONE frame reaches the consumer.
     #[tokio::test]
@@ -783,7 +783,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P1-12 regression: a host-supplied heartbeat interval of ZERO must not
+    /// Regression: a host-supplied heartbeat interval of ZERO must not
     /// panic the transport task — the driver clamps it and keeps serving.
     #[tokio::test]
     async fn zero_heartbeat_interval_does_not_panic_the_driver() {
@@ -824,7 +824,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P0-2 regression: opening the transport against an unreachable host must
+    /// Regression: opening the transport against an unreachable host must
     /// not fail or block — the daemon side stays fully functional (frames
     /// enqueue durably) and the manager task keeps dialing instead of exiting.
     #[tokio::test]
@@ -865,7 +865,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P0-2 regression: the transport survives a failure window far past the
+    /// Regression: the transport survives a failure window far past the
     /// old 60-retry budget, then — once the host comes up — establishes the
     /// connection and flushes the pending outbox as on any reconnect.
     #[tokio::test]
@@ -927,7 +927,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P2-16 regression: under ack lag a flush transmits ONLY the rows not yet
+    /// Regression: under ack lag a flush transmits ONLY the rows not yet
     /// sent on this connection (the old driver replayed the entire unacked
     /// outbox on every flush — O(n²)); a reconnect still replays everything
     /// unacked.
@@ -1034,7 +1034,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P2-16: a half-open connection — the peer completes the handshake and
+    /// A half-open connection — the peer completes the handshake and
     /// then goes completely silent, never reading or writing — is detected by
     /// the read-liveness window and redialed (the old write-only heartbeat left
     /// this to the ~15-minute TCP retransmit timeout).
@@ -1077,7 +1077,7 @@ mod tests {
         transport.shutdown().await;
     }
 
-    /// P2-16: when ack progress stalls for a full ack window on a live
+    /// When ack progress stalls for a full ack window on a live
     /// connection, the transmitted backlog is retransmitted — the at-least-once
     /// safety valve that incremental flushing removed from the per-flush path.
     #[tokio::test]

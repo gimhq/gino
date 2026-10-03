@@ -1,4 +1,4 @@
-//! Managed thread executor (PLAN-003 §5, PLAN-006 §3-D).
+//! Managed thread executor (D).
 //!
 //! The runner's execution plane is the [`ThreadExecutor`]: a **source-agnostic
 //! pending-thread drainer** (agent-architecture §5/§6/§8) that claims `threads`
@@ -94,7 +94,7 @@ pub(crate) fn task_parked(db: &Mutex<Db>, task_id: &str) -> bool {
     }
 }
 
-/// The per-task model override (OD15) for `task_id`, or `None` when the task
+/// The per-task model override for `task_id`, or `None` when the task
 /// has none — then the engine keeps the globally configured `config.engine.model`.
 /// A missing row (task rows are seeded lazily) and a lookup failure both answer
 /// `None`: an unreadable definition must degrade to the global model, never fail
@@ -162,7 +162,7 @@ pub(crate) enum Continuity {
 /// ("kill only when the engine emits no events"). The total-time budget is
 /// enforced on wall clock inside the run (the event wait is bounded by the
 /// remaining budget), so a silent engine cannot wedge the serial plane even
-/// with the inactivity watchdog disabled (P2-19).
+/// with the inactivity watchdog disabled.
 #[derive(Clone, Copy, Debug)]
 // The shared `_timeout` suffix is the meaningful distinction here (vs a count);
 // dropping it would make `watchdog.running`/`dispatched` ambiguous at use sites.
@@ -176,7 +176,7 @@ pub(crate) struct WatchdogCfg {
     /// disables the in-run inactivity watchdog (the total-time budget still
     /// bounds the run).
     pub(crate) inactivity_timeout: Option<std::time::Duration>,
-    /// Bounded post-cancel drain (P1-6/P2-17): how long a cancelled turn may
+    /// Bounded post-cancel drain: how long a cancelled turn may
     /// keep streaming (to settle with its own `result`) before the engine
     /// child is hard-killed by the session drop.
     pub(crate) cancel_drain_timeout: std::time::Duration,
@@ -324,7 +324,7 @@ fn transcript_event(event: EngineEvent) -> Option<TranscriptEvent> {
     }
 }
 
-/// The out-of-band attachment plane wired onto an executor (PLAN-005, Lane F):
+/// The out-of-band attachment plane wired onto an executor (Lane F):
 /// the byte backend + cache ([`AttachmentManager`]) and the per-thread inbound
 /// descriptor resolver ([`AttachmentSource`]). Optional — when absent the
 /// executor neither materializes inputs nor collects outputs (today's
@@ -344,19 +344,19 @@ pub(crate) struct ThreadExecutor {
     workspace_dir: PathBuf,
     watchdog: WatchdogCfg,
     active: AsyncMutex<Option<ActiveRun>>,
-    /// Out-of-band attachment plane (PLAN-005); `None` until Lane G wires it.
+    /// Out-of-band attachment plane; `None` until Lane G wires it.
     attachments: Option<AttachmentRig>,
-    /// Per-thread task config/skills provisioner (PLAN-007 §3/§6); `None` until
+    /// Per-thread task config/skills provisioner; `None` until
     /// the runner wires it. When present, each run materializes the task scope
     /// into `work_dir/project/` and the engine cwd becomes that `project/` dir;
     /// when absent the executor behaves as before (cwd = `work_dir`).
     provisioning: Option<Arc<Provisioner>>,
-    /// The daemon shutdown token (P1-6); `None` until the runner wires it.
+    /// The daemon shutdown token; `None` until the runner wires it.
     /// When tripped it converges onto the same cancelled path a host
     /// `interrupt` takes: the active run settles within the bounded drain
     /// window and the pending drain stops starting new runs.
     shutdown: Option<Arc<Cancel>>,
-    /// The transport flush signal (P2-16); `None` until the runner wires it.
+    /// The transport flush signal; `None` until the runner wires it.
     /// Poked after every persisted outbox frame so transcript events stream
     /// to the host near-real-time during a long run instead of arriving in
     /// one batch after the whole drain.
@@ -404,7 +404,7 @@ impl ThreadExecutor {
         self
     }
 
-    /// Wire the transport flush signal (P2-16): the executor pokes it after
+    /// Wire the transport flush signal: the executor pokes it after
     /// each persisted outbox frame, so a `thread_message` streamed mid-run
     /// ships over the live socket immediately rather than after the whole
     /// drain. Builder-style so the existing [`Self::new`] call sites stay
@@ -420,7 +420,7 @@ impl ThreadExecutor {
         self.flush.is_some()
     }
 
-    /// Wire the daemon shutdown token (P1-6). Builder-style so the existing
+    /// Wire the daemon shutdown token. Builder-style so the existing
     /// [`Self::new`] call sites (unit tests) stay unchanged. When the token
     /// trips, the active run is cancelled through the same path a host
     /// `interrupt` takes and [`Self::drain_pending`] stops starting new runs.
@@ -429,7 +429,7 @@ impl ThreadExecutor {
         self
     }
 
-    /// Wire the out-of-band attachment plane (PLAN-005, Lane F): inbound
+    /// Wire the out-of-band attachment plane (Lane F): inbound
     /// descriptors are materialized into `work_dir/inputs/` before each run
     /// and `work_dir/output/` artifacts are uploaded after, their descriptors
     /// attached to the terminal `thread_result`. Builder-style so the existing
@@ -443,7 +443,7 @@ impl ThreadExecutor {
         self
     }
 
-    /// Wire the per-thread task provisioning plane (PLAN-007 §3/§6): before each
+    /// Wire the per-thread task provisioning plane: before each
     /// run the task's desired entries are materialized into `work_dir/project/`
     /// (scope = task id, §9b), the isolated git working area `project/workspace/`
     /// is created, and the engine cwd becomes `project/`. Builder-style so the
@@ -472,7 +472,7 @@ impl ThreadExecutor {
         let mut dispatched = 0;
         let mut parked = 0;
         for thread in pending {
-            // Daemon shutdown (P1-6): stop starting new runs; the still-pending
+            // Daemon shutdown: stop starting new runs; the still-pending
             // threads re-run on the next boot.
             if self.shutdown_requested() {
                 debug!("shutdown tripped; stopping the pending drain");
@@ -604,7 +604,7 @@ impl ThreadExecutor {
             initial_prompt: Some(prompt),
             task_id: Some(thread.task_id.clone()),
             thread_id: Some(thread.id.clone()),
-            // Per-task model (OD15): read HERE, at spawn time, so a `task_upsert`
+            // Per-task model: read HERE, at spawn time, so a `task_upsert`
             // that changes the model reaches the next run without disturbing the
             // one in flight — the same apply-on-next-run policy as `config_update`.
             model: task_model(&self.db, &thread.task_id),
@@ -664,7 +664,7 @@ impl ThreadExecutor {
             .await
     }
 
-    /// [`Self::finalize`] plus terminal-state provisioning cleanup (P1-11):
+    /// [`Self::finalize`] plus terminal-state provisioning cleanup:
     /// when the run settles into a terminal state (not `active`, not a retry
     /// re-pend), the task-scope manifest rows are released — the scope's link
     /// tree lives under this thread's now-dead `work_dir`, so keeping the rows
@@ -756,14 +756,14 @@ impl ThreadExecutor {
         rig.manager.collect_outputs(Path::new(work_dir)).await
     }
 
-    /// Resolve the engine working directory for a run (PLAN-007 §3/§6).
+    /// Resolve the engine working directory for a run.
     ///
     /// Without the provisioning rig the cwd is the thread's `work_dir` itself
     /// (back-compat; unit tests). With it wired, the per-thread `project/` layout
     /// is materialized first: `work_dir/project/` (the engine cwd) holds the
     /// task's instruction file + `.claude/skills` symlinks, and
     /// `project/workspace/` is the isolated git working area — created empty so a
-    /// repo there never sees the injected config (PLAN-007 §3/§4). The attachment
+    /// repo there never sees the injected config. The attachment
     /// plane is UNCHANGED: `inputs/`/`output/` stay siblings under `work_dir`, not
     /// under `project/`.
     ///
@@ -785,8 +785,8 @@ impl ThreadExecutor {
             warn!(thread = %thread.id, error = %err, "failed to create project dir (continuing)");
         }
         // Materialize the task's desired entries into `project/` under the TASK
-        // id scope (§9b: scope = 'global' | <task_id> — P1-11 fix; thread-id
-        // scoping left one immortal row set per fire). `project/` itself stays
+        // id scope (§9b: scope = 'global' | <task_id>; thread-id
+        // scoping would leave one immortal row set per fire). `project/` itself stays
         // per-thread: a successive fire reconciles the same scope against its
         // new root, upserting the rows (UNIQUE(scope, target)) to point at the
         // fresh tree instead of accumulating. A reconcile error degrades — see
@@ -801,7 +801,7 @@ impl ThreadExecutor {
         project_dir
     }
 
-    /// The task's desired provisioning entries (PLAN-007 §5), parsed from the
+    /// The task's desired provisioning entries, parsed from the
     /// persisted `tasks.entries` JSON. An absent column, a DB error or malformed
     /// JSON yields an empty set — reconciling against which simply installs
     /// nothing and removes any stale links for the scope.
@@ -857,7 +857,7 @@ impl ThreadExecutor {
     }
 
     /// Drop any leftover active-run handle at shutdown, after the worker task
-    /// has stopped (P1-6): releasing the session `Arc` kills the engine child
+    /// has stopped: releasing the session `Arc` kills the engine child
     /// (`kill_on_drop`), so no engine process survives the daemon.
     pub(crate) async fn kill_active(&self) {
         if let Some(run) = self.active.lock().await.take() {
@@ -872,7 +872,7 @@ impl ThreadExecutor {
 
     /// Whether this run should stop: its own [`Cancel`] (host `interrupt`) or
     /// the daemon shutdown token — both cancellation sources converge on the
-    /// one cancelled path (P1-6).
+    /// one cancelled path.
     fn cancel_requested(&self, cancel: &Cancel) -> bool {
         cancel.is_cancelled() || self.shutdown_requested()
     }
@@ -906,7 +906,7 @@ impl ThreadExecutor {
     /// Claim a pending thread: `pending → dispatched`, stamping `started_at`
     /// (the attempt's start — both watchdogs key off it, the schema has no
     /// separate `dispatched_at`) and assigning the per-thread `work_dir`.
-    /// The flip is a CAS guarded on `status = 'pending'` (audit P2-18);
+    /// The flip is a CAS guarded on `status = 'pending'`;
     /// `None` means the claim was lost — the row is no longer pending (a
     /// concurrent claimer won) and this caller must not drive the thread.
     fn claim(&self, thread: &ThreadRow) -> DbResult<Option<ThreadRow>> {
@@ -949,7 +949,7 @@ impl ThreadExecutor {
             }
             // Total-time watchdog (Tr), on WALL CLOCK: the event wait below is
             // bounded by the remaining budget, so a silent engine cannot wedge
-            // the serial plane even with the inactivity watchdog off (P2-19).
+            // the serial plane even with the inactivity watchdog off.
             let Some(remaining) = Self::remaining_budget(started, self.watchdog.running_timeout)
             else {
                 return Conclusion::Failure {
@@ -1046,7 +1046,7 @@ impl ThreadExecutor {
             .filter(|remaining| !remaining.is_zero())
     }
 
-    /// Bounded post-cancel drain (P1-6, P2-17). The turn was cancelled — by a
+    /// Bounded post-cancel drain. The turn was cancelled — by a
     /// host `interrupt` or the daemon shutdown — and [`Self::interrupt`] asked
     /// the engine to stop gracefully. Give it `cancel_drain_timeout` to settle
     /// with its own `result`: an engine that settles has flushed its session
@@ -1146,7 +1146,7 @@ impl ThreadExecutor {
                 }
             }
             Conclusion::Cancelled { session_id } => {
-                // Terminal `cancelled`, no retry. Resume-handle policy (P2-17):
+                // Terminal `cancelled`, no retry. Resume-handle policy:
                 // `session_id` is `Some` only when the engine settled its own
                 // `result` inside the post-cancel drain window (state flushed,
                 // handle verified — see `drain_cancelled`); a hard-killed turn
@@ -1334,14 +1334,14 @@ impl ThreadExecutor {
         if let Err(err) = Self::emit_message(&lock_db(&self.db), thread, event) {
             warn!(thread = %thread.id, error = %err, "failed to enqueue thread_message");
         } else {
-            // P2-16: ship the frame over the live socket now — without the
+            // Ship the frame over the live socket now — without the
             // poke it would sit in the outbox until the post-drain flush.
             self.poke_flush();
         }
     }
 
     /// Poke the transport flush (when wired) so freshly enqueued outbox
-    /// frames transmit immediately (P2-16). `Notify::notify_one` stores a
+    /// frames transmit immediately. `Notify::notify_one` stores a
     /// permit, so a poke never blocks and never gets lost.
     fn poke_flush(&self) {
         if let Some(flush) = &self.flush {
@@ -1376,7 +1376,7 @@ impl ThreadExecutor {
 
     /// Emit the terminal `thread_result`, carrying `final_seq` = the last `seq`
     /// streamed on the thread. Runs on the caller-held `db` — in production
-    /// always inside the [`Self::persist_and_emit`] transaction (P1-8).
+    /// always inside the [`Self::persist_and_emit`] transaction.
     // One argument per `thread_result` `data` field (status/result/error/
     // failure_reason/engine_session_id/attachments); bundling them into a
     // struct here would only move the same fields behind one more name.
@@ -1416,7 +1416,7 @@ impl ThreadExecutor {
     // -- Small helpers --------------------------------------------------
 
     /// Persist a thread transition and enqueue its outbox frame in ONE
-    /// `BEGIN IMMEDIATE` transaction (P1-8): the thread row and the frame
+    /// `BEGIN IMMEDIATE` transaction: the thread row and the frame
     /// commit together or not at all, so a crash between them can no longer
     /// strand a terminal thread the host never hears about. On error nothing
     /// is written — the row keeps its previous state for the watchdog /
@@ -1432,7 +1432,7 @@ impl ThreadExecutor {
         if let Err(err) = committed {
             warn!(thread = %thread.id, error = %err, "failed to commit thread state + outbox frame atomically");
         } else {
-            // P2-16: the terminal frame is durable — stream it out now.
+            // The terminal frame is durable — stream it out now.
             self.poke_flush();
         }
     }

@@ -1,4 +1,4 @@
-//! Agent enrollment flow (PLAN-003 §2.1).
+//! Agent enrollment flow.
 //!
 //! Two tokens, two jobs. The **register token** is a bootstrap credential
 //! (env/CLI) used *only* to enroll. Enrollment exchanges it — over
@@ -136,7 +136,7 @@ pub(crate) async fn load_or_register(
 /// Drive [`register`] until it succeeds or fails terminally, backing off between
 /// transient attempts on the shared reconnect schedule (1 s base, 10 s ceiling).
 ///
-/// Attempts are unbounded, matching the reconnect loop (P0-2): only the delay is
+/// Attempts are unbounded, matching the reconnect loop: only the delay is
 /// capped, never the number of tries. Enrollment runs before the daemon's shared
 /// cancellation token exists — and before the signal handlers that would set it
 /// are installed — so there is deliberately no cancellation branch here: a

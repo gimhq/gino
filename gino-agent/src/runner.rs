@@ -1,4 +1,4 @@
-//! The persistent gino-agent daemon (PLAN-003 §1/§5/§6, PLAN-006 §3 Lane G).
+//! The persistent gino-agent daemon.
 //!
 //! [`run_daemon`] wires the whole node agent together on the **protocol-v2** path
 //! and serves until shutdown:
@@ -61,7 +61,7 @@ use crate::transport::{Inbound, MAX_INBOX_RETRIES, Transport, TransportConfig};
 /// acked.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Bounded graceful drain at shutdown (P1-6): how long the executor worker gets
+/// Bounded graceful drain at shutdown: how long the executor worker gets
 /// to settle the interrupted active run (post-interrupt drain, output collection,
 /// finalize) before it is aborted and the leftover engine session killed.
 /// Comfortably above the executor's in-run `cancel_drain_timeout` and inside
@@ -72,7 +72,7 @@ const SHUTDOWN_DRAIN_WINDOW: Duration = Duration::from_secs(15);
 /// single-instance flock.
 const DAEMON_LOCK_FILE: &str = "agent.lock";
 
-/// The daemon's single-instance guard (audit P2-18): an exclusive advisory
+/// The daemon's single-instance guard: an exclusive advisory
 /// lock (`flock`-style, via [`std::fs::File::try_lock`]) on a lockfile in the
 /// state dir, held for the daemon's whole lifetime and released by the OS on
 /// any exit, clean or not. A second daemon fails fast instead of racing the
@@ -133,7 +133,7 @@ fn prepare_state_dirs(paths: &crate::config::Paths) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the env/CLI bootstrap layer (PLAN-003 §2.1/§3): the host/identity
+/// Resolve the env/CLI bootstrap layer: the host/identity
 /// inputs, then the local paths from the environment (`GINO_WORKSPACE_DIR` /
 /// `GINO_DB_PATH` / `CLAUDE_CONFIG_USE_DEFAULT`, see
 /// [`ConfigOverlay::paths_from_env`]) — resolved *before* the DB opens so ops or
@@ -182,7 +182,7 @@ async fn run_async(
 
     prepare_state_dirs(&config.paths)?;
 
-    // Single-instance guard (P2-18), taken BEFORE the DB open so a second
+    // Single-instance guard, taken BEFORE the DB open so a second
     // daemon can never run migrations — let alone claim threads — against a
     // live instance's database. Held (via the binding) until run_async returns.
     let _daemon_lock = acquire_daemon_lock(&config.paths.workspace_dir)?;
@@ -196,7 +196,7 @@ async fn run_async(
         .context("resolving runner identity")?;
     info!(agent_id = %identity.agent_id, "runner identity resolved");
 
-    // PLAN-007-7 (A): authoritative startup config fetch. On a restart the runner
+    // 7 (A): authoritative startup config fetch. On a restart the runner
     // reuses its persisted identity (no second register), so `GET /agent/config` —
     // not the register response — re-supplies the versioned desired set the version
     // gate reads (see [`fetch_and_apply_config`]). Non-fatal / offline-tolerant.
@@ -208,7 +208,7 @@ async fn run_async(
         heartbeat: Duration::from_millis(config.heartbeat_interval_ms),
         ..TransportConfig::default()
     };
-    // The dial happens in the background (P0-2): the daemon boots and serves
+    // The dial happens in the background: the daemon boots and serves
     // local work while the host is unreachable; outbound frames queue durably
     // and replay once a connection is up.
     let mut transport = Transport::open(
@@ -219,7 +219,7 @@ async fn run_async(
     );
     info!("transport started; connecting in the background");
 
-    // The GLOBAL provisioning scope root (PLAN-007 §1/§6). Created up front so the
+    // The GLOBAL provisioning scope root. Created up front so the
     // engine always launches with a stable config dir — even with no entries.
     let engine_config_dir = config.paths.engine_config_dir.clone();
     info!(dir = %engine_config_dir.display(), "engine config dir (CLAUDE_CONFIG_DIR for the engine)");
@@ -230,15 +230,15 @@ async fn run_async(
         )
     })?;
 
-    // One shutdown token for every plane (P1-6): the serve loop, the scheduler,
+    // One shutdown token for every plane: the serve loop, the scheduler,
     // the executor worker AND the active engine run (via the executor's converged
     // cancel path) all watch this token, so a shutdown signal cancels an in-flight
     // turn instead of waiting out its running_timeout.
     let cancel = Arc::new(Cancel::new());
 
     // The v2 execution plane: the source-agnostic pending-thread drainer, its
-    // out-of-band attachment plane (PLAN-005, Lane Z1) and the global config/skills
-    // provisioner (PLAN-007) — all over one shared content-addressed manager — then
+    // out-of-band attachment plane (Lane Z1) and the global config/skills
+    // provisioner — all over one shared content-addressed manager — then
     // the startup global reconcile. A resolved message's inbound descriptors reach
     // the executor through the durable `thread_attachments` snapshot (P1-10b).
     let flush = transport.flush_handle();
@@ -299,7 +299,7 @@ async fn run_async(
     };
     serve(&mut transport, &context, &cancel).await;
 
-    // Shutdown (P1-6): drain the execution plane within a bounded window (the
+    // Shutdown: drain the execution plane within a bounded window (the
     // active run is cancelled, not waited out), stop the scheduler, fail any
     // leftover in-flight threads (so the host sees a terminal result rather than
     // a silent gap), then drain the transport. No engine child survives this.
@@ -317,7 +317,7 @@ async fn run_async(
     Ok(())
 }
 
-/// Stop the execution plane within a bounded drain window (P1-6): trip the
+/// Stop the execution plane within a bounded drain window: trip the
 /// shutdown token (stops the worker loop and, through the executor's converged
 /// cancel path, the active run), gracefully interrupt the running engine turn
 /// (the same [`ThreadExecutor::interrupt`] machinery a host `interrupt` frame
@@ -399,7 +399,7 @@ fn in_flight_threads(db: &Mutex<Db>) -> Vec<ThreadRow> {
 
 /// Map the [`ExecutorConfig`] knobs onto the executor's watchdog thresholds. A
 /// zero `inactivity_timeout_secs` disables the in-run inactivity watchdog only —
-/// the total-time watchdog still bounds a silent engine on wall clock (P2-19),
+/// the total-time watchdog still bounds a silent engine on wall clock,
 /// so the serial plane can never wedge indefinitely.
 fn watchdog_cfg(cfg: &ExecutorConfig) -> WatchdogCfg {
     WatchdogCfg {
@@ -411,7 +411,7 @@ fn watchdog_cfg(cfg: &ExecutorConfig) -> WatchdogCfg {
     }
 }
 
-/// PLAN-007-7 (A): fetch the authoritative config from `GET /agent/config/:id` and
+/// 7 (A): fetch the authoritative config from `GET /agent/config/:id` and
 /// merge it onto `config`. The payload is the same host-assigned overlay the register
 /// response carries (engine credentials, limits, the versioned global provisioning
 /// set, …); fetching it at startup is what lets a **restart** re-acquire that config
@@ -457,14 +457,14 @@ async fn fetch_and_apply_config(
     }
 }
 
-/// Build the full execution plane over ONE shared content-addressed manager
-/// (PLAN-007 §2): the [`ThreadExecutor`] (+ its attachment plane), the global
+/// Build the full execution plane over ONE shared content-addressed manager:
+/// the [`ThreadExecutor`] (+ its attachment plane), the global
 /// config/skills [`Provisioner`], and the startup global reconcile. The manager is
 /// built once and shared between both planes so bytes are fetched + cached once; a
 /// `None` manager (absent host base / connect token) degrades both planes off. The
 /// returned provisioner is `None` in that same degraded case. The startup reconcile
 /// (repair → reconcile(global) → gc) is non-fatal — see [`reconcile_global_startup`].
-/// Also returns the live engine-settings seam (audit P2-19) the executor's engine
+/// Also returns the live engine-settings seam the executor's engine
 /// snapshots at every spawn, so the `config_update` route can replace its contents.
 async fn build_execution_plane(
     config: &Config,
@@ -517,7 +517,7 @@ async fn build_execution_plane(
 }
 
 /// Build the v2 [`ThreadExecutor`] and (when present) wire its out-of-band
-/// attachment plane (PLAN-005, Lane Z1) onto the shared `manager`. The inbound
+/// attachment plane (Lane Z1) onto the shared `manager`. The inbound
 /// descriptors reach the executor through a [`DbAttachmentSource`] over the
 /// durable `thread_attachments` snapshot the prompt drainer writes (the message
 /// is consumed before materialization, and retries/restarts must resolve the
@@ -536,9 +536,9 @@ fn build_executor(
     let engine: Arc<dyn Engine> = Arc::new(ReloadableEngine {
         settings: Arc::clone(&seams.claude),
     });
-    // The daemon shutdown token (P1-6): a shutdown cancels the active run through
+    // The daemon shutdown token: a shutdown cancels the active run through
     // the executor's converged cancel path and stops the pending drain. The
-    // transport flush signal (P2-16): the executor pokes it after each persisted
+    // transport flush signal: the executor pokes it after each persisted
     // frame so transcript events stream mid-run over the live socket.
     let mut executor = ThreadExecutor::new(
         engine,
@@ -573,7 +573,7 @@ fn build_executor(
     } else {
         debug!("attachment plane disabled (no host base / connect token)");
     }
-    // Per-thread task provisioning (PLAN-007 §3/§6): materialize the task scope
+    // Per-thread task provisioning: materialize the task scope
     // into `work_dir/project/` and run the engine there. Shares the same handle
     // (and cache) as the global startup reconcile; `None` keeps cwd = `work_dir`.
     if let Some(provisioner) = provisioner {
@@ -587,8 +587,8 @@ fn build_executor(
 
 /// Resolve the Claude engine settings from the config, exporting the workspace
 /// dir (`GINO_WORKSPACE_DIR`, read by the PreCompact `archive` hook subprocess)
-/// and pointing the engine at the provisioned global config dir (PLAN-007 §6) on
-/// top of the credential env. Rebuilt on a live `config_update` (audit P2-19) so
+/// and pointing the engine at the provisioned global config dir on
+/// top of the credential env. Rebuilt on a live `config_update` so
 /// a rotated credential reaches the next engine run without a restart.
 fn engine_settings(config: &Config, engine_config_dir: &Path) -> ClaudeSettings {
     let mut settings = ClaudeSettings::from_config(config);
@@ -602,7 +602,7 @@ fn engine_settings(config: &Config, engine_config_dir: &Path) -> ClaudeSettings 
     settings
 }
 
-/// The live engine-settings seam (audit P2-19): the executor's engine snapshots
+/// The live engine-settings seam: the executor's engine snapshots
 /// these settings at every spawn, and the `config_update` route replaces them
 /// after merging the overlay onto the live [`Config`] — so a rotated
 /// `anthropicApiKey` takes effect without a daemon restart.
@@ -693,8 +693,8 @@ impl ReloadableCodexEngine {
     }
 }
 
-/// Build the shared content-addressed [`AttachmentManager`] (PLAN-005, agent-
-/// architecture §9; unified with PLAN-007 §2): the config-selected byte backend
+/// Build the shared content-addressed [`AttachmentManager`] (agent-
+/// architecture §9): the config-selected byte backend
 /// ([`attachments::build_backend`] — host-proxy by default) over a workspace-scoped
 /// cache. ONE manager backs both the executor's attachment plane and the config/
 /// skills [`Provisioner`], so bytes are fetched and cached once. Returns `None`
@@ -719,7 +719,7 @@ fn build_attachment_manager(config: &Config, http: &HttpClient) -> Option<Arc<At
     Some(Arc::new(manager))
 }
 
-/// Run the **version-gated** startup global provisioning sequence (PLAN-007 §6/§7).
+/// Run the **version-gated** startup global provisioning sequence.
 ///
 /// The host owns a monotonic GLOBAL config `version` scoping the desired `entries`
 /// set; the runner reconciles the global scope ONLY when that version advances past
@@ -821,7 +821,7 @@ struct ServeContext {
     drain: Arc<Notify>,
     /// Retry budget stamped on executor-created (chat) threads.
     chat_max_attempts: i64,
-    /// Global config/skills provisioner (PLAN-007); `None` when the byte backend
+    /// Global config/skills provisioner; `None` when the byte backend
     /// is absent, in which case `config_update` provisioning is a no-op.
     provisioner: Option<Arc<Provisioner>>,
     /// The global scope root the provisioner materializes into (= the engine's
@@ -831,7 +831,7 @@ struct ServeContext {
     /// layer of the config.rs precedence chain) and drives the engine-settings
     /// rebuild below.
     config: Mutex<Config>,
-    /// The live engine-settings seam (audit P2-19): replaced on `config_update`,
+    /// The live engine-settings seam: replaced on `config_update`,
     /// snapshotted by [`ReloadableEngine`] at every engine spawn.
     engine_settings: SharedEngineSettings,
     /// The codex twin of [`ServeContext::engine_settings`], snapshotted by
@@ -840,7 +840,7 @@ struct ServeContext {
     codex_settings: SharedCodexSettings,
 }
 
-/// Resolve when a daemon shutdown signal arrives (P1-6): SIGINT (Ctrl-C) and —
+/// Resolve when a daemon shutdown signal arrives: SIGINT (Ctrl-C) and —
 /// on unix — SIGTERM (what systemd `stop`/`restart` sends) are handled
 /// identically. A listener that cannot be installed is logged and disabled;
 /// the other signal and the internal cancel/`close` paths still shut down.
@@ -874,7 +874,7 @@ async fn shutdown_signal() {
 /// Pump inbound v2 frames until a shutdown signal or a `close`. Outbound frames
 /// are produced straight into the durable outbox by the executor/scheduler and
 /// shipped by the transport (flush/replay), so the serve loop has no outbound
-/// branch. Transport loss never ends the loop (P0-2): the manager reconnects
+/// branch. Transport loss never ends the loop: the manager reconnects
 /// forever, and even a dead manager task only stops the frame pump — the
 /// daemon (scheduler + executor) keeps serving local work until shutdown.
 async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cancel) {
@@ -905,7 +905,7 @@ async fn serve(transport: &mut Transport, context: &ServeContext, cancel: &Cance
 }
 
 /// Block until a shutdown signal or an internal cancel — the tail of [`serve`]
-/// once the transport channel has closed (P0-2: transport death must not shut
+/// once the transport channel has closed (transport death must not shut
 /// the daemon down; the scheduler and executor keep running until a real
 /// shutdown).
 async fn wait_for_shutdown(cancel: &Cancel) {
@@ -921,7 +921,7 @@ async fn wait_for_shutdown(cancel: &Cancel) {
 /// its inbox row: a successfully applied frame is marked processed; a FAILED
 /// apply leaves the row unprocessed (it replays on reconnect) and bumps its
 /// processing-failure counter, so the poison policy counts real failures — never
-/// reconnects (P1-12/P2-19). Returns [`ControlFlow::Break`] for a `close`.
+/// reconnects. Returns [`ControlFlow::Break`] for a `close`.
 ///
 /// A `message` is the one frame **not** settled here: its text is the chat
 /// thread's prompt, consumed (and marked) later by the [`InboxPromptSource`].
@@ -933,7 +933,7 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
         InboundFrameV2::Message {
             task_id, thread_id, ..
         } => {
-            // Idempotent thread minting (P0-3): an absent `threadId` derives the
+            // Idempotent thread minting: an absent `threadId` derives the
             // thread id from the inbox row, so a reconnect replay of the same row
             // finds the already-minted thread instead of racing a fresh one.
             let tid = thread_id.unwrap_or_else(|| minted_thread_id(&task_id, inbox_id));
@@ -993,10 +993,10 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
         }
         InboundFrameV2::ConfigUpdate { data, .. } => {
             debug!(keys = ?config_keys(&data), "config_update received");
-            // Applied on both planes (audit P2-19): the overlay merges onto the
+            // Applied on both planes: the overlay merges onto the
             // live config + engine settings (rotated credentials reach the next
             // engine run), and a re-pushed global provisioning set is reconciled
-            // live (PLAN-007 §6). Always marked processed: the host re-pushes
+            // live. Always marked processed: the host re-pushes
             // config on connect, so a replay is worthless.
             apply_config_update(context, &data).await;
             ControlFlow::Continue(())
@@ -1064,7 +1064,7 @@ fn conclude_inbox_row(db: &Mutex<Db>, inbox_id: i64, applied: bool) {
 }
 
 /// Apply a host `cron_upsert`, seeding a minimal task row first when the cron
-/// arrives before its `task_upsert` (P2-19: the ordering must not drop the cron —
+/// arrives before its `task_upsert` (the ordering must not drop the cron —
 /// the later `task_upsert` patches the seeded row in place).
 fn handle_cron_upsert(
     db: &Mutex<Db>,
@@ -1090,7 +1090,7 @@ fn handle_cron_upsert(
 /// Every field follows the OMISSION-PRESERVES rule the `entries` column already
 /// had: an absent field leaves the stored value alone, so a partial `task_upsert`
 /// never wipes a definition the host pushed earlier. The task DEFINITION fields
-/// (`engine`/`model`/`workdir`/`meta`, OD15) ride the same rule; only `model`
+/// (`engine`/`model`/`workdir`/`meta`) ride the same rule; only `model`
 /// reaches execution today (at the next engine spawn, see
 /// [`crate::executor`]) — `workdir` and `meta` are persisted and nothing more.
 fn apply_task_def(db: &Mutex<Db>, task_id: &str, data: &TaskUpsertData) -> bool {
@@ -1194,8 +1194,8 @@ fn task_meta_json(task_id: &str, data: &TaskUpsertData) -> Result<Option<String>
     })
 }
 
-/// Persist a `task_upsert`'s provisioning entries onto the `tasks` row (PLAN-007
-/// §5). Present → serialized to the `entries` JSON column for the per-thread
+/// Persist a `task_upsert`'s provisioning entries onto the `tasks` row.
+/// Present → serialized to the `entries` JSON column for the per-thread
 /// materialize ([`ThreadExecutor::with_provisioning`]); absent (`None`) → left
 /// untouched, so a `task_upsert` that omits `entries` never wipes a prior set.
 /// Returns `false` on a serialize/DB failure.
@@ -1280,14 +1280,14 @@ fn config_keys(data: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Apply a live `config_update` end-to-end (audit P2-19). The payload is parsed
+/// Apply a live `config_update` end-to-end. The payload is parsed
 /// ONCE as a [`ConfigOverlay`], then applied on both planes:
 ///
 /// 1. **engine/config** ([`apply_engine_config`]) — merge the overlay onto the
 ///    live [`Config`] and rebuild the shared engine settings, so a rotated
 ///    `anthropicApiKey` reaches the next engine run without a restart.
 /// 2. **provisioning** ([`apply_provisioning_update`]) — the version-gated global
-///    reconcile (PLAN-007 §6).
+///    reconcile.
 ///
 /// A payload that does not parse as an overlay is dropped, not retried: the
 /// failure is deterministic (a replay re-fails identically) and the host
@@ -1327,7 +1327,7 @@ fn apply_engine_config(context: &ServeContext, overlay: ConfigOverlay) {
     debug!("config_update merged onto live config; engine settings apply on the next run");
 }
 
-/// Apply the provisioning side of a live `config_update` (PLAN-007 §6) under the SAME
+/// Apply the provisioning side of a live `config_update` under the SAME
 /// version gate as the startup reconcile. Re-reconcile the global scope ONLY when the
 /// overlay carries BOTH a `version` and an
 /// `entries` set AND that version advances past the persisted applied version. The
@@ -1395,9 +1395,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests;
 
-/// Focused coverage of the PLAN-007-5a global-provisioning startup wiring
+/// Focused coverage of the global-provisioning startup wiring
 /// (`reconcile_global_startup`) against a fake byte fetcher — the full host-driven
-/// path is exercised by the e2e harness (L3-6).
+/// path is exercised by the e2e harness.
 #[cfg(test)]
 mod provisioning_wiring_tests {
     use std::collections::HashMap;
@@ -1531,7 +1531,7 @@ mod provisioning_wiring_tests {
         );
     }
 
-    /// AUTHORITATIVE-EMPTY (PLAN-007 §4): a VERSIONED config whose `version` ADVANCES
+    /// AUTHORITATIVE-EMPTY: a VERSIONED config whose `version` ADVANCES
     /// with zero entries means the host genuinely wants none → the reconcile removes
     /// every installed global entry, and the applied version advances.
     #[tokio::test]
@@ -1573,7 +1573,7 @@ mod provisioning_wiring_tests {
         assert_eq!(lock_applied(&db), Some(2), "applied version advanced to 2");
     }
 
-    /// NON-AUTHORITATIVE-EMPTY (PLAN-007 §4, the restart-durability crux): an empty
+    /// NON-AUTHORITATIVE-EMPTY (the restart-durability crux): an empty
     /// set with NO version (offline / not-yet-loaded) must NOT wipe — the installed
     /// global entry survives (repair-only), and the applied version is unchanged.
     #[tokio::test]

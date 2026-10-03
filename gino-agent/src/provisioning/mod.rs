@@ -1,22 +1,21 @@
 //! Engine config & skills provisioning — the pure-filesystem content-addressed
-//! store + symlink materialization primitives (agent-architecture §9b; PLAN-007
-//! §2/§3/§7).
+//! store + symlink materialization primitives (agent-architecture §9b).
 //!
 //! This module owns the **byte/bundle → store** and **store → symlink** seam, and
 //! nothing else: NO DB, NO network/fetch, NO reconcile orchestration. The
-//! reconcile engine (a later PLAN-007 L3) drives these primitives — it fetches +
-//! verifies bytes out-of-band (reusing the §9 / PLAN-005 attachment cache), then:
+//! reconcile engine ([`reconcile`]) drives these primitives — it fetches +
+//! verifies bytes out-of-band (reusing the §9 attachment cache), then:
 //!
 //! * materializes them into the store ([`store::materialize_file`] /
 //!   [`store::materialize_dir`]) at `store/<name>/<sha256[:12]>` — a single FILE
 //!   for `kind=file`, a DIRECTORY (unpacked uncompressed tar) for `kind=dir`,
-//!   content-addressed and idempotent (PLAN-007 §2); and
+//!   content-addressed and idempotent; and
 //! * loads them by **symlink** ([`store::link`]) — `<scope-root>/<target>` points
 //!   into the store entry (zero-copy; update = repoint, §2).
 //!
 //! Safety: `target` is host-influenced, so [`safe_link_path`] confines every link
-//! under its scope root (rejecting absolute / `..` / `.` / empty / NUL, PLAN-007
-//! Risk 3), the store `name` is sanitized to a single safe component (the shared
+//! under its scope root (rejecting absolute / `..` / `.` / empty / NUL),
+//! the store `name` is sanitized to a single safe component (the shared
 //! [`crate::paths::safe_component`]), and tar unpack refuses any member that
 //! escapes the store dir.
 
@@ -28,11 +27,11 @@ pub(crate) mod reconcile;
 pub(crate) mod store;
 
 // The reconcile engine ties the store + DB + fetch seam together; the runner
-// (PLAN-007-5a global wiring) drives `Provisioner` and supplies the `BlobFetcher`
+// (5a global wiring) drives `Provisioner` and supplies the `BlobFetcher`
 // (the shared `AttachmentManager` impl).
 pub(crate) use reconcile::{BlobFetcher, Provisioner};
 
-/// Length of the git-style short store id (`sha256[:12]`, PLAN-007 §2).
+/// Length of the git-style short store id (`sha256[:12]`).
 const SHORT_ID_LEN: usize = 12;
 
 /// Errors raised by the provisioning store/symlink layer. Byte content is never
@@ -40,7 +39,7 @@ const SHORT_ID_LEN: usize = 12;
 #[derive(Debug, Error)]
 pub(crate) enum ProvisioningError {
     /// A link `target` is unsafe (absolute / `..` / `.` / empty / NUL) — it could
-    /// escape the scope root (PLAN-007 Risk 3).
+    /// escape the scope root.
     #[error("unsafe link target {target:?}")]
     UnsafeTarget { target: String },
     /// A store `name` is unsafe (empty / `.` / `..` / separators / NUL) — it could
@@ -93,7 +92,7 @@ impl From<crate::paths::UnsafeName> for ProvisioningError {
 }
 
 /// Resolve a host-influenced `target` to a concrete link path under `scope_root`,
-/// confining it inside that root (PLAN-007 Risk 3).
+/// confining it inside that root.
 ///
 /// Unlike a store `name`, a `target` MAY contain `/` separators (e.g.
 /// `.claude/skills/demo`); nested *normal* components are allowed. Rejected:

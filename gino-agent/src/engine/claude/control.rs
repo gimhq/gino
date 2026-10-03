@@ -1,4 +1,4 @@
-//! The Claude control protocol over stdio (PLAN-001 §"control protocol").
+//! The Claude control protocol over stdio.
 //!
 //! Claude Code's `-p` print mode with `--input-format stream-json
 //! --permission-prompt-tool stdio` speaks a **bidirectional control protocol**:
@@ -18,7 +18,7 @@
 //! *lines* (no trailing newline; the writer adds that) and classifies inbound
 //! control requests. It performs no I/O, so it is exhaustively unit-testable.
 //!
-//! ## Tolerance (PLAN-001 Risk 1)
+//! ## Tolerance
 //!
 //! The control wire is the SDK's internal format and can drift between claude
 //! versions. Parsing is therefore defensive: a missing field degrades to a

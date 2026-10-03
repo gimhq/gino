@@ -1,4 +1,4 @@
-//! The engine abstraction (PLAN-003 §5).
+//! The engine abstraction.
 //!
 //! An [`Engine`] is a backend that runs agent work; a [`Session`] is one
 //! conversation driven by that backend. The runner's transport, scheduler and
@@ -82,7 +82,7 @@ pub(crate) enum LogLevel {
     Error,
 }
 
-/// Configuration for a long-lived [`Session`] (PLAN-003 §5 `SessionCfg`).
+/// Configuration for a long-lived [`Session`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SessionCfg {
     /// Working directory the engine runs in. Empty means the current directory.
@@ -94,7 +94,7 @@ pub(crate) struct SessionCfg {
     /// An optional first user message sent right after the handshake.
     pub(crate) initial_prompt: Option<String>,
     /// Per-task model id overriding the backend's configured model for THIS
-    /// session (the host's `task_upsert.data.model`, OD15). `None` keeps the
+    /// session (the host's `task_upsert.data.model`). `None` keeps the
     /// engine's own configured model. Read at spawn only — see the
     /// apply-on-next-run note on the Claude backend's `start_session`.
     pub(crate) model: Option<String>,
@@ -105,7 +105,7 @@ pub(crate) struct SessionCfg {
     pub(crate) thread_id: Option<String>,
 }
 
-/// The result of a completed turn (PLAN-003 §5 `RunOutcome`). Carries the
+/// The result of a completed turn. Carries the
 /// host-output triple `{status, result, newSessionId}` plus an optional error
 /// detail; the transport maps this onto an `output` frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +124,7 @@ pub(crate) struct RunOutcome {
     pub(crate) error_kind: Option<RunErrorKind>,
 }
 
-/// An event emitted while a [`Session`] runs (PLAN-003 §5 `EngineEvent`). The
+/// An event emitted while a [`Session`] runs. The
 /// runner forwards these to the orchestrator (mapping `Result` → `output`, the
 /// rest → transcript events and logs) and persists the session id from
 /// `SessionStarted`.

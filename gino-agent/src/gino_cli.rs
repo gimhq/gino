@@ -3,7 +3,7 @@
 //! inspect this agent and manage its own scheduled triggers via the `gino` skill.
 //!
 //! Everything operates on the agent's LOCAL state (v2: tasks/threads/crons live on
-//! the agent, OD14). Each invocation is a SHORT-LIVED, SEPARATE process that opens
+//! the agent). Each invocation is a SHORT-LIVED, SEPARATE process that opens
 //! the same WAL database as the running daemon:
 //!   * reads (`system`, `task`, `thread`, `cron list`) are plain queries;
 //!   * `cron` mutations write a `crons` row the daemon's scheduler polls (≤1 s) and
@@ -96,7 +96,7 @@ pub(crate) struct IdArg {
 
 /// Open the daemon's database for a CLI invocation.
 ///
-/// DECISION (audit P2-18): the CLI must NOT migrate. Every subcommand used to
+/// DECISION: the CLI must NOT migrate. Every subcommand used to
 /// call the migrating open, so any CLI invocation from a mismatched binary
 /// could rewrite the schema underneath a live daemon. [`Db::open_existing`]
 /// neither creates nor migrates: a missing file or a schema version other than

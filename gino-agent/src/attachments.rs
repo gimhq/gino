@@ -1,4 +1,4 @@
-//! Out-of-band attachment channel (agent-architecture §9 / §14 A1–A6; PLAN-005).
+//! Out-of-band attachment channel (agent-architecture §9 / §14 A1–A6).
 //!
 //! Bytes never ride a protocol frame — only **descriptors** do
 //! (`{ id, name, content_type, size, sha256, ref, direction? }`, see
@@ -51,7 +51,7 @@ const CACHE_SUBDIR: &str = "attachments-cache";
 const DIRECTION_OUTBOUND: &str = "outbound";
 
 /// Run a blocking filesystem/hash closure on the tokio blocking pool, off the
-/// async worker threads (audit P2-15). The large-byte work in this crate —
+/// async worker threads. The large-byte work in this crate —
 /// 100 MB-scale reads/writes, full-buffer hashing, store scans — must not run
 /// inline in an async fn; this is the one seam the provisioning/attachment
 /// paths hop through. A panic inside `task` is resumed on the caller (same
@@ -383,7 +383,7 @@ impl AttachmentManager {
                     limit: self.config.max_execution_bytes,
                 });
             }
-            // 100 MB-scale write → blocking pool, not the async worker (P2-15).
+            // 100 MB-scale write → blocking pool, not the async worker.
             let dest = inputs_dir.join(safe);
             let dir = inputs_dir.clone();
             let write_dest = dest.clone();
@@ -405,7 +405,7 @@ impl AttachmentManager {
     /// per-execution budget caps the total. Symlinks are ignored (no traversal).
     pub(crate) async fn collect_outputs(&self, work_dir: &Path) -> Vec<AttachmentDescriptor> {
         let output_dir = work_dir.join(OUTPUT_SUBDIR);
-        // The recursive dir walk is a filesystem scan → blocking pool (P2-15).
+        // The recursive dir walk is a filesystem scan → blocking pool.
         let scan = run_blocking(move || list_files(&output_dir))
             .await
             .and_then(|listed| listed);
@@ -446,7 +446,7 @@ impl AttachmentManager {
     }
 
     /// The configured single-file size cap (A5). The config/skills provisioner
-    /// ([`crate::provisioning`], PLAN-007) picks this as its [`fetch_verified`]
+    /// ([`crate::provisioning`]) picks this as its [`fetch_verified`]
     /// `max_bytes`.
     ///
     /// [`fetch_verified`]: AttachmentManager::fetch_verified
@@ -456,7 +456,7 @@ impl AttachmentManager {
 
     /// Fetch the verified bytes for a content-addressed artifact by `reference` +
     /// `sha256`, independent of any attachment **descriptor** — the byte seam the
-    /// config/skills provisioner ([`crate::provisioning`], PLAN-007 §2/§5) fetches
+    /// config/skills provisioner ([`crate::provisioning`]) fetches
     /// through.
     ///
     /// Serves from the content-addressed cache by `sha256` when present (no
@@ -477,7 +477,7 @@ impl AttachmentManager {
         max_bytes: u64,
     ) -> Result<Vec<u8>, AttachmentError> {
         // The cache probe re-hashes the whole cached blob (verification sweep) —
-        // off the async worker (P2-15).
+        // off the async worker.
         let cached = {
             let cache_dir = self.cache_dir.clone();
             let sha = sha256.to_owned();
@@ -520,7 +520,7 @@ impl AttachmentManager {
         // Promote the verified temp file into the cache by rename (same dir, so
         // same filesystem); an over-cache-cap blob is simply not cached. The
         // rename is cheap but the follow-up LRU pass scans the whole cache dir —
-        // run the pair on the blocking pool (P2-15).
+        // run the pair on the blocking pool.
         if bytes.len() as u64 <= self.config.cache_max_bytes {
             let cache_dir = self.cache_dir.clone();
             let cap = self.config.cache_max_bytes;
@@ -567,7 +567,7 @@ impl AttachmentManager {
             });
         }
         // Bounded read-back: the in-flight cap guarantees the file ≤ max_bytes.
-        // Still up to 100 MB — read on the blocking pool (P2-15).
+        // Still up to 100 MB — read on the blocking pool.
         let tmp = tmp.to_path_buf();
         Ok(run_blocking(move || std::fs::read(&tmp)).await??)
     }
@@ -612,7 +612,7 @@ impl AttachmentManager {
         let content_type = guess_content_type(rel);
         self.check_content_type(&content_type)?;
         // Full read + full-buffer hash + cache write (incl. the LRU scan inside
-        // cache_put) of a 100 MB-scale artifact → blocking pool (P2-15).
+        // cache_put) of a 100 MB-scale artifact → blocking pool.
         let (bytes, sha256) = {
             let abs = abs.to_path_buf();
             let max_single = self.config.max_single_bytes;
@@ -671,7 +671,7 @@ impl AttachmentManager {
 // ---------------------------------------------------------------------------
 // Content-addressed cache (A4). Free functions (not methods) so the async call
 // sites can move an owned `cache_dir` + cap into a `spawn_blocking` closure
-// (P2-15) — every one of these touches the filesystem, and `cache_get`/
+// — every one of these touches the filesystem, and `cache_get`/
 // `cache_put`/`cache_gc` do full-blob hashing or a whole-dir scan.
 // ---------------------------------------------------------------------------
 
@@ -826,7 +826,7 @@ fn touch(path: &Path) {
 }
 
 /// Best-effort MIME guess from a file extension; unknown → octet-stream. The
-/// attachment bytes are opaque (no redaction over binaries, PLAN-005 §5).
+/// attachment bytes are opaque (no redaction over binaries).
 fn guess_content_type(name: &str) -> String {
     let ext = Path::new(name)
         .extension()
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(backend.download_count(), 1, "second fetch is a cache hit");
     }
 
-    /// P2-15 seam: the blocking-pool hops (cache probe, streamed read-back,
+    /// Seam: the blocking-pool hops (cache probe, streamed read-back,
     /// cache promote + LRU GC) return correct results under concurrent load —
     /// distinct blobs fetched in parallel each verify and cache independently.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

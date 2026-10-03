@@ -1,4 +1,4 @@
-//! Provisioning reconcile / GC / repair orchestrator (PLAN-007 §6/§7; agent-
+//! Provisioning reconcile / GC / repair orchestrator (agent-
 //! architecture §9b).
 //!
 //! The [`Provisioner`] ties the merged provisioning pieces together: it diffs a
@@ -10,9 +10,9 @@
 //! host chooses the meta-driven `target` per engine.
 //!
 //! Bytes arrive through the [`BlobFetcher`] seam (production: the
-//! [`AttachmentManager`], reusing the PLAN-005 content-addressed cache), so the
+//! [`AttachmentManager`], reusing the content-addressed cache), so the
 //! orchestrator does no host I/O itself and is unit-testable with a fake fetcher.
-//! NO runner / executor / engine wiring lives here — that is a later PLAN-007 L3.
+//! NO runner / executor / engine wiring lives here.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ const STORE_SUBDIR: &str = "store";
 /// Out-of-band byte/bundle fetch for one content-addressed artifact. Abstracted
 /// as a trait so the [`Provisioner`] is unit-testable with a fake fetcher;
 /// production wires the [`AttachmentManager`] impl (which serves from / fills the
-/// PLAN-005 attachment cache and verifies integrity).
+/// Attachment cache and verifies integrity).
 #[async_trait]
 pub(crate) trait BlobFetcher: Send + Sync {
     /// Fetch + integrity-verify the bytes for `(reference, sha256)`. For a `dir`
@@ -64,7 +64,7 @@ impl BlobFetcher for AttachmentManager {
 // ===========================================================================
 
 /// The reconcile / GC / repair orchestrator over the content-addressed store +
-/// `config_entries` manifest (PLAN-007 §6/§7).
+/// `config_entries` manifest.
 pub(crate) struct Provisioner {
     /// Workspace root that holds the `store/` tree (the store root passed to
     /// [`store`] primitives).
@@ -73,7 +73,7 @@ pub(crate) struct Provisioner {
     fetcher: Arc<dyn BlobFetcher>,
     /// Serializes GC against reconcile / repair so GC never removes a store entry
     /// a reconcile is mid-materializing, between materialize and link (the
-    /// store-mutating critical sections, PLAN-007 Risk 4).
+    /// store-mutating critical sections).
     gc_lock: AsyncMutex<()>,
 }
 
@@ -105,7 +105,7 @@ impl Provisioner {
     /// by full `sha256` on the host's blob route (`GET /agent/attachments?sha256=…`,
     /// authorized by desired-set membership). Content addressing, not the entry
     /// name: the name is a logical label, only the sha identifies the bytes the
-    /// host actually serves (PLAN-007 §5 / host configstore serve).
+    /// host actually serves (host configstore serve).
     fn reference_for(sha256: &str) -> String {
         format!("/agent/attachments?sha256={sha256}")
     }
@@ -169,11 +169,11 @@ impl Provisioner {
 
         let kind = store_kind(entry.kind);
         let store_path = store::store_path(&self.workspace_dir, &entry.id, &entry.sha256)?;
-        // Reuse requires full-hash re-verification (P2-17): the short-id path
+        // Reuse requires full-hash re-verification: the short-id path
         // plus a shape check is not identity — a truncated post-crash file or a
         // tampered entry passes `is_file()` forever. A verified entry keeps the
         // re-reconcile fetch-free; anything else is evicted and re-fetched. The
-        // sweep re-reads every byte of the entry → blocking pool (P2-15).
+        // sweep re-reads every byte of the entry → blocking pool.
         let verified = {
             let store_path = store_path.clone();
             let sha = entry.sha256.clone();
@@ -213,7 +213,7 @@ impl Provisioner {
     /// bytes, and re-materialize it as `kind` — the shared heal path of
     /// reconcile and repair. Eviction stays ordered before the fetch (as
     /// before); the filesystem halves (tree removal, tar unpack / large-file
-    /// write + seal) run on the blocking pool (P2-15), only the fetch is async.
+    /// write + seal) run on the blocking pool, only the fetch is async.
     async fn evict_and_materialize(
         &self,
         name: &str,
@@ -259,14 +259,14 @@ impl Provisioner {
         };
 
         // The whole-store directory scan (plus tree deletions) is filesystem
-        // work → blocking pool (P2-15).
+        // work → blocking pool.
         let workspace_dir = self.workspace_dir.clone();
         run_blocking(move || gc_scan(&workspace_dir, &referenced)).await??;
         Ok(())
     }
 
-    /// Release every manifest row for `scope` — the terminal-state cleanup half of
-    /// P1-11. Dropping the rows removes the scope from the repair/GC root set: the
+    /// Release every manifest row for `scope` — the terminal-state cleanup.
+    /// Dropping the rows removes the scope from the repair/GC root set: the
     /// store entries it referenced become refcount-orphans that the next
     /// [`Self::gc`] collects, and [`Self::repair`] no longer rebuilds the scope's
     /// symlink tree at startup. The on-disk symlinks are deliberately left in
@@ -288,7 +288,7 @@ impl Provisioner {
         Ok(())
     }
 
-    /// Restart-repair (PLAN-007 §7, Risk 2; P2-17): for each manifest row,
+    /// Restart-repair (Risk 2): for each manifest row,
     /// full-hash verify the store entry — a missing/truncated/tampered entry is
     /// evicted, re-fetched and re-materialized; an intact one has its read-only
     /// sealing healed (a chmod'ed-back entry is re-sealed). A missing or dangling
@@ -311,7 +311,7 @@ impl Provisioner {
             // relocated workspace; the table stores an absolute snapshot only).
             let store_path = store::store_path(&self.workspace_dir, &row.name, &row.sha256)?;
             // Full-hash verification sweep + recursive re-seal both walk/read the
-            // whole entry → one blocking-pool hop for the pair (P2-15).
+            // whole entry → one blocking-pool hop for the pair.
             let intact = {
                 let store_path = store_path.clone();
                 let sha = row.sha256.clone();
@@ -354,7 +354,7 @@ impl Provisioner {
 /// The filesystem half of [`Provisioner::gc`]: scan the store tree and remove
 /// every `store/<name>/<short>` entry not in `referenced`. Extracted as a free
 /// function so the whole scan-and-delete pass moves onto the blocking pool in
-/// one hop (P2-15).
+/// one hop.
 fn gc_scan(
     workspace_dir: &Path,
     referenced: &HashSet<(String, String)>,
@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(std::fs::read(link.join("SKILL.md")).unwrap(), b"# demo\n");
     }
 
-    /// P1-11: releasing a scope drops its manifest rows, which unroots the scope
+    /// Releasing a scope drops its manifest rows, which unroots the scope
     /// from repair (a lost link stays gone, nothing re-fetched) and lets GC
     /// collect the now-unreferenced store entry. The on-disk symlink itself is
     /// left in place — the dead scope root is reclaimed wholesale elsewhere.
@@ -845,7 +845,7 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    /// P2-17 acceptance: a post-crash zero-length store file passes `is_file()`
+    /// Acceptance: a post-crash zero-length store file passes `is_file()`
     /// but fails full-hash re-verification — reconcile evicts and re-fetches it
     /// instead of silently reusing the corrupt entry.
     #[tokio::test]
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(mode_of(&store_file), 0o444, "healed entry is re-sealed");
     }
 
-    /// P2-17 acceptance: an entry tampered through the store path (the symlink
+    /// Acceptance: an entry tampered through the store path (the symlink
     /// write-through poisoning scenario) is detected by repair's full-hash
     /// verification, evicted, and re-fetched.
     #[tokio::test]
@@ -913,7 +913,7 @@ mod tests {
         assert_eq!(mode_of(&store_file), 0o444, "healed entry is re-sealed");
     }
 
-    /// P2-17 acceptance: an intact entry whose read-only sealing was chmod'ed
+    /// Acceptance: an intact entry whose read-only sealing was chmod'ed
     /// back is re-sealed by repair without any re-fetch.
     #[tokio::test]
     async fn repair_reseals_chmod_back_entry_without_refetch() {
@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(mode_of(&store_dir.join("SKILL.md")), 0o444);
     }
 
-    /// P2-15 seam: reconciles of distinct scopes driven concurrently — with the
+    /// Seam: reconciles of distinct scopes driven concurrently — with the
     /// verify / unpack / materialize work hopping through the blocking pool —
     /// land every symlink and manifest row correctly, and the shared dir bundle
     /// is still fetched exactly once (the reconciles serialize on the GC lock,

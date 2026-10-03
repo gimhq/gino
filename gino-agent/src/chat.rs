@@ -1,5 +1,5 @@
-//! Chat-threading policy for inbound `message` frames (host-v2 §M4; audit
-//! P0-3/P0-4) — the executor's companion module for the chat plane.
+//! Chat-threading policy for inbound `message` frames (host-architecture M4) —
+//! the executor's companion module for the chat plane.
 //!
 //! This module owns the inbound message → thread policy the runner wires around
 //! the [`ThreadExecutor`]:
@@ -7,7 +7,7 @@
 //! * **routing / minting** ([`ensure_chat_thread`], [`minted_thread_id`]) — a
 //!   present `threadId` continues its thread; an absent one maps to a thread id
 //!   derived deterministically from the message's inbox row, so reconnect
-//!   replays never mint duplicate threads (P0-3);
+//!   replays never mint duplicate threads;
 //! * **prompt resolution** ([`InboxPromptSource`]) — the drainer's
 //!   [`PromptSource`]: a chat/api thread runs (and consumes) its oldest
 //!   unprocessed inbox `message`, a cron thread runs its trigger's
@@ -15,7 +15,7 @@
 //! * **the post-terminal re-scan** ([`drain_with_queued_messages`]) — messages
 //!   queued while their thread was in flight are re-pended and drained until
 //!   none remain, so the second of two quick messages executes instead of
-//!   rotting in the inbox (P0-4).
+//!   rotting in the inbox.
 //!
 //! The runner (see [`crate::runner`]) supplies the wiring: it calls into this
 //! policy from its inbound router and its executor worker loop.
@@ -36,7 +36,7 @@ const DEFAULT_ENGINE: &str = "claude";
 /// Drain every `pending` thread, then keep re-pending threads whose inbox holds a
 /// queued `message` (one that arrived while the thread was in flight and was only
 /// logged "queued") and draining again until no queued message remains — the
-/// post-terminal re-scan that closes P0-4 (the second of two quick messages must
+/// post-terminal re-scan (the second of two quick messages must
 /// EXECUTE once the first run finishes, not rot in the inbox). Terminates because
 /// every re-pended thread's next run consumes its queued message row.
 pub(crate) async fn drain_with_queued_messages(
@@ -52,7 +52,7 @@ pub(crate) async fn drain_with_queued_messages(
 }
 
 /// Re-pend every resting thread that still has an unprocessed inbox `message`
-/// targeting it (P0-4). An untargeted (absent-`threadId`) row maps to its
+/// targeting it. An untargeted (absent-`threadId`) row maps to its
 /// deterministically minted thread ([`minted_thread_id`]) — recreating it if a
 /// crash lost the mint. Threads that are in flight (or already `pending`) are
 /// left alone: their message stays queued for the next pass. Cron threads are
@@ -163,7 +163,7 @@ fn resolve_inbox_message(db: &Mutex<Db>, thread: &ThreadRow) -> Option<String> {
     message.map(|data| data.text)
 }
 
-/// The deterministic thread id for an absent-`threadId` `message` (P0-3): derived
+/// The deterministic thread id for an absent-`threadId` `message`: derived
 /// from the inbox row that carries the message, so every delivery of that row —
 /// original or reconnect replay — resolves to the SAME thread instead of minting a
 /// fresh UUID each time (N reconnects must not race N+1 threads for one inbox
@@ -211,12 +211,12 @@ pub(crate) fn seed_task_if_missing(db: &Db, task_id: &str) -> bool {
 /// Ensure the chat thread `tid` exists and is runnable for a `message` (host-v2
 /// §M4 threading). A host-supplied `threadId` CONTINUES that thread; an absent
 /// one arrives here as the [`minted_thread_id`] derived from the message's inbox
-/// row, so the call is idempotent across replays (P0-3). A resting
+/// row, so the call is idempotent across replays. A resting
 /// (`active`/`succeeded`/`failed`/`cancelled`) thread is re-set `pending` for the
 /// new turn, KEEPING its `engine_session_id` so the engine conversation resumes;
 /// an in-flight (or already `pending`) thread is left as-is — the message waits in
-/// the inbox and [`repend_queued_messages`] re-pends the thread once it settles
-/// (P0-4). An unknown `tid` creates a fresh thread with no carried
+/// the inbox and [`repend_queued_messages`] re-pends the thread once it settles.
+/// An unknown `tid` creates a fresh thread with no carried
 /// `engine_session_id`, so the outbound `thread_result`/`thread_message` carry it
 /// back for the host to record as `current_thread_id`. Returns `true` when this
 /// call made the thread `pending` (re-pended or created).
@@ -549,7 +549,7 @@ mod tests {
         );
     }
 
-    /// P0-3 regression: replaying an unprocessed absent-`threadId` message (the
+    /// Regression: replaying an unprocessed absent-`threadId` message (the
     /// reconnect replay re-delivers the SAME inbox row) derives the SAME thread id
     /// and must NOT mint a second thread — N reconnects used to race N+1 threads
     /// for one inbox row.
@@ -624,7 +624,7 @@ mod tests {
         );
     }
 
-    /// P0-4 regression: two quick messages to the SAME thread — the first runs
+    /// Regression: two quick messages to the SAME thread — the first runs
     /// immediately; the second (queued while the thread was in flight) must
     /// actually EXECUTE once the first run finishes, driven by the post-terminal
     /// inbox re-scan. Asserts the second EXECUTION (the engine receives the
@@ -700,7 +700,7 @@ mod tests {
         assert!(ensure_chat_thread(&db, "t-1", "th-1", 1));
 
         // Message 2 arrives while th-1 is in flight: only queued (the original
-        // P0-4 defect: nothing ever re-checked the inbox after the run).
+        // Defect: nothing ever re-checked the inbox after the run).
         let m2 = InboundFrameV2::Message {
             task_id: "t-1".to_owned(),
             thread_id: Some("th-1".to_owned()),
@@ -747,7 +747,7 @@ mod tests {
 
         // The post-terminal re-scan re-pends the thread for the queued message...
         assert_eq!(repend_queued_messages(&db, 1), 1);
-        // ...and the next drain EXECUTES it (this is the P0-4 fix).
+        // ...and the next drain EXECUTES it (this is the fix).
         executor.drain_pending(&source).await;
         assert_eq!(
             *prompts_seen.lock().unwrap(),

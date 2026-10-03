@@ -1,4 +1,4 @@
-//! stream-json line parsing → [`EngineEvent`] (PLAN-001 §"event mapping").
+//! stream-json line parsing → [`EngineEvent`].
 //!
 //! Every non-control line on the child's stdout is a stream-json message whose
 //! shape mirrors the Claude Agent SDK. This module maps the messages the runner

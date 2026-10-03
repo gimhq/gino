@@ -1,4 +1,4 @@
-//! Wire protocol types (PLAN-003 §2, PLAN-002 §4, PLAN-001 event mapping).
+//! Wire protocol types.
 //!
 //! These are the serde envelopes exchanged with the orchestrator. They are
 //! host-wire-compatible: field names match the existing TypeScript runner
@@ -7,11 +7,11 @@
 //!
 //! ## The live contract is v2
 //!
-//! The runner speaks `protocolVersion = 2` end to end (PLAN-006 Lane B /
-//! agent-architecture §10): the [`v2`] module is the live frame catalog —
+//! The runner speaks `protocolVersion = 2` end to end
+//! (agent-architecture §10): the [`v2`] module is the live frame catalog —
 //! correlation ids (`taskId`/`threadId`/`cronId`) at the **envelope top level**,
 //! business fields under `data`, and the `thread_*`/`cron_*` frames. The v1
-//! `output`/`idle`/`task_*` frame enums have been removed (PLAN-006 §4); only the
+//! `output`/`idle`/`task_*` frame enums have been removed; only the
 //! shared HTTP registration DTOs ([`RegisterRequest`] et al.) remain at this top
 //! level.
 //!
@@ -33,7 +33,7 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// Negotiated wire-protocol version, bumped **1 → 2** for the task/cron/thread
-/// rebuild (PLAN-006 / agent-architecture §10). The agent sends it in
+/// rebuild (agent-architecture §10). The agent sends it in
 /// `POST /agent/register`; the host returns the version it will speak and rejects
 /// a mismatch with `register_error { reason: "unsupported_protocol" }`
 /// ([`RegisterError`]). Compatibility is additive-within-major: new optional
@@ -75,7 +75,7 @@ impl fmt::Debug for Redacted {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP registration (PLAN-003 §2.1)
+// HTTP registration
 // ---------------------------------------------------------------------------
 
 /// `POST /agent/register` request body.
@@ -225,10 +225,10 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol v2 frames (PLAN-006 Lane B)
+// Protocol v2 frames
 // ---------------------------------------------------------------------------
 
-/// Protocol **v2** frame types (PLAN-006 Lane B; agent-architecture §10/§12/§14).
+/// Protocol **v2** frame types (agent-architecture §10/§12/§14).
 ///
 /// ## Envelope vs payload
 ///
@@ -260,7 +260,7 @@ mod tests {
 ///
 /// These frames are the **live** wire contract, driven end to end by
 /// `transport`/`executor`/`scheduler`/`runner`; the v1 frame enums they replaced
-/// have been removed (PLAN-006 §4). Enrollment ([`RegisterRequest`] et al.) is
+/// have been removed. Enrollment ([`RegisterRequest`] et al.) is
 /// shared and unchanged.
 pub(crate) mod v2 {
     use serde::{Deserialize, Serialize};
@@ -328,7 +328,7 @@ pub(crate) mod v2 {
         pub(crate) direction: Option<String>,
     }
 
-    /// Shape of a [`ProvisioningEntry`]'s materialized artifact (PLAN-007 §1): a
+    /// Shape of a [`ProvisioningEntry`]'s materialized artifact: a
     /// single `file` (e.g. an instruction file `CLAUDE.md`/`AGENTS.md`) or a `dir`
     /// bundle (e.g. a skill = `SKILL.md` + files). Wire-parses `"file"`/`"dir"`; an
     /// unknown kind string fails to deserialize.
@@ -339,7 +339,7 @@ pub(crate) mod v2 {
         Dir,
     }
 
-    /// A versioned, content-addressed **provisioning entry** (PLAN-007 §1): one
+    /// A versioned, content-addressed **provisioning entry**: one
     /// instruction file or skill bundle to materialize into a scope root. Engine-
     /// agnostic — the runner only knows `target`/`kind`; the host chooses the
     /// meta-driven `target` per engine (claude→`CLAUDE.md`, codex→`AGENTS.md`, …).
@@ -381,7 +381,7 @@ pub(crate) mod v2 {
         pub(crate) kind: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) status: Option<String>,
-        /// The backend this task's threads run on (protocol.md §7, OD15). The
+        /// The backend this task's threads run on (protocol.md §7). The
         /// runner implements `claude` and `codex`, and selects the backend per
         /// run from this field. An engine this build does not implement — or one
         /// whose backend is not registered on this runner — is warned about and
@@ -404,7 +404,7 @@ pub(crate) mod v2 {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) meta: Option<Value>,
         /// Task-scope provisioning entries (instruction file + skills) materialized
-        /// into `<thread.work_dir>/project/` (PLAN-007 §5). Absent → `None`.
+        /// into `<thread.work_dir>/project/`. Absent → `None`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub(crate) entries: Option<Vec<ProvisioningEntry>>,
     }

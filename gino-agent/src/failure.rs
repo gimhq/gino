@@ -26,7 +26,7 @@
 //! [`classify_engine_error`] does the same for process-level [`EngineError`]s.
 //! Error *prose* is never consulted — it is (or quotes) model output, and
 //! substring matching against it misclassifies ordinary text ("took 1500ms",
-//! "400") into policy-changing reasons (P2-14). Callers that *know* the cause
+//! "400") into policy-changing reasons. Callers that *know* the cause
 //! (the watchdog setting `runner.timeout`) construct the reason directly.
 //!
 //! Several reasons are part of the spec §6 wire taxonomy but have no
@@ -60,7 +60,7 @@ pub(crate) enum RunnerFailure {
 /// Only [`ProcessFailure`](Self::ProcessFailure) and [`Unknown`](Self::Unknown)
 /// have constructing code paths today: the engine reports no structured cause
 /// finer than `RunErrorKind`, so the provider-specific reasons cannot be
-/// detected without prose-matching (banned — P2-14). They stay declared (wire
+/// detected without prose-matching (banned). They stay declared (wire
 /// taxonomy, spec §6) under per-variant allows until a structured signal exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentFailure {
@@ -195,7 +195,7 @@ impl std::fmt::Display for FailureReason {
 
 /// Map a turn's structured error cause ([`RunErrorKind`], the engine's parsed
 /// `result.subtype`) into a [`FailureReason`]. Only the structured signal is
-/// consulted — never the error/result prose (P2-14).
+/// consulted — never the error/result prose.
 pub(crate) fn classify_outcome(kind: Option<RunErrorKind>) -> FailureReason {
     match kind {
         Some(RunErrorKind::MaxTurns) => FailureReason::Runner(RunnerFailure::IterationLimit),
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn classify_outcome_ignores_prose_entirely() {
-        // P2-14 regression: classification takes no text input at all, so
+        // Regression: classification takes no text input at all, so
         // error-looking prose ("took 1500ms" → 500, "400" → invalid_request)
         // can never flip policy. The fallback must be resume-safe so a healthy
         // engine_session_id survives an unclassified failure.

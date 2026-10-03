@@ -1,6 +1,6 @@
 //! Shared path-component safety: the single validator every subsystem uses
-//! before joining an attacker-influenced name under a local directory
-//! (PLAN-005 risk 3 / PLAN-007 Risk 3). Callers wrap [`UnsafeName`] in their
+//! before joining an attacker-influenced name under a local directory.
+//! Callers wrap [`UnsafeName`] in their
 //! own domain error (`From` impls live beside those error types).
 
 /// A name rejected by [`safe_component`]: used as a path component it could

@@ -1,14 +1,12 @@
 #![forbid(unsafe_code)]
 
-//! `gino-agent` — a generic, WebSocket-based, runtime-agnostic agent runner
-//! (PLAN-003). It is the persistent node agent: it registers with the gino
+//! `gino-agent` — a generic, WebSocket-based, runtime-agnostic agent runner.
+//! It is the persistent node agent: it registers with the gino
 //! orchestrator, receives its config, and supervises local execution.
 //!
-//! This crate is built up across several changes. This one establishes the
-//! foundation: project config, the global [`config`] layer, and the CLI with
-//! subcommand dispatch. The transport, engine, db, executor and scheduler
-//! modules — and the real `run`/`archive` behavior — land on top of this
-//! skeleton later.
+//! This module owns the CLI and subcommand dispatch; the daemon itself lives
+//! in [`runner`], on top of the transport, engine, db, executor and scheduler
+//! modules.
 //!
 //! The `gino-agent` binary is a thin wrapper around [`run`].
 
@@ -53,7 +51,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-/// Bootstrap inputs (PLAN-003 §2.1): the only things the runner needs to start.
+/// Bootstrap inputs: the only things the runner needs to start.
 /// Everything else — agent id, connect token, config — is host-assigned at
 /// registration. These are global so they may appear before or after the
 /// subcommand.
@@ -141,7 +139,7 @@ pub fn run() -> Result<()> {
 
 /// Install the process-wide rustls `CryptoProvider`. Both aws-lc-rs and ring are
 /// compiled in (pulled by reqwest and tokio-tungstenite respectively), so rustls
-/// cannot pick one implicitly; we pin aws-lc-rs (PLAN-001 Lock 2). Idempotent: a
+/// cannot pick one implicitly; we pin aws-lc-rs. Idempotent: a
 /// second call — or another installer winning the race — is a harmless no-op.
 fn install_crypto_provider() {
     if rustls::crypto::aws_lc_rs::default_provider()
@@ -157,7 +155,7 @@ fn install_crypto_provider() {
 ///
 /// This runs as a short-lived subprocess Claude spawns for its PreCompact hook,
 /// so it cannot reach host-assigned config; the workspace path is resolved from
-/// the `GINO_WORKSPACE_DIR` env (set by the engine when it spawns Claude in L3-5)
+/// the `GINO_WORKSPACE_DIR` env (set by the engine when it spawns Claude)
 /// or the built-in default. No network, no runtime needed.
 fn archive() -> Result<()> {
     let workspace_dir = env_path_or("GINO_WORKSPACE_DIR", |paths| paths.workspace_dir);

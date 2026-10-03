@@ -1,4 +1,4 @@
-//! The runner's [`AttachmentSource`] (PLAN-005, agent-architecture §9; audit
+//! The runner's [`AttachmentSource`] (agent-architecture §9; audit
 //! P1-10b).
 //!
 //! Inbound attachment **descriptors** ride the inbox `message` frame

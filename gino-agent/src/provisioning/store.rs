@@ -1,7 +1,7 @@
-//! Content-addressed store + symlink primitives (agent-architecture §9b; PLAN-007
-//! §2/§3). Pure filesystem: bytes/bundle → store, store → symlink, plus on-disk
+//! Content-addressed store + symlink primitives (agent-architecture §9b).
+//! Pure filesystem: bytes/bundle → store, store → symlink, plus on-disk
 //! integrity ([`verify_entry`] full-hash re-verification and [`seal_entry`]
-//! read-only sealing — audit P2-17). The caller (the reconcile L3) supplies
+//! read-only sealing). The caller (the reconcile L3) supplies
 //! absolute paths and pre-verified bytes; this module does no fetching or DB work.
 //!
 //! Layout under a workspace `store_root`:
@@ -45,7 +45,7 @@ const HASH_CHUNK: usize = 64 * 1024;
 /// (both unavailable / undesirable here): `.tmp.<final>.<pid>.<seq>`.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The two artifact shapes (PLAN-007 §1): a single file or a directory bundle.
+/// The two artifact shapes: a single file or a directory bundle.
 /// [`link`] uses it to validate the store entry's on-disk type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntryKind {
@@ -165,7 +165,7 @@ pub(crate) fn materialize_dir(
     }
 }
 
-/// Full-hash re-verification of a store entry (audit P2-17): existence alone is
+/// Full-hash re-verification of a store entry: existence alone is
 /// not identity — the store path uses a 48-bit short id, and a post-crash
 /// truncated file passes `is_file()` forever. For `kind=file` the file bytes are
 /// re-hashed incrementally and compared to the full `sha256`; for `kind=dir` the
@@ -208,7 +208,7 @@ pub(crate) fn seal_entry(store_path: &Path, kind: EntryKind) -> Result<(), Provi
 }
 
 /// Create (or REPOINT) a symlink at `<scope_root>/<target>` pointing to
-/// `store_path` (PLAN-007 §2). Parent dirs of the link are created as needed; an
+/// `store_path`. Parent dirs of the link are created as needed; an
 /// existing link/file is replaced atomically (symlink to a temp sibling, then
 /// rename over). `kind` validates the store entry's on-disk type. Returns the
 /// link path.

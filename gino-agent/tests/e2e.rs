@@ -1,4 +1,4 @@
-//! End-to-end §5b scenarios (PLAN-006 Lane I) — the deterministic full-loop tests.
+//! End-to-end §5b scenarios — the deterministic full-loop tests.
 //!
 //! Each scenario boots the real `gino-agent` binary against an in-process stub
 //! host with a scripted fake-`claude` (see [`support`]) and asserts the host
@@ -22,7 +22,7 @@
 //!   `(taskId, threadId, seq)`; `final_seq` == per-thread count.
 //! * `failure_timeout_is_retried`, `failure_prose_400_keeps_session`,
 //!   `failure_agent_error_not_retried` (§5b #6) — `runner.timeout` (retried),
-//!   error prose never classified (P2-14: a "400"-looking message keeps the
+//!   error prose never classified (a "400"-looking message keeps the
 //!   session), unclassified engine errors → `agent.unknown` (not retried).
 //! * `attachment_round_trip` (§5b #7) — inbound descriptor → `inputs/` → engine
 //!   reads → `output/` → upload → host `attachments`; sha256 verified; cache hit
@@ -45,7 +45,7 @@
 //!   scheduled_at)` prevent a re-fire/re-run while the unsynced outbox result
 //!   replays (one `thread_run`, messages de-dup, `round_count` stays 1).
 //!
-//! Provisioning scenarios (PLAN-007 — engine config & skills). The runner owns
+//! Provisioning scenarios (engine config & skills). The runner owns
 //! `GINO_WORKSPACE_DIR`, so these assert on the **on-disk** content-addressed store
 //! and symlinks it materializes (not the host mirror). Global scope:
 //! `engine-config/<target>` is a symlink into `store/<name>/<sha256[:12]>`. Task
@@ -75,13 +75,13 @@
 //! persisted identity on a restart (no second `POST /agent/register`), but the
 //! GLOBAL set is now restart-durable: the startup `GET /agent/config` re-supplies
 //! the host's versioned desired set, and the version gate reconciles the global scope
-//! ONLY when that version advances (PLAN-007-7). A restart at the same version takes
+//! ONLY when that version advances. A restart at the same version takes
 //! the repair-only path, so the global manifest + store survive. The task manifest
 //! (`tasks.entries` + `config_entries`) is likewise durable, so #5/#6 keep exercising
 //! the scope-agnostic `Provisioner::gc`/`repair` on the task scope, while the version
 //! gate itself is covered head-on by the restart-durability scenarios below.
 //!
-//! Restart-durability scenarios (PLAN-007-7 — the version gate, global scope):
+//! Restart-durability scenarios (the version gate, global scope):
 //!
 //! * `restart_same_global_version_is_durable` — a restart that re-fetches the SAME
 //!   config version repairs-only: the global symlinks + store survive with ZERO
@@ -426,7 +426,7 @@ async fn failure_timeout_is_retried() {
     runner.shutdown().await;
 }
 
-/// P2-14 regression: an errored result whose PROSE looks like a malformed
+/// Regression: an errored result whose PROSE looks like a malformed
 /// request ("HTTP 400", "invalid request") carries no structured cause, so it
 /// classifies `agent.unknown` — NOT `runner.invalid_request` — and the healthy
 /// engine session id survives for resume instead of being discarded on a
@@ -950,7 +950,7 @@ async fn cron_crash_restart_no_double_execution() {
 }
 
 // ===========================================================================
-// PLAN-007 — engine config & skills provisioning (global + task scope), e2e
+// Engine config & skills provisioning (global + task scope), e2e
 // ===========================================================================
 //
 // These scenarios drive the SAME black-box harness (real binary + StubHost + fake
@@ -1520,7 +1520,7 @@ async fn path_traversal_global_entry_is_contained_and_daemon_survives() {
 }
 
 // ===========================================================================
-// PLAN-007-7 — GLOBAL config version gate / restart durability, e2e
+// GLOBAL config version gate / restart durability, e2e
 // ===========================================================================
 //
 // The fix this lane delivers: a restart reuses the persisted identity (no second

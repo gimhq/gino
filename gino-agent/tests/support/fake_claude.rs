@@ -1,4 +1,4 @@
-//! The **stub engine** for the §5b e2e harness (PLAN-006 §5b).
+//! The **stub engine** for the §5b e2e harness.
 //!
 //! The runner's only engine today is the Claude CLI engine
 //! (`crate::engine::claude`), which spawns a `claude` binary resolved from `PATH`
@@ -64,7 +64,7 @@ pub enum Behavior {
     /// succeed. Exercises the attachment round-trip (materialise → engine reads →
     /// output → upload). The `../` reaches the `inputs/`/`output/` dirs the
     /// attachment plane keeps under the thread `work_dir`: with task provisioning
-    /// active (PLAN-007 §3) the engine cwd is `work_dir/project/`, so those dirs
+    /// active the engine cwd is `work_dir/project/`, so those dirs
     /// are siblings of the cwd's parent.
     Attachment {
         /// The backend session id announced in `system/init`.
@@ -86,7 +86,7 @@ impl Behavior {
 
 /// The fixed input/output file names the [`Behavior::Attachment`] script uses.
 /// The attachment plane keeps `inputs/`/`output/` under the thread `work_dir`,
-/// while task provisioning (PLAN-007 §3) sets the engine cwd to
+/// while task provisioning sets the engine cwd to
 /// `work_dir/project/`, so the script reaches them via `../inputs`/`../output`.
 pub const ATTACHMENT_INPUT_NAME: &str = "input.txt";
 /// The output artifact name written by the [`Behavior::Attachment`] script.
@@ -151,7 +151,7 @@ fn render(behavior: &Behavior) -> String {
         Behavior::Attachment { session_id } => {
             use std::fmt::Write as _;
             script.push_str(&emit(&init_line(session_id)));
-            // cwd is `work_dir/project/` (PLAN-007 §3); the attachment plane keeps
+            // cwd is `work_dir/project/`; the attachment plane keeps
             // `inputs/`/`output/` under `work_dir`, so reach them via `../`.
             script.push_str("mkdir -p ../output\n");
             let _ = writeln!(

@@ -1,4 +1,4 @@
-//! HTTP client (PLAN-003 §2 / §2.1, decision 5; agent-architecture §10).
+//! HTTP client (agent-architecture §10).
 //!
 //! The WebSocket is the primary channel; HTTP is retained for the endpoints that
 //! sit outside the persistent socket. Enrollment is **protocol-version-shared**
@@ -12,7 +12,7 @@
 //!   connect token in the `x-internal-token` header.
 //!
 //! The **attachment proxy** client (`GET /agent/attachments/:id` /
-//! `POST /agent/attachments`, agent-architecture §9 / PLAN-005, Lane F) lives
+//! `POST /agent/attachments`, agent-architecture §9, Lane F) lives
 //! here too — see [`HttpClient::download_attachment`] /
 //! [`HttpClient::upload_attachment`]. It is the **host-proxy** byte backend: the
 //! same connect-token auth as the endpoints above, but the bytes ride the request
@@ -40,11 +40,11 @@ const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
 const ATTACHMENT_NAME_HEADER: &str = "x-attachment-name";
 /// Content hash of an uploaded attachment, so the host can dedup/verify too.
 const ATTACHMENT_SHA256_HEADER: &str = "x-attachment-sha256";
-/// Bound on establishing the TCP/TLS connection (audit P2-16: the client
+/// Bound on establishing the TCP/TLS connection (the client
 /// previously had no timeouts at all, so registration could hang forever).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Idle guard between successive reads of a response (headers or body chunks).
-/// DECISION (P2-16): connect + idle-read timeouts, deliberately NO whole-request
+/// DECISION: connect + idle-read timeouts, deliberately NO whole-request
 /// `timeout` — attachment transfers stream arbitrarily large bodies, so a total
 /// -duration cap would abort legitimate slow transfers, while the idle guard
 /// still bounds a stalled response on every endpoint.
@@ -175,7 +175,7 @@ impl HttpClient {
     }
 
     /// `GET {url}` — stream an attachment's raw bytes from the host proxy
-    /// (`GET /agent/attachments/:id`, agent-architecture §9 / PLAN-005) into
+    /// (`GET /agent/attachments/:id`, agent-architecture §9) into
     /// `sink`, returning the byte count. The body is never buffered whole (audit
     /// P1-10a): a declared `Content-Length` over `max_bytes` aborts before any
     /// body read, and the chunk loop aborts as soon as the running count would
@@ -320,7 +320,7 @@ mod tests {
 
     use super::HttpClient;
 
-    /// P2-16: the production client is built with bounded connect/read
+    /// The production client is built with bounded connect/read
     /// timeouts (through the same seam the test below exercises), so no
     /// endpoint can hang forever.
     #[test]
@@ -331,7 +331,7 @@ mod tests {
         assert!(super::READ_TIMEOUT <= Duration::from_mins(5));
     }
 
-    /// P2-16: a host that accepts the request but never answers is bounded by
+    /// A host that accepts the request but never answers is bounded by
     /// the idle-read guard — the call errors out instead of hanging forever
     /// (the old client had no timeouts at all).
     #[tokio::test]

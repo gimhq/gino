@@ -1,5 +1,5 @@
 //! Engine-agnostic local scheduler — v2 scheduling plane (agent-architecture
-//! §4/§5/§7, PLAN-006 §3 Lane C).
+//! §4/§5/§7).
 //!
 //! The runner owns its triggers. A single tokio task loads the active
 //! [`crons`](crate::db) on each pass, sleeps until the earliest `next_run` is due
@@ -37,7 +37,7 @@
 //! collapses missed periods (anchored advance past now), `cron` recomputes from
 //! wall-clock, `once` dispatches if within a grace window else logs `missed`.
 //!
-//! ## v1 strangler removal (PLAN-006 §4)
+//! ## v1 strangler removal
 //!
 //! The v2 path is the only live one: [`Scheduler::new`] takes `(db, cancel)`, fires
 //! triggers into `cron_logs` + pending `threads`, and signals
@@ -45,7 +45,7 @@
 //! execution shims (`TaskDispatcher`, `output_of`, `mode_of`, the v1 task-upsert
 //! handlers) and the host-mirror task-snapshot merge (`reconcile_snapshot`) are
 //! gone, as is the v1 `compute_next_run`/`validate_schedule` pair that only the
-//! cancelled in-runner tool server drove (PLAN-007). Consumers:
+//! cancelled in-runner tool server drove. Consumers:
 //!
 //! * `runner.rs` → [`Cancel`], [`Scheduler`], [`apply_cron_upsert`] /
 //!   [`apply_cron_delete`] (v2 cron routes).
@@ -93,7 +93,7 @@ const SKIP_SHARED_BUSY: &str = "shared_thread_busy";
 /// `cron_logs.skip_reason` for a `once` whose slot lapsed during downtime.
 const MISSED_ONCE_STALE: &str = "once_catchup_window_exceeded";
 
-/// Seconds between queue-GC sweeps (audit P1-9). The sweep piggybacks on the
+/// Seconds between queue-GC sweeps. The sweep piggybacks on the
 /// scheduler's existing tick (no extra thread/task); retention is measured in
 /// days, so sweeping more often than hourly buys nothing.
 const GC_SWEEP_INTERVAL_SECS: i64 = 3_600;
@@ -557,7 +557,7 @@ pub(crate) struct Scheduler {
     /// Per-thread retry budget stamped on cron-fired threads
     /// (`config.executor.max_attempts`).
     max_attempts: i64,
-    /// Queue-GC retention window in days (`config.retention.days`, audit P1-9).
+    /// Queue-GC retention window in days (`config.retention.days`).
     retention_days: u32,
 }
 
@@ -615,7 +615,7 @@ impl Scheduler {
         }
         // Process-local skip/last-status tally per cron, feeding `cron_state`.
         let mut tally: HashMap<String, CronTally> = HashMap::new();
-        // Queue-GC pacing (audit P1-9): swept on the existing tick, at most once
+        // Queue-GC pacing: swept on the existing tick, at most once
         // per GC_SWEEP_INTERVAL_SECS. `None` sweeps on the first tick so a
         // long-idle DB starts draining immediately (bounded batches).
         let mut last_gc: Option<DateTime<Utc>> = None;
@@ -665,8 +665,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// One bounded queue-GC sweep over the retention-managed tables (audit
-    /// P1-9): acked outbox, processed inbox, cron ledger lines, and attachment
+    /// One bounded queue-GC sweep over the retention-managed tables:
+    /// acked outbox, processed inbox, cron ledger lines, and attachment
     /// snapshots of terminal threads, each older than the retention window.
     /// Runs [`GC_MAX_BATCHES`] batches of [`GC_BATCH_ROWS`] at most, taking and
     /// releasing the DB mutex per batch, so a year-old backlog never stalls the
@@ -775,7 +775,7 @@ impl Scheduler {
         }
     }
 
-    /// Fire one due cron **atomically** (P1-8/P2-13): the whole fire — ledger
+    /// Fire one due cron **atomically**: the whole fire — ledger
     /// append, driven-thread mutation, cron advance, `cron_state` enqueue — runs
     /// in one `BEGIN IMMEDIATE` transaction under one DB-mutex hold, so a crash
     /// or error anywhere leaves no partial state; the slot simply retries on the
@@ -828,7 +828,7 @@ impl Scheduler {
 
         // Round-count truth = cron_logs MAX(round_seq); this fire is the next
         // round. A read error PROPAGATES (rolling the fire back) rather than
-        // silently restarting the round count at 0 (P2-13).
+        // silently restarting the round count at 0.
         let round_seq = db.max_round_seq(&cron.id)?.unwrap_or(0) + 1;
 
         // Shared continuity needs the open thread's state to decide overlap.
@@ -875,7 +875,7 @@ impl Scheduler {
         }
 
         // A fresh (deduped) shared fire drives a NEW turn on the ongoing thread:
-        // re-pend it, keeping the engine session (P0-1). After the dedup so a
+        // re-pend it, keeping the engine session. After the dedup so a
         // replayed slot never re-runs a turn that already executed.
         if let FireAction::Dispatch {
             thread_id,
@@ -921,7 +921,7 @@ impl Scheduler {
     }
 
     /// Re-set a resting shared thread `pending` so a fresh fire actually runs a
-    /// new turn (P0-1): the `engine_session_id` (continuity) is KEPT, the
+    /// new turn: the `engine_session_id` (continuity) is KEPT, the
     /// prompt is RE-SNAPSHOTTED from the current cron row so a `cron_upsert`
     /// prompt edit reaches the next turn (within-turn retries still reuse the
     /// thread snapshot), the per-turn fields (attempt counter, failure fields,
@@ -965,7 +965,7 @@ impl Scheduler {
     /// a `once` marked `completed`. The write is [`Db::advance_cron`] — a targeted
     /// UPDATE of the scheduling columns only, guarded on `status = 'active'`, so a
     /// `cron_delete`/`cron_upsert` that landed after the tick-read wins and a
-    /// deleted cron is never resurrected (P2-13). Returns the advanced row (for
+    /// deleted cron is never resurrected. Returns the advanced row (for
     /// `cron_state`), or `None` when the guard rejected the stale advance.
     fn advance_cron(
         db: &Db,
@@ -1036,7 +1036,7 @@ fn lock_db(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
 }
 
 /// Unwrap one queue-GC batch result, degrading a failure to zero-with-warning
-/// so a GC error never disturbs scheduling or execution (audit P1-9).
+/// so a GC error never disturbs scheduling or execution.
 fn gc_batch(result: Result<usize, DbError>, table: &str) -> usize {
     result.unwrap_or_else(|err| {
         warn!(table, error = %err, "queue GC batch failed");
@@ -1525,7 +1525,7 @@ mod tests {
         );
     }
 
-    /// P1-8/P2-13 regression: a fire is ONE transaction. A failure on its last
+    /// Regression: a fire is ONE transaction. A failure on its last
     /// write (the `cron_state` outbox enqueue — forced here by dropping the
     /// outbox table) must roll back the whole fire: no pending thread, no
     /// ledger row, no cron advance — never the old partial state.
@@ -1572,7 +1572,7 @@ mod tests {
         assert_eq!(lock_db(&db).max_round_seq("c-1").unwrap(), Some(1));
     }
 
-    /// P2-13 regression: a `cron_delete` landing between the scheduler's
+    /// Regression: a `cron_delete` landing between the scheduler's
     /// tick-read and the fire's advance must win — the guarded targeted UPDATE
     /// rejects the stale advance instead of resurrecting the cancelled cron to
     /// `active` with a fresh `next_run`.
@@ -1605,7 +1605,7 @@ mod tests {
         assert_eq!(reloaded.next_run, None, "no resurrected next_run");
     }
 
-    /// P2-13 regression: a `max_round_seq` read error aborts the fire (and rolls
+    /// Regression: a `max_round_seq` read error aborts the fire (and rolls
     /// it back) instead of being swallowed to round 0 and corrupting the round
     /// accounting.
     #[test]
@@ -1801,7 +1801,7 @@ mod tests {
 
     #[test]
     fn shared_fire_repends_resting_thread_keeping_session_clearing_turn_fields() {
-        // P0-1: a later shared fire must make the ongoing thread runnable again
+        // A later shared fire must make the ongoing thread runnable again
         // (`pending`), KEEPING engine_session_id (continuity) and the prompt
         // snapshot while clearing every per-turn field.
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
@@ -1894,7 +1894,7 @@ mod tests {
         assert_eq!(lock_db(&db).max_round_seq("c-sh").unwrap(), Some(1));
     }
 
-    // ===== scheduler + executor integration (P0-1 / P1-5 regressions) =====
+    // ===== scheduler + executor integration =====
 
     /// Records the `resume` handle and `initial_prompt` of every session the
     /// engine is asked to start, then replays a successful turn on `session_id`.
@@ -1962,7 +1962,7 @@ mod tests {
         )
     }
 
-    /// The audit's named blind spot (P0-1): the SECOND fire of a
+    /// The audit's named blind spot: the SECOND fire of a
     /// shared-continuity cron must actually EXECUTE an engine run — resuming
     /// the same engine session — not merely write a `dispatched` ledger row.
     #[tokio::test]
@@ -1992,7 +1992,7 @@ mod tests {
         assert_eq!(*engine.resumes.lock().unwrap(), vec![None]);
 
         // Fire 2 + drain: the second fire EXECUTES a second engine run that
-        // resumes the recorded session — the P0-1 defect was that no run
+        // resumes the recorded session — the defect was that no run
         // happened at all despite a `dispatched` cron_logs row.
         let advanced = lock_db(&db).get_cron("c-sh").unwrap().unwrap();
         let slot2 = parse_iso(advanced.next_run.as_deref().unwrap()).unwrap();
@@ -2106,7 +2106,7 @@ mod tests {
         }
     }
 
-    /// P1-5: under the shipped default config a cron thread's retryable failure
+    /// Under the shipped default config a cron thread's retryable failure
     /// must actually retry — the config retry budget reaches cron threads
     /// (no more hardcoded `max_attempts: 1`) and attempt 2 happens.
     #[tokio::test]
@@ -2253,7 +2253,7 @@ mod tests {
         assert_eq!(rows[0].thread_id.as_deref(), Some("c-1"));
     }
 
-    // ===== queue GC sweep (audit P1-9) =====
+    // ===== queue GC sweep =====
 
     /// The sweep deletes expired terminal rows across the retention-managed
     /// tables in one call, and leaves rows still owed to the at-least-once

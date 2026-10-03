@@ -1,5 +1,4 @@
-//! The `archive` subcommand — PreCompact transcript archiving (PLAN-001
-//! §"PreCompact archiving").
+//! The `archive` subcommand — PreCompact transcript archiving.
 //!
 //! Claude Code is configured (via the `--settings` hook this runner builds) to
 //! run `gino-agent archive` just before it compacts a conversation. The hook
@@ -32,7 +31,7 @@ use tracing::{info, warn};
 const MAX_BODY_CHARS: usize = 2000;
 
 /// Sidecar lockfile under the conversations dir serializing concurrent `archive`
-/// hook processes (audit P2-19).
+/// hook processes.
 const CONVERSATIONS_LOCK_FILE: &str = ".sessions-index.lock";
 
 /// Errors raised while archiving a transcript.
@@ -145,7 +144,7 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
         source,
     })?;
 
-    // Serialize concurrent PreCompact hooks (audit P2-19). Decision: an advisory
+    // Serialize concurrent PreCompact hooks. Decision: an advisory
     // exclusive lock on a sidecar lockfile — each hook is its own short-lived
     // `gino-agent archive` process, so there is no in-process single writer to
     // lean on and the lock must work cross-process. Held (via the binding) across
@@ -283,7 +282,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 /// Slug a summary into a filename fragment: lowercase, non-alphanumerics collapsed
 /// to single dashes, trimmed, capped at 50 characters. A summary with no ASCII
 /// alphanumerics at all (e.g. fully non-ASCII) used to slug to the empty string —
-/// making every such same-day archive share one name (audit P2-19); it now falls
+/// making every such same-day archive share one name; it now falls
 /// back to a content hash, so distinct summaries yield distinct, non-empty names.
 fn sanitize_filename(summary: &str) -> String {
     let mut out = String::new();
@@ -336,7 +335,7 @@ fn lock_conversations_dir(dir: &Path) -> Result<fs::File, ArchiveError> {
 
 /// The first free `<stamp>-<name>[-N].md` path under `dir`: same-day archives
 /// with identical (or identically-slugged) summaries get `-2`, `-3`, … suffixes
-/// instead of overwriting each other (audit P2-19). The caller holds the
+/// instead of overwriting each other. The caller holds the
 /// conversations-dir lock, so the existence probe cannot race another hook.
 fn unique_archive_path(dir: &Path, stamp: &str, name: &str) -> PathBuf {
     let base = dir.join(format!("{stamp}-{name}.md"));
@@ -600,7 +599,7 @@ mod tests {
         assert!(index.entries[0].full_path.ends_with(&archive));
     }
 
-    /// P2-19 regression: a summary with no ASCII alphanumerics used to slug to
+    /// Regression: a summary with no ASCII alphanumerics used to slug to
     /// the EMPTY string, so every such same-day archive shared one name. The
     /// content-hash fallback yields distinct, non-empty, deterministic slugs.
     #[test]
@@ -617,7 +616,7 @@ mod tests {
         assert_eq!(first, sanitize_filename("éàü"));
     }
 
-    /// P2-19 regression: two same-day archives with the SAME summary get
+    /// Regression: two same-day archives with the SAME summary get
     /// distinct file names (counter suffix) instead of overwriting each other,
     /// and both land in the index.
     #[test]
@@ -687,7 +686,7 @@ mod tests {
         );
     }
 
-    /// P2-19 regression: the index update is a read-modify-write; two archive
+    /// Regression: the index update is a read-modify-write; two archive
     /// hooks racing it used to lose entries (a stale read clobbers the other
     /// writer's insert). The conversations-dir advisory lock serializes the
     /// whole archive write, so every concurrent run's entry survives.

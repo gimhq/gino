@@ -80,7 +80,7 @@ fn task_owns_active_run_matches_only_in_flight_threads() {
     assert!(!task_owns_active_run(&db, "t-unknown"));
 }
 
-/// P2-18 regression: the daemon's single-instance lock is exclusive and
+/// Regression: the daemon's single-instance lock is exclusive and
 /// fails fast. The lock is per open-file-description, so a second handle in
 /// THIS process conflicts exactly like a second daemon process would — that
 /// is the seam this test drives (no subprocess needed).
@@ -102,7 +102,7 @@ fn daemon_lock_is_exclusive_and_released_on_drop() {
 
 /// Audit P3 wiring: the daemon path builds its executor with the transport
 /// flush signal attached, so transcript frames stream mid-run in production
-/// (the P2-16 behavior the executor's own tests pin down).
+/// (the behavior the executor's own tests pin down).
 #[tokio::test]
 async fn build_execution_plane_wires_the_transport_flush() {
     let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
@@ -152,7 +152,7 @@ async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContex
     }
 }
 
-/// P2-19 regression: a `config_update` carrying a rotated `anthropicApiKey`
+/// Regression: a `config_update` carrying a rotated `anthropicApiKey`
 /// takes effect WITHOUT a restart — the route merges the overlay onto the
 /// live config and rebuilds the shared engine settings the executor's engine
 /// snapshots at its next spawn — and the inbox row is settled like any other
@@ -196,7 +196,7 @@ async fn config_update_rotated_key_applies_to_the_next_engine_run() {
     assert!(lock_db(&db).list_unprocessed_inbox().unwrap().is_empty());
 }
 
-/// P2-19: a `config_update` whose payload does not parse as a config overlay
+/// A `config_update` whose payload does not parse as a config overlay
 /// follows the dead-letter policy — dropped and settled (the failure is
 /// deterministic and the host re-pushes config on connect), never left to
 /// head-of-line-block the inbox — and the engine settings stay untouched.
@@ -319,8 +319,7 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
 
 /// A `task_upsert` carrying `entries` persists them as the `tasks.entries` JSON
 /// (insert-new and patch-existing); a later `task_upsert` that OMITS `entries`
-/// must leave the prior set intact, while an explicit (empty) set replaces it
-/// (PLAN-007 §5).
+/// must leave the prior set intact, while an explicit (empty) set replaces it.
 #[test]
 fn task_upsert_persists_entries_and_omission_preserves_them() {
     let db = Mutex::new(Db::open_in_memory().unwrap());
@@ -532,7 +531,7 @@ async fn unsupported_engine_is_stored_but_never_fails_the_task() {
     );
 }
 
-/// P2-19 regression (inbound half): a processing FAILURE leaves the inbox row
+/// Regression (inbound half): a processing FAILURE leaves the inbox row
 /// unprocessed (so it replays) and bumps the failure counter; a success marks
 /// it processed. The poison policy discards the row only after
 /// [`MAX_INBOX_RETRIES`] processing failures — reconnects never count.
@@ -595,7 +594,7 @@ fn processing_failure_leaves_row_unprocessed_and_poisons_after_limit() {
     );
 }
 
-/// P2-19 regression: a `cron_upsert` arriving BEFORE its `task_upsert` is not
+/// Regression: a `cron_upsert` arriving BEFORE its `task_upsert` is not
 /// dropped — the task row is seeded and the cron applies (the later
 /// `task_upsert` patches the seeded row in place).
 #[test]
@@ -652,7 +651,7 @@ fn cron_upsert_before_task_upsert_is_not_dropped() {
     );
 }
 
-/// P0-2 regression, over the runner's own wiring: with the host UNREACHABLE
+/// Regression, over the runner's own wiring: with the host UNREACHABLE
 /// (the transport dialing in the background, never connected) the local
 /// planes still run — the scheduler fires a due cron and the executor
 /// worker drains it through the engine — and shutdown completes cleanly.
@@ -828,7 +827,7 @@ async fn local_planes_run_and_shut_down_cleanly_while_host_unreachable() {
     transport.shutdown().await;
 }
 
-/// P1-6 regression: SIGTERM (what systemd `stop` sends) resolves the
+/// Regression: SIGTERM (what systemd `stop` sends) resolves the
 /// shutdown-signal future — the old code handled only SIGINT and left
 /// SIGTERM on the default handler. The OS edge is exercised in-process:
 /// tokio's listener registration replaces the default disposition, so
@@ -860,7 +859,7 @@ async fn sigterm_resolves_the_shutdown_signal() {
         .unwrap();
 }
 
-/// P1-6 regression, over the runner's own shutdown sequence: a shutdown
+/// Regression, over the runner's own shutdown sequence: a shutdown
 /// while a run is ACTIVE trips the run's cancellation and the worker
 /// settles within the bounded drain window — the old code awaited the
 /// worker unconditionally, blocking up to running_timeout (30 min) until

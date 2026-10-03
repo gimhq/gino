@@ -1,4 +1,4 @@
-# Lock 6 (`unwrap_used`/`expect_used`/`panic`/`dbg_macro` = deny) is relaxed inside
+# `unwrap_used`/`expect_used`/`panic`/`dbg_macro` = deny is relaxed inside
 # tests so assertions can use `unwrap`/`expect` without ceremony.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true

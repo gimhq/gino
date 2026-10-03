@@ -1,4 +1,4 @@
-//! Global configuration layer (PLAN-003 §3).
+//! Global configuration layer.
 //!
 //! Every setting the runner needs — the orchestrator URL, identity, engine
 //! credentials, scheduler limits, paths and log level — is resolved here into a
@@ -16,9 +16,8 @@
 //! Each source produces a [`ConfigOverlay`] (a partial, all-optional view) that
 //! is merged onto the running [`Config`] with [`Config::apply`]. Only fields the
 //! overlay actually sets override what is already there; absent fields are left
-//! untouched. This module performs **no** network IO — the register/HTTP/WS
-//! wiring that produces those overlays lands in later changes; here we expose
-//! only the merge surface.
+//! untouched. This module performs **no** network IO — it exposes only the
+//! merge surface; the register/HTTP/WS wiring produces the overlays.
 //!
 //! ## Secrets
 //!
@@ -38,8 +37,8 @@ use crate::protocol::v2::ProvisioningEntry;
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
 /// Default SQLite filename within the workspace directory.
 const DEFAULT_DB_FILE: &str = "agent.db";
-/// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root
-/// (PLAN-007 §1/§6): the runner materializes the global instruction file + skills
+/// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root:
+/// the runner materializes the global instruction file + skills
 /// here and launches the engine with `ENGINE_CONFIG_DIR`/`CLAUDE_CONFIG_DIR`
 /// pointed at it. Overridden by `CLAUDE_CONFIG_USE_DEFAULT` (see
 /// [`ConfigOverlay::paths_from_env`]).
@@ -56,7 +55,7 @@ const DEFAULT_ATTACHMENT_MAX_EXECUTION_BYTES: u64 = 500 * 1024 * 1024;
 const DEFAULT_ATTACHMENT_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// Default days a terminal queue row (acked outbox / processed inbox / cron_logs
 /// ledger line / terminal-thread attachment snapshot) is retained before the
-/// periodic GC sweep deletes it (audit P1-9).
+/// periodic GC sweep deletes it.
 const DEFAULT_RETENTION_DAYS: u32 = 30;
 
 /// Errors raised while validating a resolved [`Config`].
@@ -96,16 +95,16 @@ pub(crate) struct Config {
     pub(crate) engine: EngineConfig,
     /// Thread-executor limits (watchdog thresholds, retry budget).
     pub(crate) executor: ExecutorConfig,
-    /// Out-of-band attachment channel limits + backend selection (PLAN-005).
+    /// Out-of-band attachment channel limits + backend selection.
     pub(crate) attachments: AttachmentsConfig,
-    /// Queue/ledger GC retention window (audit P1-9).
+    /// Queue/ledger GC retention window.
     pub(crate) retention: RetentionConfig,
     /// Global-scope provisioning entries — the desired set of instruction files +
-    /// skills materialized into `$ENGINE_CONFIG_DIR/` (PLAN-007 §5). The host
+    /// skills materialized into `$ENGINE_CONFIG_DIR/`. The host
     /// re-pushes the full desired global set each refresh; an overlay carrying
     /// `entries` **replaces** this vec. Default = empty.
     pub(crate) entries: Vec<ProvisioningEntry>,
-    /// Host-assigned GLOBAL config version (PLAN-007 §6, version gate). Monotonic
+    /// Host-assigned GLOBAL config version (version gate). Monotonic
     /// and server-owned; it scopes the agent's global config set (`entries`) and
     /// drives the startup/`config_update` reconcile decision: the runner reconciles
     /// the global scope **only when this advances** past the persisted applied
@@ -115,7 +114,7 @@ pub(crate) struct Config {
     // version, distinct from the wire `protocol_version` and an entry's `sha256`.
     #[allow(
         clippy::struct_field_names,
-        reason = "PLAN-007 §6 names this the config version; the `config_` qualifier disambiguates it"
+        reason = "the `config_` qualifier disambiguates it from the protocol version"
     )]
     pub(crate) config_version: Option<i64>,
     /// Transport liveness ping cadence, in milliseconds (`heartbeatIntervalMs`).
@@ -242,7 +241,7 @@ pub(crate) enum AttachmentBackendKind {
 }
 
 /// Out-of-band attachment channel limits + backend selection (agent-architecture
-/// §9, decisions A2/A4/A5; PLAN-005). Only descriptors ride the wire; bytes move
+/// §9, decisions A2/A4/A5). Only descriptors ride the wire; bytes move
 /// on this channel, bounded by the limits below.
 #[derive(Clone, Debug)]
 pub(crate) struct AttachmentsConfig {
@@ -270,7 +269,7 @@ impl Default for AttachmentsConfig {
     }
 }
 
-/// Queue/ledger GC retention window (audit P1-9). The periodic sweep deletes
+/// Queue/ledger GC retention window. The periodic sweep deletes
 /// **terminal** rows — acked outbox, processed inbox, cron_logs ledger lines,
 /// and attachment snapshots of terminal threads — older than this window.
 /// Un-acked/un-processed rows are never deleted regardless of age (the
@@ -399,7 +398,7 @@ impl Config {
             self.entries = list;
         }
 
-        // The GLOBAL config version is latest-Some-wins (PLAN-007 §6): a versioned
+        // The GLOBAL config version is latest-Some-wins: a versioned
         // layer pins it, an unversioned layer leaves the prior version untouched.
         overlay_field(&mut self.config_version, version);
 
@@ -419,7 +418,7 @@ impl Config {
         }
     }
 
-    /// Merge the attachment-channel overlay (PLAN-005 limits + backend). Split out
+    /// Merge the attachment-channel overlay (limits + backend). Split out
     /// of [`Self::apply`] to keep that merge readable; an unrecognized backend
     /// string leaves the current selection (host-proxy default) untouched rather
     /// than failing the whole config refresh.
@@ -468,13 +467,13 @@ impl Config {
         Ok(host.trim_end_matches('/'))
     }
 
-    /// `POST {host}/agent/register` — the enrollment endpoint (PLAN-003 §2.1).
+    /// `POST {host}/agent/register` — the enrollment endpoint.
     pub(crate) fn register_url(&self) -> Result<String, ConfigError> {
         Ok(format!("{}/agent/register", self.http_base()?))
     }
 
-    /// `GET {host}/agent/config/{agent_id}` — the authoritative config fetch
-    /// (PLAN-003 §2 / PLAN-007 §6). On a fresh enrollment this re-supplies what the
+    /// `GET {host}/agent/config/{agent_id}` — the authoritative config fetch.
+    /// On a fresh enrollment this re-supplies what the
     /// register response already carried; on a **restart** (persisted identity, no
     /// second register) it is the only source of the host's desired config —
     /// including the versioned global provisioning set the reconcile version gate
@@ -540,11 +539,11 @@ pub(crate) struct ConfigOverlay {
     executor: ExecutorOverlay,
     attachments: AttachmentsOverlay,
     retention: RetentionOverlay,
-    /// Full desired global provisioning set (PLAN-007 §5). Unlike `register_token`
+    /// Full desired global provisioning set. Unlike `register_token`
     /// this is host-sent, so it is **not** `#[serde(skip)]`; when present it
     /// replaces `Config::entries` wholesale.
     entries: Option<Vec<ProvisioningEntry>>,
-    /// Host-assigned GLOBAL config version (PLAN-007 §6). Monotonic; carried on
+    /// Host-assigned GLOBAL config version. Monotonic; carried on
     /// register-config / GET `/agent/config` / `config_update` alongside `entries`,
     /// and the sole signal the reconcile version gate keys on.
     version: Option<i64>,
@@ -618,7 +617,7 @@ struct PathsOverlay {
 }
 
 impl ConfigOverlay {
-    /// Build the env/CLI bootstrap overlay from the PLAN-003 §2.1 inputs. The
+    /// Build the env/CLI bootstrap overlay from the inputs. The
     /// register token is the only secret carried by the bootstrap layer.
     pub(crate) fn bootstrap(
         host_url: Option<String>,
@@ -648,7 +647,7 @@ impl ConfigOverlay {
     }
 
     /// Build the env/CLI **paths** bootstrap overlay from `GINO_WORKSPACE_DIR` /
-    /// `GINO_DB_PATH` (PLAN-003 §3 config precedence; ARCHITECTURE "Config layer").
+    /// `GINO_DB_PATH`.
     /// Part of the same env/CLI bootstrap layer as [`Self::bootstrap`]; kept a
     /// separate builder so the daemon can resolve filesystem paths *before* it
     /// opens the DB without entangling them with the host/identity inputs (which
@@ -716,7 +715,7 @@ impl ConfigOverlay {
         serde_json::from_str(raw)
     }
 
-    /// The global provisioning entries this overlay carries, if any (PLAN-007 §5).
+    /// The global provisioning entries this overlay carries, if any.
     /// Lets the runner re-reconcile the global scope on a live `config_update`
     /// without applying (and discarding) the whole overlay: `Some` is the full
     /// re-pushed desired set; `None` means the update did not touch provisioning.
@@ -724,8 +723,8 @@ impl ConfigOverlay {
         self.entries.as_deref()
     }
 
-    /// The host-assigned GLOBAL config version this overlay carries, if any
-    /// (PLAN-007 §6). Mirrors [`Self::entries`]: lets the `config_update` route read
+    /// The host-assigned GLOBAL config version this overlay carries, if any.
+    /// Mirrors [`Self::entries`]: lets the `config_update` route read
     /// the version to apply the reconcile version gate without consuming the overlay.
     pub(crate) fn version(&self) -> Option<i64> {
         self.version
