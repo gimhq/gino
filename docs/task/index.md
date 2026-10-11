@@ -34,3 +34,4 @@ Each task is a single line linking to its detail file. All detailed information 
 ## Tasks
 
 - [-] [**20261003-1648-structure-docs-agent-alignment Repository structure, documentation, and gino-agent PMA-Rust alignment**](20261003-1648-structure-docs-agent-alignment.md) `P1`
+- [-] [**20261003-1725-agent-direct-ops Agent file and environment operations without an engine**](20261003-1725-agent-direct-ops.md) `P1`
