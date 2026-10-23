@@ -123,6 +123,21 @@ describe("BlobStore — content-addressed put/read", () => {
       rmSync(secret, { force: true });
     }
   });
+
+  it("delete removes a directory it leaves empty and keeps one that still holds a blob", () => {
+    const only = store.put("xfer-one", enc.encode("staged"));
+    const first = store.put("shared.md", enc.encode("first"));
+    const second = store.put("shared.md", enc.encode("second"));
+
+    store.delete(only.ref);
+    store.delete(first.ref);
+
+    expect(existsSync(resolve(storeDir, "xfer-one"))).toBe(false);
+    expect(store.exists(second.ref)).toBe(true);
+    // A missing blob is still a no-op, and the root itself is never removed.
+    store.delete(only.ref);
+    expect(existsSync(storeDir)).toBe(true);
+  });
 });
 
 describe("config_artifacts registry — ingest/get/list", () => {

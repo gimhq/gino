@@ -97,7 +97,20 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
   { name: "interrupt", dir: "host", frame: { type: "interrupt" } },
   { name: "close", dir: "host", frame: { type: "close" } },
   { name: "config_update", dir: "host", frame: { type: "config_update", data: { heartbeatIntervalMs: 15000 } } },
+  { name: "pty_open", dir: "host", frame: { type: "pty_open", ptyId: "p-1", data: { cols: 80, rows: 24 } } },
+  { name: "pty_input", dir: "host", frame: { type: "pty_input", ptyId: "p-1", data: { data: "aGk=" } } },
+  { name: "pty_resize", dir: "host", frame: { type: "pty_resize", ptyId: "p-1", data: { cols: 120, rows: 40 } } },
+  { name: "pty_close", dir: "host", frame: { type: "pty_close", ptyId: "p-1" } },
+  { name: "pty_ready", dir: "agent", frame: { type: "pty_ready", ptyId: "p-1", data: {} } },
+  { name: "pty_output", dir: "agent", frame: { type: "pty_output", ptyId: "p-1", data: { data: "AP8=" } } },
+  { name: "pty_exit", dir: "agent", frame: { type: "pty_exit", ptyId: "p-1", data: { exit_code: 0 } } },
+  { name: "fs_request", dir: "host", frame: { type: "fs_request", reqId: "r-1", data: { op: "put", path: "notes.txt", ref: "/agent/attachments/xfer-1", sha256: "deadbeef", size: 12 } } },
   { name: "ack (host)", dir: "host", frame: { type: "ack", id: 7 } },
+  {
+    name: "fs_response",
+    dir: "agent",
+    frame: { type: "fs_response", reqId: "r-1", data: { ok: true, sha256: "deadbeef", size: 12 } },
+  },
 ];
 
 describe("protocol v2 frame contract", () => {
@@ -112,7 +125,7 @@ describe("protocol v2 frame contract", () => {
       });
     }
 
-    it("covers every type in the catalog (15 frame types)", () => {
+    it("covers every type in the catalog", () => {
       const types = new Set(VALID.map(v => (v.frame as { type: string }).type));
       expect(types).toEqual(new Set([
         "thread_result",
@@ -129,6 +142,15 @@ describe("protocol v2 frame contract", () => {
         "interrupt",
         "close",
         "config_update",
+        "fs_request",
+        "fs_response",
+        "pty_open",
+        "pty_input",
+        "pty_resize",
+        "pty_close",
+        "pty_ready",
+        "pty_output",
+        "pty_exit",
       ]));
     });
   });

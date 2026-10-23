@@ -23,12 +23,15 @@ export function agentConfig(agentId: string, heartbeatIntervalMs: number) {
  * just its first capability's) plus the host-assigned monotonic `version`,
  * delivered on register / `GET /agent/config` (additive; the agent reconciles
  * only when the version advances — agent-architecture §9b). Empty entries when
- * nothing is declared, so the response stays backward-compatible.
+ * nothing is declared, so the response stays backward-compatible. Also carries
+ * the agent's host-set `remoteOps` switches (all `false` unless an operator
+ * enabled them).
  */
 export function globalConfig(storage: Storage, agent: AgentRow) {
   return {
     entries: resolveEntriesForEngines(storage, GLOBAL_SCOPE, agent.capabilities.engines),
     version: getGlobalConfigVersion(storage),
+    remoteOps: { fs: agent.capabilities.remote_ops?.fs === true, pty: agent.capabilities.remote_ops?.pty === true },
   };
 }
 

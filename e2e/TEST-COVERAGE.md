@@ -161,6 +161,22 @@ Authenticated by the per-agent connect token; authorized by task placement.
 | targets resolved | `PUT /admin/config/entries {scope:"global"}` | host resolves `CLAUDE.md`→`CLAUDE.md`, dir→`.claude/skills/<name>` |
 | register config carries entries | fresh `POST /agent/register` | the resolved global desired-set is delivered on register |
 
+### 9b. Engine-free file operations — 9 checks
+
+Added after the latest recorded run; not yet part of the 79/79 figure above.
+
+| Check | Request | Asserts |
+|-------|---------|---------|
+| 200 + disabled | `POST /admin/agents/:id/fs {op:"list"}` | the file group is off by default; the agent answers `disabled` |
+| remote-ops 200 | `POST /admin/agents/:id/remote-ops {fs:true}` | the switch is stored and pushed; the agent starts accepting requests |
+| upload ok / download returns the bytes | `PUT /admin/agents/:id/files?path=` then `GET` | a file uploaded through the host downloads back identically (binary-safe) over the byte channel |
+| list shows the file | `fs {op:"list"}` | the directory listing carries the new file |
+| rename ok / old path is not_found | `fs {op:"rename"}` then `{op:"stat"}` | rename moves the file |
+| remove ok | `fs {op:"remove", recursive:true}` | the directory is deleted |
+| disabled again | `remote-ops {fs:false}` then `fs` | switching the group off takes effect live |
+
+No engine runs in this group: the fake engines are never invoked.
+
 ### 10. Agent OOB control — 3 checks
 | Check | Request | Asserts |
 |-------|---------|---------|
@@ -186,6 +202,21 @@ Authenticated by the per-agent connect token; authorized by task placement.
 > and a cron scheduled before the task's first message being silently dropped on
 > the agent (fixed agent-side by P2-19: a `cron_upsert` for an unknown task seeds
 > a minimal task row — see the cron-ordering probe above).
+
+## Terminal integration checks
+
+The terminal suite runs separately from this compose harness:
+
+- `packages/host-hono/tests/integration/real-pty.test.ts`, with `GINO_PTY_TEST_BIN` set to a
+  built agent: real Host, Agent and browser WebSocket; default-off enablement, TTY input/output,
+  resize, final output/exit status, revocation, no PTY inbox/outbox rows and no engine thread.
+- `gino-agent/src/remote_ops/pty/tests.rs`: PTY allocation, binary input, Ctrl-C, invalid opens,
+  process reaping, rapid disable/re-enable and closed-consumer cleanup.
+- `gino-agent/src/transport/mod.rs`: disconnect/reconnect reaps the old process, ignores stale
+  terminal input and never replays terminal frames.
+- Host SDK and Hono/standalone tests cover bounded buffers, pending-open cancellation, session
+  drop paths, ticket authorization/single use/agent and origin binding, rate limits, and the
+  Bun and Node WebSocket adapters. The TLS-termination case binds the authenticated origin.
 
 ## Not covered (out of scope for this harness)
 

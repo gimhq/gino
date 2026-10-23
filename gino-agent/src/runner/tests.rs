@@ -129,6 +129,7 @@ async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContex
     let http = crate::transport::http::HttpClient::new().unwrap();
     let cancel = Arc::new(crate::scheduler::Cancel::new());
     let config = crate::config::Config::default();
+    let remote_ops = Arc::new(crate::remote_ops::RemoteOps::new(false, dir));
     let (executor, provisioner, settings) = super::build_execution_plane(
         &config,
         &http,
@@ -149,6 +150,7 @@ async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContex
         config: Mutex::new(config),
         engine_settings: settings.claude,
         codex_settings: settings.codex,
+        remote_ops,
     }
 }
 
@@ -762,6 +764,10 @@ async fn local_planes_run_and_shut_down_cleanly_while_host_unreachable() {
         SecretString::from("tok"),
         Arc::clone(&db),
         TransportConfig::default(),
+        Arc::new(crate::remote_ops::RemoteOps::new(
+            false,
+            std::path::Path::new("/nonexistent"),
+        )),
     );
 
     let engine = Arc::new(CountingEngine {

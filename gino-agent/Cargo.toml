@@ -13,6 +13,8 @@ publish = false
 anyhow = "1"
 # Object-safe async trait methods for the `Engine`/`Session` abstraction.
 async-trait = "0.1"
+# Terminal byte frames.
+base64 = "0.23"
 # RFC3339 timestamps and interval arithmetic for the scheduler.
 chrono = { version = "0.4.45", default-features = false, features = ["now"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -22,7 +24,9 @@ croner = "2"
 # Stream/Sink combinators for the split WebSocket connection.
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # SIGINT to the `codex exec` child, which has no in-band cancel channel.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "term"] }
+# Async pseudo-terminal allocation and process spawning.
+pty-process = { version = "0.5.3", features = ["async"] }
 # HTTP client for register, config refresh and the output fallback.
 # PINNED: 0.13 forces `rustls-platform-verifier`, which pulls the
 # CDLA-Permissive-2.0 `webpki-root-certs` that deny.toml does not allow.

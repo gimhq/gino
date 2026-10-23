@@ -52,6 +52,7 @@ use crate::executor::{ThreadExecutor, WatchdogCfg};
 use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
 use crate::register::{self, ResolvedIdentity};
+use crate::remote_ops::RemoteOps;
 use crate::scheduler::{Cancel, Scheduler, apply_cron_delete, apply_cron_upsert, now, to_iso};
 use crate::transport::http::HttpClient;
 use crate::transport::{Inbound, MAX_INBOX_RETRIES, Transport, TransportConfig};
@@ -211,11 +212,13 @@ async fn run_async(
     // The dial happens in the background: the daemon boots and serves
     // local work while the host is unreachable; outbound frames queue durably
     // and replay once a connection is up.
+    let remote_ops = build_remote_ops(&config, &http);
     let mut transport = Transport::open(
         ws_url,
         identity.connect_token,
         Arc::clone(&db),
         transport_config,
+        Arc::clone(&remote_ops),
     );
     info!("transport started; connecting in the background");
 
@@ -296,6 +299,7 @@ async fn run_async(
         config: Mutex::new(config),
         engine_settings: seams.claude,
         codex_settings: seams.codex,
+        remote_ops,
     };
     serve(&mut transport, &context, &cancel).await;
 
@@ -693,6 +697,20 @@ impl ReloadableCodexEngine {
     }
 }
 
+/// Build the engine-free operations handle. Its file transfers get their own
+/// [`AttachmentManager`]: they stream straight to and from the destination and
+/// never touch the content-addressed cache.
+fn build_remote_ops(config: &Config, http: &HttpClient) -> Arc<RemoteOps> {
+    let remote_ops = RemoteOps::new(config.remote_ops.fs, &config.paths.workspace_dir);
+    remote_ops.configure(
+        config.remote_ops.fs,
+        config.remote_ops.pty,
+        &config.paths.workspace_dir,
+    );
+    remote_ops.set_byte_channel(build_attachment_manager(config, http));
+    Arc::new(remote_ops)
+}
+
 /// Build the shared content-addressed [`AttachmentManager`] (agent-
 /// architecture §9): the config-selected byte backend
 /// ([`attachments::build_backend`] — host-proxy by default) over a workspace-scoped
@@ -838,6 +856,8 @@ struct ServeContext {
     /// [`ReloadableCodexEngine`]. Held whether or not the backend was registered,
     /// so the seam stays in step with the live config either way.
     codex_settings: SharedCodexSettings,
+    /// Follows the live config: a `config_update` can switch a group on or off.
+    remote_ops: Arc<RemoteOps>,
 }
 
 /// Resolve when a daemon shutdown signal arrives: SIGINT (Ctrl-C) and —
@@ -1317,6 +1337,11 @@ fn apply_engine_config(context: &ServeContext, overlay: ConfigOverlay) {
     let (rebuilt, rebuilt_codex) = {
         let mut config = lock(&context.config);
         config.apply(overlay);
+        context.remote_ops.configure(
+            config.remote_ops.fs,
+            config.remote_ops.pty,
+            &config.paths.workspace_dir,
+        );
         (
             engine_settings(&config, &context.engine_config_dir),
             codex_settings(&config, &context.engine_config_dir),

@@ -60,6 +60,7 @@ Inside a running task the engine reaches the same CLI through `$GINO_RUNNER_BIN`
 | `engine/` | the `Engine`/`Session` abstraction with `claude` and `codex` backends |
 | `attachments.rs`, `attachment_source.rs` | the out-of-band byte channel and its cache |
 | `provisioning/` | content-addressed store and reconcile for config and skills |
+| `remote_ops/` | host-driven file operations and PTY sessions without an engine (each group defaults off) |
 | `register.rs`, `config.rs`, `login.rs` | enrollment, layered config, credentials |
 | `archive.rs`, `gino_cli.rs` | the `archive` hook and the operator CLI |
 

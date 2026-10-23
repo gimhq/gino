@@ -119,6 +119,8 @@ pub(crate) struct Config {
     pub(crate) config_version: Option<i64>,
     /// Transport liveness ping cadence, in milliseconds (`heartbeatIntervalMs`).
     pub(crate) heartbeat_interval_ms: u64,
+    /// Host-enabled engine-free operation groups (`remoteOps`); all off by default.
+    pub(crate) remote_ops: RemoteOpsConfig,
     /// Filesystem layout (workspace + DB path).
     pub(crate) paths: Paths,
     // No `log_level` here: the tracing filter is fixed at process start from
@@ -142,9 +144,19 @@ impl Default for Config {
             entries: Vec::new(),
             config_version: None,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
+            remote_ops: RemoteOpsConfig::default(),
             paths: Paths::default(),
         }
     }
+}
+
+/// Which engine-free operation groups the host has enabled for this agent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RemoteOpsConfig {
+    /// File operations (`fs_request`).
+    pub(crate) fs: bool,
+    /// Interactive terminal sessions.
+    pub(crate) pty: bool,
 }
 
 /// Engine environment exposed to the execution backend.
@@ -332,6 +344,7 @@ impl Config {
             entries,
             version,
             heartbeat_interval_ms,
+            remote_ops,
             paths,
         } = overlay;
 
@@ -342,6 +355,12 @@ impl Config {
         overlay_secret(&mut self.connect_token, connect_token);
         if let Some(ms) = heartbeat_interval_ms {
             self.heartbeat_interval_ms = ms;
+        }
+        if let Some(enabled) = remote_ops.pty {
+            self.remote_ops.pty = enabled;
+        }
+        if let Some(enabled) = remote_ops.fs {
+            self.remote_ops.fs = enabled;
         }
 
         let EngineOverlay {
@@ -548,7 +567,15 @@ pub(crate) struct ConfigOverlay {
     /// and the sole signal the reconcile version gate keys on.
     version: Option<i64>,
     heartbeat_interval_ms: Option<u64>,
+    remote_ops: RemoteOpsOverlay,
     paths: PathsOverlay,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RemoteOpsOverlay {
+    fs: Option<bool>,
+    pty: Option<bool>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -1445,5 +1472,28 @@ mod tests {
             rendered.contains("REDACTED"),
             "expected secrecy redaction marker in: {rendered}"
         );
+    }
+
+    #[test]
+    fn remote_ops_are_off_until_a_host_layer_enables_them() {
+        let mut config = Config::default();
+        assert!(!config.remote_ops.fs);
+        assert!(!config.remote_ops.pty);
+        config.apply(ConfigOverlay::from_json(r#"{ "remoteOps": { "pty": true } }"#).unwrap());
+        assert!(config.remote_ops.pty);
+        assert!(!config.remote_ops.fs);
+
+        config.apply(ConfigOverlay::from_json(r#"{ "remoteOps": { "fs": true } }"#).unwrap());
+        assert!(config.remote_ops.fs);
+
+        // A layer that does not mention the group leaves it as it was.
+        config.apply(ConfigOverlay::from_json(r#"{ "heartbeatIntervalMs": 5000 }"#).unwrap());
+        assert!(config.remote_ops.fs);
+
+        config.apply(ConfigOverlay::from_json(r#"{ "remoteOps": { "fs": false } }"#).unwrap());
+        assert!(!config.remote_ops.fs);
+        assert!(config.remote_ops.pty);
+        config.apply(ConfigOverlay::from_json(r#"{ "remoteOps": { "pty": false } }"#).unwrap());
+        assert!(!config.remote_ops.pty);
     }
 }

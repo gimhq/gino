@@ -1,8 +1,8 @@
 # 20261003-1726-agent-direct-ops Agent file and environment operations without an engine
 
-- **status**: draft
+- **status**: implementing
 - **createdAt**: 2026-10-03 17:26
-- **approvedAt**: (pending)
+- **approvedAt**: 2026-10-11 01:12
 - **relatedTask**: 20261003-1725-agent-direct-ops
 
 ## Context
@@ -196,3 +196,51 @@ either side. No protocol version bump — all frames are additive and ignored by
   the Claude Code safety classifier ("create RCE surface"); no feature code is on disk. Awaiting the
   owner's chosen path (grant a Bash permission rule for these writes, or land the code by hand).
   This plan stays `draft` until implementation can proceed.
+- 2026-10-11 — Second investigation pass; implementation was stopped by the safety classifier again
+  before any feature code was written. Open points found, to settle before implementation:
+  1. **Where the per-agent `remoteOps` flags persist.** The `agents` table has no field for them
+     and `AgentRepo` has no method that updates `capabilities`. Either store them inside the
+     `capabilities` JSON column (no migration, but a new port method in the memory and sqlite
+     adapters) or add a column (a migration, which contradicts *Scope*). Owner decision needed.
+  2. **Teardown hook.** `SessionRegistry` drops a session on four paths (`attach` supersede,
+     `detach`, `closeAgent`, `closeAll`); `wire/socket.ts` `detachSocket` only observes one, and
+     reports `evicted = false` after `closeAgent`. Rejecting pending requests and ending PTY
+     sessions needs a hook in `SessionRegistry`, not in `detachSocket`.
+  3. **Task file is stale.** `docs/task/20261003-1725-agent-direct-ops.md` still lists "confined to
+     a root" and "the agent's operator enables them" as acceptance criteria; both contradict owner
+     decisions 2 and 3.
+  4. `paths.workspaceDir` is host-overridable in `ConfigOverlay`, so the base for relative paths
+     follows the live config, not the startup value.
+- 2026-10-11 — Owner decision 4: **implement the file group first; `exec` and PTY are deferred.**
+  This pass delivers `fs_request`/`fs_response` end to end and the `remoteOps.fs` switch only. The
+  `exec_*` and `pty_*` frames, `remoteOps.exec`/`remoteOps.pty`, the PTY WebSocket route and the
+  `pty-process` dependency stay in this plan as a later pass. Open point 1 is settled for this
+  pass as: the flags live in the `capabilities` JSON column (`remote_ops`), no migration.
+- 2026-10-11 — File group implemented (plan stays `implementing` for the deferred `exec`/PTY pass).
+  - Agent: `remote_ops/` (`mod.rs`, `fs.rs`), a live-send channel in `transport/ws.rs`,
+    `remoteOps.fs` in `config.rs`, wiring in `runner.rs`. New dependency `base64` 0.23 (latest
+    stable; the lockfile also keeps the transitive 0.22).
+  - Host: `agents/remote.ts`, `fs_request`/`fs_response` schemas, `reqId` on the envelope,
+    `SessionRegistry.onDrop`, `AgentRepo.setCapabilities` (memory + sqlite, no migration),
+    `host.agents.fs` / `host.agents.setRemoteOps`, `POST /admin/agents/:id/fs` and
+    `POST /admin/agents/:id/remote-ops`.
+  - Verified: agent `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test` (rust:1.96
+    container); host typecheck and every package's `bun test`; a manual run of the real host
+    against the real agent binary covering enable, mkdir, write, read, ranged read, base64, list,
+    absolute path, rename, remove, disable and the offline refusal.
+  - Not done: the `apps/host` rate limit (no admin route is rate limited today; left for the
+    `exec`/PTY pass, where it matters most); the Docker e2e scenario is written
+    (`e2e/e2e.ts` `testRemoteFs`) but the compose suite was not run; `tests/node/conformance.mts`
+    was not run because it needs a `dist` build.
+- 2026-10-12 — Owner decision 5: **file contents go over the attachment byte channel only.** The
+  inline `read`/`write` operations, their `base64` encoding and the 1 MiB ranged transfer are
+  removed (and with them the `base64` dependency); `fs_request` gains `put` and `get`, which
+  carry a reference instead of bytes. The host stages a transfer in the blob store under a
+  host-minted single-use name: `GET /agent/attachments/:id` serves it only to the agent it was
+  minted for while the request is pending, and the staged copy is deleted when the transfer
+  settles. New surface: `host.agents.putFile` / `getFile`, `PUT|GET /admin/agents/:id/files`.
+  `/admin/agents/:id/fs` accepts the metadata operations only. No migration.
+  Verified by the agent gates (rust:1.96), the host suites, and a manual run of the real host
+  against the real agent binary (text and 3 MB binary upload, overwrite, download, absolute path,
+  refusals; no staged bytes left on the host, no cache copy on the agent). Each transfer holds the
+  whole file in memory on both sides, bounded by the existing upload and attachment limits.

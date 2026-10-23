@@ -21,6 +21,16 @@ export type AgentStatus = "enrolled" | "online" | "offline" | "removed";
 export interface AgentCapabilities {
   engines: string[];
   max_threads?: number;
+  /** Host-set switches for engine-free operations; absent = all off. */
+  remote_ops?: RemoteOpsFlags;
+}
+
+/** Which engine-free operation groups the host has enabled for an agent. */
+export interface RemoteOpsFlags {
+  /** File operations (`fs_request`). */
+  fs?: boolean;
+  /** Interactive terminal sessions. */
+  pty?: boolean;
 }
 
 /** Everything needed to mint an agent identity. */
@@ -169,6 +179,17 @@ export function revokeOwner(storage: Storage, agentId: string, ownerId: string):
  */
 export function setAgentAccess(storage: Storage, agentId: string, access: "dedicated" | "public"): void {
   storage.agents.setAccess(agentId, access);
+}
+
+/**
+ * Set which engine-free operation groups an agent accepts. ADMIN-ONLY
+ * mutation, like the access policy: the register body can never set it.
+ */
+export function setAgentRemoteOps(storage: Storage, agent: AgentRow, flags: RemoteOpsFlags): void {
+  storage.agents.setCapabilities(agent.id, { ...agent.capabilities, remote_ops: {
+    fs: flags.fs ?? agent.capabilities.remote_ops?.fs ?? false,
+    pty: flags.pty ?? agent.capabilities.remote_ops?.pty ?? false,
+  } });
 }
 
 /** List the owners granted access to an agent. */

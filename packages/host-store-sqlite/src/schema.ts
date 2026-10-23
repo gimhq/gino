@@ -31,7 +31,7 @@ export const agents = sqliteTable("agents", {
   connectTokenHash: text("connect_token_hash").notNull(), // per-agent connect token; revoked on remove
   registerTokenRef: text("register_token_ref"), // which shared register token enrolled it
   capabilities: text("capabilities", { mode: "json" })
-    .$type<{ engines: string[]; max_threads?: number }>()
+    .$type<{ engines: string[]; max_threads?: number; remote_ops?: { fs?: boolean; pty?: boolean } }>()
     .notNull(), // { engines:[…], max_threads } (max_threads host-overridable)
   status: text("status").notNull(), // enrolled | online | offline | removed
   launcherKind: text("launcher_kind"), // OOB routing

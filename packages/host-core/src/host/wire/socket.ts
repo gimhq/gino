@@ -11,7 +11,7 @@ import { replayUnacked } from "../../protocol/outbox";
 
 /** Host events (M6: a stored thread_message triggers the webhook pump via `transcript.message`). */
 function inboundDeps(ctx: WireContext, agentId: string): InboundDeps {
-  return { storage: ctx.storage, sender: ctx.sessions, agentId, logger: ctx.logger, metrics: ctx.metrics, events: ctx.events };
+  return { storage: ctx.storage, sender: ctx.sessions, agentId, logger: ctx.logger, metrics: ctx.metrics, events: ctx.events, remote: ctx.remote };
 }
 
 export function attachSocket(ctx: WireContext, agentId: string, ws: WsLike): void {

@@ -40,6 +40,10 @@ the host spec [`docs/host-architecture.md`](host-architecture.md). The runner ty
   content_type, size, sha256, ref, direction}`). A descriptor's `ref` is a
   byte-channel path the agent resolves against its host base URL
   (`/agent/attachments/<id>`) — never a host-internal storage path.
+- **Live-only frames** ride the same WebSocket but bypass both delivery buffers: the
+  `fs_request` / `fs_response` pair (§5) is never persisted, acked or replayed. It is
+  correlated by a host-minted top-level `reqId`, and a request can only be sent to an
+  agent that is connected right now.
 - The agent always **dials out** to the host (NAT/firewall friendly). The host never
   connects into the agent; out-of-band control is the launcher's job (see
   [`docs/host-architecture.md`](host-architecture.md)), not part of this protocol.
@@ -61,7 +65,8 @@ Response (success):
               "configUrl": "/agent/config/<agentId>", "outputUrl": "/agent/output/<agentId>",
               "heartbeatIntervalMs": 30000, "protocolVersion": 2,
               "entries": [ { "name": "...", "sha256": "...", "target": "...", "kind": "file|dir" } ],
-              "version": 0 } }
+              "version": 0,
+              "remoteOps": { "fs": false, "pty": false } } }
 ```
 
 `config.entries` is the GLOBAL-scope desired provisioning set and `config.version`
@@ -70,6 +75,10 @@ agent reconciles the global scope only when `version` advances past its applied
 version. The same two fields are delivered on `GET /agent/config/:agentId`
 (which returns the config object FLAT, not nested under `config`) and on
 `config_update`.
+`config.remoteOps` carries the host-set switches for engine-free operations (§5); every
+group is `false` until an operator enables it for that agent. It is delivered the same
+three ways. The agent has no local switch and never sets it itself: a `remote_ops` value
+in the register body's `capabilities` is ignored.
 Response (failure): `{ "register_error": { "reason": "invalid_register_token | rate_limited | invalid_body | registration_disabled | unsupported_protocol" } }`.
 
 Rules:
@@ -99,7 +108,7 @@ level; `data` carries the type-specific business payload only.**
 ```
 
 - **Envelope** keys: `type`; the delivery ids `outboxId` / `msgId`; the correlation ids
-  `taskId` / `threadId` / `cronId`.
+  `taskId` / `threadId` / `cronId`; and `reqId` on live-only file requests or `ptyId` on live terminal sessions.
 - **`data`**: business fields only — it **never** repeats the correlation ids. In
   particular `engine_session_id` is a *value* of a thread (the engine `--resume` handle),
   so it lives **inside `data`** on `thread_result` (stored, not routed-by).
@@ -140,6 +149,7 @@ agent-architecture); bytes never travel in frames.
 | `thread_message` | `taskId`, `threadId` | `{seq, kind, role?, content?, tool?, input?, output?, tool_use_id?, parent_tool_use_id?}` | one ordered transcript event (mirror → `messages`) |
 | `cron_state` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity?, next_run?, status?, round_count, skipped_count, last_status?}` | local scheduling-ledger summary (mirror → `crons`) |
 | `heartbeat` | — | `{activeThreads?, …}` | liveness (interval from `config.heartbeatIntervalMs`) |
+| `fs_response` | `reqId` | `{ok, entries? \| stat? \| sha256 + size, error?}` | answers the `fs_request` with the same `reqId`; live-only |
 | `msg_ack` | (top-level `msgId`) | — | durably stored an inbound message |
 | `ack` | (top-level `id`) | — | acked a host outbound frame |
 
@@ -155,6 +165,7 @@ agent-architecture); bytes never travel in frames.
 | `interrupt` | `taskId?` | — | graceful cancel of the current turn (engine stays alive); with `taskId`, scoped: the agent interrupts only if that task owns the in-flight turn. Delivery is LIVE-ONLY (at-most-once): the host sends it to an online agent and never replays it on reconnect — a stale cancel must not fire against a future turn |
 | `close` | — | `{reason?}` (`stop\|restart\|remove`) | runner-level wind-down and exit (agent removal / launcher stop), **not** per-task close — per-task close = `task_upsert{status:"closed"}` + scoped `interrupt` |
 | `config_update` | — | `{entries, version, <config fields>}` | live config change (the §3 global overlay; `data` is required — `entries` + `version` drive the version-gated reconcile) |
+| `fs_request` | `reqId` | `{op, path, to?, recursive?, ref? + sha256? + size?, upload?}` | one engine-free file operation; live-only (never queued, never replayed) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
 
 Every durable host→agent frame additionally carries the top-level delivery id `msgId`
@@ -204,6 +215,104 @@ The agent is **authoritative for scheduling and execution**; `thread_result` / `
 are mirror-only writes on the host (read model). The host is a sink for results and a
 source for config + work — never on the execution critical path.
 
+### 5.1 Engine-free file operations (`fs_request` / `fs_response`)
+
+The host can operate on an agent's files directly, without prompting an engine.
+
+- `op` ∈ `list`, `stat`, `mkdir`, `remove`, `rename`, and the two transfers `put`, `get`.
+- **Paths are not confined to a root.** A relative `path` (and `to`) resolves against the
+  agent's workspace directory; an absolute one is used as given. The agent's container and
+  uid are the only boundary.
+- **File bytes never ride in a frame** — they move over the attachment byte channel (§2),
+  whole file at a time:
+  - `put {path, ref, sha256, size}` — the host has staged the bytes; the agent downloads
+    `ref` (a `/agent/attachments/<id>` path) into a temporary file beside `path`, verifies
+    the sha256, and renames it into place, so the destination is replaced atomically or not
+    at all. The parent directory must exist. An existing destination keeps its permission
+    bits, and a symlink is written through to its target.
+  - `get {path, upload}` — the agent uploads the file with `POST /agent/attachments` under
+    the name `upload` and answers `{ok, sha256, size}`; the host reads the bytes back by
+    that name and digest. `path` must be a regular file.
+  - The staged bytes are single-use: `ref` is served only to the agent it was minted for
+    and only while the request is pending, and the host deletes them when the transfer
+    settles. Only the host mints `ref` and `upload`; a caller cannot supply them.
+  - A file larger than the agent's single-attachment limit is refused with `too_large`
+    before any bytes move; the host additionally caps what it accepts for a `put`.
+- `recursive` lets `mkdir` create parents and `remove` delete a non-empty directory.
+  `remove` on a symlink removes the link, never its target.
+- `list` returns `entries: [{name, type, size, mtime_ms?}]` sorted by name; `stat` returns
+  `stat: {type, size, mtime_ms?}`. `type` ∈ `file`, `dir`, `symlink`, `other`.
+- A failure is `{ok: false, error: {code, message}}` with `code` ∈ `disabled`, `not_found`,
+  `exists`, `too_large`, `invalid`, `denied`, `io`.
+- **Enablement is host-driven.** The agent answers `disabled` until its host-assigned
+  config carries `remoteOps.fs = true` (§3). There is no agent-side switch.
+- **Live-only.** The request carries no `msgId`/`outboxId`; neither side persists either
+  frame. The host refuses a request for an offline agent at once, and fails every pending
+  request when the agent's socket drops. A response that arrives for an unknown `reqId` is
+  ignored. A peer that does not implement the frames ignores them (§4.2), so the host times
+  the request out.
+
+### 5.2 Interactive terminals (live-only)
+
+Terminals share the agent socket with file and work frames. Every terminal frame carries a
+host-minted `ptyId` at the envelope top level and has no delivery ID or acknowledgment.
+
+| Direction | Type | Data |
+|---|---|---|
+| host → agent | `pty_open` | `{argv?, cwd?, env?, cols?, rows?}` |
+| host → agent | `pty_input` | `{data}` (base64 bytes) |
+| host → agent | `pty_resize` | `{cols, rows}` |
+| host → agent | `pty_close` | none |
+| agent → host | `pty_ready` | `{}` |
+| agent → host | `pty_output` | `{data}` (base64 bytes) |
+| agent → host | `pty_exit` | `{exit_code?, signal?, error?: {code, message}}` |
+
+- `remoteOps.pty` defaults to false. Host configuration enables it independently of `fs`;
+  disabling it ends existing terminals, including across a rapid disable/re-enable.
+- Default argv is `[/bin/sh]`; default size is 80 columns by 24 rows. Dimensions must be
+  integers in 1–1000. Relative cwd resolves against the current workspace; absolute cwd is
+  honored. Existing sessions keep their original cwd. The terminal inherits only normal
+  user/path/locale variables, plus `TERM=xterm-256color` and explicitly supplied `env`.
+- Open options are capped at 64 KiB, with at most 64 argv items and environment entries.
+  Input/output chunks contain at most 16 KiB of decoded bytes. Each agent permits eight
+  sessions; input queues hold 64 chunks, the connection output queue holds 64 frames, and
+  the host's unread output buffer is capped at 256 KiB per terminal. Slow consumers close.
+  There is no flow control: input that overflows the queue ends the terminal with
+  `input_overflow`, and a malformed input or resize frame ends it with `invalid`.
+- `pty_ready` confirms successful spawn before output or input. The host defaults to a
+  30-second open timeout, including when an older agent ignores the new frame types.
+- Input and resize commands are processed in arrival order. Natural completion drains final
+  output before `pty_exit`; a descendant that still holds the terminal does not delay it.
+  Close terminates the shell and its foreground/process group and reaps the direct child.
+  Independently detached processes are outside terminal ownership.
+- A terminal belongs to one connection: agent disconnect, replacement, host shutdown, client
+  cancellation or disabling the group ends it. Reconnect never restores it or replays bytes.
+  Unknown terminal IDs and another agent's responses are ignored. Protocol version stays 2.
+
+The Host SDK exposes `host.agents.openPty(agentId, options?, signal?)`. It resolves after
+`pty_ready` to `{id, write(Uint8Array), resize(cols, rows), close(), output, exited}`. `output`
+is a byte `ReadableStream`; `exited` resolves to the exit payload. The optional AbortSignal
+also cancels a pending open. Canceling the output stream closes the terminal.
+
+The optional Hono admin bridge (enabled by injecting `upgradeWebSocket`) uses:
+
+1. `POST /admin/agents/:id/pty-ticket`, with normal admin authorization, returns
+   `{success: true, data: {ticket, expiresAt}}`. Tickets expire in 30 seconds, are single-use,
+   are scoped to the agent, and cannot authorize any other admin route.
+2. `GET /admin/agents/:id/pty?ticket=...` upgrades the browser connection. Non-browser clients
+   may use the normal admin authorization instead. A supplied Origin must match the Origin
+   from the authenticated ticket request (or the request URL origin when absent). This works
+   through TLS termination without trusting forwarded headers. Direct admin upgrades require
+   the request URL origin. The standalone app limits tickets and upgrades to 30 requests per
+   minute per IP.
+3. Within five seconds, send `{type: "open", data: {...options}}`. Wait for
+   `{type: "ready", data: {ptyId}}`, then send `input` / `resize` / `close` using the same
+   data shapes above. The server emits `output` and `exit`. One socket owns one terminal;
+   messages do not take a client-selected ptyId. The browser's pending send buffer is bounded.
+
+Standalone paths are prefixed with `/api` (and the configured base path, when present).
+Ticket responses are not cacheable; request logs omit query strings.
+
 ## 6. Multiplexing & ordering (one WS, N parallel threads)
 
 Many threads share one connection, so their frames interleave. The receiver MUST NOT assume
@@ -231,6 +340,8 @@ Parse model: a whole job is `WHERE task_id = ?`; one conversation is
   dedup, retry, and watchdog are runner-local; only the `cron_state` summary is shared.
 - The `task_id ↔ delivery channel` mapping — host-private routing.
 - Storage schemas on either side — private; only the envelopes above are shared.
+- Running a command or opening a terminal on the agent without an engine — not part of
+  the protocol yet; only the file operations of §5.1 are.
 - Attachment **bytes** — only descriptors ride frames; bytes move on the separate channel
   (§2 / agent-architecture §9).
 
@@ -522,6 +633,218 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
           },
           "required": [
             "type"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "fs_response"
+            },
+            "reqId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "ok": {
+                  "type": "boolean"
+                },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "mtime_ms": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "size",
+                      "name"
+                    ],
+                    "additionalProperties": {}
+                  }
+                },
+                "stat": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "mtime_ms": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "size"
+                  ],
+                  "additionalProperties": {}
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "error": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "additionalProperties": {}
+                }
+              },
+              "required": [
+                "ok"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "reqId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_ready"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_output"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "string",
+                  "maxLength": 21848,
+                  "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                }
+              },
+              "required": [
+                "data"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_exit"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "exit_code": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "signal": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "error": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "additionalProperties": {}
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
           ],
           "additionalProperties": {}
         },
@@ -937,6 +1260,218 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
           "properties": {
             "type": {
               "type": "string",
+              "const": "fs_request"
+            },
+            "reqId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "list",
+                    "stat",
+                    "mkdir",
+                    "remove",
+                    "rename",
+                    "put",
+                    "get"
+                  ]
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "to": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "recursive": {
+                  "type": "boolean"
+                },
+                "ref": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "upload": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "path"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "reqId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_open"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "argv": {
+                  "minItems": 1,
+                  "maxItems": 64,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 4096
+                  }
+                },
+                "cwd": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "env": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^=\\0]+$"
+                  },
+                  "additionalProperties": {
+                    "type": "string",
+                    "maxLength": 4096
+                  }
+                },
+                "cols": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                },
+                "rows": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_input"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "string",
+                  "maxLength": 21848,
+                  "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                }
+              },
+              "required": [
+                "data"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_resize"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "cols": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                },
+                "rows": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                }
+              },
+              "required": [
+                "cols",
+                "rows"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_close"
+            },
+            "ptyId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ptyId"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
               "const": "ack"
             },
             "id": {
@@ -1227,6 +1762,218 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
           },
           "required": [
             "type"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "fs_response"
+            },
+            "reqId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "ok": {
+                  "type": "boolean"
+                },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "mtime_ms": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "size",
+                      "name"
+                    ],
+                    "additionalProperties": {}
+                  }
+                },
+                "stat": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "mtime_ms": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "size"
+                  ],
+                  "additionalProperties": {}
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "error": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "additionalProperties": {}
+                }
+              },
+              "required": [
+                "ok"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "reqId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_ready"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {},
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_output"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "string",
+                  "maxLength": 21848,
+                  "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                }
+              },
+              "required": [
+                "data"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_exit"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "exit_code": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "signal": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "error": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "additionalProperties": {}
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
           ],
           "additionalProperties": {}
         },
@@ -1635,6 +2382,218 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
           },
           "required": [
             "type"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "fs_request"
+            },
+            "reqId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "list",
+                    "stat",
+                    "mkdir",
+                    "remove",
+                    "rename",
+                    "put",
+                    "get"
+                  ]
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "to": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "recursive": {
+                  "type": "boolean"
+                },
+                "ref": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "upload": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "op",
+                "path"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "reqId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_open"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "argv": {
+                  "minItems": 1,
+                  "maxItems": 64,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 4096
+                  }
+                },
+                "cwd": {
+                  "type": "string",
+                  "maxLength": 4096
+                },
+                "env": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": "^[^=\\0]+$"
+                  },
+                  "additionalProperties": {
+                    "type": "string",
+                    "maxLength": 4096
+                  }
+                },
+                "cols": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                },
+                "rows": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_input"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "data": {
+                  "type": "string",
+                  "maxLength": 21848,
+                  "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+                }
+              },
+              "required": [
+                "data"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_resize"
+            },
+            "ptyId": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "cols": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                },
+                "rows": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000
+                }
+              },
+              "required": [
+                "cols",
+                "rows"
+              ],
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "type",
+            "ptyId",
+            "data"
+          ],
+          "additionalProperties": {}
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "pty_close"
+            },
+            "ptyId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ptyId"
           ],
           "additionalProperties": {}
         },

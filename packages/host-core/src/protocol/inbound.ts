@@ -22,6 +22,7 @@
 // Unknown `type`s and unknown fields are ignored (protocol §4.2). Business
 // `data` is validated here (still M2) against the `frames.ts` schemas right
 // before it reaches a writer; the writers themselves stay transport-free.
+import type { RemoteOps } from "../agents/remote";
 import type { HostEvents } from "../host/events";
 import type { Metrics } from "../host/metrics";
 import type { Storage } from "../host/ports/storage";
@@ -58,6 +59,8 @@ export interface InboundDeps {
   events?: HostEvents;
   /** Metrics sink (the host context's); absent → counters are not recorded. */
   metrics?: Metrics;
+  /** Pending engine-free requests; absent → `fs_response` frames are ignored. */
+  remote?: RemoteOps;
 }
 
 /** Build the `ack{id}` for a frame that carried its own `outboxId`, else null. */
@@ -270,6 +273,22 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
       if (decoded.id != null) {
         ackOutbox(storage, agentId, decoded.id);
         deps.events?.emit("outbox.acked", { agentId, id: decoded.id, type: "ack" });
+      }
+      return null;
+    }
+
+    case "pty_ready":
+    case "pty_output":
+    case "pty_exit": {
+      if (decoded.ptyId != null)
+        deps.remote?.receivePty(agentId, decoded.type, decoded.ptyId, decoded.data);
+      return null;
+    }
+
+    case "fs_response": {
+      // Live-only: correlated by `reqId`, never acked.
+      if (decoded.reqId != null) {
+        deps.remote?.resolve(agentId, decoded.reqId, decoded.data);
       }
       return null;
     }

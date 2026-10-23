@@ -79,6 +79,15 @@ export function edgeRoutes({ config, host }: EdgeDeps) {
     },
   }));
 
+  router.post("/admin/agents/:id/pty-ticket", rateLimit({
+    bucket: "pty-ticket",
+    limits: () => ({ windowMs: 60_000, max: 30 }),
+  }));
+  router.get("/admin/agents/:id/pty", rateLimit({
+    bucket: "pty-upgrade",
+    limits: () => ({ windowMs: 60_000, max: 30 }),
+  }));
+
   // ── Routers ─────────────────────────────────────────────────────────────────
 
   // The shared `hono/bun` upgrade — its `websocket` handler is registered on
@@ -89,7 +98,7 @@ export function edgeRoutes({ config, host }: EdgeDeps) {
     clientIp: c => getClientIp(c, config),
     maxUploadBytes: config.MAX_UPLOAD_BYTES,
   }));
-  router.route("/admin", adminRouter(host, { authorize: adminTokenAuthorize(config) }));
+  router.route("/admin", adminRouter(host, { authorize: adminTokenAuthorize(config), upgradeWebSocket }));
   router.route("/messages", messagesRouter(host, { authorize: channelTokenAuthorize(config) }));
   router.route("/llm", llmRouter(host, { config, basePath: config.BASE_PATH }));
   return router;

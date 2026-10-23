@@ -1,4 +1,5 @@
 import type { Host } from "@gino/host-core";
+import type { UpgradeWebSocket } from "hono/ws";
 import type { Authorize, HostEnv } from "../env";
 import { Hono } from "hono";
 import { requireAuthorized } from "../auth";
@@ -6,6 +7,7 @@ import { bindHost } from "../env";
 import { adminAgentRoutes } from "./agents";
 import { adminChannelRoutes } from "./channels";
 import { adminConfigRoutes } from "./config";
+import { adminPtyRoutes } from "./pty";
 import { adminTaskRoutes } from "./tasks";
 
 export interface AdminRouterOptions {
@@ -15,6 +17,8 @@ export interface AdminRouterOptions {
    * admitted). `null` → 401 on every admin route.
    */
   readonly authorize: Authorize;
+  /** Enables the terminal bridge using the same runtime adapter as the agent router. */
+  readonly upgradeWebSocket?: UpgradeWebSocket;
 }
 
 /**
@@ -28,6 +32,9 @@ export function adminRouter(host: Host, opts: AdminRouterOptions) {
   const router = new Hono<HostEnv>();
 
   router.use("*", bindHost(host));
+
+  if (opts.upgradeWebSocket)
+    router.route("/agents", adminPtyRoutes(host, opts.authorize, opts.upgradeWebSocket));
 
   // The embedder's authorization guards every admin route (incl. the mounted sub-routers).
   router.use("*", requireAuthorized(opts.authorize));

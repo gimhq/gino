@@ -17,6 +17,8 @@
 export interface AgentCapabilitiesJson {
   engines: string[];
   max_threads?: number;
+  /** Host-set switches for engine-free operations; absent = all off. Never taken from the agent. */
+  remote_ops?: { fs?: boolean; pty?: boolean };
 }
 
 /** A stored agent: identity, capabilities, access policy, liveness and its launcher binding. Only the connect token's HASH is ever persisted. */

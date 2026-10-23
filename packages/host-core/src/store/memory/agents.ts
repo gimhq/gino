@@ -81,6 +81,12 @@ export function memoryAgentRepo(): AgentRepo {
         row.access = access;
       }
     },
+    setCapabilities(agentId, capabilities) {
+      const row = agents.get(agentId);
+      if (row && row.status !== REMOVED) {
+        row.capabilities = capabilities;
+      }
+    },
     setRemoved(agentId, revokedTokenHash) {
       const row = agents.get(agentId);
       if (row) {

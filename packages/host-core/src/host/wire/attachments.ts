@@ -106,6 +106,11 @@ function serveBlob(ctx: WireContext, sel: { id?: string; sha256?: string }, ifNo
  * agent placed on the attachment's `task_id`. Unknown id → 404; wrong agent → 403.
  */
 function serveById(ctx: WireContext, requesterId: string, id: string, opts: { ifNoneMatch?: string | undefined }): HttpResult {
+  // A pending file transfer: single-use bytes staged for exactly this agent.
+  const staged = ctx.remote.grantedBytes(id, requesterId);
+  if (staged) {
+    return { status: 200, headers: { "content-type": "application/octet-stream", "content-length": String(staged.byteLength), "cache-control": "no-store" }, body: staged };
+  }
   const att = getAttachmentById(ctx.storage, id);
   if (!att) {
     throw new NotFoundError("attachment", id);

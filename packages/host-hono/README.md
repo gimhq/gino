@@ -66,3 +66,20 @@ routes join the same spec.
   host-core and is protocol-visible; this package only wires the callbacks up.
 - **No server.** It builds routers; you call `Bun.serve` or `@hono/node-server`.
 - **No storage or host construction.** Pass in a `Host` you already built.
+
+## Browser terminals
+
+Pass the same `upgradeWebSocket` helper to `adminRouter(host, {authorize, upgradeWebSocket})`
+and `agentRouter`. This enables `POST /admin/agents/:id/pty-ticket` (admin authorization) and
+`GET /admin/agents/:id/pty?ticket=...` (single-use, 30-second ticket). A supplied browser Origin
+must match the authenticated ticket request's Origin, falling back to its URL origin when
+absent. This supports TLS termination without trusting forwarded headers. Existing admin
+routes retain their normal authorization.
+
+The browser sends `open`, waits for `ready`, then sends `input` (base64 bytes), `resize`, or
+`close`. The server emits `output` and `exit`; closing the socket ends its terminal. See
+[`protocol §5.2`](../../docs/protocol.md#52-interactive-terminals-live-only) for full payloads.
+
+The real host/agent integration check runs with
+`GINO_PTY_TEST_BIN=/absolute/path/to/gino-agent bun test tests/integration/real-pty.test.ts`.
+It is skipped by ordinary package tests when the binary path is absent.

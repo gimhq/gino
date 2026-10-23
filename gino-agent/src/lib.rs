@@ -25,6 +25,7 @@ mod paths;
 mod protocol;
 mod provisioning;
 mod register;
+mod remote_ops;
 mod runner;
 mod scheduler;
 mod transport;

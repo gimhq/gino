@@ -456,6 +456,10 @@ async fn transcript_streams_to_the_host_during_the_run() {
         secrecy::SecretString::from("tok"),
         Arc::clone(&db),
         crate::transport::TransportConfig::default(),
+        Arc::new(crate::remote_ops::RemoteOps::new(
+            false,
+            std::path::Path::new("/nonexistent"),
+        )),
     );
 
     let engine: Arc<dyn Engine> = Arc::new(GatedEngine { gate });

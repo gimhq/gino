@@ -52,6 +52,7 @@ use tracing::warn;
 
 use crate::db::Db;
 use crate::protocol::v2::InboundFrameV2;
+use crate::remote_ops::RemoteOps;
 
 pub(crate) use self::ws::MAX_INBOX_RETRIES;
 use self::ws::WsDriver;
@@ -171,6 +172,7 @@ impl Transport {
         connect_token: SecretString,
         db: Arc<Mutex<Db>>,
         config: TransportConfig,
+        remote_ops: Arc<RemoteOps>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(Cancel::new());
@@ -186,6 +188,7 @@ impl Transport {
             read_timeout: config.read_timeout,
             ack_timeout: config.ack_timeout,
             backoff: Backoff::new(config.backoff),
+            remote_ops,
         };
         let manager = tokio::spawn(run_manager(driver));
         Self {
@@ -491,6 +494,13 @@ mod tests {
 
     type ServerWs = WebSocketStream<TcpStream>;
 
+    fn remote_ops_off() -> Arc<crate::remote_ops::RemoteOps> {
+        Arc::new(crate::remote_ops::RemoteOps::new(
+            false,
+            std::path::Path::new("/nonexistent"),
+        ))
+    }
+
     fn test_config() -> TransportConfig {
         TransportConfig {
             // Far longer than any test runs, so no heartbeat, read-liveness
@@ -583,6 +593,7 @@ mod tests {
             SecretString::from("connect-secret"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
 
         let (first, second) = server.await.unwrap();
@@ -636,6 +647,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
 
         let inbound = transport.recv().await.unwrap();
@@ -714,6 +726,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
 
         let (first, second) = server.await.unwrap();
@@ -757,6 +770,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
 
         let (first_ack, second_ack) = server.await.unwrap();
@@ -811,6 +825,7 @@ mod tests {
                 heartbeat: Duration::ZERO,
                 ..test_config()
             },
+            remote_ops_off(),
         );
 
         // The frame flows through a live (un-panicked) driver task.
@@ -822,6 +837,150 @@ mod tests {
         let ack: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(ack, json!({ "type": "msg_ack", "msgId": 1 }));
         transport.shutdown().await;
+    }
+
+    /// An `fs_request` is answered over the socket without touching the inbox
+    /// or the outbox, so it can never be replayed.
+    #[tokio::test]
+    async fn fs_request_is_answered_live_and_never_persisted() {
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut responses = Vec::new();
+            for (req_id, data) in [
+                ("r-1", json!({"op": "mkdir", "path": "d"})),
+                ("r-2", json!({"op": "stat", "path": "d"})),
+            ] {
+                let frame = json!({"type": "fs_request", "reqId": req_id, "data": data});
+                ws.send(Message::text(frame.to_string())).await.unwrap();
+                responses.push(next_text(&mut ws).await);
+            }
+            responses
+        });
+
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/agent-fs"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            test_config(),
+            Arc::new(crate::remote_ops::RemoteOps::new(true, dir.path())),
+        );
+
+        let responses = server.await.unwrap();
+        let made: Value = serde_json::from_str(&responses[0]).unwrap();
+        assert_eq!(
+            made,
+            json!({"type": "fs_response", "reqId": "r-1", "data": {"ok": true}})
+        );
+        let stat: Value = serde_json::from_str(&responses[1]).unwrap();
+        assert_eq!(stat["reqId"], json!("r-2"));
+        assert_eq!(stat["data"]["stat"]["type"], json!("dir"));
+        assert!(dir.path().join("d").is_dir());
+
+        {
+            let guard = db.lock().unwrap();
+            assert!(guard.list_unprocessed_inbox().unwrap().is_empty());
+            assert!(guard.list_unacked_outbox().unwrap().is_empty());
+        }
+        transport.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pty_disconnect_reaps_process_and_reconnect_never_replays_terminal_frames() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let ops = Arc::new(crate::remote_ops::RemoteOps::new(false, dir.path()));
+        ops.configure(false, true, dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let transport = Transport::open(
+            format!("ws://{addr}/agent/ws/pty"),
+            SecretString::from("tok"),
+            Arc::clone(&db),
+            test_config(),
+            ops,
+        );
+        let check = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::text(
+                json!({
+                    "type": "pty_open", "ptyId": "old",
+                    "data": { "argv": ["/bin/sh", "-c", "echo $$; exec sleep 60"] }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            let ready: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+            assert_eq!(ready["type"], "pty_ready");
+            let output: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+            let bytes = STANDARD
+                .decode(output["data"]["data"].as_str().unwrap())
+                .unwrap();
+            let pid = String::from_utf8_lossy(&bytes)
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            ws.close(None).await.unwrap();
+            drop(ws);
+
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            assert_eq!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            );
+            ws.send(Message::text(
+                json!({ "type": "pty_input", "ptyId": "old", "data": { "data": "eA==" } })
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::text(
+                json!({ "type": "pty_open", "ptyId": "new", "data": {
+                "argv": ["/bin/sh", "-c", "read line; printf '%s' \"$line\"; exit 4"]
+            } })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            let ready: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+            assert_eq!(ready["type"], "pty_ready");
+            assert_eq!(ready["ptyId"], "new");
+            ws.send(Message::text(json!({ "type": "pty_input", "ptyId": "new", "data": { "data": STANDARD.encode(b"new-session\n") } }).to_string())).await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let frame: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+                assert_eq!(frame["ptyId"], "new");
+                if frame["type"] == "pty_exit" {
+                    assert_eq!(frame["data"]["exit_code"], 4);
+                    break;
+                }
+                assert_eq!(frame["type"], "pty_output");
+                bytes.extend(
+                    STANDARD
+                        .decode(frame["data"]["data"].as_str().unwrap())
+                        .unwrap(),
+                );
+            }
+            assert!(String::from_utf8_lossy(&bytes).contains("new-session"));
+        };
+        tokio::time::timeout(Duration::from_secs(10), check)
+            .await
+            .unwrap();
+        transport.shutdown().await;
+        let guard = db.lock().unwrap();
+        assert!(guard.list_unprocessed_inbox().unwrap().is_empty());
+        assert!(guard.list_unacked_outbox().unwrap().is_empty());
     }
 
     /// Regression: opening the transport against an unreachable host must
@@ -840,6 +999,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
 
         // The producer path works while offline: enqueue a frame's `data` to the
@@ -917,6 +1077,7 @@ mod tests {
                 },
                 ..test_config()
             },
+            remote_ops_off(),
         );
 
         let frame: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
@@ -975,6 +1136,7 @@ mod tests {
             SecretString::from("tok"),
             Arc::clone(&db),
             test_config(),
+            remote_ops_off(),
         );
         let flush = transport.flush_handle();
 
@@ -1068,6 +1230,7 @@ mod tests {
                 read_timeout: Duration::from_millis(200),
                 ..test_config()
             },
+            remote_ops_off(),
         );
 
         tokio::time::timeout(Duration::from_secs(10), server)
@@ -1114,6 +1277,7 @@ mod tests {
                 ack_timeout: Duration::from_millis(100),
                 ..test_config()
             },
+            remote_ops_off(),
         );
 
         let (first, second) = tokio::time::timeout(Duration::from_secs(10), server)

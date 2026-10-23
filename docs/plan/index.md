@@ -1,6 +1,6 @@
 # Gino - Plan Index
 
-> Updated: 2026-10-03
+> Updated: 2026-10-12
 
 ## Usage
 
@@ -32,4 +32,7 @@ Each plan is a single line linking to its detail file. All detailed information 
 ## Plans
 
 - [-] [**20261003-1650-structure-docs-agent-alignment Repository structure, documentation, and gino-agent PMA-Rust alignment**](20261003-1650-structure-docs-agent-alignment.md) `2026-10-03`
-- [ ] [**20261003-1726-agent-direct-ops Agent file and environment operations without an engine**](20261003-1726-agent-direct-ops.md) `2026-10-03`
+- [-] [**20261003-1726-agent-direct-ops Agent file and environment operations without an engine**](20261003-1726-agent-direct-ops.md) `2026-10-03`
+
+- [x] [**20261012-1616-agent-pty Agent PTY sessions over the live operations channel**](20261012-1616-agent-pty.md) `2026-10-12`
+- [x] [**20261012-2019-remote-ops-review-fixes Fix remote operations review findings**](20261012-2019-remote-ops-review-fixes.md) `2026-10-12`

@@ -3,7 +3,7 @@
 // register (HTTP) → WS with the connect token → online → close → offline.
 import process from "node:process";
 import { createHost, memoryStorage, noopLogger } from "@gino/host-core";
-import { agentRouter, errorHandler } from "@gino/host-hono";
+import { adminRouter, agentRouter, errorHandler } from "@gino/host-hono";
 import { nodeWebSocket } from "@gino/host-hono/node";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
@@ -26,6 +26,10 @@ async function main() {
   const app = new Hono();
   const { upgradeWebSocket, injectWebSocket } = nodeWebSocket(app);
   app.route("/agent", agentRouter(host, { upgradeWebSocket }));
+  app.route("/admin", adminRouter(host, {
+    upgradeWebSocket,
+    authorize: c => c.req.header("authorization") === "Bearer node-terminal-admin" ? { kind: "admin" } : null,
+  }));
   app.onError(errorHandler);
 
   const server = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" });
@@ -63,6 +67,29 @@ async function main() {
   ws.send(JSON.stringify({ type: "heartbeat", data: { activeThreads: 1 } }));
   await settle();
   assert(host.agents.get(agentId)?.activeThreads === 1, "heartbeat updated activeThreads");
+
+  ws.on("message", (text) => {
+    const frame = JSON.parse(text.toString());
+    if (frame.type === "pty_open") {
+      ws.send(JSON.stringify({ type: "pty_ready", ptyId: frame.ptyId, data: {} }));
+      ws.send(JSON.stringify({ type: "pty_exit", ptyId: frame.ptyId, data: { exit_code: 0 } }));
+    }
+  });
+  const ticketRes = await fetch(`${httpBase}/admin/agents/${agentId}/pty-ticket`, {
+    method: "POST",
+    headers: { authorization: "Bearer node-terminal-admin" },
+  });
+  assert(ticketRes.status === 200, "admin obtains a terminal ticket");
+  const { data: { ticket } } = await ticketRes.json();
+  const terminal = new WebSocket(`ws://127.0.0.1:${port}/admin/agents/${agentId}/pty?ticket=${ticket}`);
+  const terminalFrames = [];
+  await new Promise((resolve, reject) => {
+    terminal.on("open", () => terminal.send(JSON.stringify({ type: "open", data: {} })));
+    terminal.on("message", text => terminalFrames.push(JSON.parse(text.toString())));
+    terminal.on("close", resolve);
+    terminal.on("error", reject);
+  });
+  assert(terminalFrames.map(frame => frame.type).join(",") === "ready,exit", "Node terminal bridge forwards ready and exit");
 
   const closed = new Promise(resolve => ws.once("close", resolve));
   ws.close();

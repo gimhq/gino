@@ -28,6 +28,8 @@ export interface DecodedFrame {
   taskId?: string;
   threadId?: string;
   cronId?: string;
+  reqId?: string;
+  ptyId?: string;
   data?: unknown;
 }
 
@@ -71,6 +73,8 @@ export function decodeFrame(raw: string | ArrayBuffer | Uint8Array): DecodedFram
     ...(e.taskId != null ? { taskId: e.taskId } : {}),
     ...(e.threadId != null ? { threadId: e.threadId } : {}),
     ...(e.cronId != null ? { cronId: e.cronId } : {}),
+    ...(e.ptyId != null ? { ptyId: e.ptyId } : {}),
+    ...(e.reqId != null ? { reqId: e.reqId } : {}),
     ...(data !== undefined ? { data } : {}),
   };
 }

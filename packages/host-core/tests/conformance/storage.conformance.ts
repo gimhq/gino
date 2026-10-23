@@ -123,6 +123,18 @@ export function describeAgentRepoConformance(target: ConformanceTarget, harness:
       expect(s().agents.get("a1")!.access).toBe("dedicated");
     });
 
+    test("setCapabilities replaces the stored capabilities, except on a removed agent", () => {
+      s().agents.insert(agentRow("a1"));
+      const before = s().agents.get("a1")!.capabilities;
+      s().agents.setCapabilities("a1", { ...before, remote_ops: { fs: true } });
+      expect(s().agents.get("a1")!.capabilities).toEqual({ ...before, remote_ops: { fs: true } });
+      s().agents.setRemoved("a1", "revoked");
+      s().agents.setCapabilities("a1", before);
+      expect(s().agents.get("a1")!.capabilities.remote_ops).toEqual({ fs: true });
+      s().agents.setCapabilities("ghost", before);
+      expect(s().agents.get("ghost")).toBeUndefined();
+    });
+
     test("touchLiveness stamps lastSeen (+activeThreads) without touching status", () => {
       s().agents.insert(agentRow("a1"));
       s().agents.touchLiveness("a1", 5_000);

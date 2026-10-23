@@ -228,6 +228,12 @@ at spawn — the same apply-on-next-run policy as the per-task `model` override 
 changes the engine reaches the *next* run without disturbing the one in flight. An **unregistered engine
 name is not fatal**: the registry warns and answers the default.
 
+**The claude backend.** One prompt can end in several `result` lines: after a background subagent
+reports back, the CLI runs another turn by itself and emits another `result`. The child is started with
+`CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`, and the run ends on `system/session_state_changed` → `idle`
+with the **latest** `result`. A CLI that never reports session state ends on its first `result`, and a
+result still held when the child exits is reported as it is.
+
 **The codex backend.**
 
 - **One `codex exec --json` child per TURN** — unlike claude, a single long-lived child driven over a
@@ -257,7 +263,8 @@ name is not fatal**: the registry warns and answers the default.
 | `item.completed` for those same kinds | `ToolResult` | `tool_result` |
 | `item.completed` `error` | `Log` (error) | a log line — **not** terminal |
 | `turn.completed` | `Result` (success) | `thread_result` succeeded |
-| `turn.failed`, `error` | `Result` (error, `Execution` → `agent.unknown`) | `thread_result` failed |
+| `turn.failed` | `Result` (error, `Execution` → `agent.unknown`) | `thread_result` failed |
+| `error` (stream-level, e.g. a reconnect notice) | `Log` (warn) | a status line — **not** terminal |
 | `item.updated`, `todo_list`, anything unknown | — | dropped |
 
 - The tool **name is the codex item kind verbatim** (`command_execution`, `file_change`, …), never aliased
@@ -321,6 +328,7 @@ the type-specific business payload only:
 | `cron_upsert` / `cron_delete` | taskId, cronId | `{kind, prompt, schedule_type?, schedule_value?, continuity, …}` |
 | `message` | taskId, threadId? | `{text, attachments?}` |
 | `interrupt` / `close` / `config_update` / `ack` | — | — |
+| `fs_request` (live-only) | reqId | `{op, path, to?, recursive?, ref? + sha256? + size?, upload?}` |
 
 **agent → host** (envelope ids · data)
 
@@ -330,6 +338,7 @@ the type-specific business payload only:
 | `thread_message` | taskId, threadId | `{seq, kind, role?, content?, tool?, input?, output?, tool_use_id?, parent_tool_use_id?}` |
 | `cron_state` | taskId, cronId | `{kind, schedule_type?, …, round_count, skipped_count, last_status}` |
 | `heartbeat` | — | `{activeThreads?, …}` |
+| `fs_response` (live-only) | reqId | `{ok, entries? \| stat? \| sha256 + size, error?}` |
 | `msg_ack` / `ack` | top-level `msgId`/`id` | — |
 
 `kind` ∈ `{user_input, assistant_text, thinking, tool_use, tool_result, status, error}` (`thinking`/`log`
@@ -342,6 +351,28 @@ means the main agent. `tool_use_id` is the engine's id for a `tool_use` block, e
 `tool_result`, so a reader can pair a call with its return value; `tool_result.output` carries
 `{content, is_error}`. Attribution introduces **no hierarchy**: `seq` stays a single per-thread monotonic
 stream across all kinds, and there are no sub-threads or parent tasks.
+
+**Engine-free file operations (`remote_ops/`).** `fs_request` lets the host list, stat, read, write,
+create, rename and remove files without prompting an engine (protocol §5.1). The transport recognizes the
+frame **before** the inbox write and answers it off the socket task: the operation runs on the blocking
+pool and its `fs_response` is sent straight to the socket, like `heartbeat`. Neither frame touches `inbox`
+or `outbox`, so nothing is replayed after a reconnect, and a response produced for a dropped connection is
+discarded. **File contents never ride in a frame**: `put` downloads the blob the host staged on the
+attachment byte channel (§9) into a temp file beside the destination, verifies its sha256 and renames it
+into place; `get` uploads the file to the byte channel under the name the host chose. Both go through
+the attachment backend directly — no content-type allowlist and no copy in the content-addressed cache —
+and are bounded by the single-attachment size limit. The group is **off** until the host-assigned config sets `remoteOps.fs` (register config,
+`GET /agent/config`, or a live `config_update`); the agent has no local switch and answers `disabled`
+meanwhile. **Paths are not confined**: a relative path resolves against `workspace_dir`, an absolute one is
+used as given — whoever holds the host's admin token can reach every file the agent's uid can, on every
+agent where the group is enabled. Standalone command requests remain deferred.
+
+**Interactive terminals (`remote_ops/pty.rs`).** `remoteOps.pty` enables connection-scoped
+`pty_*` frames (protocol §5.2). `pty-process` supplies asynchronous PTY allocation and process
+spawning. Each session has ordered bounded input, raw-byte output, resize, cancellation and
+explicit child reaping. Disabling PTY revokes active sessions through a configuration epoch.
+The socket owns the session registry and a bounded live output channel; both are discarded
+and workers joined before reconnect. No terminal frame enters inbox/outbox or starts an engine.
 
 **Multiplexing & ordering (one WS, N parallel threads).** Concurrent threads' frames interleave. The host
 **demuxes by `threadId`**, **orders each thread's transcript by `seq`** (per-thread monotonic, assigned

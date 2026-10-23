@@ -18,12 +18,13 @@ import type { AgentRow, Storage } from "../host/ports/storage";
 import type { AgentTransport } from "../host/ports/transport";
 import type { Logger } from "../logger";
 import type { InspectState, Launcher } from "./launchers/types";
+import type { RemoteOpsFlags } from "./registry";
 import type { SessionRegistry } from "./sessions";
 import { randomBytes } from "node:crypto";
 import { enqueue, purgeAgentOutbox } from "../protocol/outbox";
 import { AppError, NotFoundError } from "../shared/lib/errors";
 import { manualLauncher } from "./launchers/manual";
-import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess } from "./registry";
+import { getAgent, grantOwner, recordPendingLaunch, removeAgent, revokeOwner, setAgentAccess, setAgentRemoteOps } from "./registry";
 
 /** Which out-of-band control operation a `ControlResult` describes. */
 export type ControlOp = "stop" | "restart" | "remove";
@@ -255,6 +256,23 @@ export function setAgentAccessControl(deps: ControlDeps, agentId: string, access
   requireActiveAgent(deps.storage, agentId);
   setAgentAccess(deps.storage, agentId, access);
   deps.logger?.info({ agentId, access }, "agent access policy set (admin)");
+}
+
+/**
+ * Enable or disable engine-free operation groups on an agent. Persisted, then
+ * pushed as a `config_update` (queued for an offline agent, which does not
+ * re-fetch its config on reconnect). 404 if unknown; 410 if `removed`.
+ */
+export function setAgentRemoteOpsControl(deps: ControlDeps, agentId: string, flags: RemoteOpsFlags): Required<RemoteOpsFlags> {
+  const agent = requireActiveAgent(deps.storage, agentId);
+  setAgentRemoteOps(deps.storage, agent, flags);
+  const remoteOps = {
+    fs: flags.fs ?? agent.capabilities.remote_ops?.fs ?? false,
+    pty: flags.pty ?? agent.capabilities.remote_ops?.pty ?? false,
+  };
+  enqueue(deps.storage, deps.sender, { agentId, type: "config_update", data: { remoteOps } });
+  deps.logger?.info({ agentId, remoteOps }, "agent remote ops set (admin)");
+  return remoteOps;
 }
 
 /** A config-driven launch request (B2b). `hostUrl` + `registerToken` are host-supplied (the agent never picks them). */

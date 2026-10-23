@@ -9,13 +9,17 @@
 //   POST   /agents/:id/grant      grant {owner_id} access
 //   POST   /agents/:id/access     set access policy {access}
 //   POST   /agents/:id/revoke     revoke {owner_id} access
+//   POST   /agents/:id/remote-ops enable/disable engine-free operation groups {fs}
+//   POST   /agents/:id/fs         one metadata operation on a connected agent (live-only)
+//   PUT    /agents/:id/files      write a file (?path=, raw body) over the byte channel
+//   GET    /agents/:id/files      read a file (?path=) over the byte channel
 //
 // Every response uses the shared `{ success, data }` envelope. The stored
 // connect-token hash is NEVER serialized.
 import type { AgentRow } from "@gino/host-core";
 import type { HostEnv } from "../env";
-import { NotFoundError } from "@gino/host-core";
-import { getAgent, getCapacity, grantAgentOwner, inspectAgent, launchAgent, listAgents, listGrants, removeAgentControl, restartAgent, revokeAgentOwner, setAgentAccessControl, stopAgent } from "@gino/host-core/domain";
+import { AppError, NotFoundError } from "@gino/host-core";
+import { FsOpData, getAgent, getCapacity, grantAgentOwner, inspectAgent, launchAgent, listAgents, listGrants, readBodyCapped, removeAgentControl, restartAgent, revokeAgentOwner, setAgentAccessControl, stopAgent } from "@gino/host-core/domain";
 import { Hono } from "hono";
 import { z } from "zod";
 import { ok } from "../api-response";
@@ -60,6 +64,14 @@ const launchBody = z.object({
 });
 
 const accessBody = z.object({ access: z.enum(["dedicated", "public"]) });
+
+const filesQuery = z.object({ path: z.string().min(1) });
+
+/** HTTP status for an agent-side refusal of a file download. */
+const FS_ERROR_STATUS: Record<string, number> = { not_found: 404, denied: 403, disabled: 409, too_large: 413, invalid: 422 };
+
+const remoteOpsBody = z.object({ fs: z.boolean().optional(), pty: z.boolean().optional() })
+  .refine(value => value.fs !== undefined || value.pty !== undefined, "At least one operation flag is required");
 
 export function adminAgentRoutes() {
   const router = new Hono<HostEnv>();
@@ -233,6 +245,82 @@ export function adminAgentRoutes() {
       const { owner_id } = c.req.valid("json");
       revokeAgentOwner({ storage: c.get("host").storage, sender: c.get("host").sessions, logger: c.get("logger") }, id, owner_id);
       return c.json(ok({ agentId: id, ownerId: owner_id, granted: false }));
+    },
+  );
+
+  // ── Engine-free operations ─────────────────────────────────────────────
+  // Off per agent until switched on here. Once on, the admin token reaches
+  // every file the agent's user can: paths are not confined to a root.
+  router.post(
+    "/:id/remote-ops",
+    describeRoute({
+      tags: [TAGS.Agents],
+      summary: "Enable or disable engine-free operation groups on an agent (admin-only)",
+      responses: { ...jsonOk(z.any(), "Remote ops set"), ...errors(401, 404, 410, 422) },
+    }),
+    validator("json", remoteOpsBody),
+    (c) => {
+      const id = c.req.param("id");
+      const flags = c.req.valid("json");
+      return c.json(ok({ agentId: id, remoteOps: c.get("host").agents.setRemoteOps(id, {
+        ...(flags.fs !== undefined ? { fs: flags.fs } : {}),
+        ...(flags.pty !== undefined ? { pty: flags.pty } : {}),
+      }) }));
+    },
+  );
+
+  router.post(
+    "/:id/fs",
+    describeRoute({
+      tags: [TAGS.Agents],
+      summary: "Run one metadata operation on a connected agent (live-only; unconfined paths)",
+      responses: { ...jsonOk(z.any(), "The agent's answer (`ok: false` carries `error`)"), ...errors(401, 404, 409, 422, 502, 504) },
+    }),
+    validator("json", FsOpData),
+    async c => c.json(ok(await c.get("host").agents.fs(c.req.param("id"), c.req.valid("json")))),
+  );
+
+  // File contents travel over the attachment byte channel, never in a frame.
+  router.put(
+    "/:id/files",
+    describeRoute({
+      tags: [TAGS.Agents],
+      summary: "Write a file on a connected agent (raw body; verified, atomic replace)",
+      responses: { ...jsonOk(z.any(), "The agent's answer (`ok: false` carries `error`)"), ...errors(401, 404, 409, 413, 422, 502, 504) },
+    }),
+    validator("query", filesQuery),
+    async (c) => {
+      const host = c.get("host");
+      const bytes = await readBodyCapped(c.req.raw, host.options.maxUploadBytes);
+      return c.json(ok(await host.agents.putFile(c.req.param("id"), c.req.valid("query").path, bytes)));
+    },
+  );
+
+  router.get(
+    "/:id/files",
+    describeRoute({
+      tags: [TAGS.Agents],
+      summary: "Read a file from a connected agent (verified bytes)",
+      responses: { 200: { description: "Bytes" }, ...errors(401, 403, 404, 409, 413, 422, 502, 504) },
+    }),
+    validator("query", filesQuery),
+    async (c) => {
+      const { path } = c.req.valid("query");
+      const file = await c.get("host").agents.getFile(c.req.param("id"), path);
+      if (!file.ok) {
+        const code = file.error?.code ?? "io";
+        throw new AppError(file.error?.message ?? "the agent refused the read", FS_ERROR_STATUS[code] ?? 502, `FS_${code.toUpperCase()}`);
+      }
+      const body = file.bytes.buffer.slice(file.bytes.byteOffset, file.bytes.byteOffset + file.bytes.byteLength) as ArrayBuffer;
+      return new Response(body, {
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(file.size),
+          "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(path.split("/").pop() ?? "file")}`,
+          "x-content-sha256": file.sha256,
+          "cache-control": "no-store",
+        },
+      });
     },
   );
 

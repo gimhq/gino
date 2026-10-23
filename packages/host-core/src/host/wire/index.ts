@@ -145,7 +145,7 @@ export interface Wire {
 }
 
 /** The slice of the context the wire closes over (a full `HostContext` satisfies it). */
-export type WireContext = Pick<HostContext, "storage" | "sessions" | "logger" | "metrics" | "events" | "options">;
+export type WireContext = Pick<HostContext, "storage" | "sessions" | "remote" | "logger" | "metrics" | "events" | "options">;
 
 export function createWire(ctx: WireContext): Wire {
   return {

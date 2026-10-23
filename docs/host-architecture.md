@@ -87,6 +87,7 @@ packages/host-core/       @gino/host-core — the control plane itself. No HTTP 
       liveness.ts            heartbeat → online/offline + active_threads
       launchers/             types.ts  index.ts  manual.ts  docker.ts   (start + OOB control)
       control.ts             launch+correlate · stop/restart/remove/inspect via owning launcher
+      remote.ts              engine-free file operations: pending fs_request map, staged file transfers, timeout, reject on session drop
       launch-reaper.ts       expire launches that never registered
     tasks/               M4  TASK MANAGEMENT & DISPATCH
       store.ts               host-authoritative task/cron identity + definitions + channel binding
@@ -206,6 +207,26 @@ in an AI conversation list). Crons **live on the agent** — the host only comma
   are **read-only mirrors** written by M5, not authored here.
 - **Dispatch** (`task → agent`, owner-pinned): resolve `task.owner_id` → an agent the owner is **permitted**
   to use (dedicated, else public); set `tasks.agent_id` **once** (no migration). See §3.
+- **Interactive terminals** (`agents/pty.ts`): `host.agents.openPty` waits for readiness and
+  returns a byte stream plus write/resize/close controls and an exit promise. Bounded buffers,
+  open timeouts, cancellation and `SessionRegistry.onDrop` cover all terminal lifetimes.
+  `remoteOps.pty` shares the existing capabilities JSON storage; partial flag updates preserve
+  the other groups. The Hono admin adapter offers a one-use ticket and a WebSocket terminal
+  bridge when supplied with the runtime's existing upgrade helper (protocol §5.2).
+- **Engine-free file operations** (`agents/remote.ts`, M3): `host.agents.fs(agentId, request)` pushes a
+  live-only `fs_request` to the agent's socket and resolves with its `fs_response` (protocol §5.1). It
+  never enters the outbox: an offline agent is refused (`409 AGENT_OFFLINE`), an unanswered request times
+  out (`504`), and a dropped or superseded session rejects everything pending for that agent
+  (`SessionRegistry.onDrop`). File contents go over the attachment byte channel instead of the frame:
+  `host.agents.putFile` / `PUT /admin/agents/:id/files` stages the bytes in the blob store under a
+  host-minted single-use name that `GET /agent/attachments/:id` serves only to that agent while the
+  request is pending; `host.agents.getFile` / `GET /admin/agents/:id/files` has the agent upload under
+  such a name and reads the bytes back verified. The staged copy is deleted when the transfer settles,
+  and each transfer holds the whole file in memory (bounded by `maxUploadBytes`). The group is **off per agent** until `host.agents.setRemoteOps` /
+  `POST /admin/agents/:id/remote-ops` turns it on; the switch is stored in `agents.capabilities.remote_ops`,
+  served as `config.remoteOps`, and pushed as a `config_update`. Paths are not confined on the agent, so
+  the admin token is the only guard on an enabled agent's files — keep it out of logs and rotate it like a
+  root credential.
 - **Orchestrator** (SOURCE): emit via M2 outbox — `task_upsert` (seed the task: `engine`/`model`/`workdir`/
   `meta` + config `entries`), `cron_upsert`/`cron_delete` (**commands** — the agent owns + fires + persists
   the cron; the host schedules nothing), `message {taskId, threadId?}`, `interrupt`/`close`/`config_update`.
@@ -444,7 +465,7 @@ router_state(    key PK, value )
 
 | area | endpoints |
 |---|---|
-| **Agents** (M3) | `GET /admin/agents` · `GET /admin/agents/:id` · `POST /admin/agents/launch` · `POST /admin/agents/:id/{stop,restart,remove}` · `POST /admin/agents/:id/grant\|revoke {owner_id}` |
+| **Agents** (M3) | `GET /admin/agents` · `GET /admin/agents/:id` · `POST /admin/agents/launch` · `POST /admin/agents/:id/{stop,restart,remove}` · `POST /admin/agents/:id/grant\|revoke {owner_id}` · `POST /admin/agents/:id/remote-ops {fs}` · `POST /admin/agents/:id/fs` · `PUT\|GET /admin/agents/:id/files?path=` |
 | **Tasks** (M4) | `GET/POST /admin/tasks` · `GET /admin/tasks/:id` (+threads/messages) · `POST /admin/tasks/:id/assign` (manual placement) · `POST /admin/tasks/:id/{message,interrupt,close}` |
 | **Crons** (M4) | `GET/POST /admin/tasks/:id/crons` · `PUT/DELETE /admin/tasks/:id/crons/:cronId` (→ `cron_upsert`/`cron_delete`) |
 | **Channels** (M6) | `POST /admin/channels` (register: `type` + `owner_id` + `filter?`) · `GET/POST /messages/:channel/{send,poll}` · webhook CRUD |

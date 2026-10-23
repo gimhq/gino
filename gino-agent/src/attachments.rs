@@ -539,6 +539,82 @@ impl AttachmentManager {
         Ok(bytes)
     }
 
+    /// Stream the blob at `reference` straight into `dest`, bypassing the cache:
+    /// the bytes land in a temp file beside `dest` under the in-flight
+    /// `max_bytes` cap, are verified against `sha256`, then renamed into place,
+    /// so `dest` is never observed half-written. An existing `dest` keeps its
+    /// permissions, and a symlink is written through to its target.
+    pub(crate) async fn download_file(
+        &self,
+        reference: &str,
+        sha256: &str,
+        max_bytes: u64,
+        dest: &Path,
+    ) -> Result<(), AttachmentError> {
+        let descriptor = AttachmentDescriptor {
+            id: String::new(),
+            name: String::new(),
+            content_type: String::new(),
+            size: 0,
+            sha256: sha256.to_owned(),
+            reference: reference.to_owned(),
+            direction: None,
+        };
+        let dest = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+        let mut tmp = dest.as_os_str().to_owned();
+        tmp.push(format!(".{}.part", uuid::Uuid::new_v4()));
+        let tmp = PathBuf::from(tmp);
+        let result = self.stream_verified(&descriptor, max_bytes, &tmp).await;
+        let result = result.and_then(|()| {
+            if let Ok(existing) = std::fs::metadata(&dest) {
+                std::fs::set_permissions(&tmp, existing.permissions())?;
+            }
+            Ok(std::fs::rename(&tmp, &dest)?)
+        });
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    async fn stream_verified(
+        &self,
+        descriptor: &AttachmentDescriptor,
+        max_bytes: u64,
+        tmp: &Path,
+    ) -> Result<(), AttachmentError> {
+        let mut sink = HashingSink {
+            inner: std::fs::File::create(tmp)?,
+            hasher: Sha256::new(),
+        };
+        self.backend
+            .download_to(descriptor, max_bytes, &mut sink)
+            .await?;
+        sink.inner.flush()?;
+        let actual = hex_digest(sink.hasher);
+        if actual != descriptor.sha256.to_ascii_lowercase() {
+            return Err(AttachmentError::IntegrityMismatch {
+                expected: descriptor.sha256.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    /// Upload `bytes` under `name` with no content-type allowlist and no cache
+    /// copy; returns their sha256.
+    pub(crate) async fn upload_bytes(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, AttachmentError> {
+        let sha256 = sha256_hex(&bytes);
+        self.backend
+            .upload(name, "application/octet-stream", &sha256, bytes)
+            .await?;
+        Ok(sha256)
+    }
+
     /// Stream `descriptor` into `tmp` with the in-flight `max_bytes` cap and
     /// incremental hashing, verify the streamed hash equals `key` (the validated
     /// lowercase expected hash), and read the cap-bounded file back. The caller

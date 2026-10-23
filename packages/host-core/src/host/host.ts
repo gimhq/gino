@@ -1,10 +1,12 @@
 import type { ControlDeps, ControlResult, LaunchAgentResult, LaunchInput, RemoveResult } from "../agents/control";
 import type { InspectState, Launcher } from "../agents/launchers";
-import type { EnrollInput, EnrollResult } from "../agents/registry";
+import type { PtySession } from "../agents/pty";
+import type { EnrollInput, EnrollResult, RemoteOpsFlags } from "../agents/registry";
+import type { GetFileResult } from "../agents/remote";
 import type { EntryInput, IngestArtifactInput } from "../configstore";
 import type { Logger } from "../logger";
 import type { TranscriptReadOptions, TranscriptStats } from "../msgstore";
-import type { ConfigEntry } from "../protocol/frames";
+import type { ConfigEntry, FsOpData, FsResponseData, PtyOpenData } from "../protocol/frames";
 import type { DispatchResult } from "../tasks";
 import type { CronUpsertInput, CronUpsertResult, MessageInput, SendMessageResult } from "../tasks/orchestrator";
 import type { CreateTaskInput, ListTasksFilter } from "../tasks/store";
@@ -40,6 +42,7 @@ import {
   restartAgent,
   revokeAgentOwner,
   setAgentAccessControl,
+  setAgentRemoteOpsControl,
   stopAgent,
 } from "../agents/control";
 import { enrollAgent, getAgent, listAgents } from "../agents/registry";
@@ -53,6 +56,7 @@ import {
   setEntries,
 } from "../configstore";
 import { getTaskThreads, getThreadRun, getTranscript, getTranscriptStats } from "../msgstore";
+import { NotFoundError } from "../shared/lib/errors";
 import {
   assignTaskToAgent,
   closeTask,
@@ -175,6 +179,37 @@ export interface AgentsApi {
    * @throws NotFoundError unknown agent; `AppError` 410 `AGENT_REMOVED`.
    */
   readonly setAccess: (agentId: string, access: "dedicated" | "public") => void;
+  /**
+   * Enable or disable engine-free operation groups on an agent. All groups are
+   * off until an operator turns them on here; the agent cannot enable them
+   * itself, and once enabled it cannot refuse. Returns the stored switches.
+   * @throws NotFoundError unknown agent; `AppError` 410 `AGENT_REMOVED`.
+   */
+  readonly setRemoteOps: (agentId: string, flags: RemoteOpsFlags) => Required<RemoteOpsFlags>;
+  /** Open a live terminal, resolving only after the agent confirms readiness. */
+  readonly openPty: (agentId: string, options?: PtyOpenData, signal?: AbortSignal) => Promise<PtySession>;
+  /**
+   * Run one metadata operation (list, stat, mkdir, remove, rename) on a
+   * connected agent without an engine. Paths are NOT confined: a relative path
+   * resolves against the agent's workspace, an absolute one is used as given.
+   * Live-only — never queued or replayed. Resolves with the agent's answer,
+   * including a refusal (`ok: false`, e.g. `disabled` while the group is off).
+   * @throws NotFoundError unknown agent; `AppError` 409 `AGENT_OFFLINE`,
+   * 504 `AGENT_TIMEOUT`, 502 `AGENT_DISCONNECTED`.
+   */
+  readonly fs: (agentId: string, request: FsOpData) => Promise<FsResponseData>;
+  /**
+   * Write a whole file on a connected agent. The bytes travel over the
+   * attachment byte channel, are verified against their sha256 and replace the
+   * destination atomically. Same path rules, answer and errors as `fs`.
+   */
+  readonly putFile: (agentId: string, path: string, bytes: Uint8Array) => Promise<FsResponseData>;
+  /**
+   * Read a whole file from a connected agent over the attachment byte channel.
+   * Resolves with the verified bytes, or the agent's refusal (`ok: false`).
+   * Same path rules and errors as `fs`.
+   */
+  readonly getFile: (agentId: string, path: string) => Promise<GetFileResult>;
   /**
    * Start a runtime through a launcher and record a pending launch keyed by a
    * single-use nonce. The agent's later `register` echoes the nonce, which
@@ -388,6 +423,30 @@ function agentsApi(ctx: HostContext): AgentsApi {
     grant: (agentId, ownerId) => grantAgentOwner(deps, agentId, ownerId),
     revoke: (agentId, ownerId) => revokeAgentOwner(deps, agentId, ownerId),
     setAccess: (agentId, access) => setAgentAccessControl(deps, agentId, access),
+    setRemoteOps: (agentId, flags) => setAgentRemoteOpsControl(deps, agentId, flags),
+    openPty: async (agentId, options = {}, signal) => {
+      if (!getAgent(storage, agentId))
+        throw new NotFoundError("agent", agentId);
+      return ctx.remote.openPty(agentId, options, signal);
+    },
+    fs: async (agentId, request) => {
+      if (!getAgent(storage, agentId)) {
+        throw new NotFoundError("agent", agentId);
+      }
+      return ctx.remote.fs(agentId, request);
+    },
+    putFile: async (agentId, path, bytes) => {
+      if (!getAgent(storage, agentId)) {
+        throw new NotFoundError("agent", agentId);
+      }
+      return ctx.remote.putFile(agentId, path, bytes);
+    },
+    getFile: async (agentId, path) => {
+      if (!getAgent(storage, agentId)) {
+        throw new NotFoundError("agent", agentId);
+      }
+      return ctx.remote.getFile(agentId, path);
+    },
     launch: input => launchAgent(deps, input),
   };
 }

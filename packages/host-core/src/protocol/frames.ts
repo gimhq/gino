@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 // M2 — PROTOCOL v2 FRAME CATALOG (the single source of truth for the wire).
 //
 // This module mirrors `docs/protocol.md` §4 (envelope) + §5 (frame catalog) as
@@ -65,6 +66,8 @@ export const Envelope = z.looseObject({
   taskId: CorrelationId.optional(),
   threadId: CorrelationId.optional(),
   cronId: CorrelationId.optional(),
+  reqId: CorrelationId.optional(),
+  ptyId: CorrelationId.optional(),
 });
 export type Envelope = z.infer<typeof Envelope>;
 
@@ -144,6 +147,71 @@ export const HeartbeatData = z.looseObject({
 });
 export type HeartbeatData = z.infer<typeof HeartbeatData>;
 
+/** One directory entry or `stat` result. */
+export const FsStat = z.looseObject({
+  type: z.string(),
+  size: z.number().int(),
+  mtime_ms: z.number().int().optional(),
+});
+export type FsStat = z.infer<typeof FsStat>;
+
+/**
+ * `fs_response.data` — the outcome of one file operation. `ok: false` carries
+ * `error`; otherwise `entries` (list), `stat` (stat), or `sha256` + `size` of
+ * the uploaded bytes (get). `error.code` is an open string: `disabled`,
+ * `not_found`, `exists`, `too_large`, `invalid`, `denied`, `io`.
+ */
+export const FsResponseData = z.looseObject({
+  ok: z.boolean(),
+  entries: z.array(FsStat.extend({ name: z.string() })).optional(),
+  stat: FsStat.optional(),
+  sha256: z.string().optional(),
+  size: z.number().int().optional(),
+  error: z.looseObject({ code: z.string(), message: z.string() }).optional(),
+});
+export type FsResponseData = z.infer<typeof FsResponseData>;
+
+/** Raw terminal bytes, capped at 16 KiB after base64 decoding. */
+export const PtyBytesData = z.looseObject({
+  // JSON Schema patterns cannot carry JavaScript regex flags.
+  // eslint-disable-next-line regexp/use-ignore-case
+  data: z.string().max(21848).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/).refine(value => Buffer.from(value, "base64").byteLength <= 16384),
+});
+export type PtyBytesData = z.infer<typeof PtyBytesData>;
+
+/** Terminal window dimensions. */
+export const PtyResizeData = z.looseObject({ cols: z.number().int().min(1).max(1000), rows: z.number().int().min(1).max(1000) });
+export type PtyResizeData = z.infer<typeof PtyResizeData>;
+
+/** Options for a new terminal; relative cwd resolves against the agent workspace. */
+export const PtyOpenData = z.looseObject({
+  argv: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).min(1).max(64).optional(),
+  cwd: z.string().max(4096).refine(value => !value.includes("\0")).optional(),
+  env: z.record(z.string().min(1).max(256).regex(/^[^=\0]+$/), z.string().max(4096).refine(value => !value.includes("\0")))
+    .refine(value => Object.keys(value).length <= 64)
+    .optional(),
+  cols: PtyResizeData.shape.cols.optional(),
+  rows: PtyResizeData.shape.rows.optional(),
+}).refine(value => Buffer.byteLength(JSON.stringify(value)) <= 65536);
+export type PtyOpenData = z.infer<typeof PtyOpenData>;
+
+/** Terminal completion, including a failed open or forced close. */
+export const PtyExitData = z.looseObject({
+  exit_code: z.number().int().optional(),
+  signal: z.number().int().optional(),
+  error: z.looseObject({ code: z.string(), message: z.string() }).optional(),
+});
+export type PtyExitData = z.infer<typeof PtyExitData>;
+
+/** Terminal frames are live-only and correlated by ptyId. */
+export const PtyOpenFrame = z.looseObject({ type: z.literal("pty_open"), ptyId: CorrelationId, data: PtyOpenData });
+export const PtyInputFrame = z.looseObject({ type: z.literal("pty_input"), ptyId: CorrelationId, data: PtyBytesData });
+export const PtyResizeFrame = z.looseObject({ type: z.literal("pty_resize"), ptyId: CorrelationId, data: PtyResizeData });
+export const PtyCloseFrame = z.looseObject({ type: z.literal("pty_close"), ptyId: CorrelationId });
+export const PtyReadyFrame = z.looseObject({ type: z.literal("pty_ready"), ptyId: CorrelationId, data: z.looseObject({}) });
+export const PtyOutputFrame = z.looseObject({ type: z.literal("pty_output"), ptyId: CorrelationId, data: PtyBytesData });
+export const PtyExitFrame = z.looseObject({ type: z.literal("pty_exit"), ptyId: CorrelationId, data: PtyExitData });
+
 // ── `data` payloads — host → agent ──────────────────────────────────────────
 
 /** A desired config/skill entry (M8) — engine-resolved `target`. */
@@ -201,6 +269,37 @@ export type MessageData = z.infer<typeof MessageData>;
 export const ConfigUpdateData = z.looseObject({});
 export type ConfigUpdateData = z.infer<typeof ConfigUpdateData>;
 
+/**
+ * A metadata operation a caller may ask for directly. A relative `path`
+ * resolves against the agent's workspace directory; an absolute one is used
+ * as given.
+ */
+export const FsOpData = z.looseObject({
+  op: z.enum(["list", "stat", "mkdir", "remove", "rename"]),
+  path: z.string().min(1),
+  /** `rename` destination. */
+  to: z.string().min(1).optional(),
+  /** `mkdir` parents / `remove` a non-empty directory. */
+  recursive: z.boolean().optional(),
+});
+export type FsOpData = z.infer<typeof FsOpData>;
+
+/**
+ * `fs_request.data` — one file operation. Adds the two transfers to
+ * `FsOpData`; file bytes never ride in a frame, they move over the attachment
+ * byte channel. `put` names the blob to download (`ref`, `sha256`, `size`);
+ * `get` names the upload the agent must make (`upload`). Only the host mints
+ * these, so they are not part of `FsOpData`.
+ */
+export const FsRequestData = FsOpData.extend({
+  op: z.enum(["list", "stat", "mkdir", "remove", "rename", "put", "get"]),
+  ref: z.string().optional(),
+  sha256: z.string().optional(),
+  size: z.number().int().nonnegative().optional(),
+  upload: z.string().optional(),
+});
+export type FsRequestData = z.infer<typeof FsRequestData>;
+
 // ── Frames — agent → host ───────────────────────────────────────────────────
 
 /** `thread_result` — agent→host, one thread reached its terminal state. */
@@ -247,6 +346,13 @@ export const MsgAckFrame = z.looseObject({
 export const AckFrame = z.looseObject({
   type: z.literal("ack"),
   id: DeliveryId,
+});
+
+/** `fs_response` — agent→host, answers the `fs_request` with the same `reqId`. Live-only: never queued or acked. */
+export const FsResponseFrame = z.looseObject({
+  type: z.literal("fs_response"),
+  reqId: CorrelationId,
+  data: FsResponseData,
 });
 
 // ── Frames — host → agent ───────────────────────────────────────────────────
@@ -329,6 +435,13 @@ export const ConfigUpdateFrame = z.looseObject({
   data: ConfigUpdateData.optional(),
 });
 
+/** `fs_request` — host→agent, one engine-free file operation. Live-only: never queued, never replayed. */
+export const FsRequestFrame = z.looseObject({
+  type: z.literal("fs_request"),
+  reqId: CorrelationId,
+  data: FsRequestData,
+});
+
 // ── Unions + inferred types ─────────────────────────────────────────────────
 
 /** Everything the agent sends to the host (discriminated on `type`). */
@@ -337,6 +450,10 @@ export const AgentFrame = z.discriminatedUnion("type", [
   ThreadMessageFrame,
   CronStateFrame,
   HeartbeatFrame,
+  FsResponseFrame,
+  PtyReadyFrame,
+  PtyOutputFrame,
+  PtyExitFrame,
   MsgAckFrame,
   AckFrame,
 ]);
@@ -352,6 +469,11 @@ export const HostFrame = z.discriminatedUnion("type", [
   InterruptFrame,
   CloseFrame,
   ConfigUpdateFrame,
+  FsRequestFrame,
+  PtyOpenFrame,
+  PtyInputFrame,
+  PtyResizeFrame,
+  PtyCloseFrame,
   AckFrame,
 ]);
 export type HostFrame = z.infer<typeof HostFrame>;
@@ -359,7 +481,7 @@ export type HostFrame = z.infer<typeof HostFrame>;
 /**
  * Any valid v2 frame, either direction. A plain union of the two
  * direction-specific discriminated unions (both carry `ack`, so a single
- * discriminated union over all 15 frames would collide on the `ack` tag).
+ * discriminated union over both directions would collide on the `ack` tag).
  * An unknown `type` matches no member and is REJECTED at parse time — the M2
  * inbound handler turns that rejection into the §4.2 "ignore unknown type"
  * policy.

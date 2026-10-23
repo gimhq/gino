@@ -44,3 +44,62 @@ Documentation and comment refactor (task `20261003-1648-structure-docs-agent-ali
 
 PMA tracking initialized: `docs/task/`, `docs/plan/`. The plan and decision documents that older
 comments cited (`PLAN-001`…`PLAN-007`, `OD7`…`OD17`) were never committed to this repository.
+
+## 2026-10-11 01:25 [progress]
+
+Engine-free file operations (task `20261003-1725-agent-direct-ops`, file group only).
+
+- New live-only frame pair `fs_request` / `fs_response`, correlated by a top-level `reqId`; never
+  persisted, acked or replayed. `protocolVersion` stays 2.
+- Off per agent until the host sets `remoteOps.fs` (`POST /admin/agents/:id/remote-ops`); the
+  switch is stored in `agents.capabilities.remote_ops` and served in the agent config. Paths are
+  not confined to a root.
+- `AgentRepo` gained `setCapabilities`; `@gino/host-core/domain` gained the `Fs*` schemas,
+  `setAgentRemoteOps` and `setAgentRemoteOpsControl`.
+- Running commands and terminal sessions remain planned
+  (`docs/plan/20261003-1726-agent-direct-ops.md`).
+
+## 2026-10-12 16:25 [progress]
+
+Engine-free file transfers moved to the attachment byte channel (task
+`20261003-1725-agent-direct-ops`).
+
+- `fs_request` drops `read`/`write` and gains `put`/`get`; file bytes no longer ride in frames.
+- New `PUT|GET /admin/agents/:id/files?path=` and `host.agents.putFile` / `getFile`. A transfer is
+  staged under a single-use name served only to the target agent, sha256-verified, written
+  atomically on the agent, and removed from the host when it settles.
+- `@gino/host-core/domain` gained `FsOpData`; `POST /admin/agents/:id/fs` now takes only the
+  metadata operations.
+
+## 2026-10-12 16:50 [completed]
+
+Interactive terminals over the live operations channel (task `20261012-1616-agent-pty`).
+
+- Added connection-scoped `pty_open/input/resize/close` and `pty_ready/output/exit` frames,
+  independent default-off `remoteOps.pty`, async PTY process management, bounded queues and
+  process cleanup on revocation or disconnect. Terminal bytes never enter durable queues.
+- Added `host.agents.openPty`, byte streams, resize/input/close and pending-open cancellation.
+- Added the admin terminal ticket and WebSocket endpoints through the existing Bun/Node
+  adapters. Tickets are short-lived, single-use, agent-bound and bound to the authenticated
+  browser origin; the standalone host rate-limits both endpoints.
+- Updated the protocol/schema, architecture, SDK examples and test coverage documentation.
+- Verified Rust release fmt/clippy, 449 tests, dependency policy and unused dependencies; Host
+  workspace checks, Node adapters and real Host/Agent/browser terminal integration passed.
+  Root lint retains eight existing failures in two unchanged scripts, detailed in the task.
+
+## 2026-10-12 20:24 [completed]
+
+Fixed four findings from a review of the engine-free file and terminal operations (task
+`20261012-2019-remote-ops-review-fixes`).
+
+- `put` keeps the permission bits of the file it replaces and writes through a symlink.
+- `pty_exit` is no longer delayed five seconds, or marked `slow_consumer`, when a descendant
+  of the exited shell still holds the terminal.
+- A terminal ended by a full input queue reports `input_overflow`, and one ended by a malformed
+  input or resize frame reports `invalid`. The input queue grew from 16 to 64 chunks.
+- Deleting a blob removes its directory once empty, so file transfers leave nothing behind in
+  the host store.
+- Added task `20261012-2024-pty-flow-control` for end-to-end terminal flow control, which this change does not provide.
+- Verified by the agent gates in `rust:1.96` (fmt, clippy, 453 tests), the host workspace
+  `typecheck` and `check` on Bun 1.4.0 with Node 24.21.0, and a run of the real host against
+  the real agent binary.

@@ -65,6 +65,13 @@ export function sqliteAgentRepo(db: AppDatabase): AgentRepo {
         .where(and(eq(agents.id, agentId), ne(agents.status, REMOVED)))
         .run();
     },
+    setCapabilities(agentId, capabilities) {
+      db
+        .update(agents)
+        .set({ capabilities })
+        .where(and(eq(agents.id, agentId), ne(agents.status, REMOVED)))
+        .run();
+    },
     setRemoved(agentId, revokedTokenHash) {
       db
         .update(agents)

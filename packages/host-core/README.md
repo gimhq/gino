@@ -238,3 +238,20 @@ regardless of which entry you import from.
 `examples/embed-node` embeds the SDK in a plain Node process (`@hono/node-server`
 + `@hono/node-ws` + better-sqlite3) and round-trips one task against the real
 `gino-agent` runner: `bun run example:embed-node` from the repo root.
+
+## Live terminals
+
+```typescript
+host.agents.setRemoteOps(agentId, { pty: true });
+const terminal = await host.agents.openPty(agentId, { cols: 100, rows: 30 });
+terminal.write(new TextEncoder().encode("pwd\n"));
+const reader = terminal.output.getReader();
+const chunk = await reader.read();
+reader.releaseLock();
+terminal.close();
+await terminal.exited;
+```
+
+Configuration delivery is asynchronous: opening before the agent applies the enablement may
+still return `disabled`. Sessions end on disconnect and are never restored or replayed. Pass an
+AbortSignal as the third argument to cancel even while opening. See protocol §5.2 for limits.

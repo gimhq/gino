@@ -9,7 +9,7 @@
 // this is purely the host-side blob index the byte channel reads from.
 import type { BlobStorePort } from "../host/ports/storage";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
 
@@ -191,9 +191,19 @@ export class BlobStore implements BlobStorePort {
     return existsSync(path) ? statSync(path).size : 0;
   }
 
-  /** Remove a blob (used only by the guarded GC sweep — never in normal operation). */
+  /** Remove a blob, and its name directory once that holds nothing else. */
   delete(ref: string): void {
-    rmSync(this.abs(ref), { force: true });
+    const path = this.abs(ref);
+    rmSync(path, { force: true });
+    const dir = dirname(path);
+    if (dir !== resolve(this.root)) {
+      try {
+        rmdirSync(dir);
+      }
+      catch {
+        // Still holds another blob, or is already gone.
+      }
+    }
   }
 
   /**

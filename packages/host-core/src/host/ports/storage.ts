@@ -24,6 +24,7 @@
 // atomicity becomes another named method, not a leak. All methods are
 // synchronous in P1 (the domain is synchronous today).
 import type {
+  AgentCapabilitiesJson,
   AgentGrantRow,
   AgentRow,
   AttachmentRow,
@@ -120,6 +121,8 @@ export interface AgentRepo {
    * (mirrors `WHERE status != 'removed'`).
    */
   setAccess: (agentId: string, access: string) => void;
+  /** Replace the stored capabilities. Skipped (no-op) when the agent is `removed` or unknown. */
+  setCapabilities: (agentId: string, capabilities: AgentCapabilitiesJson) => void;
   /**
    * Permanent removal bookkeeping (`registry.removeAgent`): flip
    * `status` to `removed` AND overwrite `connectTokenHash` with the caller's

@@ -17,6 +17,7 @@ import type { Wire } from "./wire";
 import { startLaunchReaper } from "../agents/launch-reaper";
 import { DEFAULT_LAUNCHERS, LauncherRegistry } from "../agents/launchers";
 import { startLivenessSweep } from "../agents/liveness";
+import { RemoteOps } from "../agents/remote";
 import { SessionRegistry } from "../agents/sessions";
 import { startConfigStoreGc } from "../configstore";
 import { generateId, ulid } from "../platform/ids";
@@ -36,6 +37,8 @@ import { createWire } from "./wire";
 export interface HostContext {
   readonly logger: Logger;
   readonly sessions: SessionRegistry;
+  /** Pending engine-free requests to connected agents (live-only; never queued). */
+  readonly remote: RemoteOps;
   readonly launchers: LauncherRegistry;
   readonly metrics: Metrics;
   /** Typed post-write event hints (see `events.ts`); one emitter per context. */
@@ -94,6 +97,8 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
   const { storage, logger } = opts;
   const options = resolveHostOptions(opts.options);
   const sessions = new SessionRegistry();
+  const remote = new RemoteOps(sessions, storage.blobs);
+  sessions.onDrop = agentId => remote.dropAgent(agentId);
   const launchers = new LauncherRegistry(opts.launchers ?? DEFAULT_LAUNCHERS);
   const events = opts.events ?? createHostEvents(logger);
 
@@ -143,6 +148,7 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
   return {
     logger,
     sessions,
+    remote,
     launchers,
     metrics,
     events,
@@ -150,7 +156,7 @@ export function createHostContext(opts: CreateHostContextOptions): HostContext {
     storage,
     clock: opts.clock ?? Date.now,
     ids: { generateId: opts.ids?.generateId ?? generateId, ulid: opts.ids?.ulid ?? ulid },
-    wire: createWire({ storage, sessions, logger, metrics, events, options }),
+    wire: createWire({ storage, sessions, remote, logger, metrics, events, options }),
     start,
     stop,
     registerService: (service) => {

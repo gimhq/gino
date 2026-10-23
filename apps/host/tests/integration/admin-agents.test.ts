@@ -34,11 +34,13 @@ const config = loadConfigStrict({
 let db: AppDatabase;
 let storage: Storage;
 let app: ReturnType<typeof createApp>;
+let host: ReturnType<typeof createAppHost>;
 
 beforeAll(() => {
   db = createDb(config.DB_PATH);
   storage = sqliteStorage(db);
-  app = createApp({ config, host: createAppHost({ config, db, logger: createLogger(config) }) });
+  host = createAppHost({ config, db, logger: createLogger(config) });
+  app = createApp({ config, host });
 });
 
 afterAll(() => {
@@ -232,5 +234,157 @@ describe("M3 /admin/agents — stop + remove", () => {
     const task = db.select().from(tasks).where(eq(tasks.id, `task-${agentId}`)).get();
     expect(task).toBeDefined();
     expect(task?.agentId).toBeNull();
+  });
+});
+
+describe("M3 /admin/agents — engine-free file operations", () => {
+  const json = (body: unknown): RequestInit => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  async function agentConfig(agentId: string, connectToken: string) {
+    const res = await app.fetch(new Request(`http://local/api/agent/config/${agentId}`, { headers: { "x-internal-token": connectToken } }));
+    expect(res.status).toBe(200);
+    return await res.json() as { remoteOps: { fs: boolean } };
+  }
+
+  it("401 without the admin bearer", async () => {
+    const { agentId } = await enroll();
+    for (const path of ["fs", "remote-ops"]) {
+      const res = await app.fetch(new Request(`http://local/api/admin/agents/${agentId}/${path}`, json({ op: "list", path: ".", fs: true })));
+      expect(res.status).toBe(401);
+    }
+  });
+
+  it("the switch is off by default, cannot be self-declared at register, and is served once an admin sets it", async () => {
+    const res = await app.fetch(new Request("http://local/api/agent/register", json({
+      registerToken: REGISTER_TOKEN,
+      protocolVersion: 2,
+      capabilities: { engines: ["claude"], remote_ops: { fs: true } },
+    })));
+    const { agentId, connectToken, config: registered } = await res.json() as { agentId: string; connectToken: string; config: { remoteOps: { fs: boolean } } };
+    expect(registered.remoteOps).toMatchObject({ fs: false });
+    expect((await agentConfig(agentId, connectToken)).remoteOps).toMatchObject({ fs: false });
+
+    const set = await admin(`/agents/${agentId}/remote-ops`, json({ fs: true }));
+    expect(set.status).toBe(200);
+    expect((await set.json() as { data: unknown }).data).toMatchObject({ agentId, remoteOps: { fs: true } });
+    expect((await agentConfig(agentId, connectToken)).remoteOps).toMatchObject({ fs: true });
+    // Queued for the agent as a config_update (it does not re-fetch on reconnect).
+    const queued = storage.outbox.listUnacked(agentId).filter(row => row.type === "config_update");
+    expect(queued.map(row => row.dataJson)).toMatchObject([{ remoteOps: { fs: true } }]);
+  });
+
+  it("404 for an unknown agent, 409 for an offline one, 422 for a bad request", async () => {
+    expect((await admin("/agents/ghost/fs", json({ op: "list", path: "." }))).status).toBe(404);
+    expect((await admin("/agents/ghost/remote-ops", json({ fs: true }))).status).toBe(404);
+    const { agentId } = await enroll();
+    const offline = await admin(`/agents/${agentId}/fs`, json({ op: "list", path: "." }));
+    expect(offline.status).toBe(409);
+    expect((await admin(`/agents/${agentId}/fs`, json({ op: "chmod", path: "." }))).status).toBe(422);
+  });
+
+  /** Attach a fake agent socket that answers each fs_request through `answer`. */
+  function attachAgent(agentId: string, answer: (data: { op: string; path: string; ref: string; upload: string; size: number }) => Promise<unknown> | unknown) {
+    const ws = {
+      send: (raw: string) => {
+        const frame = JSON.parse(raw) as { type: string; reqId: string; data: Parameters<typeof answer>[0] };
+        expect(frame.type).toBe("fs_request");
+        void Promise.resolve(answer(frame.data)).then(data =>
+          host.wire.onSocketMessage(agentId, JSON.stringify({ type: "fs_response", reqId: frame.reqId, data })));
+      },
+      close: () => {},
+    };
+    host.wire.attachSocket(agentId, ws);
+    return () => host.wire.detachSocket(agentId, ws);
+  }
+
+  const agentFetch = (path: string, connectToken: string, init?: RequestInit) =>
+    app.fetch(new Request(`http://local/api${path}`, { ...init, headers: { "x-internal-token": connectToken, ...(init?.headers ?? {}) } }));
+
+  it("round-trips a metadata request to the connected agent and nothing is queued", async () => {
+    const { agentId } = await enroll();
+    const detach = attachAgent(agentId, (data) => {
+      expect({ op: data.op, path: data.path }).toEqual({ op: "stat", path: "a.txt" });
+      return { ok: true, stat: { type: "file", size: 2 } };
+    });
+    try {
+      const res = await admin(`/agents/${agentId}/fs`, json({ op: "stat", path: "a.txt" }));
+      expect(res.status).toBe(200);
+      expect((await res.json() as { data: unknown }).data).toEqual({ ok: true, stat: { type: "file", size: 2 } });
+      expect(storage.outbox.listUnacked(agentId)).toEqual([]);
+    }
+    finally {
+      detach();
+    }
+  });
+
+  it("the transfer operations cannot be requested through /fs", async () => {
+    const { agentId } = await enroll();
+    for (const op of ["put", "get", "read", "write"]) {
+      expect((await admin(`/agents/${agentId}/fs`, json({ op, path: "a", ref: "http://elsewhere/x" }))).status).toBe(422);
+    }
+  });
+
+  it("PUT /files stages the bytes for that agent only and removes them afterwards", async () => {
+    const { agentId, connectToken } = await enroll();
+    const other = await enroll();
+    const content = new TextEncoder().encode("hello from the host\n");
+    let stagedRef = "";
+    const detach = attachAgent(agentId, async (data) => {
+      expect(data).toMatchObject({ op: "put", path: "dir/note.txt", size: content.byteLength });
+      stagedRef = data.ref;
+      // Another agent's connect token cannot fetch the staged bytes.
+      expect((await agentFetch(data.ref, other.connectToken)).status).toBe(403);
+      const fetched = await agentFetch(data.ref, connectToken);
+      expect(fetched.status).toBe(200);
+      expect(new Uint8Array(await fetched.arrayBuffer())).toEqual(content);
+      return { ok: true };
+    });
+    try {
+      const res = await admin(`/agents/${agentId}/files?path=${encodeURIComponent("dir/note.txt")}`, { method: "PUT", body: content });
+      expect(res.status).toBe(200);
+      expect((await res.json() as { data: unknown }).data).toEqual({ ok: true });
+      // Single-use: the grant and the staged bytes are gone.
+      expect((await agentFetch(stagedRef, connectToken)).status).toBe(404);
+      expect(storage.outbox.listUnacked(agentId)).toEqual([]);
+    }
+    finally {
+      detach();
+    }
+  });
+
+  it("GET /files returns the bytes the agent uploaded and maps a refusal to a status", async () => {
+    const { agentId, connectToken } = await enroll();
+    const content = new Uint8Array([0xFF, 0x00, 0xFE, 0x41]);
+    const detach = attachAgent(agentId, async (data) => {
+      if (data.path === "missing") {
+        return { ok: false, error: { code: "not_found", message: "No such file" } };
+      }
+      const uploaded = await agentFetch("/agent/attachments", connectToken, { method: "POST", headers: { "x-attachment-name": data.upload }, body: content });
+      expect(uploaded.status).toBe(201);
+      const { sha256, size } = await uploaded.json() as { sha256: string; size: number };
+      return { ok: true, sha256, size };
+    });
+    try {
+      const res = await admin(`/agents/${agentId}/files?path=${encodeURIComponent("out/b.bin")}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-disposition")).toContain("b.bin");
+      expect(new Uint8Array(await res.arrayBuffer())).toEqual(content);
+
+      const missing = await admin(`/agents/${agentId}/files?path=missing`);
+      expect(missing.status).toBe(404);
+      expect((await missing.json() as { error: { code: string } }).error.code).toBe("FS_NOT_FOUND");
+    }
+    finally {
+      detach();
+    }
+  });
+
+  it("the file routes need the admin bearer, a path, and a connected agent", async () => {
+    const { agentId } = await enroll();
+    expect((await app.fetch(new Request(`http://local/api/admin/agents/${agentId}/files?path=a`))).status).toBe(401);
+    expect((await admin(`/agents/${agentId}/files`)).status).toBe(422);
+    expect((await admin(`/agents/${agentId}/files?path=a`)).status).toBe(409);
+    expect((await admin(`/agents/${agentId}/files?path=a`, { method: "PUT", body: "x" })).status).toBe(409);
+    expect((await admin("/agents/ghost/files?path=a")).status).toBe(404);
   });
 });

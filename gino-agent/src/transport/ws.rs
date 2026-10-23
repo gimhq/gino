@@ -58,6 +58,7 @@ use tracing::{debug, warn};
 use super::{Backoff, Cancel, Inbound, build_envelope, lock_db};
 use crate::db::Db;
 use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
+use crate::remote_ops::{self, RemoteOps};
 
 /// The auth header carrying the connect token (host WS handler reads this name).
 const INTERNAL_TOKEN_HEADER: &str = "x-internal-token";
@@ -155,6 +156,7 @@ pub(super) struct WsDriver {
     pub(super) read_timeout: Duration,
     pub(super) ack_timeout: Duration,
     pub(super) backoff: Backoff,
+    pub(super) remote_ops: Arc<RemoteOps>,
 }
 
 impl WsDriver {
@@ -183,6 +185,21 @@ impl WsDriver {
     /// ack-progress check, and the read-liveness deadline until the socket drops
     /// or shutdown is requested.
     async fn serve(&mut self, stream: WsStream) {
+        let (live_tx, mut live_rx) = mpsc::channel(64);
+        let mut ptys = remote_ops::pty::Sessions::default();
+        self.serve_connection(stream, &mut ptys, &live_tx, &mut live_rx)
+            .await;
+        drop(live_rx);
+        ptys.shutdown().await;
+    }
+
+    async fn serve_connection(
+        &mut self,
+        stream: WsStream,
+        ptys: &mut remote_ops::pty::Sessions,
+        live_tx: &mpsc::Sender<String>,
+        live_rx: &mut mpsc::Receiver<String>,
+    ) {
         let (mut sink, mut read) = stream.split();
 
         // Full replay on (re)connect — the one moment every unacked row is
@@ -225,7 +242,7 @@ impl WsDriver {
                     last_rx = tokio::time::Instant::now();
                     match message {
                         Some(Ok(message)) => {
-                            if !self.on_message(message, &mut sink).await {
+                            if !self.on_message(message, &mut sink, ptys, live_tx).await {
                                 return;
                             }
                         }
@@ -249,6 +266,11 @@ impl WsDriver {
                             warn!(error = %err, "outbox flush failed; reconnecting");
                             return;
                         }
+                    }
+                }
+                Some(frame) = live_rx.recv() => {
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(Message::text(frame))).await, Ok(Ok(()))) {
+                        return;
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -283,9 +305,28 @@ impl WsDriver {
 
     /// Handle one inbound websocket message. Returns `false` when the connection
     /// should be torn down (peer close, or an unrecoverable send error).
-    async fn on_message(&self, message: Message, sink: &mut WsSink) -> bool {
+    async fn on_message(
+        &self,
+        message: Message,
+        sink: &mut WsSink,
+        ptys: &mut remote_ops::pty::Sessions,
+        live_tx: &mpsc::Sender<String>,
+    ) -> bool {
         match message {
             Message::Text(text) => {
+                if let Some(frame) = remote_ops::pty::parse(text.as_str()) {
+                    ptys.handle(frame, &self.remote_ops, live_tx);
+                    return true;
+                }
+                // Live-only: answered off the socket task, bypassing the inbox.
+                if let Some(request) = remote_ops::parse_request(text.as_str()) {
+                    let remote_ops = Arc::clone(&self.remote_ops);
+                    let live_tx = live_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = live_tx.send(remote_ops.respond(request).await).await;
+                    });
+                    return true;
+                }
                 match handle_inbound(text.as_str(), sink, &self.db, &self.inbound_tx).await {
                     Ok(()) => true,
                     Err(err) => {

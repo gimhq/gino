@@ -1,3 +1,4 @@
+import type { AgentTransport, WsLike } from "../host/ports/transport";
 // M3 — SESSIONS (live connection registry; the host→agent push surface).
 //
 // An agent always DIALS OUT (protocol §2): the host never connects in. This
@@ -10,7 +11,7 @@
 // §8.4) so the outbox can deliver/replay without importing transport details,
 // and it never parses `data` — it ships an already-encoded frame object as JSON.
 
-import type { AgentTransport, WsLike } from "../host/ports/transport";
+import { Buffer } from "node:buffer";
 
 export type { WsLike };
 
@@ -34,6 +35,9 @@ const WS_OPEN = 1;
 export class SessionRegistry implements AgentTransport {
   private readonly sessions = new Map<string, Session>();
 
+  /** Called whenever an agent's current socket is dropped or superseded. */
+  onDrop?: (agentId: string) => void;
+
   /**
    * Attach (or replace) the socket for an agent. A reconnect supersedes any
    * stale socket: the previous one is closed so a single agent never has two
@@ -49,6 +53,7 @@ export class SessionRegistry implements AgentTransport {
       catch {
         // The stale socket may already be gone — detaching is best-effort.
       }
+      this.onDrop?.(agentId);
     }
     this.sessions.set(agentId, { agentId, ws });
   }
@@ -68,6 +73,7 @@ export class SessionRegistry implements AgentTransport {
       return false;
     }
     this.sessions.delete(agentId);
+    this.onDrop?.(agentId);
     return true;
   }
 
@@ -88,6 +94,7 @@ export class SessionRegistry implements AgentTransport {
     let closed = 0;
     for (const [agentId, session] of this.sessions) {
       this.sessions.delete(agentId);
+      this.onDrop?.(agentId);
       closed += 1;
       try {
         session.ws.close(code, reason);
@@ -110,6 +117,7 @@ export class SessionRegistry implements AgentTransport {
       return false;
     }
     this.sessions.delete(agentId);
+    this.onDrop?.(agentId);
     try {
       session.ws.close(code, reason);
     }
@@ -133,7 +141,14 @@ export class SessionRegistry implements AgentTransport {
       return false;
     }
     try {
-      session.ws.send(JSON.stringify(frame));
+      const text = JSON.stringify(frame);
+      if (typeof frame.type === "string" && frame.type.startsWith("pty_") && frame.type !== "pty_close") {
+        const raw = (session.ws.raw ?? session.ws) as { bufferedAmount?: number; getBufferedAmount?: () => number } | undefined;
+        const queued = raw?.getBufferedAmount?.() ?? raw?.bufferedAmount ?? 0;
+        if (queued + Buffer.byteLength(text) > 256 * 1024)
+          return false;
+      }
+      session.ws.send(text);
       return true;
     }
     catch {

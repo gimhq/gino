@@ -1,6 +1,6 @@
 # Gino - Task List
 
-> Updated: 2026-10-03
+> Updated: 2026-10-12
 
 ## Usage
 
@@ -35,3 +35,7 @@ Each task is a single line linking to its detail file. All detailed information 
 
 - [-] [**20261003-1648-structure-docs-agent-alignment Repository structure, documentation, and gino-agent PMA-Rust alignment**](20261003-1648-structure-docs-agent-alignment.md) `P1`
 - [-] [**20261003-1725-agent-direct-ops Agent file and environment operations without an engine**](20261003-1725-agent-direct-ops.md) `P1`
+
+- [x] [**20261012-1616-agent-pty Agent PTY sessions over the live operations channel**](20261012-1616-agent-pty.md) `P1`
+- [x] [**20261012-2019-remote-ops-review-fixes Fix remote operations review findings**](20261012-2019-remote-ops-review-fixes.md) `P1`
+- [ ] [**20261012-2024-pty-flow-control Terminal flow control**](20261012-2024-pty-flow-control.md) `P2`

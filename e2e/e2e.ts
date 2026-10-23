@@ -716,6 +716,54 @@ async function testLifecycle(): Promise<void> {
   });
 }
 
+// ── engine-free file operations (live-only fs frames) ────────────────────────
+
+async function testRemoteFs(): Promise<void> {
+  group("engine-free file operations");
+  const agentId = ctx.realAgentId;
+  if (!agentId) {
+    check("real agent available", false, "testAgentOnline did not resolve an agent id");
+    return;
+  }
+  const fs = (body: unknown): Promise<Res> => admin("POST", `/agents/${agentId}/fs`, body);
+  const file = "e2e-remote-fs/note.txt";
+
+  await step("off by default → the agent answers `disabled`", async () => {
+    const r = await fs({ op: "list", path: "." });
+    check("200", r.status === 200, `status ${r.status}`);
+    check("disabled", r.json?.data?.ok === false && r.json?.data?.error?.code === "disabled", r.text);
+  });
+
+  await step("admin enables the file group → the agent applies the config_update", async () => {
+    const r = await admin("POST", `/agents/${agentId}/remote-ops`, { fs: true });
+    check("remote-ops 200", r.status === 200 && r.json?.data?.remoteOps?.fs === true, r.text);
+    await waitFor("fs enabled on the agent", async () => (await fs({ op: "mkdir", path: "e2e-remote-fs", recursive: true })).json?.data?.ok === true, 15_000, 300);
+  });
+
+  await step("upload → download → list → rename → remove", async () => {
+    const content = new Uint8Array([0xFF, 0x00, 0xFE, ...new TextEncoder().encode("hello from the host\n")]);
+    const files = `${BASE}/admin/agents/${agentId}/files?path=${encodeURIComponent(file)}`;
+    const uploaded = await fetch(files, { method: "PUT", headers: adminBearer, body: content });
+    check("upload ok", uploaded.status === 200 && (await uploaded.json())?.data?.ok === true, `status ${uploaded.status}`);
+    const downloaded = await fetch(files, { headers: adminBearer });
+    const got = new Uint8Array(await downloaded.arrayBuffer());
+    check("download returns the bytes", downloaded.status === 200 && got.length === content.length && got.every((b, i) => b === content[i]), `status ${downloaded.status}, ${got.length} bytes`);
+    const listed = await fs({ op: "list", path: "e2e-remote-fs" });
+    check("list shows the file", (listed.json?.data?.entries ?? []).some((e: any) => e.name === "note.txt" && e.type === "file"), listed.text);
+    const renamed = await fs({ op: "rename", path: file, to: "e2e-remote-fs/moved.txt" });
+    check("rename ok", renamed.json?.data?.ok === true, renamed.text);
+    const gone = await fs({ op: "stat", path: file });
+    check("old path is not_found", gone.json?.data?.error?.code === "not_found", gone.text);
+    const removed = await fs({ op: "remove", path: "e2e-remote-fs", recursive: true });
+    check("remove ok", removed.json?.data?.ok === true, removed.text);
+  });
+
+  await step("admin disables the group again → `disabled`", async () => {
+    await admin("POST", `/agents/${agentId}/remote-ops`, { fs: false });
+    await waitFor("fs disabled on the agent", async () => (await fs({ op: "list", path: "." })).json?.data?.error?.code === "disabled", 15_000, 300);
+  });
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -738,6 +786,7 @@ async function main(): Promise<void> {
   await testAttachments();
   await testLlmProxy();
   await testProvisioning();
+  await testRemoteFs();
   await testAgentControl();
   await testLifecycle(); // destructive `close` → runs last
 

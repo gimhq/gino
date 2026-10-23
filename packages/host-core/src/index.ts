@@ -133,3 +133,5 @@ export { HEARTBEAT_INTERVAL_MS, isSupportedProtocol, PROTOCOL_VERSION } from "@g
 
 // ─── The `AppError` family (what every namespace throws) ───
 export { AppError, ForbiddenError, NotFoundError, PayloadTooLargeError, UnauthorizedError, ValidationError } from "@gino/host-core/domain";
+
+export type { PtyExitData, PtyOpenData, PtySession, RemoteOpsFlags } from "@gino/host-core/domain";

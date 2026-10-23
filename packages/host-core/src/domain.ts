@@ -13,6 +13,7 @@ export * from "./agents/launchers/docker";
 export * from "./agents/launchers/manual";
 export type * from "./agents/launchers/types";
 export * from "./agents/liveness";
+export type { PtySession } from "./agents/pty";
 export * from "./agents/registry";
 export * from "./agents/sessions";
 export { createStore } from "./configstore";
