@@ -9,7 +9,8 @@
 //! | `system` / `init`           | [`EngineEvent::SessionStarted`] (carries `session_id`) |
 //! | `assistant`                 | one event per content block, in order: `thinking` → [`EngineEvent::Thinking`], `tool_use` → [`EngineEvent::ToolUse`], all `text` blocks concatenated into one [`EngineEvent::Output`] |
 //! | `user`                      | one [`EngineEvent::ToolResult`] per `tool_result` block |
-//! | `result`                    | [`EngineEvent::Result`] (turn complete; error subtypes → [`RunStatus::Error`]) |
+//! | `result`                    | [`EngineEvent::Result`] (error subtypes → [`RunStatus::Error`]); held until `idle` when the CLI reports session state |
+//! | `system` / `session_state_changed` | releases the held `Result` on `idle`, else nothing |
 //! | `system` / `api_retry`,`hook_*` | [`EngineEvent::Log`]       |
 //! | `user` (plain echo), unknown | dropped (empty `Vec`)         |
 //!
@@ -25,11 +26,65 @@ use serde_json::{Value, json};
 
 use crate::engine::{EngineEvent, LogLevel, RunErrorKind, RunOutcome, RunStatus};
 
+/// Folds a session's stream-json lines into [`EngineEvent`]s, deciding which
+/// `result` ends the run.
+///
+/// One prompt can produce several `result` lines: after a background subagent
+/// reports back, the CLI runs another turn and emits another `result`. A CLI
+/// that reports session state marks the real end with `session_state_changed`
+/// → `idle`, so each `result` is held and only the latest is released then.
+/// A CLI that never reports session state has its `result` forwarded at once.
+#[derive(Debug, Default)]
+pub(super) struct EventMapper {
+    /// Whether a `session_state_changed` line has been seen.
+    reports_state: bool,
+    /// The latest `result`, waiting for `idle`.
+    held: Option<RunOutcome>,
+}
+
+impl EventMapper {
+    /// Map one parsed stdout line to the events it carries, in stream order.
+    pub(super) fn map_line(&mut self, value: &Value) -> Vec<EngineEvent> {
+        if is_session_state(value) {
+            self.reports_state = true;
+            if value.get("state").and_then(Value::as_str) == Some("idle") {
+                return self.finish().into_iter().collect();
+            }
+            return Vec::new();
+        }
+        let events = map_line(value);
+        if !self.reports_state {
+            return events;
+        }
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::Result(outcome) => {
+                    self.held = Some(outcome);
+                    None
+                }
+                other => Some(other),
+            })
+            .collect()
+    }
+
+    /// Release a `result` still held when the child exits.
+    pub(super) fn finish(&mut self) -> Option<EngineEvent> {
+        self.held.take().map(EngineEvent::Result)
+    }
+}
+
+/// Whether the line is a `system` / `session_state_changed` message.
+fn is_session_state(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("system")
+        && value.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
+}
+
 /// Map a parsed stdout stream-json line to the [`EngineEvent`]s it carries, in
 /// stream order. An empty `Vec` means the line is ignored (a plain `user` prompt
 /// echo, an unrecognised type). The caller must have already excluded
 /// `control_request`/`control_response` lines.
-pub(crate) fn map_line(value: &Value) -> Vec<EngineEvent> {
+fn map_line(value: &Value) -> Vec<EngineEvent> {
     let parent = parent_tool_use_id(value);
     match value
         .get("type")
@@ -235,8 +290,75 @@ fn error_kind_of(subtype: &str) -> Option<RunErrorKind> {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::map_line;
+    use super::{EventMapper, map_line};
     use crate::engine::{EngineEvent, LogLevel, RunErrorKind, RunStatus};
+
+    fn result_line(text: &str) -> Value {
+        json!({ "type": "result", "subtype": "success", "is_error": false, "result": text })
+    }
+
+    fn state_line(state: &str) -> Value {
+        json!({ "type": "system", "subtype": "session_state_changed", "state": state })
+    }
+
+    fn result_text(event: Option<EngineEvent>) -> Option<String> {
+        match event {
+            Some(EngineEvent::Result(outcome)) => outcome.result,
+            other => panic!("expected a result event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_is_forwarded_at_once_when_the_cli_reports_no_session_state() {
+        let mut mapper = EventMapper::default();
+        let mut events = mapper.map_line(&result_line("all done"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(result_text(events.pop()).as_deref(), Some("all done"));
+        assert!(mapper.finish().is_none());
+    }
+
+    #[test]
+    fn result_is_held_until_the_session_goes_idle() {
+        let mut mapper = EventMapper::default();
+        assert!(mapper.map_line(&state_line("running")).is_empty());
+        assert!(
+            mapper
+                .map_line(&result_line("subagent still running"))
+                .is_empty()
+        );
+        // The CLI starts another turn on the subagent's report.
+        assert_eq!(
+            mapper.map_line(&json!({ "type": "system", "subtype": "init", "session_id": "s" })),
+            vec![EngineEvent::SessionStarted {
+                session_id: "s".to_owned()
+            }]
+        );
+        assert!(mapper.map_line(&result_line("the answer is 4")).is_empty());
+
+        let mut events = mapper.map_line(&state_line("idle"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            result_text(events.pop()).as_deref(),
+            Some("the answer is 4")
+        );
+        assert!(mapper.finish().is_none());
+    }
+
+    #[test]
+    fn idle_without_a_result_emits_nothing() {
+        let mut mapper = EventMapper::default();
+        assert!(mapper.map_line(&state_line("running")).is_empty());
+        assert!(mapper.map_line(&state_line("idle")).is_empty());
+    }
+
+    #[test]
+    fn finish_releases_a_result_held_when_the_child_exits() {
+        let mut mapper = EventMapper::default();
+        mapper.map_line(&state_line("running"));
+        assert!(mapper.map_line(&result_line("all done")).is_empty());
+        assert_eq!(result_text(mapper.finish()).as_deref(), Some("all done"));
+        assert!(mapper.finish().is_none());
+    }
 
     #[test]
     fn init_becomes_session_started() {

@@ -103,3 +103,14 @@ Fixed four findings from a review of the engine-free file and terminal operation
 - Verified by the agent gates in `rust:1.96` (fmt, clippy, 453 tests), the host workspace
   `typecheck` and `check` on Bun 1.4.0 with Node 24.21.0, and a run of the real host against
   the real agent binary.
+
+## 2026-10-13 20:30 [fix]
+
+Engine turn-end detection (task `20261013-1955-engine-turn-end`). Real turns captured from
+`claude 2.1.296` and `codex-cli 0.162.1` showed two events the agent wrongly treated as the end
+of a run. The claude backend now starts the child with `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS=1`
+and ends the run on `session_state_changed` → `idle` with the latest `result`, so a turn that
+dispatches a background subagent reports the answer of the follow-up turn instead of the interim
+text; a CLI without session state still ends on its first `result`. The codex backend maps a
+stream-level `error` (a reconnect notice) to a warn log instead of a failed run. Verified by the
+agent gates: fmt, clippy, 436 unit, 21 integration and 1 doc test.

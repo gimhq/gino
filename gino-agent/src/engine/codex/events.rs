@@ -8,7 +8,7 @@
 //! | `thread.started`  | [`EngineEvent::SessionStarted`] (carries `thread_id`)|
 //! | `turn.completed`  | [`EngineEvent::Result`] — success                   |
 //! | `turn.failed`     | [`EngineEvent::Result`] — error                     |
-//! | `error`           | [`EngineEvent::Result`] — error (stream-level)      |
+//! | `error`           | [`EngineEvent::Log`] — warn (a retry notice, not terminal) |
 //! | `item.started`    | [`EngineEvent::ToolUse`] for a tool-ish item        |
 //! | `item.updated`    | dropped (empty `Vec`)                               |
 //! | `item.completed`  | [`EngineEvent::Output`] / [`EngineEvent::Thinking`] / [`EngineEvent::ToolResult`] / [`EngineEvent::Log`] |
@@ -114,10 +114,13 @@ impl EventMapper {
                 error: None,
                 error_kind: None,
             })],
-            // `turn.failed` nests the reason under `error`; the stream-level
-            // `error` event puts its text at the top level as `message`.
             "turn.failed" => vec![self.failure(value.get("error"))],
-            "error" => vec![self.failure(Some(value))],
+            // A stream-level `error` is a notice (e.g. "Reconnecting...") and
+            // the turn keeps running; a fatal one is followed by `turn.failed`.
+            "error" => vec![EngineEvent::Log {
+                level: LogLevel::Warn,
+                message: error_message(Some(value)),
+            }],
             "item.started" => item_started(value),
             "item.completed" => self.item_completed(value),
             // Everything else, `item.updated` included, carries nothing the host
@@ -202,7 +205,7 @@ impl EventMapper {
         }
     }
 
-    /// The error [`RunOutcome`] for a failed turn or a stream-level error.
+    /// The error [`RunOutcome`] for a failed turn.
     ///
     /// DECISION: [`RunErrorKind::Execution`]. `failure::classify_outcome` maps it
     /// to `agent.unknown` — non-retryable and resume-safe, the right posture for
@@ -390,16 +393,27 @@ mod tests {
     }
 
     #[test]
-    fn stream_level_error_reads_its_top_level_message() {
+    fn stream_level_error_is_a_warning_and_does_not_end_the_turn() {
         let mut mapper = EventMapper::new();
-        let events = mapper.map_line(&json!({"type": "error", "message": "stream died"}));
-        let [EngineEvent::Result(outcome)] = events.as_slice() else {
-            panic!("expected exactly one Result event, got {events:?}");
+        mapper.map_line(&json!({"type": "thread.started", "thread_id": "th-1"}));
+        let events = mapper.map_line(&json!({
+            "type": "error",
+            "message": "Reconnecting... waiting for network",
+        }));
+        assert_eq!(
+            events,
+            vec![EngineEvent::Log {
+                level: LogLevel::Warn,
+                message: "Reconnecting... waiting for network".to_owned(),
+            }]
+        );
+
+        // The turn recovers and still ends on its own terminal event.
+        let terminal = mapper.map_line(&json!({"type": "turn.completed"}));
+        let [EngineEvent::Result(outcome)] = terminal.as_slice() else {
+            panic!("expected exactly one Result event, got {terminal:?}");
         };
-        assert_eq!(outcome.status, RunStatus::Error);
-        assert_eq!(outcome.error.as_deref(), Some("stream died"));
-        assert_eq!(outcome.error_kind, Some(RunErrorKind::Execution));
-        assert!(outcome.session_id.is_none());
+        assert_eq!(outcome.status, RunStatus::Success);
     }
 
     #[test]

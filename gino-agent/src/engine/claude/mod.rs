@@ -12,8 +12,8 @@
 //!   line is mapped by [`events`] into an [`EngineEvent`] on the session's stream.
 //!
 //! The handshake is `initialize` → `set_permission_mode(bypassPermissions)` →
-//! first `user` turn. A `result` completes a turn but leaves the process alive for
-//! the next one; [`ClaudeSession::interrupt`] cancels a turn gracefully without
+//! first `user` turn. A `result` completes a turn but leaves the process alive, and
+//! the CLI may run further turns on its own before it reports `idle`; [`ClaudeSession::interrupt`] cancels a turn gracefully without
 //! killing it. The child is configured `kill_on_drop`, so dropping the session
 //! tears the process down.
 
@@ -39,6 +39,7 @@ use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use self::control::ControlAsk;
+use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
 
@@ -374,6 +375,9 @@ impl StderrTail {
     }
 }
 
+/// Makes the CLI emit `system/session_state_changed` lines.
+const SESSION_STATE_EVENTS_ENV: &str = "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS";
+
 /// Spawn the `claude` child, wire the reader/writer tasks, and perform the
 /// handshake. Returns the live [`ClaudeSession`].
 ///
@@ -422,6 +426,8 @@ fn spawn_session(
     if let Some(thread_id) = thread_id {
         command.env("GINO_THREAD_ID", thread_id);
     }
+    // Ask for `session_state_changed`, whose `idle` marks the end of the run.
+    command.env(SESSION_STATE_EVENTS_ENV, "1");
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
     let stdin = child
@@ -516,6 +522,7 @@ async fn reader_task(
     stderr_drain: JoinHandle<()>,
     stderr_tail: StderrTail,
 ) {
+    let mut mapper = EventMapper::default();
     let mut lines = BufReader::new(stdout).lines();
     loop {
         match lines.next_line().await {
@@ -523,9 +530,12 @@ async fn reader_task(
                 if line.trim().is_empty() {
                     continue;
                 }
-                handle_line(&line, &events, &writer);
+                handle_line(&line, &mut mapper, &events, &writer);
             }
             Ok(None) => {
+                if let Some(event) = mapper.finish() {
+                    let _ = events.send(event);
+                }
                 // Child exited: stderr hits EOF too — give its drain a grace
                 // window so the tail is complete before it is surfaced.
                 let _ = tokio::time::timeout(STDERR_DRAIN_WINDOW, stderr_drain).await;
@@ -550,6 +560,7 @@ async fn reader_task(
 /// sent in stream order.
 fn handle_line(
     line: &str,
+    mapper: &mut EventMapper,
     events: &mpsc::UnboundedSender<EngineEvent>,
     writer: &mpsc::UnboundedSender<String>,
 ) {
@@ -565,7 +576,7 @@ fn handle_line(
         control::TYPE_CONTROL_REQUEST => answer_control(&value, writer),
         control::TYPE_CONTROL_RESPONSE => trace!("control_response from engine"),
         _ => {
-            for event in events::map_line(&value) {
+            for event in mapper.map_line(&value) {
                 // The receiver lives as long as the session; a send failure just
                 // means the consumer dropped the stream — nothing to recover.
                 let _ = events.send(event);
@@ -952,6 +963,78 @@ fi
         assert_eq!(outcome.result.as_deref(), Some("all good"));
         assert_eq!(outcome.session_id.as_deref(), Some("sess-smoke"));
         assert!(outcome.error.is_none());
+    }
+
+    /// A stub that reports session state when asked to, and answers a prompt
+    /// with an interim result followed by a second turn's result.
+    fn write_two_turn_claude(dir: &Path) -> PathBuf {
+        let path = dir.join("two-turn-claude.sh");
+        let script = r#"#!/usr/bin/env bash
+set -u
+state() {
+  if [ "${CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS:-}" = 1 ]; then
+    printf '%s\n' "{\"type\":\"system\",\"subtype\":\"session_state_changed\",\"state\":\"$1\"}"
+  fi
+}
+state running
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-two"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"subagent still running","session_id":"sess-two"}'
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-two"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"the answer is 4","session_id":"sess-two"}'
+state idle
+# Stay alive like the real CLI until the host closes stdin.
+cat >/dev/null
+"#;
+        {
+            let mut file = std::fs::File::create(&path).expect("create stub");
+            file.write_all(script.as_bytes()).expect("write stub");
+            let mut perms = file.metadata().expect("stub metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod stub");
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn session_reports_the_result_of_the_last_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let engine = ClaudeEngine::new(ClaudeSettings {
+            binary: write_two_turn_claude(dir.path()),
+            ..ClaudeSettings::default()
+        });
+        let session = loop {
+            match engine
+                .start_session(SessionCfg {
+                    cwd: dir.path().to_path_buf(),
+                    initial_prompt: Some("hi".to_owned()),
+                    ..SessionCfg::default()
+                })
+                .await
+            {
+                Ok(session) => break session,
+                Err(EngineError::Spawn(err))
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => panic!("unexpected engine error: {err}"),
+            }
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = session.events();
+            while let Some(event) = stream.next().await {
+                if let EngineEvent::Result(outcome) = event {
+                    return Some(outcome);
+                }
+            }
+            None
+        })
+        .await
+        .expect("session timed out")
+        .expect("stream ended without a result");
+
+        assert_eq!(outcome.result.as_deref(), Some("the answer is 4"));
     }
 
     /// Audit P3: a child that dies at startup (e.g. an auth failure) writes its
