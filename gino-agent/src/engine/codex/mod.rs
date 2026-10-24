@@ -707,7 +707,7 @@ mod tests {
             work_dir: Some(work_dir.clone()),
             ..SessionCfg::default()
         };
-        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let isolation = sandbox::resolve(&settings.isolation, None, &root, None).unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &cfg),
             &launch_context(&settings, &cfg),
@@ -751,6 +751,7 @@ mod tests {
                 mode: Some("sandbox".to_owned()),
                 network: Some(crate::sandbox::NetworkSpec {
                     mode: Some("allowlist".to_owned()),
+                    ..crate::sandbox::NetworkSpec::default()
                 }),
                 ..IsolationSpec::default()
             },
