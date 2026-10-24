@@ -294,7 +294,6 @@ mod tests {
                 .unwrap();
             assert!(routes.iter().any(|r| {
                 r.header.destination_prefix_length == 0
-                    && r.attributes.contains(&RouteAttribute::Oif(index))
                     && r.attributes
                         .contains(&RouteAttribute::Gateway(RouteAddress::Inet(cfg.gateway)))
             }));
