@@ -1132,7 +1132,10 @@ mod tests {
     fn root_euid_fails_only_sandboxed_launches() {
         let d = direct(Path::new("/ws/threads/t1/project"));
         let off = IsolationSpec::default();
-        assert_eq!(launch_as(d.clone(), &ctx(&off, None, None, None), 0).unwrap(), d);
+        assert_eq!(
+            launch_as(d.clone(), &ctx(&off, None, None, None), 0).unwrap(),
+            d
+        );
 
         let sandbox = spec(Some("sandbox"), None);
         let err = launch_as(d, &ctx(&sandbox, None, None, None), 0).unwrap_err();
