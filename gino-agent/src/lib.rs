@@ -10,6 +10,7 @@
 //!
 //! The `gino-agent` binary is a thin wrapper around [`run`].
 
+mod agent_api;
 mod archive;
 mod attachment_source;
 mod attachments;
