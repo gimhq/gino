@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["target/"]
+
+[default.extend-words]
+# "unparseable" is an accepted spelling used in identifiers; "reacked" is re-acked.
+unparseable = "unparseable"
+reacked = "reacked"

@@ -30,6 +30,9 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "Zlib",
+    # Mozilla's root-certificate data in `webpki-root-certs` (via
+    # `rustls-platform-verifier`).
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

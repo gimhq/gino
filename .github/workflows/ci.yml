@@ -46,7 +46,7 @@ jobs:
         run: bun run package --version 0.0.0-ci --asset-url https://example.invalid/gino.js
 
   agent:
-    name: agent (rust) — fmt + clippy + test
+    name: agent (rust) — fmt + clippy + test + supply chain
     runs-on: ubuntu-latest
     timeout-minutes: 25
     defaults:
@@ -75,10 +75,10 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       # Prebuilt binaries, pinned versions — reproducible and fast (no compile).
-      - name: Install cargo-deny + cargo-shear
+      - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny@0.19.8,cargo-shear@1.13.1
+          tool: cargo-deny@0.19.8,cargo-shear@1.13.1,cargo-nextest@0.9.149,cargo-hack@0.6.45,typos@1.51.1
 
       - name: Format
         run: cargo fmt --all --check
@@ -86,8 +86,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --release --locked --all-targets
 
+      - name: Typos
+        run: typos
+
+      # Builds against the declared `rust-version` (Cargo.toml) — the MSRV gate.
+      - name: MSRV
+        run: cargo hack check --rust-version --locked
+
       - name: Test
-        run: cargo test --release --locked
+        run: cargo nextest run --release --locked
+
+      - name: Doctests
+        run: cargo test --doc --release --locked
 
       - name: Deny (supply-chain policy)
         run: cargo deny check

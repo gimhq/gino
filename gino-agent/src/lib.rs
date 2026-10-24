@@ -32,7 +32,7 @@ mod transport;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use tracing::debug;
+use tracing::{debug, error, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, ConfigOverlay};
@@ -114,6 +114,8 @@ enum Command {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    disable_core_dumps();
+    install_panic_hook();
     install_crypto_provider();
 
     match cli.command.unwrap_or(Command::Run) {
@@ -138,10 +140,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// Install the process-wide rustls `CryptoProvider`. Both aws-lc-rs and ring are
-/// compiled in (pulled by reqwest and tokio-tungstenite respectively), so rustls
-/// cannot pick one implicitly; we pin aws-lc-rs. Idempotent: a
-/// second call — or another installer winning the race — is a harmless no-op.
+/// Install aws-lc-rs as the process-wide rustls `CryptoProvider` before any TLS
+/// use, so no client depends on rustls picking a default. Idempotent: a second
+/// call — or another installer winning the race — is a harmless no-op.
 fn install_crypto_provider() {
     if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -179,6 +180,38 @@ fn env_path_or(
     )
 }
 
+/// Set `RLIMIT_CORE` to zero so a crash never writes the process memory —
+/// which holds the connect token and engine credentials — to disk.
+fn disable_core_dumps() {
+    if let Err(err) = rlimit::setrlimit(rlimit::Resource::CORE, 0, 0) {
+        warn!(error = %err, "failed to disable core dumps");
+    }
+}
+
+/// Log every panic as a structured `error` event with its location and a
+/// backtrace, replacing the default stderr report.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location().map(ToString::to_string);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        error!(
+            message = panic_message(info.payload()),
+            location = location.as_deref(),
+            %backtrace,
+            "panic"
+        );
+    }));
+}
+
+/// The text of a panic payload (`panic!` produces `&str` or `String`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 /// Install a tracing subscriber writing to stderr. `RUST_LOG` takes precedence;
 /// otherwise the level is derived from the `-v` count.
 fn init_tracing(verbose: u8) {
@@ -194,4 +227,22 @@ fn init_tracing(verbose: u8) {
         .with_writer(std::io::stderr)
         .with_target(true)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{disable_core_dumps, panic_message};
+
+    #[test]
+    fn core_dumps_are_disabled() {
+        disable_core_dumps();
+        assert_eq!(rlimit::getrlimit(rlimit::Resource::CORE).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn panic_message_reads_str_and_string_payloads() {
+        assert_eq!(panic_message(&"boom"), "boom");
+        assert_eq!(panic_message(&String::from("bang")), "bang");
+        assert_eq!(panic_message(&42_u8), "non-string panic payload");
+    }
 }

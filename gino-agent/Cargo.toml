@@ -7,8 +7,10 @@ description = "Generic WebSocket-based, runtime-agnostic agent runner daemon for
 repository = "https://github.com/gimhq/gino"
 publish = false
 
-# TLS: every client uses rustls with the aws-lc-rs provider and verifies against
-# the OS trust store (`rustls-native-certs`); deny.toml bans openssl/native-tls.
+# TLS: every client uses rustls with the aws-lc-rs provider (the only provider
+# compiled in) and verifies against the OS trust store — reqwest through
+# `rustls-platform-verifier`, the WebSocket through `rustls-native-certs`.
+# deny.toml bans openssl/native-tls.
 [dependencies]
 anyhow = "1"
 # Object-safe async trait methods for the `Engine`/`Session` abstraction.
@@ -27,12 +29,13 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 nix = { version = "0.31", default-features = false, features = ["signal", "term"] }
 # Async pseudo-terminal allocation and process spawning.
 pty-process = { version = "0.5.3", features = ["async"] }
-# HTTP client for register, config refresh and the output fallback.
-# PINNED: 0.13 forces `rustls-platform-verifier`, which pulls the
-# CDLA-Permissive-2.0 `webpki-root-certs` that deny.toml does not allow.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+# HTTP client for register, config refresh and the output fallback. Default
+# features are off because they enable native-tls.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # `bundled` compiles the vendored SQLite, so no system libsqlite3 is needed.
 rusqlite = { version = "0.37", features = ["bundled"] }
+# RLIMIT_CORE = 0 at startup: a core dump would carry the connect token.
+rlimit = "0.11"
 # Direct dependency so the aws-lc-rs `CryptoProvider` can be installed at startup.
 rustls = "0.23"
 secrecy = "0.10"
@@ -55,7 +58,7 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 # Reconnecting WebSocket client.
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Session and request ids for the engine control protocol.
@@ -69,6 +72,18 @@ ulid = "3"
 tempfile = "3"
 # Mock HTTP host for the register / config-refresh integration tests (no network).
 wiremock = "0.6"
+
+# `release` keeps unwinding so panics carry backtraces; `dist` is the shipped
+# binary: size-tuned, aborting on panic after the hook has logged it.
+[profile.release]
+panic = "unwind"
+
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 # Lint policy lives in the manifest so dev and CI share one gate; `cargo clippy`
 # is invoked without extra flags.
