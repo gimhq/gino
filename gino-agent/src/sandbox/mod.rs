@@ -309,6 +309,88 @@ fn loosens(setting: &'static str, from: &str, to: &str) -> IsolationError {
     }
 }
 
+/// Validate a local isolation floor at load: known modes, valid extra paths
+/// and valid allowlist rules.
+pub(crate) fn validate_floor(
+    floor: &IsolationSpec,
+    workspace_dir: &Path,
+) -> Result<(), IsolationError> {
+    match floor.mode.as_deref() {
+        None | Some("off" | "sandbox") => {}
+        Some("vm") => return Err(IsolationError::NotSupported("isolation.mode: vm".into())),
+        Some(other) => return Err(IsolationError::UnknownMode(other.to_owned())),
+    }
+    if let Some(network) = network_mode(floor) {
+        network_strictness(network)?;
+    }
+    let workspace = normalize(workspace_dir);
+    validate_paths(floor.read_paths.as_deref(), &workspace)?;
+    validate_paths(floor.write_paths.as_deref(), &workspace)?;
+    let rules = floor
+        .network
+        .as_ref()
+        .and_then(|n| n.allow.as_deref())
+        .unwrap_or_default();
+    RuleSet::compile(rules, &[]).map_err(IsolationError::InvalidAllowlist)?;
+    Ok(())
+}
+
+/// Layer a host `engine.isolation` block onto the local floor.
+///
+/// Only `mode` and `network.mode` are taken from `host`, and only when they
+/// tighten the floor (same ordering as a task override); everything else stays
+/// the floor's. Returns the effective default and the host fields ignored.
+pub(crate) fn tighten_floor(
+    floor: &IsolationSpec,
+    host: IsolationSpec,
+) -> (IsolationSpec, Vec<&'static str>) {
+    let mut effective = floor.clone();
+    let mut ignored = Vec::new();
+    let floor_mode = floor.mode.as_deref().unwrap_or("off");
+    if let Some(to) = host.mode {
+        if tightens(mode_strictness, floor_mode, &to) {
+            effective.mode = Some(to);
+        } else {
+            ignored.push("mode");
+        }
+    }
+    let host_network = host.network.unwrap_or_default();
+    if let Some(to) = host_network.mode {
+        // An off floor confines no network, so any known network mode tightens it.
+        let from = if floor_mode == "off" {
+            "full"
+        } else {
+            network_mode(floor).unwrap_or("none")
+        };
+        if tightens(network_strictness, from, &to) {
+            effective
+                .network
+                .get_or_insert_with(NetworkSpec::default)
+                .mode = Some(to);
+        } else {
+            ignored.push("network.mode");
+        }
+    }
+    if host_network.allow.is_some() {
+        ignored.push("network.allow");
+    }
+    if host.read_paths.is_some() {
+        ignored.push("readPaths");
+    }
+    if host.write_paths.is_some() {
+        ignored.push("writePaths");
+    }
+    if host.allow_task_override.is_some() {
+        ignored.push("allowTaskOverride");
+    }
+    (effective, ignored)
+}
+
+/// Whether `to` is at least as strict as `from`; unknown values never are.
+fn tightens(strictness: fn(&str) -> Result<u8, IsolationError>, from: &str, to: &str) -> bool {
+    matches!((strictness(from), strictness(to)), (Ok(from), Ok(to)) if to >= from)
+}
+
 /// Extract the task override from a task's free-form `meta` JSON.
 ///
 /// Missing, non-JSON or non-object meta, or meta without an `isolation` key,
@@ -647,7 +729,8 @@ mod tests {
     use super::{
         Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
         NetworkMode, NetworkSpec, SandboxHost, check_not_root, first_child, launch, launch_as,
-        llm_endpoint, override_from_meta, resolve, sandbox_init_pid, stat_ppid, wrap,
+        llm_endpoint, override_from_meta, resolve, sandbox_init_pid, stat_ppid, tighten_floor,
+        validate_floor, wrap,
     };
     use crate::engine::EngineError;
     use crate::net::rules::{AlwaysAllow, Decision, Proto, RuleError, RuleSet};
@@ -1650,5 +1733,202 @@ mod tests {
         let _ = parent.wait();
 
         assert_eq!(sandbox_init_pid(i32::MAX), None);
+    }
+
+    fn host(raw: &str) -> IsolationSpec {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn modes(spec: &IsolationSpec) -> (Option<&str>, Option<&str>) {
+        (spec.mode.as_deref(), super::network_mode(spec))
+    }
+
+    #[test]
+    fn host_may_tighten_the_floor() {
+        let floor = spec(Some("sandbox"), Some("full"));
+        for (raw, expected) in [
+            (r#"{ "network": { "mode": "allowlist" } }"#, "allowlist"),
+            (r#"{ "network": { "mode": "none" } }"#, "none"),
+            (
+                r#"{ "mode": "sandbox", "network": { "mode": "full" } }"#,
+                "full",
+            ),
+        ] {
+            let (effective, ignored) = tighten_floor(&floor, host(raw));
+            assert_eq!(
+                modes(&effective),
+                (Some("sandbox"), Some(expected)),
+                "{raw}"
+            );
+            assert!(ignored.is_empty(), "{raw}");
+        }
+        let (effective, ignored) = tighten_floor(
+            &spec(Some("sandbox"), Some("allowlist")),
+            host(r#"{ "network": { "mode": "none" } }"#),
+        );
+        assert_eq!(modes(&effective), (Some("sandbox"), Some("none")));
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn host_may_turn_an_off_floor_into_a_sandbox() {
+        for floor in [IsolationSpec::default(), spec(Some("off"), Some("none"))] {
+            let (effective, ignored) = tighten_floor(
+                &floor,
+                host(r#"{ "mode": "sandbox", "network": { "mode": "full" } }"#),
+            );
+            assert_eq!(modes(&effective), (Some("sandbox"), Some("full")));
+            assert!(ignored.is_empty());
+        }
+    }
+
+    #[test]
+    fn host_loosening_is_ignored() {
+        for (floor, raw, field) in [
+            (spec(Some("sandbox"), None), r#"{ "mode": "off" }"#, "mode"),
+            (
+                spec(Some("sandbox"), None),
+                r#"{ "network": { "mode": "allowlist" } }"#,
+                "network.mode",
+            ),
+            (
+                spec(Some("sandbox"), Some("none")),
+                r#"{ "network": { "mode": "full" } }"#,
+                "network.mode",
+            ),
+            (
+                spec(Some("sandbox"), Some("allowlist")),
+                r#"{ "network": { "mode": "full" } }"#,
+                "network.mode",
+            ),
+            (spec(Some("sandbox"), None), r#"{ "mode": "jail" }"#, "mode"),
+            (
+                spec(Some("sandbox"), Some("full")),
+                r#"{ "network": { "mode": "open" } }"#,
+                "network.mode",
+            ),
+        ] {
+            let (effective, ignored) = tighten_floor(&floor, host(raw));
+            assert_eq!(effective, floor, "{raw}");
+            assert_eq!(ignored, [field], "{raw}");
+        }
+    }
+
+    #[test]
+    fn host_paths_rules_and_override_flag_are_ignored() {
+        let floor = with_rules(
+            with_paths(spec(Some("sandbox"), Some("allowlist")), &["/data/ro"], &[]),
+            r#"[{ "host": "*.pypi.org", "ports": [443] }]"#,
+        );
+        let (effective, ignored) = tighten_floor(
+            &floor,
+            host(
+                r#"{ "network": { "mode": "none", "allow": [{ "host": "evil.example", "ports": "*" }] },
+                     "readPaths": ["/etc"], "writePaths": ["/srv"], "allowTaskOverride": true }"#,
+            ),
+        );
+        assert_eq!(
+            ignored,
+            [
+                "network.allow",
+                "readPaths",
+                "writePaths",
+                "allowTaskOverride"
+            ]
+        );
+        assert_eq!(modes(&effective), (Some("sandbox"), Some("none")));
+        assert_eq!(effective.read_paths, floor.read_paths);
+        assert_eq!(effective.write_paths, floor.write_paths);
+        assert_eq!(effective.allow_task_override, None);
+        assert_eq!(
+            effective.network.as_ref().unwrap().allow,
+            floor.network.as_ref().unwrap().allow
+        );
+    }
+
+    #[test]
+    fn task_meta_applies_on_top_of_floor_and_host() {
+        let floor = with_rules(
+            spec(Some("sandbox"), Some("full")),
+            r#"[{ "host": "*.pypi.org", "ports": [443] }]"#,
+        );
+        let (effective, _) =
+            tighten_floor(&floor, host(r#"{ "network": { "mode": "allowlist" } }"#));
+
+        // Loosening the host-tightened default is refused.
+        assert_loosens(
+            &effective,
+            &spec(None, Some("full")),
+            "isolation.network.mode",
+            "allowlist",
+            "full",
+        );
+        // The file rules plus the LLM endpoint make up the run's allowlist.
+        let iso = run(&effective, None).unwrap();
+        let rules = allowlist_of(&iso);
+        assert!(allows(rules, "files.pypi.org", 443));
+        assert!(allows(rules, "api.anthropic.com", 443));
+        assert!(!allows(rules, "example.com", 443));
+        // Tightening still works.
+        let iso = run(&effective, Some(&spec(None, Some("none")))).unwrap();
+        assert_eq!(iso.network, NetworkMode::None);
+
+        // allowTaskOverride from the floor still lets a task loosen.
+        let (effective, _) = tighten_floor(
+            &allowing(floor),
+            host(r#"{ "network": { "mode": "none" } }"#),
+        );
+        let iso = run(&effective, Some(&spec(None, Some("full")))).unwrap();
+        assert_eq!(iso.network, NetworkMode::Full);
+    }
+
+    #[test]
+    fn floor_validation() {
+        let workspace = Path::new(WORKSPACE);
+        validate_floor(&IsolationSpec::default(), workspace).unwrap();
+        validate_floor(
+            &with_rules(
+                with_paths(
+                    spec(Some("sandbox"), Some("allowlist")),
+                    &["/data/ro"],
+                    &["/data/rw"],
+                ),
+                r#"[{ "host": "*.pypi.org", "ports": [443] }]"#,
+            ),
+            workspace,
+        )
+        .unwrap();
+
+        let err = |floor: IsolationSpec| validate_floor(&floor, workspace).unwrap_err();
+        assert!(
+            matches!(err(spec(Some("jail"), None)), IsolationError::UnknownMode(m) if m == "jail")
+        );
+        assert!(matches!(
+            err(spec(Some("vm"), None)),
+            IsolationError::NotSupported(_)
+        ));
+        assert!(matches!(
+            err(spec(Some("sandbox"), Some("open"))),
+            IsolationError::UnknownNetworkMode(m) if m == "open"
+        ));
+        assert!(matches!(
+            err(with_paths(spec(None, None), &["data/ro"], &[])),
+            IsolationError::InvalidPath {
+                reason: "not absolute",
+                ..
+            }
+        ));
+        assert!(matches!(
+            err(with_paths(spec(None, None), &[], &[WORKSPACE])),
+            IsolationError::InvalidPath { .. }
+        ));
+        // Rules are checked whatever the network mode.
+        assert!(matches!(
+            err(with_rules(
+                spec(Some("sandbox"), Some("full")),
+                r#"[{ "host": "ok.example", "ports": "*" }, { "host": "bad host", "ports": "*" }]"#,
+            )),
+            IsolationError::InvalidAllowlist(RuleError::Host { index: 1, .. })
+        ));
     }
 }
