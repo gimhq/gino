@@ -754,7 +754,7 @@ impl ThreadExecutor {
         Some((guard, access))
     }
 
-        /// [`Self::finalize`] plus terminal-state provisioning cleanup:
+    /// [`Self::finalize`] plus terminal-state provisioning cleanup:
     /// when the run settles into a terminal state (not `active`, not a retry
     /// re-pend), the task-scope manifest rows are released — the scope's link
     /// tree lives under this thread's now-dead `work_dir`, so keeping the rows
