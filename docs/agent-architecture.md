@@ -375,8 +375,16 @@ destinations:
   rewritten for the engine to `10.0.2.2` with the same scheme, userinfo, port, path and query; only that
   gateway port is forwarded to the host loopback address. A non-loopback IP literal is allowed as that exact address and
   port. An always-allowed endpoint is exempt from the private-address refusal (e.g. an LLM proxy on the
-  LAN) for its exact host:port; loopback and unspecified addresses stay refused. `full` mode keeps the
-  original URL.
+  LAN) for its exact host:port; loopback, unspecified and link-local (`169.254.0.0/16`, `fe80::/10`)
+  addresses stay refused, and a link-local IP-literal base URL fails the run before spawn. `full` mode
+  keeps the original URL.
+- **LLM endpoint under a floor.** With a local isolation file the always-allowed endpoint (and the
+  loopback gateway forward) comes only from the daemon's own `ANTHROPIC_BASE_URL` (its process env), never
+  from a host `engine.anthropicBaseUrl`. A host base URL that differs from the daemon's gets no
+  always-allow: it is admitted only when a floor `network.allow` rule already covers its host and port
+  over TCP (and then follows the normal rule path, private-address refusal included); a loopback one is
+  never admitted. Otherwise the run fails before spawn with an error naming `engine.anthropicBaseUrl`,
+  without echoing the URL.
 - **DNS.** The engine's `resolv.conf` is `nameserver 10.0.2.2`. Allowed names get a stable fake IPv4
   address from `198.18.0.0/15`, which the exit maps back to the name; the real address is resolved on the
   host. Names matched by neither a host rule nor the LLM endpoint get NXDOMAIN. IPv4 only: `AAAA` (and

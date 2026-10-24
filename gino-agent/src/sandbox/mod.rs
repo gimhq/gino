@@ -35,9 +35,9 @@ use self::bwrap::{
 use crate::engine::EngineError;
 use crate::net::exit::{Exit, ExitConfig, GatewayForward};
 use crate::net::fdpass::recv_fd;
-use crate::net::rules::{AlwaysAllow, Rule, RuleError, RuleSet, normalize_name};
+use crate::net::rules::{AlwaysAllow, Proto, Rule, RuleError, RuleSet, normalize_name};
 use crate::net::tun::TunConfig;
-use crate::net::upstream::is_local;
+use crate::net::upstream::{is_link_local, is_local};
 
 /// Sandbox `$HOME` when the daemon has none.
 const DEFAULT_SANDBOX_HOME: &str = "/home/gino";
@@ -177,6 +177,13 @@ pub(crate) enum IsolationError {
     InvalidAllowlist(#[source] RuleError),
     #[error("invalid {LLM_BASE_URL_ENV} for the network allowlist")]
     InvalidBaseUrl,
+    #[error("{LLM_BASE_URL_ENV} names a link-local address, which is never allowed")]
+    LinkLocalBaseUrl,
+    #[error(
+        "engine.anthropicBaseUrl differs from the daemon's {LLM_BASE_URL_ENV} and no \
+         network.allow rule of the local isolation file covers it (loopback never is)"
+    )]
+    HostBaseUrl,
     #[error("invalid isolation in task meta: {0}")]
     InvalidTaskMeta(#[source] serde_json::Error),
     #[error("engine sandbox is unavailable: {0}")]
@@ -187,18 +194,31 @@ pub(crate) enum IsolationError {
     Network(String),
 }
 
+/// The `ANTHROPIC_BASE_URL` sources an allowlisted run's LLM endpoint is
+/// derived from.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LlmBaseUrl<'a> {
+    /// What the engine is launched with; `None` means the default host.
+    pub(crate) engine: Option<&'a str>,
+    /// The daemon's own, from its process env.
+    pub(crate) daemon: Option<&'a str>,
+    /// A local isolation floor is configured.
+    pub(crate) floored: bool,
+}
+
 /// Resolve the effective isolation for a run.
 ///
 /// The override's `mode` and `network.mode` win over the default's; extra paths
 /// and allowlist rules come from the config default only. Unless the default
 /// sets `allowTaskOverride`, an override may only tighten the default. When the
 /// resolved mode is off nothing else is validated. An allowlist also admits the
-/// LLM endpoint at `llm_base_url` (default `api.anthropic.com:443`).
+/// LLM endpoint at `llm.engine` (default `api.anthropic.com:443`); see
+/// [`allowlist`] for the floor case.
 pub(crate) fn resolve(
     default: &IsolationSpec,
     task_override: Option<&IsolationSpec>,
     workspace_dir: &Path,
-    llm_base_url: Option<&str>,
+    llm: LlmBaseUrl<'_>,
 ) -> Result<Isolation, IsolationError> {
     if let Some(task) = task_override
         && !default.allow_task_override.unwrap_or(false)
@@ -227,7 +247,7 @@ pub(crate) fn resolve(
     };
     let (allowlist, llm_gateway) = match network {
         NetworkMode::Allowlist => {
-            let (rules, gateway) = allowlist(default, llm_base_url)?;
+            let (rules, gateway) = allowlist(default, llm)?;
             (Some(rules), gateway)
         }
         NetworkMode::None | NetworkMode::Full => (None, None),
@@ -249,12 +269,17 @@ pub(crate) fn resolve(
 
 /// Compile the config default's allow rules plus the always-allowed LLM
 /// endpoint. A loopback endpoint is not a rule but the returned gateway
-/// forward; an IP-literal one is an always-allowed address.
+/// forward; an IP-literal one is an always-allowed address; a link-local one
+/// is refused.
+///
+/// Under a local floor only the daemon's own base URL gets this treatment. An
+/// engine URL that differs from it gets no always-allow: it must be covered by
+/// a floor rule and must not be loopback.
 fn allowlist(
     default: &IsolationSpec,
-    llm_base_url: Option<&str>,
+    llm: LlmBaseUrl<'_>,
 ) -> Result<(Arc<RuleSet>, Option<GatewayForward>), IsolationError> {
-    let endpoint = llm_endpoint(llm_base_url)?;
+    let endpoint = llm_endpoint(llm.engine)?;
     let rules = default
         .network
         .as_ref()
@@ -262,7 +287,18 @@ fn allowlist(
         .unwrap_or_default();
     let host = normalize_name(&endpoint.host);
     let literal = host.parse::<IpAddr>().ok();
-    let (rules, gateway) = if host == "localhost" || literal.is_some_and(is_local) {
+    let loopback = host == "localhost" || literal.is_some_and(is_local);
+    if llm.floored && llm.engine != llm.daemon {
+        let rules = RuleSet::compile(rules, &[]).map_err(IsolationError::InvalidAllowlist)?;
+        if loopback || !rules.rule_covers(&host, endpoint.port, Proto::Tcp) {
+            return Err(IsolationError::HostBaseUrl);
+        }
+        return Ok((Arc::new(rules), None));
+    }
+    if literal.is_some_and(is_link_local) {
+        return Err(IsolationError::LinkLocalBaseUrl);
+    }
+    let (rules, gateway) = if loopback {
         if endpoint.port == 0 {
             return Err(IsolationError::InvalidBaseUrl);
         }
@@ -341,6 +377,12 @@ fn llm_base_url(env: &[(String, OsString)]) -> Option<String> {
         .or_else(|| std::env::var_os(LLM_BASE_URL_ENV))
         .and_then(|value| value.into_string().ok())
         .filter(|value| !value.is_empty())
+}
+
+/// The daemon's own `ANTHROPIC_BASE_URL`, from its process env. Empty means
+/// unset.
+fn daemon_llm_base_url() -> Option<String> {
+    llm_base_url(&[])
 }
 
 /// Fail when `task` would loosen `default`'s mode or network mode.
@@ -723,6 +765,8 @@ pub(crate) struct LaunchContext<'a> {
     pub(crate) global_config_dir: Option<&'a Path>,
     /// Env keys naming the engine config dir; sandboxed, they name the engine home.
     pub(crate) config_dir_keys: &'a [&'a str],
+    /// A local isolation floor is configured.
+    pub(crate) floored: bool,
 }
 
 /// Host facts a sandboxed launch is built from.
@@ -781,11 +825,16 @@ pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, 
 
 fn launch_as(direct: Launch, ctx: &LaunchContext<'_>, euid: u32) -> Result<Launch, EngineError> {
     let base_url = llm_base_url(&direct.env);
+    let daemon_base_url = daemon_llm_base_url();
     let isolation = resolve(
         ctx.isolation,
         ctx.task_override,
         ctx.workspace_dir,
-        base_url.as_deref(),
+        LlmBaseUrl {
+            engine: base_url.as_deref(),
+            daemon: daemon_base_url.as_deref(),
+            floored: ctx.floored,
+        },
     )?;
     match isolation.mode {
         IsolationMode::Off => Ok(direct),
@@ -989,7 +1038,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
+        Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext, LlmBaseUrl,
         NetworkMode, NetworkSpec, SandboxHost, check_not_root, first_child, launch, launch_as,
         llm_endpoint, override_from_meta, resolve, sandbox_init_pid, stat_ppid, tighten_floor,
         validate_floor, wrap,
@@ -1021,11 +1070,20 @@ mod tests {
         spec
     }
 
+    /// No floor: the engine's URL is trusted as is.
+    fn unfloored(engine: Option<&str>) -> LlmBaseUrl<'_> {
+        LlmBaseUrl {
+            engine,
+            daemon: engine,
+            floored: false,
+        }
+    }
+
     fn run(
         default: &IsolationSpec,
         task: Option<&IsolationSpec>,
     ) -> Result<Isolation, IsolationError> {
-        resolve(default, task, Path::new(WORKSPACE), None)
+        resolve(default, task, Path::new(WORKSPACE), LlmBaseUrl::default())
     }
 
     fn path_error(path: &str) -> IsolationError {
@@ -1531,7 +1589,7 @@ mod tests {
             &default,
             None,
             Path::new(WORKSPACE),
-            Some("http://proxy.example:8080"),
+            unfloored(Some("http://proxy.example:8080")),
         )
         .unwrap();
         let rules = allowlist_of(&iso);
@@ -1704,6 +1762,7 @@ mod tests {
             self_exe,
             global_config_dir: None,
             config_dir_keys: &KEYS,
+            floored: false,
         }
     }
 
@@ -1787,7 +1846,7 @@ mod tests {
             &spec(Some("sandbox"), Some("allowlist")),
             None,
             Path::new(WORKSPACE),
-            base_url,
+            unfloored(base_url),
         )
         .unwrap()
     }
@@ -1828,7 +1887,7 @@ mod tests {
             &spec(Some("sandbox"), Some("allowlist")),
             None,
             Path::new(WORKSPACE),
-            Some("http://user:pw@127.0.0.1:0/x"),
+            unfloored(Some("http://user:pw@127.0.0.1:0/x")),
         )
         .unwrap_err();
         assert!(matches!(err, IsolationError::InvalidBaseUrl), "{err:?}");
@@ -1840,7 +1899,7 @@ mod tests {
                 &spec(Some("sandbox"), Some(network)),
                 None,
                 Path::new(WORKSPACE),
-                Some("http://127.0.0.1:8080"),
+                unfloored(Some("http://127.0.0.1:8080")),
             )
             .unwrap();
             assert!(iso.llm_gateway.is_none(), "{network}");
@@ -1866,6 +1925,105 @@ mod tests {
                 rules.decide(None, ip, port + 1, Proto::Tcp),
                 Decision::Deny { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn link_local_llm_endpoint_is_refused() {
+        for url in [
+            "http://169.254.169.254/latest",
+            "https://[fe80::1]:8443",
+            "http://[::ffff:169.254.169.254]",
+        ] {
+            for llm in [
+                unfloored(Some(url)),
+                LlmBaseUrl {
+                    floored: true,
+                    ..unfloored(Some(url))
+                },
+            ] {
+                let err = resolve(
+                    &spec(Some("sandbox"), Some("allowlist")),
+                    None,
+                    Path::new(WORKSPACE),
+                    llm,
+                )
+                .unwrap_err();
+                assert!(matches!(err, IsolationError::LinkLocalBaseUrl), "{url}");
+                assert!(!err.to_string().contains("169.254"), "{err}");
+            }
+        }
+    }
+
+    const FLOOR_RULES: &str = r#"[
+        { "host": "proxy.example", "ports": [8443] },
+        { "cidr": "127.0.0.0/8", "ports": "*" }
+    ]"#;
+
+    fn floored(engine: Option<&str>, daemon: Option<&str>) -> Result<Isolation, IsolationError> {
+        resolve(
+            &with_rules(spec(Some("sandbox"), Some("allowlist")), FLOOR_RULES),
+            None,
+            Path::new(WORKSPACE),
+            LlmBaseUrl {
+                engine,
+                daemon,
+                floored: true,
+            },
+        )
+    }
+
+    #[test]
+    fn floor_keeps_the_daemon_llm_endpoint_always_allowed() {
+        for url in [None, Some("https://llm.example")] {
+            let iso = floored(url, url).unwrap();
+            let host = url.map_or("api.anthropic.com", |_| "llm.example");
+            assert_eq!(
+                allowlist_of(&iso).decide(Some(host), ANY_IP, 443, Proto::Tcp),
+                Decision::Allow { rule_index: None },
+                "{url:?}"
+            );
+            assert!(iso.llm_gateway.is_none());
+        }
+        let url = Some("http://localhost:8080/llm");
+        let gateway = floored(url, url).unwrap().llm_gateway.unwrap();
+        assert_eq!(gateway.port, 8080);
+        assert!(gateway.target.ip().is_loopback());
+    }
+
+    #[test]
+    fn floor_admits_a_host_llm_url_only_through_a_floor_rule() {
+        for daemon in [None, Some("https://llm.example")] {
+            let iso = floored(Some("https://proxy.example:8443/v1"), daemon).unwrap();
+            assert!(iso.llm_gateway.is_none());
+            let rules = allowlist_of(&iso);
+            assert_eq!(
+                rules.decide(Some("proxy.example"), ANY_IP, 8443, Proto::Tcp),
+                Decision::Allow {
+                    rule_index: Some(0)
+                }
+            );
+            // No endpoint is always allowed.
+            assert!(!allows(rules, "api.anthropic.com", 443));
+            assert!(!allows(rules, "llm.example", 443));
+        }
+    }
+
+    #[test]
+    fn floor_refuses_an_uncovered_or_loopback_host_llm_url() {
+        for (engine, daemon) in [
+            ("https://proxy.example/v1", None),
+            ("https://other.example:8443", Some("https://llm.example")),
+            ("http://u:pw@127.0.0.1:8080", None),
+            ("http://localhost:8080", Some("http://localhost:9090")),
+        ] {
+            let err = floored(Some(engine), daemon).unwrap_err();
+            assert!(matches!(err, IsolationError::HostBaseUrl), "{engine}");
+            let message = err.to_string();
+            assert!(message.contains("engine.anthropicBaseUrl"), "{message}");
+            for part in ["example", "127.0.0.1", "localhost", "pw"] {
+                assert!(!message.contains(part), "{message}");
+            }
         }
     }
 
@@ -1903,7 +2061,7 @@ mod tests {
             &spec(Some("sandbox"), Some(network)),
             None,
             Path::new(WORKSPACE),
-            Some(base_url),
+            unfloored(Some(base_url)),
         )
         .unwrap();
         let off = IsolationSpec::default();

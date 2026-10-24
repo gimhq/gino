@@ -77,6 +77,8 @@ pub(crate) struct ClaudeSettings {
     pub(crate) config_dir: Option<PathBuf>,
     /// Default isolation (`engine.isolation`); empty means off.
     pub(crate) isolation: IsolationSpec,
+    /// A local isolation floor (`GINO_ISOLATION_FILE`) is configured.
+    pub(crate) isolation_floored: bool,
     /// The daemon workspace dir, which isolation paths are checked against.
     pub(crate) workspace_dir: PathBuf,
 }
@@ -95,6 +97,7 @@ impl Default for ClaudeSettings {
             env: Vec::new(),
             config_dir: None,
             isolation: IsolationSpec::default(),
+            isolation_floored: false,
             workspace_dir: PathBuf::new(),
         }
     }
@@ -131,6 +134,7 @@ impl ClaudeSettings {
             allowed_tools: engine.allowed_tools.clone(),
             env,
             isolation: engine.isolation.clone(),
+            isolation_floored: engine.isolation_floor.is_some(),
             workspace_dir: config.paths.workspace_dir.clone(),
             ..Self::default()
         }
@@ -439,6 +443,7 @@ fn launch_context<'a>(settings: &'a ClaudeSettings, cfg: &'a SessionCfg) -> Laun
         self_exe: settings.self_exe.as_deref(),
         global_config_dir: settings.config_dir.as_deref(),
         config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+        floored: settings.isolation_floored,
     }
 }
 
@@ -805,7 +810,13 @@ mod tests {
             ..SessionCfg::default()
         };
         let args = SessionArgs::for_session(&cfg);
-        let isolation = sandbox::resolve(&settings.isolation, None, &root, None).unwrap();
+        let isolation = sandbox::resolve(
+            &settings.isolation,
+            None,
+            &root,
+            sandbox::LlmBaseUrl::default(),
+        )
+        .unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &args, Some("task-1"), None),
             &launch_context(&settings, &cfg),

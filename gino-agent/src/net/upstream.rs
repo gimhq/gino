@@ -162,10 +162,22 @@ pub fn is_local(ip: IpAddr) -> bool {
     }
 }
 
+/// True for link-local addresses (`169.254.0.0/16`, `fe80::/10`, also
+/// IPv4-mapped), which include cloud metadata endpoints.
+pub fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.is_unicast_link_local(), |v4| v4.is_link_local()),
+    }
+}
+
 /// Accepts `ip` for an always-allowed endpoint, which may live on a private
-/// network: only addresses naming the host itself ([`is_local`]) are refused.
+/// network: addresses naming the host itself ([`is_local`]) and link-local
+/// addresses are refused.
 pub fn check_always_allowed(ip: IpAddr) -> Result<(), UpstreamError> {
-    if is_local(ip) {
+    if is_local(ip) || is_link_local(ip) {
         return Err(UpstreamError::new(
             RejectKind::Reset,
             format!("{ip} is a forbidden destination address"),
@@ -516,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn always_allowed_refuses_only_local_addresses() {
+    fn always_allowed_refuses_only_local_and_link_local_addresses() {
         for ip in [
             "10.1.2.3",
             "172.17.0.1",
@@ -534,6 +546,11 @@ mod tests {
             "::1",
             "::",
             "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "febf::1",
+            "::ffff:169.254.169.254",
         ] {
             let ip = ip.parse().unwrap();
             let err = check_always_allowed(ip).unwrap_err();
@@ -545,6 +562,14 @@ mod tests {
     async fn resolve_always_allowed_refuses_loopback() {
         let err = resolve_always_allowed("localhost", 8080).await.unwrap_err();
         assert_eq!(err.kind(), RejectKind::Reset);
+    }
+
+    #[tokio::test]
+    async fn resolve_always_allowed_refuses_link_local() {
+        for name in ["169.254.169.254", "fe80::1"] {
+            let err = resolve_always_allowed(name, 80).await.unwrap_err();
+            assert_eq!(err.kind(), RejectKind::Reset, "{name}");
+        }
     }
 
     #[tokio::test]
