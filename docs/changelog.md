@@ -180,3 +180,20 @@ The release signing key is confined to a dedicated `publish` job. The `host` and
 only build and upload artifacts; `publish` downloads them, signs with the pinned lode-cli,
 validates and uploads to the release, and exposes `LODE_SIGNING_KEY` only to its key-check and
 sign steps, so no job that runs dependency code (`bun install`, cargo build scripts) can read it.
+
+## 2026-10-24 13:10 [progress]
+
+Engine sandbox step 1 and the nsplane-independent half of step 2 (task
+`20261024-0058-engine-sandbox`, BKD campaign `l1-i8j3v2zw-20261024030108`). Merge 7f68007
+(`bkd/0pc3dgdu`, sandbox-core): `engine.isolation` config with a per-task `meta.isolation`
+override, the bubblewrap launch chain (`sandbox-init` running the engine as uid 1000 with no
+capabilities and `no_new_privs`, SIGINT/SIGTERM forwarding), per-thread mounts with a read-only
+root, per-thread engine home and archive dir, network modes `none` and `full`, fail-closed probe,
+`gino-agent/scripts/sandbox-it.sh` and docs/agent-architecture.md §9d. Merge 1cbd94e
+(`bkd/b0k8cu9f`, net-framework): standalone `gino-agent/src/net/` (rules, fake-address pool, DNS
+policy, upstream connect/relay, limits, TUN creation via `tun-rs` + `rtnetlink`, fd passing via
+`rustix`), not wired into the runner yet; the merge combines the two `rustix` entries. Verified on
+the merged tree by the full agent gate (fmt, clippy, typos, MSRV, nextest 585 passed / 10
+privileged skipped, doctests, deny, shear) and `sandbox-it.sh` 8/8. Open: fail closed when the
+agent runs as root, whether task overrides may loosen isolation, real claude/codex verification,
+and the `allowlist` glue on nsplane v0.17.0.

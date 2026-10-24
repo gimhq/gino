@@ -29,3 +29,7 @@ Adding an engine sandbox
 ## Notes
 
 Plan: [20261024-0058-engine-sandbox](../plan/20261024-0058-engine-sandbox.md)
+
+- 2026-10-24: step 1 merged (7f68007) and the nsplane-independent net library merged (1cbd94e).
+  Remaining: fail-closed as root, task-override tightening, real-engine verification, and the
+  `allowlist` glue on nsplane v0.17.0.
