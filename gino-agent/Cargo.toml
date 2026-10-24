@@ -28,6 +28,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # SIGINT to the `codex exec` child, which has no in-band cancel channel, and
 # the nested user-namespace drop in `sandbox-init`.
 nix = { version = "0.31", default-features = false, features = ["sched", "signal", "term", "user"] }
+# Guest DNS: wire codec, the `Resolver` trait and the fake-address pool.
+nsplane-dns = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0", features = ["netstack"] }
+# TUN device creation (TUNSETIFF) without unsafe code in this crate.
+nsplane-tun = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
 # Async pseudo-terminal allocation and process spawning.
 pty-process = { version = "0.5.3", features = ["async"] }
 # HTTP client for register, config refresh and the output fallback. Default
@@ -63,8 +67,6 @@ tokio = { version = "1", features = [
     "process",
     "signal",
 ] }
-# TUN device creation (TUNSETIFF) without unsafe code in this crate.
-tun-rs = { version = "2.8.13", default-features = false }
 # Reconnecting WebSocket client.
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
