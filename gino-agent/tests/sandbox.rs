@@ -884,6 +884,62 @@ async fn missing_bwrap_fails_closed_without_running_the_engine() {
 }
 
 // ---------------------------------------------------------------------------
+// The local agent API inside the sandbox
+// ---------------------------------------------------------------------------
+
+const API_PROBE: &str = r#"
+value SOCK 'echo "$GINO_AGENT_SOCK"'
+value CRON_ID '"$GINO_RUNNER_BIN" cron create --type interval --value 3600000 --prompt p'
+check CRON_LIST_OK '"$GINO_RUNNER_BIN" cron list'
+value CRON_LIST '"$GINO_RUNNER_BIN" cron list | cut -f1'
+check TASK_LIST_OK '"$GINO_RUNNER_BIN" task list'
+value TASK_LIST '"$GINO_RUNNER_BIN" task list | cut -f1'
+check READ_DB 'cat "@DB@"'
+"#;
+
+#[tokio::test]
+#[ignore = "needs bubblewrap and user namespaces; run scripts/sandbox-it.sh"]
+async fn sandboxed_engine_manages_its_own_crons_through_the_agent_api() {
+    if !enabled() {
+        return;
+    }
+    let host = StubHost::start(sandbox_config("none", json!({}))).await;
+    let workspace = Workspace::new().await;
+    let fakes = claude_fakes(&render(API_PROBE, &workspace));
+    let runner = RunnerProc::spawn_in_with_fakes(&host, &workspace, fakes, None);
+    assert!(
+        host.wait_connected(RUN_TIMEOUT).await,
+        "runner never connected"
+    );
+
+    host.push_task_upsert("t-other", Some("other"), Some("chat"), None, 1)
+        .await;
+    host.push_task_upsert("t-api", Some("mine"), Some("chat"), None, 2)
+        .await;
+    let run = run_thread(&host, "t-api", "th-api", 3).await;
+    assert_eq!(run.status, "succeeded", "run: {run:?}");
+    let results = probes(&host, "t-api", "th-api").await;
+    let cron_id = results["CRON_ID"].clone();
+    let uuid = cron_id
+        .strip_prefix("cron-")
+        .unwrap_or_else(|| panic!("cron create: {results:#?}"));
+    uuid::Uuid::parse_str(uuid).unwrap_or_else(|_| panic!("cron create: {results:#?}"));
+    expect(
+        &results,
+        &[
+            ("SOCK", "/run/gino/agent.sock"),
+            ("CRON_LIST_OK", "ok"),
+            ("CRON_LIST", &cron_id),
+            ("TASK_LIST_OK", "ok"),
+            ("TASK_LIST", "t-api"),
+            ("READ_DB", "denied"),
+        ],
+    );
+
+    runner.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Task meta.isolation overrides
 // ---------------------------------------------------------------------------
 
@@ -947,7 +1003,7 @@ async fn task_meta_isolation_overrides_the_default() {
         ],
     );
     assert!(
-        results["CLI"].contains("agent state is not available inside the sandbox"),
+        results["CLI"].contains("workspace_dir : (not available to this run)"),
         "in-sandbox CLI: {}",
         results["CLI"]
     );

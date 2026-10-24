@@ -109,6 +109,26 @@ pub(crate) struct SessionCfg {
     pub(crate) work_dir: Option<PathBuf>,
     /// The task's isolation override (`tasks.meta.isolation`).
     pub(crate) isolation: Option<IsolationSpec>,
+    /// Local agent API access for this run, exported as `GINO_AGENT_SOCK` /
+    /// `GINO_AGENT_TOKEN`. `None` exports neither.
+    pub(crate) agent_api: Option<AgentApiAccess>,
+}
+
+/// The local agent API socket and the run's token. `Debug` never prints the
+/// token.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AgentApiAccess {
+    pub(crate) socket: PathBuf,
+    pub(crate) token: String,
+}
+
+impl std::fmt::Debug for AgentApiAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentApiAccess")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The result of a completed turn. Carries the

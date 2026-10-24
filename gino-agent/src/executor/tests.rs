@@ -8,13 +8,15 @@ use futures_util::stream::{self, BoxStream};
 use std::path::PathBuf;
 
 use super::{Continuity, PromptSource, ThreadExecutor, WatchdogCfg};
+use crate::agent_api::{RunScope, TokenRegistry};
 use crate::attachments::{
     AttachmentBackend, AttachmentError, AttachmentManager, AttachmentSource, sha256_hex,
 };
 use crate::config::AttachmentsConfig;
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::{
-    Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
+    AgentApiAccess, Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session,
+    SessionCfg,
 };
 use crate::protocol::frames::{
     AttachmentDescriptor, EntryKind, MessageKind, ProvisioningEntry, ThreadMessageData,
@@ -2074,4 +2076,196 @@ async fn unknown_task_engine_runs_on_the_default_backend() {
     );
     assert_eq!(final_row.status, "succeeded");
     assert_eq!(final_row.result.as_deref(), Some("default backend"));
+}
+
+// -- Local agent API run tokens ---------------------------------------
+
+/// What a [`TokenProbe`] saw at spawn: the session's API access and the scope
+/// its token resolved to in the registry at that moment.
+type TokenSighting = (Option<AgentApiAccess>, Option<RunScope>);
+
+/// Records the API access each spawn receives, then replays `script` (pending
+/// forever after it when `stall`), or fails the spawn when `fail_start`.
+struct TokenProbe {
+    registry: TokenRegistry,
+    script: Vec<EngineEvent>,
+    stall: bool,
+    fail_start: bool,
+    seen: Arc<Mutex<Vec<TokenSighting>>>,
+}
+
+#[async_trait]
+impl Engine for TokenProbe {
+    fn name(&self) -> &'static str {
+        "token-probe"
+    }
+    async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
+        let scope = cfg
+            .agent_api
+            .as_ref()
+            .and_then(|api| self.registry.lookup(&api.token));
+        self.seen.lock().unwrap().push((cfg.agent_api, scope));
+        if self.fail_start {
+            return Err(EngineError::Spawn(std::io::Error::other("no binary")));
+        }
+        Ok(Box::new(MockSession {
+            script: self.script.clone(),
+            stall: self.stall,
+        }))
+    }
+}
+
+fn token_probe(
+    script: Vec<EngineEvent>,
+    stall: bool,
+    fail_start: bool,
+) -> (TokenProbe, TokenRegistry, Arc<Mutex<Vec<TokenSighting>>>) {
+    let registry = TokenRegistry::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe = TokenProbe {
+        registry: registry.clone(),
+        script,
+        stall,
+        fail_start,
+        seen: Arc::clone(&seen),
+    };
+    (probe, registry, seen)
+}
+
+/// Run `thread_id` through `probe` with the agent API wired, interrupting it
+/// once running when `interrupt`, and return the final status.
+async fn run_with_agent_api(
+    probe: TokenProbe,
+    registry: &TokenRegistry,
+    thread_id: &str,
+    interrupt: bool,
+) -> String {
+    let db = test_db();
+    let ws = tempfile::tempdir().unwrap();
+    let engine: Arc<dyn Engine> = Arc::new(probe);
+    let exec = Arc::new(
+        ThreadExecutor::new(
+            engine,
+            Arc::clone(&db),
+            ws.path().to_path_buf(),
+            WatchdogCfg {
+                inactivity_timeout: None,
+                cancel_drain_timeout: std::time::Duration::from_millis(100),
+                ..WatchdogCfg::default()
+            },
+        )
+        .with_agent_api(registry.clone(), PathBuf::from("/ws/run/agent.sock")),
+    );
+    lock(&db)
+        .insert_thread(&pending_thread(thread_id, 1))
+        .unwrap();
+    let runner = Arc::clone(&exec);
+    let thread = pending_thread(thread_id, 1);
+    let handle = tokio::spawn(async move {
+        runner
+            .run_thread(thread, "go".to_owned(), Continuity::Isolated)
+            .await
+    });
+    if interrupt {
+        for _ in 0..200 {
+            if lock(&db).get_thread(thread_id).unwrap().unwrap().status == "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        exec.interrupt().await;
+    }
+    handle.await.unwrap().status
+}
+
+/// The run's token resolved to exactly its own task and thread while the
+/// engine ran, and no longer resolves once the run is over.
+fn assert_token_scoped_then_revoked(
+    registry: &TokenRegistry,
+    seen: &Mutex<Vec<TokenSighting>>,
+    thread_id: &str,
+) {
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "exactly one spawn per run");
+    let (access, scope) = &seen[0];
+    let access = access.as_ref().expect("the run gets API access");
+    assert_eq!(access.socket, PathBuf::from("/ws/run/agent.sock"));
+    assert_eq!(
+        scope.as_ref(),
+        Some(&RunScope {
+            task_id: "task-1".to_owned(),
+            thread_id: thread_id.to_owned(),
+        })
+    );
+    assert_eq!(
+        registry.lookup(&access.token),
+        None,
+        "revoked after the run"
+    );
+}
+
+#[tokio::test]
+async fn succeeded_run_token_is_scoped_then_revoked() {
+    let (probe, registry, seen) = token_probe(
+        vec![started("sess-tok"), ok_result("done", "sess-tok")],
+        false,
+        false,
+    );
+    let status = run_with_agent_api(probe, &registry, "th-tok-ok", false).await;
+    assert_eq!(status, "succeeded");
+    assert_token_scoped_then_revoked(&registry, &seen, "th-tok-ok");
+}
+
+#[tokio::test]
+async fn failed_run_token_is_scoped_then_revoked() {
+    let (probe, registry, seen) = token_probe(vec![err_result("boom")], false, false);
+    let status = run_with_agent_api(probe, &registry, "th-tok-err", false).await;
+    assert_eq!(status, "failed");
+    assert_token_scoped_then_revoked(&registry, &seen, "th-tok-err");
+}
+
+#[tokio::test]
+async fn failed_start_token_is_revoked() {
+    let (probe, registry, seen) = token_probe(Vec::new(), false, true);
+    let status = run_with_agent_api(probe, &registry, "th-tok-start", false).await;
+    assert_eq!(status, "failed");
+    assert_token_scoped_then_revoked(&registry, &seen, "th-tok-start");
+}
+
+#[tokio::test]
+async fn cancelled_run_token_is_scoped_then_revoked() {
+    let (probe, registry, seen) = token_probe(vec![started("sess-tok-c")], true, false);
+    let status = run_with_agent_api(probe, &registry, "th-tok-cancel", true).await;
+    assert_eq!(status, "cancelled");
+    assert_token_scoped_then_revoked(&registry, &seen, "th-tok-cancel");
+}
+
+#[tokio::test]
+async fn without_agent_api_a_run_gets_no_access() {
+    let db = test_db();
+    let ws = tempfile::tempdir().unwrap();
+    let (probe, _registry, seen) = token_probe(
+        vec![started("sess-none"), ok_result("done", "sess-none")],
+        false,
+        false,
+    );
+    let engine: Arc<dyn Engine> = Arc::new(probe);
+    let exec = ThreadExecutor::new(
+        engine,
+        Arc::clone(&db),
+        ws.path().to_path_buf(),
+        no_inactivity(),
+    );
+    lock(&db)
+        .insert_thread(&pending_thread("th-tok-none", 1))
+        .unwrap();
+    let row = exec
+        .run_thread(
+            pending_thread("th-tok-none", 1),
+            "go".to_owned(),
+            Continuity::Isolated,
+        )
+        .await;
+    assert_eq!(row.status, "succeeded");
+    assert_eq!(*seen.lock().unwrap(), [(None, None)]);
 }
