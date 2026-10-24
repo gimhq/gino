@@ -34,9 +34,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::TimeDelta;
+use futures_util::future::OptionFuture;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
+use crate::agent_api::{self, AgentApiServer, ApiContext};
 use crate::attachment_source::DbAttachmentSource;
 use crate::attachments::{self, AttachmentManager, AttachmentSource};
 use crate::chat::{
@@ -174,6 +176,7 @@ pub(crate) fn run_daemon(
 }
 
 /// Resolve config → register → connect → start scheduler + executor → serve.
+#[allow(clippy::too_many_lines)] // the daemon's linear startup/shutdown sequence
 async fn run_async(
     host: Option<String>,
     register_token: Option<String>,
@@ -276,6 +279,7 @@ async fn run_async(
     );
     let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let scheduler_task = tokio::spawn(scheduler.run());
+    let api = start_agent_api(&config, &db, &nudge, &flush);
 
     let worker = tokio::spawn(run_worker(
         Arc::clone(&executor),
@@ -303,6 +307,7 @@ async fn run_async(
     };
     serve(&mut transport, &context, &cancel).await;
 
+    OptionFuture::from(api.map(AgentApiServer::shutdown)).await;
     // Shutdown: drain the execution plane within a bounded window (the
     // active run is cancelled, not waited out), stop the scheduler, fail any
     // leftover in-flight threads (so the host sees a terminal result rather than
@@ -319,6 +324,41 @@ async fn run_async(
     transport.shutdown().await;
     info!("gino-agent stopped");
     Ok(())
+}
+
+/// Serve the local agent API under the workspace. A failure is logged and the
+/// daemon carries on without it.
+fn start_agent_api(
+    config: &Config,
+    db: &Arc<Mutex<Db>>,
+    nudge: &Arc<Notify>,
+    flush: &Arc<Notify>,
+) -> Option<AgentApiServer> {
+    let ctx = ApiContext {
+        db: Arc::clone(db),
+        nudge: Arc::clone(nudge),
+        flush: Arc::clone(flush),
+        agent_name: config.agent_name.clone(),
+        host_url: config.host_url.clone(),
+        workspace_dir: config.paths.workspace_dir.clone(),
+        db_path: config.paths.db_path.clone(),
+    };
+    match AgentApiServer::start(ctx, &config.paths.workspace_dir) {
+        Ok(server) => {
+            info!(
+                socket = %agent_api::socket_path(&config.paths.workspace_dir).display(),
+                "local agent API listening"
+            );
+            Some(server)
+        }
+        Err(err) => {
+            error!(
+                error = format!("{err:#}"),
+                "starting the local agent API failed; continuing without it"
+            );
+            None
+        }
+    }
 }
 
 /// Stop the execution plane within a bounded drain window: trip the

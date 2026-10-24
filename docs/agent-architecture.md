@@ -446,6 +446,7 @@ must come from the environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, 
 **Archive and `gino` CLI.** The PreCompact archive (`gino-agent archive`) writes to `<work_dir>/conversations` via
 `GINO_ARCHIVE_DIR`. The in-engine `gino` CLI cannot open the agent DB and reports "agent state is not
 available inside the sandbox".
+The target design replaces direct DB access with the local agent API (§10b).
 
 **Network.** `none`: own network namespace with loopback only. `full`: the host network
 (`--share-net`); when `/etc/resolv.conf` links outside `/etc`, its target is bound read-only.
@@ -540,6 +541,156 @@ and workers joined before reconnect. No terminal frame enters inbox/outbox or st
 serially by the runner), and writes idempotently on `(thread_id, seq)` (dedup, since at-least-once replay can
 duplicate). `thread_result.final_seq` lets the host verify it received `1..final_seq`. `outboxId` is
 delivery/ack only; `seq` is the per-thread continuity contract.
+
+## 10b. Local agent API
+
+**Purpose.** A local, per-workspace API through which in-engine tools (the `gino` CLI, skills, a future VM
+guest) read and change agent state. It is the one contract they all follow. Target design: **nothing
+outside the daemon opens `agent.db`** — the in-engine CLI becomes a client of this API instead of opening
+the database itself.
+
+**Transport.** Unix stream socket at `<workspace_dir>/run/agent.sock`.
+
+- The daemon creates `<workspace_dir>/run` with mode **0700** (and chmods an existing dir to 0700), removes
+  any stale file at the socket path, binds, then sets the socket file to **0600**.
+- The socket lives as long as the daemon: on shutdown the listener stops, open connections close and the
+  socket file is removed (best-effort).
+
+**Framing.** Newline-delimited JSON (UTF-8). One request per line, exactly one response line per request,
+in order; a connection may carry any number of requests.
+
+```json
+{"v":1,"id":"1","method":"cron.list","params":{}}
+{"v":1,"id":"1","result":{"crons":[],"scoped":true}}
+{"v":1,"id":"2","method":"thread.show","params":{"id":"nope"}}
+{"v":1,"id":"2","error":{"code":"not_found","message":"no such thread: nope"}}
+```
+
+- `params` is optional (absent = `{}`) and must be a JSON object when present.
+- `id` is a client-chosen string, echoed verbatim; it is `null` in the response when the line could not be
+  parsed far enough to read a string `id`.
+- Every response carries `"v":1` and exactly one of `result` / `error` (`{code, message}`).
+
+**Limits and timeouts.**
+
+| limit | value | on violation |
+|---|---|---|
+| request line length (excluding `\n`) | 65536 bytes | one `invalid_params` response (id `null`, "request line exceeds 65536 bytes"), then the connection is closed |
+| idle connection (no complete request line) | 60 s | connection closed |
+| method handler | 10 s | `unavailable` ("request timed out") |
+| concurrent connections, total | 64 | connection closed immediately, no response |
+| concurrent authenticated connections per run token | 8 | that `auth` returns `unavailable` ("too many connections for this token"); the connection stays unauthenticated |
+| concurrent operator connections | 8 | connection closed immediately, no response (counted separately from run tokens) |
+
+**Versioning.** `v` must be the integer `1`. A missing or different `v` returns `unsupported_version`
+("unsupported protocol version; this agent speaks v1"). Future versions bump `v`; the daemon answers only
+versions it implements.
+
+**Authentication.** A connection's scope is either **operator** (full access) or **run**
+(`{task_id, thread_id}`); a new connection has no scope unless it qualifies as operator. Any method other
+than `auth` on a connection without scope returns `unauthenticated`.
+
+- **Run tokens.** 256 random bits from `/dev/urandom`, hex-encoded (64 lowercase hex chars). The registry
+  stores only the SHA-256 of each token mapped to its scope, so lookups never compare the raw secret. The
+  executor registers a token **before spawning** an engine run and **revokes** it when the run ends. The
+  engine receives `GINO_AGENT_SOCK` (socket path as seen by the engine), `GINO_AGENT_TOKEN`, and the
+  existing `GINO_TASK_ID` / `GINO_THREAD_ID`.
+- **`auth`** `{"token":"<hex>"}` → `{"scope":"run","task_id":"…","thread_id":"…"}`. An unknown or revoked
+  token returns `unauthenticated` and leaves the connection with **no** scope — an operator connection that
+  presents a bad token loses operator access too.
+- **Revocation.** Once revoked, every later request on a connection that authenticated with the token gets
+  `unauthenticated`, and new `auth` with it fails.
+- **Operator access.** At accept time the server reads the peer credentials (`SO_PEERCRED`). The connection
+  is operator-scoped iff the peer uid equals the daemon's uid **and** the peer pid is known **and** the
+  targets of `/proc/<pid>/ns/user` and `/proc/<pid>/ns/pid` equal the daemon's own
+  (`/proc/self/ns/{user,pid}`). Any read failure → not operator. A sandboxed engine runs in nested
+  namespaces, so it never gets operator access even when its outer uid matches. Operator connections need
+  no `auth`.
+- **A presented token always wins:** an operator connection that authenticates with a valid token becomes
+  run-scoped.
+
+**Run-scope rules.** A run-scoped caller only sees and changes its own `task_id`:
+
+- an explicit `task_id` param that is not its own → `forbidden`;
+- a task, thread or cron named by id that belongs to another task → `not_found`, with exactly the
+  response a missing id gets, so another task's objects are indistinguishable from nonexistent ones
+  (and nothing is changed);
+- listings are filtered to its own task; `system.info` is redacted (below).
+
+**Threat-model limit.** Unsandboxed engines run as the daemon's uid and can read another engine's token
+from `/proc/<pid>/environ`, so run scope is a hard boundary **only under the engine sandbox** (§9d,
+separate PID namespace) — matching the isolation model.
+
+**Object shapes.** Field names are snake_case; optional DB columns are `null` when empty.
+
+| shape | fields |
+|---|---|
+| TaskSummary | `id, name, kind, status, created_at` (`name`/`kind` nullable) |
+| ThreadSummary | `id, task_id, status, source, attempt, max_attempts, engine_session_id` |
+| ThreadDetail | ThreadSummary + `cron_id, failure_reason, engine, duration_ms, prompt, result, error` |
+| CronInfo | `id, task_id, kind, status, schedule_type, schedule_value, next_run, last_fired_at, continuity, run_count, prompt, created_at, updated_at` |
+
+**Methods.**
+
+| method | params | result |
+|---|---|---|
+| `auth` | `{token}` | `{scope:"run", task_id, thread_id}` |
+| `system.info` | `{}` | see below |
+| `task.list` | `{}` | `{tasks:[TaskSummary]}` |
+| `task.show` | `{id}` | `{task:TaskSummary, threads:[ThreadSummary], crons:[CronInfo]}` |
+| `thread.list` | `{task_id?}` | `{threads:[ThreadSummary]}` |
+| `thread.show` | `{id}` | `{thread:ThreadDetail}` |
+| `cron.create` | `{type:"cron"\|"interval"\|"once", value, prompt, continuity?="isolated", task_id?}` | `{cron:CronInfo}` |
+| `cron.list` | `{task_id?}` | `{crons:[CronInfo], scoped:bool}` |
+| `cron.delete` | `{id}` | `{cron:CronInfo}` (status `cancelled`, `next_run` null) |
+| `cron.pause` | `{id}` | `{cron:CronInfo}` (status `paused`, `next_run` kept) |
+| `cron.resume` | `{id}` | `{cron:CronInfo}` (status `active`, `next_run` recomputed) |
+
+- **`system.info`.** Operator:
+  `{"scope":"operator","version","agent_id","name","host_url","capabilities":["claude"],"workspace_dir","db_path","tasks":N,"active_crons":N,"threads":{"pending":N,"running":N}}`.
+  Run: the same without `workspace_dir` / `db_path`, `"scope":"run"`, and counts covering only the caller's
+  own task. `version` is the crate version; `agent_id` the persisted identity's id (`null` if not
+  registered); `name` / `host_url` the daemon config `agent_name` / `host_url` (nullable). It never
+  includes the connect token, the enrollment token or any other task's data.
+- **`task.list`.** Run: only its own task, if it exists.
+- **`task.show`.** Missing, or (run scope) another task's id → `not_found` ("no such task: <id>").
+- **`thread.list`.** Run: defaults to (and only allows) its own task. Operator: `task_id` required
+  (`invalid_params` "task_id is required").
+- **`thread.show`.** Missing, or (run scope) another task's thread → `not_found` ("no such thread: <id>").
+- **`cron.create`.** Run: task defaults to its own; operator: `task_id` required. A `continuity` other than
+  `isolated`/`shared` → `invalid_params` ("continuity must be 'isolated' or 'shared' (got '<x>')"); a
+  schedule rejected by `next_run_at_creation` → `invalid_params` ("invalid schedule: type=<t> value=<v>:
+  <reason>"); unknown task → `not_found` ("no such task: <id>"). The row is built like the CLI's
+  `cron create`: id `cron-<uuid v4>`, kind `schedule`, status `active`, `run_count` 0,
+  `created_at` = `updated_at` = now.
+- **`cron.list`.** Run: all of its own task's crons (every status), `scoped:true`. Operator: with
+  `task_id` → that task's crons, `scoped:true`; without → active crons across all tasks, `scoped:false`.
+- **`cron.delete` / `cron.pause` / `cron.resume`.** Missing, or (run scope) another task's cron →
+  `not_found` ("no such cron: <id>"), with no side effects. `cron.resume` recomputes `next_run` forward from now via
+  `next_run_at_creation` (`null` if that fails).
+- **Cron side effects.** Every successful cron mutation (`create`, `delete`, `pause`, `resume`) updates
+  `updated_at`, enqueues a `cron_state` outbox row (best-effort; a failure is logged, not returned), then
+  nudges the scheduler and the transport flush.
+
+**Error codes** (stable snake_case strings).
+
+| code | meaning |
+|---|---|
+| `unauthenticated` | no valid scope on this connection (no `auth` yet, bad token, revoked token) |
+| `forbidden` | an explicit `task_id` param outside the caller's scope |
+| `not_found` | the referenced task / thread / cron does not exist, or is outside the caller's scope |
+| `invalid_params` | malformed JSON, missing / ill-typed fields, invalid schedule, unknown method ("unknown method: <name>") |
+| `unsupported_version` | `v` missing or not `1` |
+| `unavailable` | handler timeout, connection limits, daemon shutting down |
+| `internal` | unexpected daemon-side failure (e.g. a database error); generic message |
+
+**Reachability.** The protocol is the same everywhere; only the path differs.
+
+| run | socket as seen by the engine |
+|---|---|
+| unsandboxed | `<workspace_dir>/run/agent.sock` directly |
+| sandboxed (§9d) | bound read-write at `/run/gino/agent.sock` |
+| VM (later) | a guest vsock port that libkrun maps to the same host Unix socket — no protocol change |
 
 ## 11. Host-side read models (mirror; otherwise host-private)
 
