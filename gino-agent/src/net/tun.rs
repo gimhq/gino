@@ -2,12 +2,16 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::fd::{AsFd, OwnedFd};
 
+use futures_util::TryStreamExt as _;
+use nsplane_tun::{Tun, TunOptions};
 use rtnetlink::{Handle, LinkUnspec, RouteMessageBuilder};
-use tun_rs::{DeviceBuilder, Layer};
 
 /// Address plan of the guest-side TUN device.
+///
+/// The daemon adopting the device fd must pass the configured MTU: `Tun::split`
+/// looks the interface MTU up by name in the caller's network namespace, so the
+/// default name (`gino0`) is one unlikely to exist on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunConfig {
     /// Interface name.
@@ -25,7 +29,7 @@ pub struct TunConfig {
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
-            name: "tun0".to_owned(),
+            name: "gino0".to_owned(),
             address: Ipv4Addr::new(10, 0, 2, 15),
             prefix_len: 24,
             gateway: Ipv4Addr::new(10, 0, 2, 2),
@@ -43,6 +47,12 @@ pub enum TunError {
     /// The rtnetlink socket could not be opened.
     #[error("open rtnetlink socket: {0}")]
     Netlink(io::Error),
+    /// Looking up the interface index failed.
+    #[error("look up interface {name}: {source}")]
+    Lookup {
+        name: String,
+        source: rtnetlink::Error,
+    },
     /// Adding the interface address failed.
     #[error("set address {address}/{prefix_len} on {name}: {source}")]
     Address {
@@ -67,33 +77,40 @@ pub enum TunError {
     },
 }
 
-/// Creates a TUN device (IFF_TUN | IFF_NO_PI), assigns the address, sets the
-/// MTU, brings the link up and adds a default route via the gateway. Returns
-/// the device fd; the device disappears when the last copy of it is closed.
-pub async fn create_tun(cfg: &TunConfig) -> Result<OwnedFd, TunError> {
-    let create_err = |source| TunError::Create {
-        name: cfg.name.clone(),
-        source,
-    };
-    let device = DeviceBuilder::new()
-        .name(&cfg.name)
-        .layer(Layer::L3)
-        .packet_information(false)
-        .inherit_enable_state()
-        .build_sync()
-        .map_err(create_err)?;
-    let index = device.if_index().map_err(create_err)?;
-    let fd = device.as_fd().try_clone_to_owned().map_err(create_err)?;
-    drop(device);
+/// Creates a plain TUN device (IFF_TUN | IFF_NO_PI, no offloads: one raw IP
+/// packet per read and write), assigns the address, sets the MTU, brings the
+/// link up and adds a default route via the gateway. The device disappears
+/// when the last copy of its fd is closed.
+pub async fn create_tun(cfg: &TunConfig) -> Result<Tun, TunError> {
+    let tun = Tun::create_with(&cfg.name, TunOptions::new().offload(false)).map_err(|source| {
+        TunError::Create {
+            name: cfg.name.clone(),
+            source,
+        }
+    })?;
 
     let (connection, handle, _) = rtnetlink::new_connection().map_err(TunError::Netlink)?;
     let connection = tokio::spawn(connection);
-    let configured = configure(&handle, index, cfg).await;
+    let configured = configure(&handle, cfg).await;
     connection.abort();
-    configured.map(|()| fd)
+    configured.map(|()| tun)
 }
 
-async fn configure(handle: &Handle, index: u32, cfg: &TunConfig) -> Result<(), TunError> {
+async fn configure(handle: &Handle, cfg: &TunConfig) -> Result<(), TunError> {
+    let lookup_err = |source| TunError::Lookup {
+        name: cfg.name.clone(),
+        source,
+    };
+    let link = handle
+        .link()
+        .get()
+        .match_name(cfg.name.clone())
+        .execute()
+        .try_next()
+        .await
+        .map_err(lookup_err)?
+        .ok_or_else(|| lookup_err(rtnetlink::Error::RequestFailed))?;
+    let index = link.header.index;
     handle
         .address()
         .add(index, IpAddr::V4(cfg.address), cfg.prefix_len)
@@ -143,7 +160,7 @@ mod tests {
     #[test]
     fn default_config_matches_guest_plan() {
         let cfg = TunConfig::default();
-        assert_eq!(cfg.name, "tun0");
+        assert_eq!(cfg.name, "gino0");
         assert_eq!(cfg.address, Ipv4Addr::new(10, 0, 2, 15));
         assert_eq!(cfg.prefix_len, 24);
         assert_eq!(cfg.gateway, Ipv4Addr::new(10, 0, 2, 2));
@@ -153,7 +170,7 @@ mod tests {
     #[test]
     fn create_error_names_requirements() {
         let err = TunError::Create {
-            name: "tun0".to_owned(),
+            name: "gino0".to_owned(),
             source: io::Error::from(io::ErrorKind::PermissionDenied),
         };
         let msg = err.to_string();
@@ -168,10 +185,10 @@ mod tests {
     /// as a non-root user that can create user namespaces, with `bwrap` on
     /// PATH and `/dev/net/tun` present.
     mod privileged {
+        use std::os::fd::AsFd as _;
         use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
         use std::time::Duration;
 
-        use futures_util::TryStreamExt as _;
         use rtnetlink::packet_route::address::AddressAttribute;
         use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags};
         use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
@@ -225,9 +242,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let fd = recv_fd(&stream, STEP_TIMEOUT).await.unwrap();
-            let meta = std::fs::File::from(fd).metadata().unwrap();
+            let meta = std::fs::File::from(fd.try_clone().unwrap())
+                .metadata()
+                .unwrap();
             assert!(meta.file_type().is_char_device());
             assert_eq!(meta.rdev(), TUN_RDEV);
+            let adopted = Tun::from_fd(fd, TunConfig::default().mtu).unwrap();
+            assert!(!adopted.offload().vnet_hdr, "expected a plain TUN device");
 
             let status = tokio::time::timeout(STEP_TIMEOUT, child.wait())
                 .await
@@ -244,11 +265,12 @@ mod tests {
                 return;
             };
             let cfg = TunConfig::default();
-            let fd = create_tun(&cfg).await.unwrap();
+            let tun = create_tun(&cfg).await.unwrap();
             assert_configured(&cfg).await;
 
             let stream = UnixStream::connect(socket).await.unwrap();
-            send_fd(&stream, fd.as_fd(), STEP_TIMEOUT).await.unwrap();
+            send_fd(&stream, tun.as_fd(), STEP_TIMEOUT).await.unwrap();
+            drop(tun);
         }
 
         async fn assert_configured(cfg: &TunConfig) {
