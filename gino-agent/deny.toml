@@ -48,3 +48,9 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# nsplane (TUN and DNS) and the dotns forks of its dependencies, pinned by tag.
+allow-git = [
+    "https://github.com/dotns/nsplane",
+    "https://github.com/dotns/smoltcp",
+    "https://github.com/dotns/simple-dns",
+]
