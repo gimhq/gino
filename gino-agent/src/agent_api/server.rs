@@ -95,7 +95,6 @@ impl AgentApiServer {
     }
 
     /// The registry run tokens are minted in.
-    #[allow(dead_code)] // used by the CLI client / executor
     pub(crate) fn registry(&self) -> TokenRegistry {
         self.registry.clone()
     }

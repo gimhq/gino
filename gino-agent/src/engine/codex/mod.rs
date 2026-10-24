@@ -357,7 +357,8 @@ const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["ENGINE_CONFIG_DIR", "CODEX_HOME"];
 /// `task_id`/`thread_id` (when present) are exported to the child as
 /// `GINO_TASK_ID`/`GINO_THREAD_ID`, and the runner's own path as
 /// `GINO_RUNNER_BIN`, so in-engine tooling can self-reference the task and
-/// re-invoke the runner without a hard-coded path.
+/// re-invoke the runner without a hard-coded path. An issued agent API token is
+/// exported as `GINO_AGENT_SOCK`/`GINO_AGENT_TOKEN`.
 fn direct_launch(settings: &CodexSettings, cfg: &SessionCfg) -> Launch {
     let mut env: Vec<(String, OsString)> = settings
         .env
@@ -378,6 +379,10 @@ fn direct_launch(settings: &CodexSettings, cfg: &SessionCfg) -> Launch {
     }
     if let Some(thread_id) = &cfg.thread_id {
         env.push(("GINO_THREAD_ID".to_owned(), thread_id.into()));
+    }
+    if let Some(api) = &cfg.agent_api {
+        env.push(("GINO_AGENT_SOCK".to_owned(), api.socket.clone().into()));
+        env.push(("GINO_AGENT_TOKEN".to_owned(), api.token.clone().into()));
     }
     Launch::direct(
         settings.binary.clone(),
@@ -632,7 +637,9 @@ mod tests {
         is_available_in, launch_context,
     };
     use crate::config::{Config, ConfigOverlay};
-    use crate::engine::{Engine, EngineError, EngineEvent, RunStatus, Session, SessionCfg};
+    use crate::engine::{
+        AgentApiAccess, Engine, EngineError, EngineEvent, RunStatus, Session, SessionCfg,
+    };
     use crate::sandbox::{self, IsolationSpec, SandboxHost};
 
     fn os_args(args: Vec<String>) -> Vec<std::ffi::OsString> {
@@ -695,6 +702,35 @@ mod tests {
         );
         let launched = sandbox::launch(direct.clone(), &launch_context(&settings, &cfg)).unwrap();
         assert_eq!(launched, direct);
+    }
+
+    #[test]
+    fn an_issued_agent_api_token_is_exported_next_to_the_thread_id() {
+        let settings = CodexSettings::default();
+        let cfg = SessionCfg {
+            task_id: Some("task-1".to_owned()),
+            thread_id: Some("th-1".to_owned()),
+            agent_api: Some(AgentApiAccess {
+                socket: "/ws/run/agent.sock".into(),
+                token: "tok".to_owned(),
+            }),
+            ..SessionCfg::default()
+        };
+        let direct = direct_launch(&settings, &cfg);
+        let env: Vec<(&str, &str)> = direct
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("GINO_TASK_ID", "task-1"),
+                ("GINO_THREAD_ID", "th-1"),
+                ("GINO_AGENT_SOCK", "/ws/run/agent.sock"),
+                ("GINO_AGENT_TOKEN", "tok"),
+            ]
+        );
     }
 
     #[test]

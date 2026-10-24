@@ -14,7 +14,6 @@ mod tests;
 use std::path::{Path, PathBuf};
 
 pub(crate) use methods::ApiContext;
-#[allow(unused_imports)] // used by the CLI client / executor
 pub(crate) use scope::{RunScope, RunToken, TokenRegistry};
 pub(crate) use server::AgentApiServer;
 

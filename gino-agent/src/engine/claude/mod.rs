@@ -41,7 +41,9 @@ use uuid::Uuid;
 use self::control::ControlAsk;
 use self::events::EventMapper;
 use crate::config::Config;
-use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
+use crate::engine::{
+    AgentApiAccess, Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg,
+};
 use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext, NetExit};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
@@ -394,11 +396,13 @@ const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["ENGINE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"
 /// `GINO_TASK_ID`/`GINO_THREAD_ID`, and the runner's own path as
 /// `GINO_RUNNER_BIN`, so in-engine tooling (the `gino-agent cron` CLI) can
 /// self-reference the task and re-invoke the runner without a hard-coded path.
+/// An issued agent API token is exported as `GINO_AGENT_SOCK`/`GINO_AGENT_TOKEN`.
 fn direct_launch(
     settings: &ClaudeSettings,
     session_args: &SessionArgs,
     task_id: Option<&str>,
     thread_id: Option<&str>,
+    agent_api: Option<&AgentApiAccess>,
 ) -> Launch {
     let mut env: Vec<(String, OsString)> = settings
         .env
@@ -421,6 +425,10 @@ fn direct_launch(
     }
     if let Some(thread_id) = thread_id {
         env.push(("GINO_THREAD_ID".to_owned(), thread_id.into()));
+    }
+    if let Some(api) = agent_api {
+        env.push(("GINO_AGENT_SOCK".to_owned(), api.socket.clone().into()));
+        env.push(("GINO_AGENT_TOKEN".to_owned(), api.token.clone().into()));
     }
     // Ask for `session_state_changed`, whose `idle` marks the end of the run.
     env.push((SESSION_STATE_EVENTS_ENV.to_owned(), "1".into()));
@@ -461,6 +469,7 @@ async fn spawn_session(
             session_args,
             cfg.task_id.as_deref(),
             cfg.thread_id.as_deref(),
+            cfg.agent_api.as_ref(),
         ),
         &launch_context(settings, cfg),
     )?;
@@ -707,7 +716,7 @@ mod tests {
         direct_launch, effective_settings, launch_context,
     };
     use crate::config::{Config, ConfigOverlay};
-    use crate::engine::{Engine, EngineError, SessionCfg};
+    use crate::engine::{AgentApiAccess, Engine, EngineError, SessionCfg};
     use crate::sandbox::{self, IsolationSpec, Launch, SandboxHost};
 
     fn env_of<'a>(launch: &'a Launch, key: &str) -> Vec<&'a OsString> {
@@ -763,7 +772,7 @@ mod tests {
             ..SessionCfg::default()
         };
         let args = SessionArgs::for_session(&cfg);
-        let direct = direct_launch(&settings, &args, Some("task-1"), Some("th-1"));
+        let direct = direct_launch(&settings, &args, Some("task-1"), Some("th-1"), None);
         assert_eq!(direct.program, Path::new("claude"));
         assert_eq!(direct.cwd, cfg.cwd);
         assert_eq!(direct.args, os_args(build_args(&settings, &args)));
@@ -786,6 +795,33 @@ mod tests {
         );
         let launched = sandbox::launch(direct.clone(), &launch_context(&settings, &cfg)).unwrap();
         assert_eq!(launched, direct);
+    }
+
+    #[test]
+    fn an_issued_agent_api_token_is_exported_next_to_the_thread_id() {
+        let settings = ClaudeSettings::default();
+        let cfg = SessionCfg::default();
+        let args = SessionArgs::for_session(&cfg);
+        let api = AgentApiAccess {
+            socket: "/ws/run/agent.sock".into(),
+            token: "tok".to_owned(),
+        };
+        let direct = direct_launch(&settings, &args, Some("task-1"), Some("th-1"), Some(&api));
+        let env: Vec<(&str, &str)> = direct
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("GINO_TASK_ID", "task-1"),
+                ("GINO_THREAD_ID", "th-1"),
+                ("GINO_AGENT_SOCK", "/ws/run/agent.sock"),
+                ("GINO_AGENT_TOKEN", "tok"),
+                ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
+            ]
+        );
     }
 
     #[test]
@@ -818,7 +854,7 @@ mod tests {
         )
         .unwrap();
         let wrapped = sandbox::wrap(
-            direct_launch(&settings, &args, Some("task-1"), None),
+            direct_launch(&settings, &args, Some("task-1"), None, None),
             &launch_context(&settings, &cfg),
             &isolation,
             &SandboxHost::fixture(None),

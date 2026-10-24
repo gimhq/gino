@@ -57,10 +57,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use crate::agent_api::{RunScope, RunToken, TokenRegistry};
 use crate::attachments::{AttachmentError, AttachmentManager, AttachmentSource};
 use crate::db::{Db, DbResult, ThreadRow};
 use crate::engine::{
-    Engine, EngineError, EngineEvent, EngineRegistry, LogLevel, RunStatus, Session, SessionCfg,
+    AgentApiAccess, Engine, EngineError, EngineEvent, EngineRegistry, LogLevel, RunStatus, Session,
+    SessionCfg,
 };
 use crate::failure::{
     AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
@@ -348,6 +350,26 @@ struct AttachmentRig {
     source: Arc<dyn AttachmentSource>,
 }
 
+/// The local agent API wired onto an executor: the registry run tokens are
+/// minted in and the host socket path handed to the engine.
+struct AgentApiRig {
+    registry: TokenRegistry,
+    socket: PathBuf,
+}
+
+/// A run's live API token; revoked on drop, so every exit path of a run
+/// (including an aborted future) releases it.
+struct RunTokenGuard {
+    registry: TokenRegistry,
+    token: RunToken,
+}
+
+impl Drop for RunTokenGuard {
+    fn drop(&mut self) {
+        self.registry.revoke(self.token.as_str());
+    }
+}
+
 /// The v2 pending-thread executor. Owns the engine, the DB handle, the
 /// workspace root, the watchdog config, and the currently-running thread (for
 /// graceful interrupt). The per-thread `seq` counter is persisted in
@@ -375,6 +397,9 @@ pub(crate) struct ThreadExecutor {
     /// to the host near-real-time during a long run instead of arriving in
     /// one batch after the whole drain.
     flush: Option<Arc<Notify>>,
+    /// The local agent API; `None` when it is not running. When present, each
+    /// run gets a token scoped to its task and thread for the run's lifetime.
+    agent_api: Option<AgentApiRig>,
 }
 
 impl std::fmt::Debug for ThreadExecutor {
@@ -406,6 +431,7 @@ impl ThreadExecutor {
             provisioning: None,
             shutdown: None,
             flush: None,
+            agent_api: None,
         }
     }
 
@@ -425,6 +451,14 @@ impl ThreadExecutor {
     /// unchanged.
     pub(crate) fn with_flush(mut self, flush: Arc<Notify>) -> Self {
         self.flush = Some(flush);
+        self
+    }
+
+    /// Wire the local agent API: each run registers a token for its task and
+    /// thread in `registry` before the engine starts and revokes it when the
+    /// run ends; the engine gets `socket` and the token.
+    pub(crate) fn with_agent_api(mut self, registry: TokenRegistry, socket: PathBuf) -> Self {
+        self.agent_api = Some(AgentApiRig { registry, socket });
         self
     }
 
@@ -628,6 +662,8 @@ impl ThreadExecutor {
                     .await;
             }
         };
+        // The run's API token, revoked when `token` drops.
+        let (token, agent_api) = self.issue_run_token(&thread).unzip();
         let cfg = SessionCfg {
             cwd,
             work_dir: thread.work_dir.as_deref().map(PathBuf::from),
@@ -640,6 +676,7 @@ impl ThreadExecutor {
             // that changes the model reaches the next run without disturbing the
             // one in flight — the same apply-on-next-run policy as `config_update`.
             model: task_model(&self.db, &thread.task_id),
+            agent_api,
             ..SessionCfg::default()
         };
         // Backend selection, in order: the TASK row's `engine` (the host's
@@ -687,6 +724,7 @@ impl ThreadExecutor {
         drop(stream);
         self.clear_active().await;
         drop(session);
+        drop(token);
 
         // 4. Collect output artifacts (A3) for a completed run, then finalize:
         // apply retry / resume-safety, persist, and emit the terminal result
@@ -694,6 +732,26 @@ impl ThreadExecutor {
         let outputs = self.collect_outbound(&thread, &conclusion).await;
         self.conclude(thread, conclusion, started, continuity, outputs)
             .await
+    }
+
+    /// Register an API token scoped to `thread`'s task and thread, returning
+    /// the guard that revokes it and the access handed to the engine. `None`
+    /// without the agent API.
+    fn issue_run_token(&self, thread: &ThreadRow) -> Option<(RunTokenGuard, AgentApiAccess)> {
+        let rig = self.agent_api.as_ref()?;
+        let token = rig.registry.register(RunScope {
+            task_id: thread.task_id.clone(),
+            thread_id: thread.id.clone(),
+        });
+        let access = AgentApiAccess {
+            socket: rig.socket.clone(),
+            token: token.as_str().to_owned(),
+        };
+        let guard = RunTokenGuard {
+            registry: rig.registry.clone(),
+            token,
+        };
+        Some((guard, access))
     }
 
     /// [`Self::finalize`] plus terminal-state provisioning cleanup:
