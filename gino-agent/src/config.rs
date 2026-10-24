@@ -32,6 +32,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::protocol::frames::ProvisioningEntry;
+use crate::sandbox::IsolationSpec;
 
 /// Default workspace directory (configurable; never a hardcoded Docker mount).
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
@@ -177,6 +178,8 @@ pub(crate) struct EngineConfig {
     pub(crate) allowed_tools: Vec<String>,
     /// Settings for the `codex` backend, namespaced under `engine.codex`.
     pub(crate) codex: CodexConfig,
+    /// Default engine isolation (`engine.isolation`); empty means off.
+    pub(crate) isolation: IsolationSpec,
 }
 
 /// Settings for the `codex` backend (`engine.codex`).
@@ -370,6 +373,7 @@ impl Config {
             model,
             allowed_tools,
             codex,
+            isolation,
         } = engine;
         overlay_secret(&mut self.engine.anthropic_api_key, anthropic_api_key);
         overlay_secret(
@@ -383,6 +387,9 @@ impl Config {
         }
 
         apply_codex_overlay(&mut self.engine.codex, codex);
+        if let Some(isolation) = isolation {
+            self.engine.isolation = isolation;
+        }
 
         let ExecutorOverlay {
             dispatched_timeout_secs,
@@ -587,6 +594,7 @@ struct EngineOverlay {
     model: Option<String>,
     allowed_tools: Option<Vec<String>>,
     codex: CodexOverlay,
+    isolation: Option<IsolationSpec>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -801,9 +809,12 @@ fn overlay_secret(dst: &mut Option<SecretString>, src: Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use secrecy::ExposeSecret;
 
     use super::{Config, ConfigError, ConfigOverlay};
+    use crate::sandbox::IsolationSpec;
 
     fn secret(config_secret: Option<&secrecy::SecretString>) -> Option<&str> {
         config_secret.map(ExposeSecret::expose_secret)
@@ -1013,6 +1024,85 @@ mod tests {
         assert_eq!(config.engine.codex.model.as_deref(), Some("gpt-5-codex"));
         assert_eq!(config.engine.codex.extra_args, ["--profile", "ci"]);
         assert_eq!(config.engine.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn isolation_defaults_to_an_empty_spec() {
+        let mut config = Config::default();
+        config.apply(ConfigOverlay::from_json(r#"{ "engine": { "model": "m" } }"#).unwrap());
+        assert_eq!(config.engine.isolation, IsolationSpec::default());
+        assert_eq!(config.engine.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn from_json_parses_the_isolation_block() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{
+                    "engine": {
+                        "model": "m",
+                        "isolation": {
+                            "mode": "sandbox",
+                            "network": { "mode": "full" },
+                            "readPaths": ["/data/ro"],
+                            "writePaths": ["/data/rw", "/data/cache"]
+                        }
+                    }
+                }"#,
+            )
+            .unwrap(),
+        );
+
+        let isolation = &config.engine.isolation;
+        assert_eq!(isolation.mode.as_deref(), Some("sandbox"));
+        assert_eq!(
+            isolation.network.as_ref().and_then(|n| n.mode.as_deref()),
+            Some("full")
+        );
+        assert_eq!(
+            isolation.read_paths.as_deref(),
+            Some(&[PathBuf::from("/data/ro")][..])
+        );
+        assert_eq!(
+            isolation.write_paths.as_deref(),
+            Some(&[PathBuf::from("/data/rw"), PathBuf::from("/data/cache")][..])
+        );
+        assert_eq!(config.engine.model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn an_isolation_block_replaces_the_earlier_one_wholesale() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{ "engine": { "isolation": { "mode": "sandbox", "readPaths": ["/data/ro"] } } }"#,
+            )
+            .unwrap(),
+        );
+        // An overlay without the block keeps it.
+        config.apply(ConfigOverlay::from_json(r#"{ "engine": { "model": "m" } }"#).unwrap());
+        assert_eq!(config.engine.isolation.mode.as_deref(), Some("sandbox"));
+        assert!(config.engine.isolation.read_paths.is_some());
+
+        // A new block replaces it, including fields it omits.
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{ "engine": { "isolation": { "network": { "mode": "none" } } } }"#,
+            )
+            .unwrap(),
+        );
+        assert!(config.engine.isolation.mode.is_none());
+        assert!(config.engine.isolation.read_paths.is_none());
+        assert_eq!(
+            config
+                .engine
+                .isolation
+                .network
+                .as_ref()
+                .and_then(|n| n.mode.as_deref()),
+            Some("none")
+        );
     }
 
     #[test]

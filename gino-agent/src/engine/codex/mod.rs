@@ -22,10 +22,9 @@ mod events;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +35,7 @@ use nix::unistd::Pid;
 use secrecy::ExposeSecret;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -44,6 +43,7 @@ use tracing::{debug, warn};
 use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
+use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext};
 
 /// Everything needed to build the `codex` argv, spawn the child, and resolve its
 /// environment. Built from the global [`Config`] via [`CodexSettings::from_config`];
@@ -92,6 +92,10 @@ pub(crate) struct CodexSettings {
     /// both the generic `ENGINE_CONFIG_DIR` and codex's own `CODEX_HOME` pointed
     /// here, so it reads the instruction file + skills the runner materialized.
     pub(crate) config_dir: Option<PathBuf>,
+    /// Default isolation (`engine.isolation`); empty means off.
+    pub(crate) isolation: IsolationSpec,
+    /// The daemon workspace dir, which isolation paths are checked against.
+    pub(crate) workspace_dir: PathBuf,
 }
 
 impl Default for CodexSettings {
@@ -106,6 +110,8 @@ impl Default for CodexSettings {
             extra_args: Vec::new(),
             env: Vec::new(),
             config_dir: None,
+            isolation: IsolationSpec::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 }
@@ -139,6 +145,8 @@ impl CodexSettings {
             extra_args: codex.extra_args.clone(),
             env,
             config_dir: None,
+            isolation: config.engine.isolation.clone(),
+            workspace_dir: config.paths.workspace_dir.clone(),
         }
     }
 }
@@ -337,44 +345,65 @@ impl StderrTail {
     }
 }
 
-/// Spawn the `codex exec` child, deliver the prompt, and wire the reader tasks.
+/// Env keys naming the engine config dir.
+const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["ENGINE_CONFIG_DIR", "CODEX_HOME"];
+
+/// The direct (unisolated) `codex exec` launch: binary, argv, env and cwd.
 ///
 /// `task_id`/`thread_id` (when present) are exported to the child as
 /// `GINO_TASK_ID`/`GINO_THREAD_ID`, and the runner's own path as
 /// `GINO_RUNNER_BIN`, so in-engine tooling can self-reference the task and
 /// re-invoke the runner without a hard-coded path.
-fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSession, EngineError> {
-    let argv = build_args(settings, cfg.resume.as_deref());
-
-    let mut command = Command::new(&settings.binary);
-    command
-        .args(&argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Captured: a child that dies at startup (bad args, auth failure) writes
-        // its reason to stderr only — the bounded tail is surfaced as a log event
-        // instead of vanishing into the daemon's inherited stderr.
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if !cfg.cwd.as_os_str().is_empty() {
-        command.current_dir(&cfg.cwd);
-    }
-    for (key, value) in &settings.env {
-        command.env(key, value);
-    }
+fn direct_launch(settings: &CodexSettings, cfg: &SessionCfg) -> Launch {
+    let mut env: Vec<(String, OsString)> = settings
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.into()))
+        .collect();
     // The provisioned engine config dir — both the generic var and codex's own.
-    for (key, value) in config_dir_env(settings) {
-        command.env(key, value);
-    }
+    env.extend(
+        config_dir_env(settings)
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.into())),
+    );
     if let Some(exe) = &settings.self_exe {
-        command.env("GINO_RUNNER_BIN", exe);
+        env.push(("GINO_RUNNER_BIN".to_owned(), exe.into()));
     }
     if let Some(task_id) = &cfg.task_id {
-        command.env("GINO_TASK_ID", task_id);
+        env.push(("GINO_TASK_ID".to_owned(), task_id.into()));
     }
     if let Some(thread_id) = &cfg.thread_id {
-        command.env("GINO_THREAD_ID", thread_id);
+        env.push(("GINO_THREAD_ID".to_owned(), thread_id.into()));
     }
+    Launch::direct(
+        settings.binary.clone(),
+        build_args(settings, cfg.resume.as_deref()),
+        env,
+        cfg.cwd.clone(),
+    )
+}
+
+/// The isolation inputs for one spawn.
+fn launch_context<'a>(settings: &'a CodexSettings, cfg: &'a SessionCfg) -> LaunchContext<'a> {
+    LaunchContext {
+        isolation: &settings.isolation,
+        task_override: cfg.isolation.as_ref(),
+        workspace_dir: &settings.workspace_dir,
+        work_dir: cfg.work_dir.as_deref(),
+        self_exe: settings.self_exe.as_deref(),
+        global_config_dir: settings.config_dir.as_deref(),
+        config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+    }
+}
+
+/// Spawn the `codex exec` child (directly or sandboxed, per the run's
+/// isolation), deliver the prompt, and wire the reader tasks.
+fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSession, EngineError> {
+    let launch = sandbox::launch(direct_launch(settings, cfg), &launch_context(settings, cfg))?;
+    // Stderr is captured: a child that dies at startup (bad args, auth failure)
+    // writes its reason to stderr only — the bounded tail is surfaced as a log
+    // event instead of vanishing into the daemon's inherited stderr.
+    let mut command = launch.command();
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
     let stdin = child
@@ -415,6 +444,7 @@ fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSess
     Ok(CodexSession {
         events: Mutex::new(Some(events_rx)),
         child: Arc::new(tokio::sync::Mutex::new(child)),
+        sandboxed: launch.sandboxed,
         tasks: vec![reader_handle],
     })
 }
@@ -501,6 +531,8 @@ async fn reader_task(
 pub(crate) struct CodexSession {
     events: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
     child: Arc<tokio::sync::Mutex<Child>>,
+    /// The child is `bwrap`; signals go to `sandbox-init` inside it.
+    sandboxed: bool,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -529,6 +561,12 @@ impl Session for CodexSession {
         };
         match i32::try_from(pid) {
             Ok(pid) => {
+                // `bwrap` does not forward signals; `sandbox-init` does.
+                let pid = if self.sandboxed {
+                    sandbox::sandbox_init_pid(pid).unwrap_or(pid)
+                } else {
+                    pid
+                };
                 if let Err(err) = kill(Pid::from_raw(pid), Signal::SIGINT) {
                     debug!(error = %err, "SIGINT to codex child failed; it is likely gone");
                 }
@@ -577,10 +615,154 @@ mod tests {
     use futures_util::StreamExt as _;
 
     use super::{
-        CodexEngine, CodexSettings, build_args, config_dir_env, effective_settings, is_available_in,
+        CodexEngine, CodexSettings, build_args, config_dir_env, direct_launch, effective_settings,
+        is_available_in, launch_context,
     };
     use crate::config::{Config, ConfigOverlay};
     use crate::engine::{Engine, EngineError, EngineEvent, RunStatus, Session, SessionCfg};
+    use crate::sandbox::{self, IsolationSpec, SandboxHost};
+
+    fn os_args(args: Vec<String>) -> Vec<std::ffi::OsString> {
+        args.into_iter().map(Into::into).collect()
+    }
+
+    #[test]
+    fn from_config_carries_isolation_and_workspace_dir() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(
+                r#"{ "engine": { "isolation": { "mode": "sandbox", "network": { "mode": "full" } } } }"#,
+            )
+            .expect("overlay"),
+        );
+        let settings = CodexSettings::from_config(&config);
+        assert_eq!(settings.isolation, config.engine.isolation);
+        assert_eq!(settings.isolation.mode.as_deref(), Some("sandbox"));
+        assert_eq!(settings.workspace_dir, config.paths.workspace_dir);
+        assert_eq!(
+            CodexSettings::from_config(&Config::default()).isolation,
+            IsolationSpec::default()
+        );
+    }
+
+    #[test]
+    fn off_launch_is_the_direct_spawn() {
+        let settings = CodexSettings {
+            self_exe: Some("/app/gino-agent".into()),
+            config_dir: Some("/ws/engine-config".into()),
+            ..CodexSettings::default()
+        };
+        let cfg = SessionCfg {
+            cwd: "/ws/threads/t1/project".into(),
+            work_dir: Some("/ws/threads/t1".into()),
+            task_id: Some("task-1".to_owned()),
+            resume: Some("thread-9".to_owned()),
+            ..SessionCfg::default()
+        };
+        let direct = direct_launch(&settings, &cfg);
+        assert_eq!(direct.program, Path::new("codex"));
+        assert_eq!(direct.cwd, cfg.cwd);
+        assert_eq!(
+            direct.args,
+            os_args(build_args(&settings, Some("thread-9")))
+        );
+        let env: Vec<(&str, &str)> = direct
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("ENGINE_CONFIG_DIR", "/ws/engine-config"),
+                ("CODEX_HOME", "/ws/engine-config"),
+                ("GINO_RUNNER_BIN", "/app/gino-agent"),
+                ("GINO_TASK_ID", "task-1"),
+            ]
+        );
+        let launched = sandbox::launch(direct.clone(), &launch_context(&settings, &cfg)).unwrap();
+        assert_eq!(launched, direct);
+    }
+
+    #[test]
+    fn sandboxed_launch_points_codex_home_at_the_engine_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bin_dir = root.join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let binary = executable_stub(bin_dir.join("codex"));
+        let work_dir = root.join("threads/t1");
+        let settings = CodexSettings {
+            self_exe: Some("/opt/gino/gino-agent".into()),
+            config_dir: Some(root.join("engine-config")),
+            isolation: IsolationSpec {
+                mode: Some("sandbox".to_owned()),
+                ..IsolationSpec::default()
+            },
+            workspace_dir: root.clone(),
+            ..CodexSettings::default()
+        };
+        let cfg = SessionCfg {
+            cwd: work_dir.join("project"),
+            work_dir: Some(work_dir.clone()),
+            ..SessionCfg::default()
+        };
+        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let wrapped = sandbox::wrap(
+            direct_launch(&settings, &cfg),
+            &launch_context(&settings, &cfg),
+            &isolation,
+            &SandboxHost::fixture(Some(bin_dir.into_os_string())),
+        )
+        .unwrap();
+
+        assert!(wrapped.sandboxed);
+        assert_eq!(wrapped.program, Path::new("/usr/bin/bwrap"));
+        let boundary = wrapped
+            .args
+            .iter()
+            .position(|a| a == "sandbox-init")
+            .unwrap();
+        assert_eq!(wrapped.args[boundary + 1], "--");
+        assert_eq!(wrapped.args[boundary + 2], binary.as_os_str());
+        assert_eq!(wrapped.args[boundary + 3], "--ask-for-approval");
+
+        let home = work_dir.join(".engine-home").into_os_string();
+        let value = |key: &str| {
+            wrapped
+                .env
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(value("ENGINE_CONFIG_DIR"), value("CODEX_HOME"));
+        assert_eq!(value("CODEX_HOME"), [home]);
+        assert_eq!(value("HOME"), ["/home/gino"]);
+        assert_eq!(value("TMPDIR"), ["/tmp"]);
+        assert_eq!(value("GINO_SANDBOX"), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_fails_before_spawning() {
+        let engine = CodexEngine::new(CodexSettings {
+            binary: PathBuf::from("/nonexistent/codex"),
+            isolation: IsolationSpec {
+                mode: Some("sandbox".to_owned()),
+                network: Some(crate::sandbox::NetworkSpec {
+                    mode: Some("allowlist".to_owned()),
+                }),
+                ..IsolationSpec::default()
+            },
+            ..CodexSettings::default()
+        });
+        let err = engine
+            .start_session(SessionCfg::default())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, EngineError::Isolation(_)), "{err:?}");
+    }
 
     /// Write an executable no-op stub at `path` and return it.
     fn executable_stub(path: PathBuf) -> PathBuf {

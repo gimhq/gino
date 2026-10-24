@@ -218,9 +218,12 @@ pub(crate) fn classify_engine_error(err: &EngineError) -> FailureReason {
         EngineError::Spawn(_) | EngineError::MissingPipe(_) | EngineError::Closed => {
             FailureReason::Agent(AgentFailure::ProcessFailure)
         }
-        // The runner built a control/input message that would not serialize:
-        // the runner's own request is malformed and would recur on resume.
-        EngineError::Serialize(_) => FailureReason::Runner(RunnerFailure::InvalidRequest),
+        // The runner built a control/input message that would not serialize, or
+        // the run's isolation is invalid or unusable: either would recur on
+        // retry and resume.
+        EngineError::Serialize(_) | EngineError::Isolation(_) => {
+            FailureReason::Runner(RunnerFailure::InvalidRequest)
+        }
     }
 }
 
@@ -331,6 +334,22 @@ mod tests {
         assert_eq!(
             classify_engine_error(&EngineError::Serialize(serialize)),
             FailureReason::Runner(RunnerFailure::InvalidRequest)
+        );
+        let isolation = crate::sandbox::IsolationError::UnknownMode("jail".to_owned());
+        assert_eq!(
+            classify_engine_error(&EngineError::Isolation(isolation)),
+            FailureReason::Runner(RunnerFailure::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn isolation_error_message_keeps_the_cause() {
+        let err = EngineError::from(crate::sandbox::IsolationError::UnknownMode(
+            "jail".to_owned(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "engine isolation: unknown isolation mode `jail`"
         );
     }
 }
