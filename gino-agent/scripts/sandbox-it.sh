@@ -56,6 +56,7 @@ docker run --rm \
   --security-opt "seccomp=$TMP/seccomp.json" \
   --security-opt apparmor=unconfined \
   --security-opt systempaths=unconfined \
+  --device /dev/net/tun \
   "${mounts[@]}" \
   -w "$WT/gino-agent" \
   -e CARGO_TERM_COLOR=never \

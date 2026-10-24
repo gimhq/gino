@@ -309,9 +309,10 @@ Isolation is **off by default**; with it off, launches are unchanged.
 
 **Requirements.** A Linux host; `bubblewrap` with `bwrap` on the daemon's `PATH`; unprivileged user
 namespaces enabled. Run the agent as a dedicated unprivileged user; a sandboxed run fails closed
-before spawn when the agent runs as root.
+before spawn when the agent runs as root. Network mode `allowlist` also needs `/dev/net/tun`.
 
-**Config.** The `engine.isolation` block (an overlay that sets it replaces the earlier block wholesale):
+**Config.** The `engine.isolation` block (without a local isolation file, an overlay that sets it
+replaces the earlier block wholesale; see *Local isolation file* below):
 
 ```json
 { "engine": { "isolation": {
@@ -338,9 +339,58 @@ before spawn when the agent runs as root.
   `full`) fails the run with "task meta.isolation would loosen `<setting>` from … to …; set
   engine.isolation.allowTaskOverride to allow this", before any not-supported check; neither value is used
   as a fallback. With `allowTaskOverride: true` the override wins as-is.
-- `vm` and `allowlist` fail the run with "`… is not supported yet`". Unknown values, an invalid path or a
+- `vm` fails the run with "`… is not supported yet`". Unknown values, an invalid path or a
   malformed `meta.isolation` also fail the run. All of these are classified as `runner.invalid_request` (§6) and
   are not retried.
+
+**Local isolation file.** `GINO_ISOLATION_FILE` (env only, no CLI flag) names an agent-local file
+holding the `engine.isolation` block as a JSON object. It is read in `ConfigOverlay::paths_from_env`, so
+both the daemon and `gino-agent login` fail at startup on a missing, malformed or invalid file; the
+error names the path, and an invalid rule also names its index (`rule <n>: …`). The file is the
+**floor**: it becomes the default, and a host `engine.isolation` overlay is layered on the floor (not on
+the previous host block) and may only tighten `mode` (`off` < `sandbox`) and `network.mode` (`full` <
+`allowlist` < `none`). A loosening value, and any host `network.allow`, `readPaths`, `writePaths` or
+`allowTaskOverride`, is ignored with one warning per field. Without a file the host block replaces the
+default as before. The host does not send an `engine.isolation` block yet, so today the file plus task
+`meta.isolation` (under the tighten-only rules above) are the only inputs.
+
+**Allowlist.** `network.mode: "allowlist"` gives the engine a network that reaches only listed
+destinations:
+
+```json
+{ "mode": "sandbox", "network": { "mode": "allowlist", "allow": [
+  { "host": "registry.npmjs.org", "ports": [443] },
+  { "host": "*.github.com", "ports": [443, 22] },
+  { "cidr": "10.20.0.0/16", "ports": "*", "proto": "udp" }
+] } }
+```
+
+- Each rule has exactly one of `host` (an exact name, or `*.suffix` matching strict subdomains only) or
+  `cidr` (IPv4/IPv6 `addr/prefix`, matched against literal-IP destinations). `ports` is a non-empty list
+  of non-zero ports or `"*"`; `proto` is `tcp` (default) or `udp`. The first matching rule wins.
+- Rules come only from the config default (the local file); `network.allow` in task `meta.isolation` is
+  dropped. A task override may still switch the network mode (tighten-only unless `allowTaskOverride`).
+- **LLM endpoint, always allowed** (TCP): the host and port of `ANTHROPIC_BASE_URL`, else
+  `api.anthropic.com:443`. A loopback base URL (`localhost`, or a loopback / unspecified IP) is
+  rewritten for the engine to `10.0.2.2` with the same scheme, userinfo, port, path and query; only that
+  gateway port is forwarded to the host loopback address. A non-loopback IP literal is allowed as that exact address and
+  port. An always-allowed endpoint is exempt from the private-address refusal (e.g. an LLM proxy on the
+  LAN) for its exact host:port; loopback and unspecified addresses stay refused. `full` mode keeps the
+  original URL.
+- **DNS.** The engine's `resolv.conf` is `nameserver 10.0.2.2`. Allowed names get a stable fake IPv4
+  address from `198.18.0.0/15`, which the exit maps back to the name; the real address is resolved on the
+  host. Names matched by neither a host rule nor the LLM endpoint get NXDOMAIN. IPv4 only: `AAAA` (and
+  other types) for an allowed name get no data.
+- **Refusal.** A flow is decided before the guest handshake completes and, when allowed, only after the
+  host connect succeeded; a refused TCP flow gets an RST, a refused UDP flow an ICMP port unreachable —
+  never accept-then-close. Private, loopback, link-local and other reserved destinations (also when a
+  name resolves to one; IPv4-mapped/NAT64/6to4 forms checked as IPv4) are refused unless a `cidr` rule
+  covers them.
+- **Limits** per run: 256 live TCP connections, 1024 UDP flows, 128 KiB TCP buffers.
+- **Decision log.** Every flow logs one `network decision` event on target `gino_agent::net` with
+  `thread_id`, `proto`, `target_name` (`-` when unknown), `target_ip`, `port` and `decision`: `allow`
+  (info, `rule_index` or `always`), `deny` (warn, `reason`), or `refused` for an allowed flow that still
+  failed (warn, `reject_kind` = `limit` / `reset` / `unreachable`, `reason`).
 
 **Launch chain.** daemon → `bwrap` → `gino-agent sandbox-init` (pid 1) → engine.
 
@@ -353,6 +403,14 @@ before spawn when the agent runs as root.
   **125** with a `sandbox-init: …` line on stderr.
 - `bwrap` does not forward signals, so `sandbox-init` forwards SIGINT/SIGTERM to the engine; the codex
   interrupt (§9c) SIGINTs `sandbox-init` rather than `bwrap`.
+- **Allowlist only:** the daemon creates a private 0700 per-run dir (`$TMPDIR/gino-net-<uuid>`) with the
+  control socket and `resolv.conf`. `bwrap` additionally gets `--cap-add CAP_NET_ADMIN`,
+  `--dev-bind /dev/net/tun`, that `resolv.conf` read-only, and the socket at `/run/gino/ctl.sock`.
+  `sandbox-init --ctl-sock` creates `gino0` (`10.0.2.15/24`, gateway `10.0.2.2`), sends its fd to the
+  daemon, closes it and waits for the daemon's ready byte before dropping capabilities and starting the
+  engine; any failure exits 125. The daemon receives the fd, starts the run's user-space exit and releases
+  the engine (30 s timeout); a setup failure kills the sandbox and fails the run with "engine sandbox
+  network setup failed: …". The exit lives as long as the session.
 - The stdio stream and the claude control protocol are unchanged.
 - The engine binary is resolved on the daemon's `PATH` and canonicalized; its install dir is bound
   read-only unless it is under `/usr`, and so is the agent binary. An engine that needs files elsewhere
@@ -383,13 +441,19 @@ available inside the sandbox".
 
 **Network.** `none`: own network namespace with loopback only. `full`: the host network
 (`--share-net`); when `/etc/resolv.conf` links outside `/etc`, its target is bound read-only.
+`allowlist`: own namespace whose default route is the TUN device (see *Allowlist*).
 
 **Fail-closed.** The first sandboxed run resolves `bwrap` and probes it once per process (cached). If
 `bwrap` is missing or the probe fails, every sandboxed run fails with "engine sandbox is unavailable: …";
 it never falls back to running unconfined.
 
-**Testing.** Privileged integration tests live in `gino-agent/scripts/sandbox-it.sh` (a sibling container
-with a custom seccomp profile, running as a non-root user) and are switched on by `GINO_SANDBOX_IT=1`.
+**Testing.** Privileged integration tests (`tests/sandbox.rs`, `#[ignore]` and gated on
+`GINO_SANDBOX_IT=1`) run via `gino-agent/scripts/sandbox-it.sh`: it builds as root in a sibling container
+with the moby seccomp profile extended for user namespaces, `/dev/net/tun` and unconfined
+AppArmor/system paths, then runs the tests as uid 1000. The real-engine e2e
+`SANDBOX_NETWORK=none|allowlist|full ./e2e/run-real-sandbox.sh` (default `none`; `--smoke` skips the
+model call) drives the real claude CLI in the sandbox through the host `/llm` proxy; exit 3 means
+Anthropic was reached but rate-limited.
 
 ## 10. Transport & protocol
 
