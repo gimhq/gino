@@ -78,13 +78,30 @@ impl UpstreamError {
 }
 
 /// True for private, loopback, link-local, documentation, benchmarking,
-/// multicast and reserved addresses. IPv4-mapped and IPv4-compatible IPv6
-/// addresses are checked as their IPv4 form.
+/// multicast and reserved addresses. IPv4-mapped, IPv4-compatible, NAT64
+/// (`64:ff9b::/96`) and 6to4 (`2002::/16`) IPv6 addresses are checked as
+/// their embedded IPv4 address.
 pub fn is_forbidden(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_forbidden(v4),
         // `to_ipv4` also maps `::` and `::1`, which land in 0.0.0.0/8.
-        IpAddr::V6(v6) => v6.to_ipv4().map_or_else(|| v6_forbidden(v6), v4_forbidden),
+        IpAddr::V6(v6) => v6
+            .to_ipv4()
+            .or_else(|| embedded_v4(v6))
+            .map_or_else(|| v6_forbidden(v6), v4_forbidden),
+    }
+}
+
+/// The IPv4 address carried by a NAT64 well-known-prefix or 6to4 address.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let o = ip.octets();
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]))
+    } else if s[0] == 0x2002 {
+        Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]))
+    } else {
+        None
     }
 }
 
@@ -443,6 +460,10 @@ mod tests {
             "::ffff:10.0.0.1",
             "::ffff:127.0.0.1",
             "::10.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::7f00:1",
+            "2002:a00:1::1",
+            "2002:c0a8:101::",
         ];
         for ip in forbidden6 {
             assert!(is_forbidden(v6(ip)), "{ip}");
@@ -453,6 +474,8 @@ mod tests {
             "fbff::1",
             "2001:db9::1",
             "64:ff9b:2::1",
+            "64:ff9b::1.1.1.1",
+            "2002:101:101::1",
             "::ffff:1.1.1.1",
         ];
         for ip in allowed6 {
