@@ -15,6 +15,7 @@ pub(crate) mod init;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -24,9 +25,16 @@ use self::bwrap::{
     prepare_engine_home, resolve_binary,
 };
 use crate::engine::EngineError;
+use crate::net::rules::{AlwaysAllow, Rule, RuleError, RuleSet};
 
 /// Sandbox `$HOME` when the daemon has none.
 const DEFAULT_SANDBOX_HOME: &str = "/home/gino";
+
+/// Env var naming the LLM API the engine talks to.
+const LLM_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+
+/// LLM API endpoint always allowed when no base URL is set.
+const DEFAULT_LLM_HOST: &str = "api.anthropic.com";
 
 /// How an engine run is isolated from the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +58,8 @@ pub(crate) enum NetworkMode {
     None,
     /// The host's network, unrestricted.
     Full,
+    /// Only the destinations in [`Isolation::allowlist`].
+    Allowlist,
 }
 
 /// Raw isolation block, as found in config (`engine.isolation`) or a task
@@ -70,18 +80,40 @@ pub(crate) struct IsolationSpec {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct NetworkSpec {
     pub(crate) mode: Option<String>,
+    /// Allowlist rules; read from the config default only.
+    pub(crate) allow: Option<Vec<Rule>>,
 }
 
 /// Resolved isolation for one run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Isolation {
     pub(crate) mode: IsolationMode,
     pub(crate) network: NetworkMode,
+    /// Compiled rules when the network mode is allowlist.
+    pub(crate) allowlist: Option<Arc<RuleSet>>,
     /// Extra host paths mounted read-only.
     pub(crate) read_paths: Vec<PathBuf>,
     /// Extra host paths mounted read-write.
     pub(crate) write_paths: Vec<PathBuf>,
 }
+
+/// Compares the allowlist by identity.
+impl PartialEq for Isolation {
+    fn eq(&self, other: &Self) -> bool {
+        let same_allowlist = match (&self.allowlist, &other.allowlist) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.mode == other.mode
+            && self.network == other.network
+            && same_allowlist
+            && self.read_paths == other.read_paths
+            && self.write_paths == other.write_paths
+    }
+}
+
+impl Eq for Isolation {}
 
 impl Isolation {
     /// No isolation: the engine runs directly on the host.
@@ -89,6 +121,7 @@ impl Isolation {
         Self {
             mode: IsolationMode::Off,
             network: NetworkMode::None,
+            allowlist: None,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
         }
@@ -114,6 +147,10 @@ pub(crate) enum IsolationError {
     },
     #[error("invalid isolation path `{}`: {reason}", path.display())]
     InvalidPath { path: PathBuf, reason: &'static str },
+    #[error("invalid network allowlist: {0}")]
+    InvalidAllowlist(#[source] RuleError),
+    #[error("invalid {LLM_BASE_URL_ENV} for the network allowlist")]
+    InvalidBaseUrl,
     #[error("invalid isolation in task meta: {0}")]
     InvalidTaskMeta(#[source] serde_json::Error),
     #[error("engine sandbox is unavailable: {0}")]
@@ -125,13 +162,15 @@ pub(crate) enum IsolationError {
 /// Resolve the effective isolation for a run.
 ///
 /// The override's `mode` and `network.mode` win over the default's; extra paths
-/// come from the config default only. Unless the default sets
-/// `allowTaskOverride`, an override may only tighten the default. When the
-/// resolved mode is off nothing else is validated.
+/// and allowlist rules come from the config default only. Unless the default
+/// sets `allowTaskOverride`, an override may only tighten the default. When the
+/// resolved mode is off nothing else is validated. An allowlist also admits the
+/// LLM endpoint at `llm_base_url` (default `api.anthropic.com:443`).
 pub(crate) fn resolve(
     default: &IsolationSpec,
     task_override: Option<&IsolationSpec>,
     workspace_dir: &Path,
+    llm_base_url: Option<&str>,
 ) -> Result<Isolation, IsolationError> {
     if let Some(task) = task_override
         && !default.allow_task_override.unwrap_or(false)
@@ -155,12 +194,12 @@ pub(crate) fn resolve(
     let network = match network {
         None | Some("none") => NetworkMode::None,
         Some("full") => NetworkMode::Full,
-        Some("allowlist") => {
-            return Err(IsolationError::NotSupported(
-                "isolation.network.mode: allowlist".into(),
-            ));
-        }
+        Some("allowlist") => NetworkMode::Allowlist,
         Some(other) => return Err(IsolationError::UnknownNetworkMode(other.to_owned())),
+    };
+    let allowlist = match network {
+        NetworkMode::Allowlist => Some(allowlist(default, llm_base_url)?),
+        NetworkMode::None | NetworkMode::Full => None,
     };
 
     let workspace = normalize(workspace_dir);
@@ -170,9 +209,49 @@ pub(crate) fn resolve(
     Ok(Isolation {
         mode,
         network,
+        allowlist,
         read_paths,
         write_paths,
     })
+}
+
+/// Compile the config default's allow rules plus the always-allowed LLM endpoint.
+fn allowlist(
+    default: &IsolationSpec,
+    llm_base_url: Option<&str>,
+) -> Result<Arc<RuleSet>, IsolationError> {
+    let endpoint = llm_endpoint(llm_base_url)?;
+    let rules = default
+        .network
+        .as_ref()
+        .and_then(|n| n.allow.as_deref())
+        .unwrap_or_default();
+    RuleSet::compile(rules, &[endpoint])
+        .map(Arc::new)
+        .map_err(IsolationError::InvalidAllowlist)
+}
+
+/// The LLM API endpoint: `llm_base_url`'s host and port, else the default host.
+fn llm_endpoint(llm_base_url: Option<&str>) -> Result<AlwaysAllow, IsolationError> {
+    match llm_base_url {
+        Some(url) => AlwaysAllow::from_url(url).ok_or(IsolationError::InvalidBaseUrl),
+        None => Ok(AlwaysAllow {
+            host: DEFAULT_LLM_HOST.to_owned(),
+            port: 443,
+        }),
+    }
+}
+
+/// `ANTHROPIC_BASE_URL` as the engine sees it: the launch env, else the
+/// inherited one. Empty means unset.
+fn llm_base_url(env: &[(String, OsString)]) -> Option<String> {
+    env.iter()
+        .rev()
+        .find(|(key, _)| key == LLM_BASE_URL_ENV)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os(LLM_BASE_URL_ENV))
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.is_empty())
 }
 
 /// Fail when `task` would loosen `default`'s mode or network mode.
@@ -234,15 +313,22 @@ fn loosens(setting: &'static str, from: &str, to: &str) -> IsolationError {
 ///
 /// Missing, non-JSON or non-object meta, or meta without an `isolation` key,
 /// means no override; an `isolation` value of the wrong shape is an error.
+/// `network.allow` is dropped: allowlist rules never come from a task.
 pub(crate) fn override_from_meta(
     meta: Option<&str>,
 ) -> Result<Option<IsolationSpec>, IsolationError> {
     let Some(Ok(serde_json::Value::Object(mut map))) = meta.map(serde_json::from_str) else {
         return Ok(None);
     };
-    let Some(value) = map.remove("isolation") else {
+    let Some(mut value) = map.remove("isolation") else {
         return Ok(None);
     };
+    if let Some(network) = value
+        .get_mut("network")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        network.remove("allow");
+    }
     serde_json::from_value(value)
         .map(Some)
         .map_err(IsolationError::InvalidTaskMeta)
@@ -363,17 +449,30 @@ impl SandboxHost {
 }
 
 /// Resolve the run's isolation and build its launch: `direct` as-is when off,
-/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root
-/// or `bwrap` is unusable.
+/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root,
+/// `bwrap` is unusable or the network mode is allowlist, which the sandbox
+/// cannot enforce yet.
 pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, EngineError> {
     launch_as(direct, ctx, nix::unistd::geteuid().as_raw())
 }
 
 fn launch_as(direct: Launch, ctx: &LaunchContext<'_>, euid: u32) -> Result<Launch, EngineError> {
-    let isolation = resolve(ctx.isolation, ctx.task_override, ctx.workspace_dir)?;
+    let base_url = llm_base_url(&direct.env);
+    let isolation = resolve(
+        ctx.isolation,
+        ctx.task_override,
+        ctx.workspace_dir,
+        base_url.as_deref(),
+    )?;
     match isolation.mode {
         IsolationMode::Off => Ok(direct),
         IsolationMode::Sandbox => {
+            if isolation.network == NetworkMode::Allowlist {
+                return Err(IsolationError::NotSupported(
+                    "launching with isolation.network.mode: allowlist".into(),
+                )
+                .into());
+            }
             check_not_root(euid)?;
             let bwrap = bwrap::ensure_available()?;
             wrap(direct, ctx, &isolation, &SandboxHost::current(bwrap))
@@ -548,9 +647,10 @@ mod tests {
     use super::{
         Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
         NetworkMode, NetworkSpec, SandboxHost, check_not_root, first_child, launch, launch_as,
-        override_from_meta, resolve, sandbox_init_pid, stat_ppid, wrap,
+        llm_endpoint, override_from_meta, resolve, sandbox_init_pid, stat_ppid, wrap,
     };
     use crate::engine::EngineError;
+    use crate::net::rules::{AlwaysAllow, Decision, Proto, RuleError, RuleSet};
 
     const WORKSPACE: &str = "/var/lib/gino-agent";
 
@@ -559,6 +659,7 @@ mod tests {
             mode: mode.map(str::to_owned),
             network: network.map(|n| NetworkSpec {
                 mode: Some(n.to_owned()),
+                ..NetworkSpec::default()
             }),
             ..IsolationSpec::default()
         }
@@ -579,7 +680,7 @@ mod tests {
         default: &IsolationSpec,
         task: Option<&IsolationSpec>,
     ) -> Result<Isolation, IsolationError> {
-        resolve(default, task, Path::new(WORKSPACE))
+        resolve(default, task, Path::new(WORKSPACE), None)
     }
 
     fn path_error(path: &str) -> IsolationError {
@@ -740,13 +841,20 @@ mod tests {
     #[test]
     fn network_override_may_only_tighten() {
         use IsolationMode::Sandbox;
-        use NetworkMode::{Full, None as NoNet};
+        use NetworkMode::{Allowlist, Full, None as NoNet};
 
         let sandbox = |network| spec(Some("sandbox"), network);
         let net = |network| spec(None, Some(network));
 
         // Tightening.
-        assert_not_supported(outcome(&sandbox(Some("full")), &net("allowlist")));
+        assert_eq!(
+            outcome(&sandbox(Some("full")), &net("allowlist")).unwrap(),
+            (Sandbox, Allowlist)
+        );
+        assert_eq!(
+            outcome(&sandbox(Some("allowlist")), &net("allowlist")).unwrap(),
+            (Sandbox, Allowlist)
+        );
         assert_eq!(
             outcome(&sandbox(Some("full")), &net("none")).unwrap(),
             (Sandbox, NoNet)
@@ -791,7 +899,10 @@ mod tests {
             outcome(&allow("none"), &net("full")).unwrap(),
             (IsolationMode::Sandbox, NetworkMode::Full)
         );
-        assert_not_supported(outcome(&allow("none"), &net("allowlist")));
+        assert_eq!(
+            outcome(&allow("none"), &net("allowlist")).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::Allowlist)
+        );
         assert_eq!(
             outcome(&allow("allowlist"), &net("full")).unwrap(),
             (IsolationMode::Sandbox, NetworkMode::Full)
@@ -806,16 +917,13 @@ mod tests {
     fn an_off_default_accepts_any_override_network() {
         for default in [IsolationSpec::default(), spec(Some("off"), Some("none"))] {
             for (network, expected) in [
-                (None, Ok(NetworkMode::None)),
-                (Some("none"), Ok(NetworkMode::None)),
-                (Some("full"), Ok(NetworkMode::Full)),
-                (Some("allowlist"), Err(())),
+                (None, NetworkMode::None),
+                (Some("none"), NetworkMode::None),
+                (Some("full"), NetworkMode::Full),
+                (Some("allowlist"), NetworkMode::Allowlist),
             ] {
                 let result = outcome(&default, &spec(Some("sandbox"), network));
-                match expected {
-                    Ok(net) => assert_eq!(result.unwrap(), (IsolationMode::Sandbox, net)),
-                    Err(()) => assert_not_supported(result),
-                }
+                assert_eq!(result.unwrap(), (IsolationMode::Sandbox, expected));
             }
         }
     }
@@ -914,14 +1022,188 @@ mod tests {
     }
 
     #[test]
-    fn vm_and_allowlist_are_not_supported_yet() {
+    fn vm_is_not_supported_yet() {
         let err = run(&spec(Some("vm"), None), None).unwrap_err();
         assert!(matches!(err, IsolationError::NotSupported(_)), "{err:?}");
         assert!(err.to_string().ends_with("is not supported yet"), "{err}");
+    }
 
-        let err = run(&spec(Some("sandbox"), Some("allowlist")), None).unwrap_err();
-        assert!(matches!(err, IsolationError::NotSupported(_)), "{err:?}");
-        assert!(err.to_string().ends_with("is not supported yet"), "{err}");
+    /// `spec` with `network.allow` set from a JSON rule list.
+    fn with_rules(mut spec: IsolationSpec, rules: &str) -> IsolationSpec {
+        spec.network.get_or_insert_with(NetworkSpec::default).allow =
+            Some(serde_json::from_str(rules).unwrap());
+        spec
+    }
+
+    fn allowlist_of(iso: &Isolation) -> &RuleSet {
+        assert_eq!(iso.network, NetworkMode::Allowlist);
+        iso.allowlist.as_deref().unwrap()
+    }
+
+    const ANY_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+
+    fn allows(rules: &RuleSet, name: &str, port: u16) -> bool {
+        matches!(
+            rules.decide(Some(name), ANY_IP, port, Proto::Tcp),
+            Decision::Allow { .. }
+        )
+    }
+
+    #[test]
+    fn meta_allowlist_tightens_an_off_default() {
+        let task = override_from_meta(Some(
+            r#"{ "isolation": { "mode": "sandbox", "network": { "mode": "allowlist" } } }"#,
+        ))
+        .unwrap()
+        .unwrap();
+        for default in [IsolationSpec::default(), spec(Some("off"), Some("none"))] {
+            let iso = run(&default, Some(&task)).unwrap();
+            assert_eq!(iso.mode, IsolationMode::Sandbox);
+            assert!(allows(allowlist_of(&iso), "api.anthropic.com", 443));
+        }
+    }
+
+    #[test]
+    fn meta_allow_rules_are_ignored() {
+        for allow in [
+            r#"[{ "host": "evil.example", "ports": "*" }]"#,
+            r#"[{ "host": "bad host", "ports": [] }]"#,
+            "5",
+        ] {
+            let meta = format!(
+                r#"{{ "isolation": {{ "mode": "sandbox",
+                    "network": {{ "mode": "allowlist", "allow": {allow} }} }} }}"#
+            );
+            let task = override_from_meta(Some(&meta)).unwrap().unwrap();
+            assert_eq!(task.network.as_ref().unwrap().allow, None, "{meta}");
+            let iso = run(&IsolationSpec::default(), Some(&task)).unwrap();
+            assert!(!allowlist_of(&iso).name_allowed("evil.example"), "{meta}");
+        }
+        // An override built in memory with rules still gets none of them.
+        let task = with_rules(
+            spec(Some("sandbox"), Some("allowlist")),
+            r#"[{ "host": "evil.example", "ports": "*" }]"#,
+        );
+        let iso = run(&IsolationSpec::default(), Some(&task)).unwrap();
+        assert!(!allowlist_of(&iso).name_allowed("evil.example"));
+    }
+
+    #[test]
+    fn allowlist_holds_only_the_llm_endpoint_without_config_rules() {
+        let iso = run(&spec(Some("sandbox"), Some("allowlist")), None).unwrap();
+        let rules = allowlist_of(&iso);
+        assert_eq!(
+            rules.decide(Some("api.anthropic.com"), ANY_IP, 443, Proto::Tcp),
+            Decision::Allow { rule_index: None }
+        );
+        assert!(!allows(rules, "api.anthropic.com", 80));
+        assert!(!allows(rules, "example.com", 443));
+        assert!(!rules.name_allowed("example.com"));
+        assert_eq!(rules.cidr_covers(ANY_IP, 443, Proto::Tcp), None);
+    }
+
+    #[test]
+    fn allowlist_adds_the_config_rules() {
+        let default = with_rules(
+            spec(Some("sandbox"), Some("allowlist")),
+            r#"[{ "host": "*.pypi.org", "ports": [443] }]"#,
+        );
+        let iso = run(&default, Some(&spec(None, Some("allowlist")))).unwrap();
+        let rules = allowlist_of(&iso);
+        assert!(allows(rules, "files.pypi.org", 443));
+        assert!(allows(rules, "api.anthropic.com", 443));
+        assert!(!allows(rules, "example.com", 443));
+    }
+
+    #[test]
+    fn config_rules_only_matter_for_allowlist() {
+        let bad = r#"[{ "host": "bad host", "ports": "*" }]"#;
+        for network in [None, Some("none"), Some("full")] {
+            let default = with_rules(spec(Some("sandbox"), network), bad);
+            let iso = run(&default, None).unwrap();
+            assert!(iso.allowlist.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_config_rule_is_rejected_with_its_index() {
+        let default = with_rules(
+            spec(Some("sandbox"), Some("allowlist")),
+            r#"[{ "host": "ok.example", "ports": "*" }, { "host": "bad host", "ports": "*" }]"#,
+        );
+        let err = run(&default, None).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                IsolationError::InvalidAllowlist(RuleError::Host { index: 1, .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("rule 1"), "{err}");
+    }
+
+    #[test]
+    fn llm_endpoint_follows_the_base_url() {
+        let endpoint = |url| llm_endpoint(url).unwrap();
+        let expect = |host: &str, port| AlwaysAllow {
+            host: host.to_owned(),
+            port,
+        };
+        assert_eq!(endpoint(None), expect("api.anthropic.com", 443));
+        assert_eq!(
+            endpoint(Some("https://proxy.example")),
+            expect("proxy.example", 443)
+        );
+        assert_eq!(
+            endpoint(Some("https://proxy.example:8443/v1")),
+            expect("proxy.example", 8443)
+        );
+        assert_eq!(
+            endpoint(Some("http://proxy.example/anthropic")),
+            expect("proxy.example", 80)
+        );
+        assert_eq!(
+            endpoint(Some("HTTP://user:pw@proxy.example:8080?x=1")),
+            expect("proxy.example", 8080)
+        );
+        for url in [
+            "proxy.example",
+            "ftp://proxy.example",
+            "https://",
+            "https://proxy.example:",
+            "https://proxy.example:99999",
+        ] {
+            let err = llm_endpoint(Some(url)).unwrap_err();
+            assert!(matches!(err, IsolationError::InvalidBaseUrl), "{url}");
+            assert!(!err.to_string().contains(url), "{err}");
+        }
+    }
+
+    #[test]
+    fn allowlist_admits_the_base_url_endpoint() {
+        let default = spec(Some("sandbox"), Some("allowlist"));
+        let iso = resolve(
+            &default,
+            None,
+            Path::new(WORKSPACE),
+            Some("http://proxy.example:8080"),
+        )
+        .unwrap();
+        let rules = allowlist_of(&iso);
+        assert!(allows(rules, "proxy.example", 8080));
+        assert!(!allows(rules, "api.anthropic.com", 443));
+    }
+
+    #[test]
+    fn isolation_spec_reads_network_allow() {
+        let spec: IsolationSpec = serde_json::from_str(
+            r#"{ "mode": "sandbox", "network": { "mode": "allowlist",
+                 "allow": [{ "host": "pypi.org", "ports": [443] }] } }"#,
+        )
+        .unwrap();
+        let allow = spec.network.unwrap().allow.unwrap();
+        assert_eq!(allow.len(), 1);
+        assert_eq!(allow[0].host.as_deref(), Some("pypi.org"));
     }
 
     #[test]
@@ -1129,6 +1411,25 @@ mod tests {
             "engine sandbox is unavailable: the agent runs as root; run it as an unprivileged user"
         );
         check_not_root(1000).unwrap();
+    }
+
+    #[test]
+    fn allowlist_launch_fails_closed() {
+        let d = direct(Path::new("/ws/threads/t1/project"));
+        let task = spec(Some("sandbox"), Some("allowlist"));
+        for euid in [0, 1000] {
+            let err = launch_as(
+                d.clone(),
+                &ctx(&IsolationSpec::default(), Some(&task), None, None),
+                euid,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, EngineError::Isolation(IsolationError::NotSupported(m))
+                    if m.contains("allowlist")),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
