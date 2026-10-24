@@ -27,6 +27,7 @@ mod provisioning;
 mod register;
 mod remote_ops;
 mod runner;
+mod sandbox;
 mod scheduler;
 mod transport;
 
@@ -98,6 +99,10 @@ enum Command {
     /// Inspect this agent's execution threads.
     #[command(subcommand)]
     Thread(gino_cli::ThreadCommand),
+    /// First process inside the engine sandbox: drops to a non-root uid and
+    /// supervises the engine.
+    #[command(hide = true)]
+    SandboxInit(sandbox::init::SandboxInitArgs),
 }
 
 /// Parse CLI arguments, install logging, and dispatch the selected subcommand.
@@ -136,6 +141,7 @@ pub fn run() -> Result<()> {
         Command::Cron(cmd) => gino_cli::cron(cmd)?,
         Command::Task(cmd) => gino_cli::task(cmd)?,
         Command::Thread(cmd) => gino_cli::thread(cmd)?,
+        Command::SandboxInit(args) => std::process::exit(sandbox::init::run(&args)),
     }
     Ok(())
 }
@@ -153,7 +159,8 @@ fn install_crypto_provider() {
 }
 
 /// The `archive` subcommand: read the PreCompact hook payload on stdin and write
-/// a Markdown archive + sessions index under the workspace `conversations` dir.
+/// a Markdown archive + sessions index under `GINO_ARCHIVE_DIR`, else the
+/// workspace `conversations` dir.
 ///
 /// This runs as a short-lived subprocess Claude spawns for its PreCompact hook,
 /// so it cannot reach host-assigned config; the workspace path is resolved from
@@ -161,8 +168,12 @@ fn install_crypto_provider() {
 /// or the built-in default. No network, no runtime needed.
 fn archive() -> Result<()> {
     let workspace_dir = env_path_or("GINO_WORKSPACE_DIR", |paths| paths.workspace_dir);
+    let conversations_dir = archive::conversations_dir(
+        std::env::var_os("GINO_ARCHIVE_DIR").map(std::path::PathBuf::from),
+        &workspace_dir,
+    );
     let stdin = std::io::stdin();
-    archive::run(&workspace_dir, stdin.lock()).context("archiving transcript")?;
+    archive::run(&conversations_dir, stdin.lock()).context("archiving transcript")?;
     Ok(())
 }
 
