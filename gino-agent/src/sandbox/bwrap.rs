@@ -24,6 +24,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bytes of probe stderr kept in the error detail.
 const STDERR_TAIL: usize = 512;
 
+/// In-sandbox path of the allowlist control socket.
+pub(crate) const CTL_SOCK: &str = "/run/gino/ctl.sock";
+
+/// Control socket file name in the per-run network dir.
+pub(crate) const CTL_SOCK_NAME: &str = "ctl.sock";
+
+/// `resolv.conf` file name in the per-run network dir.
+pub(crate) const RESOLV_CONF_NAME: &str = "resolv.conf";
+
 /// Shape of one host root entry such as `/bin`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RootEntry {
@@ -119,6 +128,9 @@ pub(crate) struct SandboxLayout {
     pub(crate) read_paths: Vec<PathBuf>,
     /// Extra host paths mounted read-write.
     pub(crate) write_paths: Vec<PathBuf>,
+    /// Per-run daemon dir holding the control socket and `resolv.conf`; set
+    /// in allowlist mode.
+    pub(crate) net_dir: Option<PathBuf>,
 }
 
 impl SandboxLayout {
@@ -225,6 +237,43 @@ fn tmpfs_shadows(layout: &SandboxLayout) -> Vec<PathBuf> {
     shadows
 }
 
+/// Let sandbox-init create the guest TUN device it hands to the daemon.
+fn push_tun(args: &mut Vec<OsString>) {
+    push(
+        args,
+        &[
+            "--cap-add".as_ref(),
+            "CAP_NET_ADMIN".as_ref(),
+            "--dev-bind".as_ref(),
+            "/dev/net/tun".as_ref(),
+            "/dev/net/tun".as_ref(),
+        ],
+    );
+}
+
+/// Bind the per-run `resolv.conf` and control socket from `net_dir`. The
+/// former lands where `/etc/resolv.conf` resolves, so a symlink out of /etc
+/// still reaches it.
+fn push_net_binds(args: &mut Vec<OsString>, net_dir: &Path, host: &HostRoot) {
+    let resolv = host
+        .resolv_conf_outside_etc
+        .as_deref()
+        .unwrap_or(Path::new("/etc/resolv.conf"));
+    let resolv_src = net_dir.join(RESOLV_CONF_NAME);
+    let ctl_src = net_dir.join(CTL_SOCK_NAME);
+    push(
+        args,
+        &[
+            "--ro-bind".as_ref(),
+            resolv_src.as_os_str(),
+            resolv.as_os_str(),
+            "--bind".as_ref(),
+            ctl_src.as_os_str(),
+            CTL_SOCK.as_ref(),
+        ],
+    );
+}
+
 /// Build the full `bwrap` argv (without the program) that runs `inner`.
 pub(crate) fn bwrap_args(
     layout: &SandboxLayout,
@@ -260,6 +309,9 @@ pub(crate) fn bwrap_args(
             layout.home.as_os_str(),
         ],
     );
+    if layout.net_dir.is_some() {
+        push_tun(&mut args);
+    }
     let shadows = tmpfs_shadows(layout);
     for shadow in &shadows {
         push(&mut args, &["--tmpfs".as_ref(), shadow.as_os_str()]);
@@ -271,6 +323,9 @@ pub(crate) fn bwrap_args(
         && let Some(resolved) = &host.resolv_conf_outside_etc
     {
         ro_bind(&mut args, resolved);
+    }
+    if let Some(net_dir) = &layout.net_dir {
+        push_net_binds(&mut args, net_dir, host);
     }
 
     if let Some(install_dir) = layout.engine_binary.parent()
@@ -508,6 +563,7 @@ mod tests {
             network: NetworkMode::None,
             read_paths: vec!["/data/ro1".into(), "/data/ro2".into()],
             write_paths: vec!["/data/rw1".into()],
+            net_dir: None,
         }
     }
 
@@ -592,6 +648,79 @@ mod tests {
         h.resolv_conf_outside_etc = None;
         let a = args(&l, &h);
         assert!(!a.iter().any(|x| x.contains("resolv")));
+    }
+
+    /// `args` with every occurrence of each `window` removed.
+    fn without(args: &[String], windows: &[&[&str]]) -> Vec<String> {
+        let mut out = args.to_vec();
+        for window in windows {
+            while let Some(at) = find(&out, window) {
+                out.drain(at..at + window.len());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn allowlist_adds_exactly_the_tun_resolv_and_control_socket_binds() {
+        let mut l = layout();
+        l.network = NetworkMode::Allowlist;
+        l.net_dir = Some("/tmp/gino-net-x".into());
+        let mut h = host();
+        h.resolv_conf_outside_etc = None;
+        let a = args(&l, &h);
+        let added: [&[&str]; 4] = [
+            &["--cap-add", "CAP_NET_ADMIN"],
+            &["--dev-bind", "/dev/net/tun", "/dev/net/tun"],
+            &[
+                "--ro-bind",
+                "/tmp/gino-net-x/resolv.conf",
+                "/etc/resolv.conf",
+            ],
+            &["--bind", "/tmp/gino-net-x/ctl.sock", "/run/gino/ctl.sock"],
+        ];
+        for window in added {
+            assert_eq!(a.windows(window.len()).filter(|w| *w == window).count(), 1);
+        }
+        // Own network namespace, devices after `--dev`, binds after /etc.
+        assert!(!a.iter().any(|x| x == "--share-net"));
+        assert!(pos(&a, &["--dev", "/dev"]) < pos(&a, added[1]));
+        assert!(pos(&a, &["--ro-bind", "/etc", "/etc"]) < pos(&a, added[2]));
+        assert!(pos(&a, added[3]) < pos(&a, &["--remount-ro", "/"]));
+        assert_eq!(a.iter().filter(|x| *x == "--cap-add").count(), 2);
+
+        let mut none = layout();
+        none.network = NetworkMode::None;
+        assert_eq!(without(&a, &added), args(&none, &h));
+    }
+
+    #[test]
+    fn allowlist_resolv_conf_lands_on_a_target_outside_etc() {
+        let mut l = layout();
+        l.network = NetworkMode::Allowlist;
+        l.net_dir = Some("/tmp/gino-net-x".into());
+        let a = args(&l, &host());
+        pos(
+            &a,
+            &[
+                "--ro-bind",
+                "/tmp/gino-net-x/resolv.conf",
+                "/run/systemd/resolve/stub-resolv.conf",
+            ],
+        );
+        assert!(!a.iter().any(|x| x == "/etc/resolv.conf"));
+        // The host's own resolver file is not mounted.
+        assert!(
+            find(
+                &a,
+                &[
+                    "--ro-bind",
+                    "/run/systemd/resolve/stub-resolv.conf",
+                    "/run/systemd/resolve/stub-resolv.conf"
+                ]
+            )
+            .is_none()
+        );
     }
 
     #[test]

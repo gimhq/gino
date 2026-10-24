@@ -43,7 +43,7 @@ use tracing::{debug, warn};
 use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
-use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext};
+use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext, NetExit};
 
 /// Everything needed to build the `codex` argv, spawn the child, and resolve its
 /// environment. Built from the global [`Config`] via [`CodexSettings::from_config`];
@@ -288,7 +288,7 @@ impl Engine for CodexEngine {
     /// rather than approximated.
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         let settings = effective_settings(&self.settings, &cfg);
-        let session = spawn_session(&settings, &cfg)?;
+        let session = spawn_session(&settings, &cfg).await?;
         Ok(Box::new(session))
     }
 }
@@ -389,6 +389,7 @@ fn launch_context<'a>(settings: &'a CodexSettings, cfg: &'a SessionCfg) -> Launc
         isolation: &settings.isolation,
         task_override: cfg.isolation.as_ref(),
         workspace_dir: &settings.workspace_dir,
+        thread_id: cfg.thread_id.as_deref(),
         work_dir: cfg.work_dir.as_deref(),
         self_exe: settings.self_exe.as_deref(),
         global_config_dir: settings.config_dir.as_deref(),
@@ -398,7 +399,10 @@ fn launch_context<'a>(settings: &'a CodexSettings, cfg: &'a SessionCfg) -> Launc
 
 /// Spawn the `codex exec` child (directly or sandboxed, per the run's
 /// isolation), deliver the prompt, and wire the reader tasks.
-fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSession, EngineError> {
+async fn spawn_session(
+    settings: &CodexSettings,
+    cfg: &SessionCfg,
+) -> Result<CodexSession, EngineError> {
     let launch = sandbox::launch(direct_launch(settings, cfg), &launch_context(settings, cfg))?;
     // Stderr is captured: a child that dies at startup (bad args, auth failure)
     // writes its reason to stderr only — the bounded tail is surfaced as a log
@@ -406,6 +410,7 @@ fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSess
     let mut command = launch.command();
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
+    let net = sandbox::start_network(launch.net, &mut child).await?;
     let stdin = child
         .stdin
         .take()
@@ -446,6 +451,7 @@ fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSess
         child: Arc::new(tokio::sync::Mutex::new(child)),
         sandboxed: launch.sandboxed,
         tasks: vec![reader_handle],
+        _net: net,
     })
 }
 
@@ -534,6 +540,8 @@ pub(crate) struct CodexSession {
     /// The child is `bwrap`; signals go to `sandbox-init` inside it.
     sandboxed: bool,
     tasks: Vec<JoinHandle<()>>,
+    /// Allowlist network exit; stops when the session is dropped.
+    _net: Option<NetExit>,
 }
 
 #[async_trait]
