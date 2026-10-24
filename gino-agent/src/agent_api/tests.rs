@@ -474,3 +474,353 @@ async fn server_lifecycle_permissions_and_operator_client() {
     assert!(matches!(err, ClientError::NotRunning(_)));
     assert_eq!(err.to_string(), "the agent is not running");
 }
+
+/// A handler fixture that keeps the db and nudge handles the server shares.
+struct Fixture {
+    _dir: TempDir,
+    shared: Arc<Shared>,
+    registry: TokenRegistry,
+    db: Arc<Mutex<Db>>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let (dir, ctx) = context();
+        let db = Arc::clone(&ctx.db);
+        let registry = TokenRegistry::default();
+        let shared = Arc::new(Shared::new(ctx, registry.clone()));
+        Self {
+            _dir: dir,
+            shared,
+            registry,
+            db,
+        }
+    }
+
+    fn operator(&self) -> Conn {
+        Conn::open(&self.shared, true)
+    }
+
+    /// A connection authenticated with a run token for `task`.
+    async fn run(&self, task: &str) -> Conn {
+        let token = self.registry.register(run_scope(task));
+        let mut conn = Conn::open(&self.shared, false);
+        let auth = conn.call("auth", json!({"token": token.as_str()})).await;
+        assert_eq!(auth["result"]["task_id"], task);
+        conn
+    }
+
+    /// `cron_state` outbox rows correlated to `cron_id`.
+    fn cron_states(&self, cron_id: &str) -> usize {
+        self.db
+            .lock()
+            .unwrap()
+            .list_unacked_outbox()
+            .unwrap()
+            .iter()
+            .filter(|r| r.msg_type == "cron_state" && r.thread_id.as_deref() == Some(cron_id))
+            .count()
+    }
+}
+
+fn task_json(id: &str) -> Value {
+    json!({"id": id, "name": format!("{id} name"), "kind": null, "status": "active", "created_at": TS})
+}
+
+fn thread_json(task: &str) -> Value {
+    json!({
+        "id": format!("{task}-thread"),
+        "task_id": task,
+        "status": "pending",
+        "source": "chat",
+        "attempt": 0,
+        "max_attempts": 3,
+        "engine_session_id": null,
+    })
+}
+
+fn cron_json(task: &str) -> Value {
+    json!({
+        "id": format!("{task}-cron"),
+        "task_id": task,
+        "kind": "schedule",
+        "status": "active",
+        "schedule_type": "interval",
+        "schedule_value": "60000",
+        "next_run": TS,
+        "last_fired_at": null,
+        "continuity": "isolated",
+        "run_count": 0,
+        "prompt": "tick",
+        "created_at": TS,
+        "updated_at": TS,
+    })
+}
+
+fn assert_error(response: &Value, code: &str, message: Option<&str>) {
+    assert_eq!(error_code(response), code, "{response}");
+    if let Some(message) = message {
+        assert_eq!(response["error"]["message"], message);
+    }
+}
+
+#[tokio::test]
+async fn task_methods_respect_scope() {
+    let fx = Fixture::new();
+    let mut op = fx.operator();
+    let list = conn_result(&mut op, "task.list", json!({})).await;
+    assert_eq!(
+        list,
+        json!({"tasks": [task_json("task-a"), task_json("task-b")]})
+    );
+    let show = conn_result(&mut op, "task.show", json!({"id": "task-b"})).await;
+    assert_eq!(
+        show,
+        json!({"task": task_json("task-b"), "threads": [thread_json("task-b")], "crons": [cron_json("task-b")]})
+    );
+    let missing = op.call("task.show", json!({"id": "nope"})).await;
+    assert_error(&missing, "not_found", Some("no such task: nope"));
+    let bad = op.call("task.show", json!({"id": 7})).await;
+    assert_error(&bad, "invalid_params", None);
+    let extra = op.call("task.list", json!({"x": 1})).await;
+    assert_error(&extra, "invalid_params", None);
+
+    let mut run = fx.run("task-a").await;
+    let list = conn_result(&mut run, "task.list", json!({})).await;
+    assert_eq!(list, json!({"tasks": [task_json("task-a")]}));
+    let show = conn_result(&mut run, "task.show", json!({"id": "task-a"})).await;
+    assert_eq!(show["task"], task_json("task-a"));
+    assert_eq!(show["threads"], json!([thread_json("task-a")]));
+    assert_eq!(show["crons"], json!([cron_json("task-a")]));
+    let other = run.call("task.show", json!({"id": "task-b"})).await;
+    assert_error(&other, "forbidden", None);
+}
+
+#[tokio::test]
+async fn thread_methods_respect_scope() {
+    let fx = Fixture::new();
+    let mut op = fx.operator();
+    let missing_task = op.call("thread.list", json!({})).await;
+    assert_error(&missing_task, "invalid_params", Some("task_id is required"));
+    let list = conn_result(&mut op, "thread.list", json!({"task_id": "task-b"})).await;
+    assert_eq!(list, json!({"threads": [thread_json("task-b")]}));
+    let show = conn_result(&mut op, "thread.show", json!({"id": "task-b-thread"})).await;
+    let mut detail = thread_json("task-b");
+    let extra = json!({
+        "cron_id": null,
+        "failure_reason": null,
+        "engine": "claude",
+        "duration_ms": null,
+        "prompt": "hi",
+        "result": null,
+        "error": null,
+    });
+    detail
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    assert_eq!(show, json!({"thread": detail}));
+    let missing = op.call("thread.show", json!({"id": "nope"})).await;
+    assert_error(&missing, "not_found", Some("no such thread: nope"));
+
+    let mut run = fx.run("task-a").await;
+    let list = conn_result(&mut run, "thread.list", json!({})).await;
+    assert_eq!(list, json!({"threads": [thread_json("task-a")]}));
+    let own = conn_result(&mut run, "thread.list", json!({"task_id": "task-a"})).await;
+    assert_eq!(own, list);
+    let other = run.call("thread.list", json!({"task_id": "task-b"})).await;
+    assert_error(&other, "forbidden", None);
+    let own = conn_result(&mut run, "thread.show", json!({"id": "task-a-thread"})).await;
+    assert_eq!(own["thread"]["task_id"], "task-a");
+    let other = run
+        .call("thread.show", json!({"id": "task-b-thread"}))
+        .await;
+    assert_error(&other, "forbidden", None);
+}
+
+#[tokio::test]
+async fn cron_list_respects_scope() {
+    let fx = Fixture::new();
+    let mut op = fx.operator();
+    let all = conn_result(&mut op, "cron.list", json!({})).await;
+    assert_eq!(
+        all,
+        json!({"crons": [cron_json("task-a"), cron_json("task-b")], "scoped": false})
+    );
+    let one = conn_result(&mut op, "cron.list", json!({"task_id": "task-b"})).await;
+    assert_eq!(one, json!({"crons": [cron_json("task-b")], "scoped": true}));
+
+    let mut run = fx.run("task-a").await;
+    let own = conn_result(&mut run, "cron.list", json!({})).await;
+    assert_eq!(own, json!({"crons": [cron_json("task-a")], "scoped": true}));
+    let other = run.call("cron.list", json!({"task_id": "task-b"})).await;
+    assert_error(&other, "forbidden", None);
+}
+
+#[tokio::test]
+async fn cron_create_validates_and_builds_the_cli_row() {
+    let fx = Fixture::new();
+    let mut op = fx.operator();
+    let params = |extra: Value| {
+        let mut p = json!({"type": "interval", "value": "60000", "prompt": "do it"});
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        p
+    };
+    let no_task = op.call("cron.create", params(json!({}))).await;
+    assert_error(&no_task, "invalid_params", Some("task_id is required"));
+    let bad_continuity = op
+        .call(
+            "cron.create",
+            params(json!({"task_id": "task-a", "continuity": "forever"})),
+        )
+        .await;
+    assert_error(
+        &bad_continuity,
+        "invalid_params",
+        Some("continuity must be 'isolated' or 'shared' (got 'forever')"),
+    );
+    let bad_schedule = op
+        .call(
+            "cron.create",
+            json!({"type": "interval", "value": "soon", "prompt": "p", "task_id": "task-a"}),
+        )
+        .await;
+    assert_error(&bad_schedule, "invalid_params", None);
+    assert!(
+        bad_schedule["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid schedule: type=interval value=soon: ")
+    );
+    let unknown_task = op
+        .call("cron.create", params(json!({"task_id": "nope"})))
+        .await;
+    assert_error(&unknown_task, "not_found", Some("no such task: nope"));
+    let missing_field = op
+        .call(
+            "cron.create",
+            json!({"type": "interval", "task_id": "task-a"}),
+        )
+        .await;
+    assert_error(&missing_field, "invalid_params", None);
+
+    let mut run = fx.run("task-a").await;
+    let other = run
+        .call("cron.create", params(json!({"task_id": "task-b"})))
+        .await;
+    assert_error(&other, "forbidden", None);
+
+    let before = crate::scheduler::now();
+    let created = conn_result(&mut run, "cron.create", params(json!({}))).await;
+    let cron = &created["cron"];
+    let id = cron["id"].as_str().unwrap().to_owned();
+    assert!(id.starts_with("cron-"));
+    assert!(uuid::Uuid::parse_str(&id["cron-".len()..]).is_ok());
+    let row = fx.db.lock().unwrap().get_cron(&id).unwrap().unwrap();
+    assert_eq!(row.task_id, "task-a");
+    assert_eq!(row.kind, "schedule");
+    assert_eq!(row.status, "active");
+    assert_eq!(row.continuity, "isolated");
+    assert_eq!(row.run_count, 0);
+    assert_eq!(row.prompt, "do it");
+    assert_eq!(row.schedule_type.as_deref(), Some("interval"));
+    assert_eq!(row.schedule_value.as_deref(), Some("60000"));
+    assert_eq!(row.last_fired_at, None);
+    assert_eq!(row.created_at, row.updated_at);
+    let next = crate::scheduler::parse_iso(row.next_run.as_deref().unwrap()).unwrap();
+    assert!(next > before);
+    assert_eq!(cron["next_run"], json!(row.next_run));
+    assert_eq!(cron["created_at"], json!(row.created_at));
+    assert_eq!(fx.cron_states(&id), 1);
+
+    let shared = conn_result(
+        &mut op,
+        "cron.create",
+        params(json!({"task_id": "task-b", "continuity": "shared"})),
+    )
+    .await;
+    assert_eq!(shared["cron"]["task_id"], "task-b");
+    assert_eq!(shared["cron"]["continuity"], "shared");
+}
+
+#[tokio::test]
+async fn cron_mutations_update_status_and_enqueue_state() {
+    let fx = Fixture::new();
+    let mut run = fx.run("task-a").await;
+    for method in ["cron.delete", "cron.pause", "cron.resume"] {
+        let other = run.call(method, json!({"id": "task-b-cron"})).await;
+        assert_error(&other, "forbidden", None);
+        let missing = run.call(method, json!({"id": "nope"})).await;
+        assert_error(&missing, "not_found", Some("no such cron: nope"));
+    }
+    assert_eq!(fx.cron_states("task-b-cron"), 0);
+
+    let paused = conn_result(&mut run, "cron.pause", json!({"id": "task-a-cron"})).await;
+    assert_eq!(paused["cron"]["status"], "paused");
+    assert_eq!(paused["cron"]["next_run"], TS);
+    assert_ne!(paused["cron"]["updated_at"], TS);
+    assert_eq!(fx.cron_states("task-a-cron"), 1);
+
+    let before = crate::scheduler::now();
+    let resumed = conn_result(&mut run, "cron.resume", json!({"id": "task-a-cron"})).await;
+    assert_eq!(resumed["cron"]["status"], "active");
+    let next = crate::scheduler::parse_iso(resumed["cron"]["next_run"].as_str().unwrap()).unwrap();
+    assert!(next > before, "next_run recomputed forward from now");
+    assert_eq!(fx.cron_states("task-a-cron"), 2);
+
+    let mut op = fx.operator();
+    let deleted = conn_result(&mut op, "cron.delete", json!({"id": "task-a-cron"})).await;
+    assert_eq!(deleted["cron"]["status"], "cancelled");
+    assert_eq!(deleted["cron"]["next_run"], Value::Null);
+    assert_eq!(fx.cron_states("task-a-cron"), 3);
+    let row = fx
+        .db
+        .lock()
+        .unwrap()
+        .get_cron("task-a-cron")
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(row.next_run, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_created_cron_is_visible_to_the_scheduler() {
+    let (_dir, ctx) = context();
+    let workspace = ctx.workspace_dir.clone();
+    let nudge = Arc::clone(&ctx.nudge);
+    let flush = Arc::clone(&ctx.flush);
+    let db = Arc::clone(&ctx.db);
+    let server = AgentApiServer::start(ctx, &workspace).unwrap();
+    let path = socket_path(&workspace);
+    let created = blocking(move || {
+        let mut client = Client::connect(&path).unwrap();
+        client
+            .call(
+                "cron.create",
+                json!({"type": "interval", "value": "1000", "prompt": "p", "task_id": "task-b"}),
+            )
+            .unwrap()
+    })
+    .await;
+    let wait = std::time::Duration::from_secs(1);
+    tokio::time::timeout(wait, nudge.notified())
+        .await
+        .expect("scheduler nudged");
+    tokio::time::timeout(wait, flush.notified())
+        .await
+        .expect("outbox flush nudged");
+    let id = created["cron"]["id"].as_str().unwrap();
+    let active = db.lock().unwrap().list_active_crons().unwrap();
+    assert!(active.iter().any(|c| c.id == id));
+    server.shutdown().await;
+}
+
+/// The `result` of a call that must succeed.
+async fn conn_result(conn: &mut Conn, method: &str, params: Value) -> Value {
+    let response = conn.call(method, params).await;
+    assert!(response.get("error").is_none(), "{method}: {response}");
+    response["result"].clone()
+}
