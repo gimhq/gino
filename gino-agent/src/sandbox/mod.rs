@@ -4,17 +4,29 @@
 //! (`tasks.meta.isolation`) are kept as raw strings and resolved per run into an
 //! [`Isolation`]. Unknown or unsupported values fail the run at resolve time
 //! instead of breaking parsing of the whole config overlay.
-
-// Not wired into engine spawning yet.
-#![cfg_attr(not(test), allow(dead_code))]
+//!
+//! [`launch`] turns an engine's direct launch into the one a run actually
+//! spawns: unchanged when off, wrapped in `bwrap` + `sandbox-init` when
+//! sandboxed.
 
 pub(crate) mod bwrap;
 pub(crate) mod init;
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 
 use serde::Deserialize;
 use thiserror::Error;
+
+use self::bwrap::{
+    HostRoot, ProvisionedGlobals, SandboxLayout, bwrap_args, engine_home, host_root,
+    prepare_engine_home, resolve_binary,
+};
+use crate::engine::EngineError;
+
+/// Sandbox `$HOME` when the daemon has none.
+const DEFAULT_SANDBOX_HOME: &str = "/home/gino";
 
 /// How an engine run is isolated from the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,9 +106,9 @@ pub(crate) enum IsolationError {
     #[error("invalid isolation in task meta: {0}")]
     InvalidTaskMeta(#[source] serde_json::Error),
     #[error("engine sandbox is unavailable: {0}")]
-    // Raised by the sandbox availability probe, not by resolution.
-    #[allow(dead_code)]
     Unavailable(String),
+    #[error("engine sandbox needs {0}")]
+    Missing(&'static str),
 }
 
 /// Resolve the effective isolation for a run.
@@ -164,6 +176,240 @@ pub(crate) fn override_from_meta(
         .map_err(IsolationError::InvalidTaskMeta)
 }
 
+/// One engine launch, built but not spawned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Launch {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<OsString>,
+    /// Variables layered onto the inherited environment, in order.
+    pub(crate) env: Vec<(String, OsString)>,
+    /// Working directory; empty means the current directory.
+    pub(crate) cwd: PathBuf,
+    /// Whether `program` is `bwrap` wrapping the engine.
+    pub(crate) sandboxed: bool,
+}
+
+impl Launch {
+    /// The engine run directly on the host.
+    pub(crate) fn direct(
+        program: PathBuf,
+        args: Vec<String>,
+        env: Vec<(String, OsString)>,
+        cwd: PathBuf,
+    ) -> Self {
+        Self {
+            program,
+            args: args.into_iter().map(OsString::from).collect(),
+            env,
+            cwd,
+            sandboxed: false,
+        }
+    }
+
+    /// A command with piped stdio that kills the child on drop.
+    pub(crate) fn command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if !self.cwd.as_os_str().is_empty() {
+            command.current_dir(&self.cwd);
+        }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        command
+    }
+}
+
+/// Per-run inputs deciding whether and how a launch is sandboxed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaunchContext<'a> {
+    /// Configured default (`engine.isolation`).
+    pub(crate) isolation: &'a IsolationSpec,
+    /// The task's override, if any.
+    pub(crate) task_override: Option<&'a IsolationSpec>,
+    pub(crate) workspace_dir: &'a Path,
+    /// The thread's work dir.
+    pub(crate) work_dir: Option<&'a Path>,
+    /// The gino-agent binary.
+    pub(crate) self_exe: Option<&'a Path>,
+    /// Provisioning dir holding the global `CLAUDE.md` and `skills/`.
+    pub(crate) global_config_dir: Option<&'a Path>,
+    /// Env keys naming the engine config dir; sandboxed, they name the engine home.
+    pub(crate) config_dir_keys: &'a [&'a str],
+}
+
+/// Host facts a sandboxed launch is built from.
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxHost {
+    /// The probed `bwrap` binary.
+    pub(crate) bwrap: PathBuf,
+    pub(crate) root: HostRoot,
+    /// `PATH` the engine binary is resolved against.
+    pub(crate) path_env: Option<OsString>,
+    /// Sandbox `$HOME`.
+    pub(crate) home: PathBuf,
+}
+
+impl SandboxHost {
+    fn current(bwrap: PathBuf) -> Self {
+        Self {
+            bwrap,
+            root: host_root(),
+            path_env: std::env::var_os("PATH"),
+            home: std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map_or_else(|| PathBuf::from(DEFAULT_SANDBOX_HOME), PathBuf::from),
+        }
+    }
+}
+
+#[cfg(test)]
+impl SandboxHost {
+    /// A fixed host layout that finds binaries on `path_env`.
+    pub(crate) fn fixture(path_env: Option<OsString>) -> Self {
+        use self::bwrap::RootEntry;
+        Self {
+            bwrap: "/usr/bin/bwrap".into(),
+            root: HostRoot {
+                entries: [
+                    RootEntry::Symlink("usr/bin".into()),
+                    RootEntry::Dir,
+                    RootEntry::Absent,
+                    RootEntry::Absent,
+                ],
+                resolv_conf_outside_etc: None,
+            },
+            path_env,
+            home: "/home/gino".into(),
+        }
+    }
+}
+
+/// Resolve the run's isolation and build its launch: `direct` as-is when off,
+/// wrapped in `bwrap` when sandboxed. Fails closed when `bwrap` is unusable.
+pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, EngineError> {
+    let isolation = resolve(ctx.isolation, ctx.task_override, ctx.workspace_dir)?;
+    match isolation.mode {
+        IsolationMode::Off => Ok(direct),
+        IsolationMode::Sandbox => {
+            let bwrap = bwrap::ensure_available()?;
+            wrap(direct, ctx, &isolation, &SandboxHost::current(bwrap))
+        }
+        IsolationMode::Vm => Err(IsolationError::NotSupported("isolation.mode: vm".into()).into()),
+    }
+}
+
+/// Wrap `direct` in `bwrap` + `sandbox-init` and create the engine home.
+pub(crate) fn wrap(
+    direct: Launch,
+    ctx: &LaunchContext<'_>,
+    isolation: &Isolation,
+    host: &SandboxHost,
+) -> Result<Launch, EngineError> {
+    let work_dir = ctx
+        .work_dir
+        .ok_or(IsolationError::Missing("the thread's work dir"))?;
+    let agent_exe = ctx
+        .self_exe
+        .ok_or(IsolationError::Missing("the gino-agent binary path"))?;
+    let engine_binary =
+        resolve_binary(&direct.program, host.path_env.as_deref()).ok_or_else(|| {
+            EngineError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("engine binary `{}` not found", direct.program.display()),
+            ))
+        })?;
+    let cwd = if direct.cwd.as_os_str().is_empty() {
+        work_dir.to_path_buf()
+    } else {
+        direct.cwd.clone()
+    };
+    let layout = SandboxLayout {
+        work_dir: work_dir.to_path_buf(),
+        cwd,
+        engine_home: engine_home(work_dir),
+        global_config_dir: ctx.global_config_dir.map(Path::to_path_buf),
+        globals: ProvisionedGlobals::inspect(ctx.global_config_dir),
+        engine_binary,
+        agent_exe: agent_exe.to_path_buf(),
+        home: host.home.clone(),
+        network: isolation.network,
+        read_paths: isolation.read_paths.clone(),
+        write_paths: isolation.write_paths.clone(),
+    };
+    prepare_engine_home(&layout).map_err(EngineError::Spawn)?;
+
+    let mut inner: Vec<OsString> = vec![
+        layout.agent_exe.clone().into(),
+        "sandbox-init".into(),
+        "--".into(),
+        layout.engine_binary.clone().into(),
+    ];
+    inner.extend(direct.args);
+
+    let mut env = direct.env;
+    env.retain(|(key, _)| !ctx.config_dir_keys.contains(&key.as_str()));
+    env.extend(ctx.config_dir_keys.iter().map(|key| {
+        (
+            (*key).to_owned(),
+            layout.engine_home.clone().into_os_string(),
+        )
+    }));
+    env.extend([
+        ("HOME".to_owned(), layout.home.clone().into_os_string()),
+        ("TMPDIR".to_owned(), "/tmp".into()),
+        (
+            "GINO_ARCHIVE_DIR".to_owned(),
+            work_dir.join("conversations").into_os_string(),
+        ),
+        ("GINO_SANDBOX".to_owned(), "1".into()),
+    ]);
+
+    Ok(Launch {
+        program: host.bwrap.clone(),
+        args: bwrap_args(&layout, &host.root, &inner),
+        env,
+        cwd: direct.cwd,
+        sandboxed: true,
+    })
+}
+
+/// Pid of the first process inside a sandbox (`sandbox-init`), the direct
+/// child of `bwrap_pid`.
+pub(crate) fn sandbox_init_pid(bwrap_pid: i32) -> Option<i32> {
+    let children = format!("/proc/{bwrap_pid}/task/{bwrap_pid}/children");
+    if let Some(pid) = std::fs::read_to_string(children)
+        .ok()
+        .and_then(|list| first_child(&list))
+    {
+        return Some(pid);
+    }
+    std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .find_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            (stat_ppid(&stat)? == bwrap_pid).then_some(pid)
+        })
+}
+
+/// First pid in a `/proc/<pid>/task/<tid>/children` list.
+fn first_child(list: &str) -> Option<i32> {
+    list.split_whitespace().next()?.parse().ok()
+}
+
+/// Parent pid from a `/proc/<pid>/stat` line; `comm` may hold spaces and `)`.
+fn stat_ppid(stat: &str) -> Option<i32> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Lexically normalize a path: drops `.` components and trailing slashes.
 fn normalize(path: &Path) -> PathBuf {
     path.components()
@@ -203,12 +449,16 @@ fn validate_paths(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use super::{
-        Isolation, IsolationError, IsolationMode, IsolationSpec, NetworkMode, NetworkSpec,
-        override_from_meta, resolve,
+        Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
+        NetworkMode, NetworkSpec, SandboxHost, first_child, launch, override_from_meta, resolve,
+        sandbox_init_pid, stat_ppid, wrap,
     };
+    use crate::engine::EngineError;
 
     const WORKSPACE: &str = "/var/lib/gino-agent";
 
@@ -424,5 +674,252 @@ mod tests {
             let err = override_from_meta(Some(meta)).unwrap_err();
             assert!(matches!(err, IsolationError::InvalidTaskMeta(_)), "{meta}");
         }
+    }
+
+    const KEYS: [&str; 2] = ["ENGINE_CONFIG_DIR", "ENGINE_OWN_DIR"];
+
+    fn direct(cwd: &Path) -> Launch {
+        Launch::direct(
+            "engine".into(),
+            vec!["-p".to_owned(), "--flag".to_owned()],
+            vec![
+                ("ENGINE_TOKEN".to_owned(), "secret".into()),
+                ("ENGINE_CONFIG_DIR".to_owned(), "/ws/engine-config".into()),
+                ("ENGINE_OWN_DIR".to_owned(), "/ws/engine-config".into()),
+                ("GINO_TASK_ID".to_owned(), "task-1".into()),
+            ],
+            cwd.to_path_buf(),
+        )
+    }
+
+    fn ctx<'a>(
+        default: &'a IsolationSpec,
+        task: Option<&'a IsolationSpec>,
+        work_dir: Option<&'a Path>,
+        self_exe: Option<&'a Path>,
+    ) -> LaunchContext<'a> {
+        LaunchContext {
+            isolation: default,
+            task_override: task,
+            workspace_dir: Path::new(WORKSPACE),
+            work_dir,
+            self_exe,
+            global_config_dir: None,
+            config_dir_keys: &KEYS,
+        }
+    }
+
+    /// A temp dir holding an executable `engine` stub, and a host whose `PATH`
+    /// finds it.
+    fn stub_host() -> (tempfile::TempDir, PathBuf, SandboxHost) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = std::fs::canonicalize(tmp.path()).unwrap().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let engine = bin_dir.join("engine");
+        std::fs::write(&engine, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = SandboxHost::fixture(Some(bin_dir.into_os_string()));
+        (tmp, engine, host)
+    }
+
+    fn sandboxed() -> Isolation {
+        run(&spec(Some("sandbox"), None), None).unwrap()
+    }
+
+    fn env_values<'a>(launch: &'a Launch, key: &str) -> Vec<&'a OsString> {
+        launch
+            .env
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    #[test]
+    fn off_launch_is_the_direct_launch() {
+        let d = direct(Path::new("/ws/threads/t1/project"));
+        let off = IsolationSpec::default();
+        assert_eq!(launch(d.clone(), &ctx(&off, None, None, None)).unwrap(), d);
+
+        let default = spec(Some("sandbox"), None);
+        let task = spec(Some("off"), None);
+        assert_eq!(
+            launch(d.clone(), &ctx(&default, Some(&task), None, None)).unwrap(),
+            d
+        );
+        assert!(!d.sandboxed);
+    }
+
+    #[test]
+    fn unsupported_or_unknown_isolation_fails_the_launch() {
+        let d = direct(Path::new(""));
+        for (default, task) in [
+            (spec(Some("vm"), None), None),
+            (spec(Some("sandbox"), Some("allowlist")), None),
+            (IsolationSpec::default(), Some(spec(Some("jail"), None))),
+            (IsolationSpec::default(), Some(spec(Some("vm"), None))),
+        ] {
+            let err = launch(d.clone(), &ctx(&default, task.as_ref(), None, None)).unwrap_err();
+            assert!(matches!(err, EngineError::Isolation(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn sandboxed_launch_wraps_the_engine_in_bwrap_and_sandbox_init() {
+        let (tmp, engine, host) = stub_host();
+        let work_dir = tmp.path().join("threads/t1");
+        let cwd = work_dir.join("project");
+        let agent = Path::new("/opt/gino/gino-agent");
+        let off = IsolationSpec::default();
+        let wrapped = wrap(
+            direct(&cwd),
+            &ctx(&off, None, Some(&work_dir), Some(agent)),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap();
+
+        assert!(wrapped.sandboxed);
+        assert_eq!(wrapped.program, Path::new("/usr/bin/bwrap"));
+        assert_eq!(wrapped.cwd, cwd);
+        let tail: Vec<OsString> = [
+            agent.as_os_str(),
+            "sandbox-init".as_ref(),
+            "--".as_ref(),
+            engine.as_os_str(),
+            "-p".as_ref(),
+            "--flag".as_ref(),
+        ]
+        .map(OsString::from)
+        .to_vec();
+        assert_eq!(wrapped.args[wrapped.args.len() - tail.len() - 1], "--");
+        assert_eq!(wrapped.args[wrapped.args.len() - tail.len()..], tail[..]);
+        let chdir = wrapped.args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(wrapped.args[chdir + 1], cwd.as_os_str());
+
+        let home = work_dir.join(".engine-home");
+        assert!(home.is_dir());
+        for key in KEYS {
+            assert_eq!(env_values(&wrapped, key), [home.as_os_str()], "{key}");
+        }
+        assert_eq!(env_values(&wrapped, "ENGINE_TOKEN"), ["secret"]);
+        assert_eq!(env_values(&wrapped, "GINO_TASK_ID"), ["task-1"]);
+        assert_eq!(env_values(&wrapped, "HOME"), ["/home/gino"]);
+        assert_eq!(env_values(&wrapped, "TMPDIR"), ["/tmp"]);
+        assert_eq!(env_values(&wrapped, "GINO_SANDBOX"), ["1"]);
+        assert_eq!(
+            env_values(&wrapped, "GINO_ARCHIVE_DIR"),
+            [work_dir.join("conversations").as_os_str()]
+        );
+    }
+
+    #[test]
+    fn sandboxed_launch_without_a_cwd_runs_in_the_work_dir() {
+        let (tmp, _, host) = stub_host();
+        let work_dir = tmp.path().join("t1");
+        let off = IsolationSpec::default();
+        let wrapped = wrap(
+            direct(Path::new("")),
+            &ctx(
+                &off,
+                None,
+                Some(&work_dir),
+                Some(Path::new("/opt/gino-agent")),
+            ),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap();
+        let chdir = wrapped.args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(wrapped.args[chdir + 1], work_dir.as_os_str());
+        assert!(wrapped.cwd.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn sandboxed_launch_needs_work_dir_agent_and_engine_binary() {
+        let (tmp, _, mut host) = stub_host();
+        let work_dir = tmp.path().join("t1");
+        let agent = Path::new("/opt/gino-agent");
+        let off = IsolationSpec::default();
+        let err = wrap(
+            direct(&work_dir),
+            &ctx(&off, None, None, Some(agent)),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Isolation(IsolationError::Missing(_))),
+            "{err:?}"
+        );
+
+        let err = wrap(
+            direct(&work_dir),
+            &ctx(&off, None, Some(&work_dir), None),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Isolation(IsolationError::Missing(_))),
+            "{err:?}"
+        );
+
+        host.path_env = None;
+        let err = wrap(
+            direct(&work_dir),
+            &ctx(&off, None, Some(&work_dir), Some(agent)),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+        assert!(!work_dir.exists());
+    }
+
+    #[test]
+    fn children_list_parsing() {
+        assert_eq!(first_child("4242 4243 \n"), Some(4242));
+        assert_eq!(first_child("17"), Some(17));
+        assert_eq!(first_child(""), None);
+        assert_eq!(first_child("x 1"), None);
+    }
+
+    #[test]
+    fn stat_parsing_skips_odd_command_names() {
+        assert_eq!(stat_ppid("123 (bwrap) S 100 123 123 0 -1"), Some(100));
+        assert_eq!(stat_ppid("124 (a b) c) R 123 1 1"), Some(123));
+        assert_eq!(stat_ppid("125 (x)"), None);
+        assert_eq!(stat_ppid("garbage"), None);
+    }
+
+    #[test]
+    fn sandbox_init_pid_finds_the_direct_child() {
+        let mut parent = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .unwrap();
+        let parent_pid = i32::try_from(parent.id()).unwrap();
+        let mut child = None;
+        for _ in 0..200 {
+            child = sandbox_init_pid(parent_pid);
+            if child.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child = child.unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{child}/stat")).unwrap();
+        assert_eq!(stat_ppid(&stat), Some(parent_pid));
+        let _ = std::process::Command::new("kill")
+            .arg(child.to_string())
+            .status();
+        let _ = parent.kill();
+        let _ = parent.wait();
+
+        assert_eq!(sandbox_init_pid(i32::MAX), None);
     }
 }

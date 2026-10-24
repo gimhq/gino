@@ -46,6 +46,8 @@ use tokio::sync::mpsc;
 
 pub(crate) use registry::EngineRegistry;
 
+use crate::sandbox::{IsolationError, IsolationSpec};
+
 /// Status of a completed engine turn. Engine-agnostic mirror of the host
 /// `output` status (`success`/`error`); the wire mapping lives in the transport
 /// layer, not here.
@@ -103,6 +105,10 @@ pub(crate) struct SessionCfg {
     pub(crate) task_id: Option<String>,
     /// The thread this session runs for, exported as `GINO_THREAD_ID`.
     pub(crate) thread_id: Option<String>,
+    /// The thread's work dir; `cwd` lies inside it. Required when sandboxed.
+    pub(crate) work_dir: Option<PathBuf>,
+    /// The task's isolation override (`tasks.meta.isolation`).
+    pub(crate) isolation: Option<IsolationSpec>,
 }
 
 /// The result of a completed turn. Carries the
@@ -204,6 +210,9 @@ pub(crate) enum EngineError {
     /// The writer task's channel closed, so the session can no longer be driven.
     #[error("engine session is closed")]
     Closed,
+    /// The run's isolation could not be resolved or set up.
+    #[error("engine isolation: {0}")]
+    Isolation(#[from] IsolationError),
 }
 
 /// A backend that runs agent work. One implementation per backend; object-safe so

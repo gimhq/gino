@@ -60,7 +60,7 @@ use tracing::{debug, warn};
 use crate::attachments::{AttachmentError, AttachmentManager, AttachmentSource};
 use crate::db::{Db, DbResult, ThreadRow};
 use crate::engine::{
-    Engine, EngineEvent, EngineRegistry, LogLevel, RunStatus, Session, SessionCfg,
+    Engine, EngineError, EngineEvent, EngineRegistry, LogLevel, RunStatus, Session, SessionCfg,
 };
 use crate::failure::{
     AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
@@ -70,6 +70,7 @@ use crate::protocol::frames::{
     ThreadStatus,
 };
 use crate::provisioning::Provisioner;
+use crate::sandbox::{self, IsolationError, IsolationSpec};
 use crate::scheduler::{Cancel, now, parse_iso, to_iso};
 
 /// Poison-tolerant DB lock (Lock 6): recover the guard rather than panic. Critical
@@ -105,6 +106,19 @@ fn task_model(db: &Mutex<Db>, task_id: &str) -> Option<String> {
         Err(err) => {
             warn!(task = %task_id, error = %err, "task model lookup failed; using the configured model");
             None
+        }
+    }
+}
+
+/// The per-task isolation override for `task_id` (`meta.isolation`), or `None`
+/// when the task has none. A missing row and a lookup failure both answer
+/// `None`, mirroring [`task_model`]; a malformed `isolation` value is an error.
+fn task_isolation(db: &Mutex<Db>, task_id: &str) -> Result<Option<IsolationSpec>, IsolationError> {
+    match lock_db(db).get_task_row(task_id) {
+        Ok(row) => sandbox::override_from_meta(row.and_then(|row| row.meta).as_deref()),
+        Err(err) => {
+            warn!(task = %task_id, error = %err, "task isolation lookup failed; using the configured isolation");
+            Ok(None)
         }
     }
 }
@@ -598,8 +612,26 @@ impl ThreadExecutor {
         // materializes the task scope into `work_dir/project/` and runs the
         // engine there; otherwise it is the `work_dir` itself (back-compat).
         let cwd = self.prepare_cwd(&thread).await;
+        // Per-task isolation, read at spawn like the model; a malformed value
+        // fails the run before anything is spawned.
+        let isolation = match task_isolation(&self.db, &thread.task_id) {
+            Ok(isolation) => isolation,
+            Err(err) => {
+                let err = EngineError::Isolation(err);
+                let conclusion = Conclusion::Failure {
+                    reason: classify_engine_error(&err),
+                    error: format!("start_session failed: {err}"),
+                    session_id: thread.engine_session_id.clone(),
+                };
+                return self
+                    .conclude(thread, conclusion, started, continuity, Vec::new())
+                    .await;
+            }
+        };
         let cfg = SessionCfg {
             cwd,
+            work_dir: thread.work_dir.as_deref().map(PathBuf::from),
+            isolation,
             resume: thread.engine_session_id.clone(),
             initial_prompt: Some(prompt),
             task_id: Some(thread.task_id.clone()),

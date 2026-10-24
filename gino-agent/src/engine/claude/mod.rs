@@ -22,8 +22,8 @@ mod events;
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use futures_util::stream::BoxStream;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
@@ -42,6 +42,7 @@ use self::control::ControlAsk;
 use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
+use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
 /// environment. Built from the global [`Config`]
@@ -74,6 +75,10 @@ pub(crate) struct ClaudeSettings {
     /// skills the runner materialized. `None` exports neither (tests / no
     /// provisioning); the runner always sets it to a stable dir.
     pub(crate) config_dir: Option<PathBuf>,
+    /// Default isolation (`engine.isolation`); empty means off.
+    pub(crate) isolation: IsolationSpec,
+    /// The daemon workspace dir, which isolation paths are checked against.
+    pub(crate) workspace_dir: PathBuf,
 }
 
 impl Default for ClaudeSettings {
@@ -89,6 +94,8 @@ impl Default for ClaudeSettings {
             max_turns: None,
             env: Vec::new(),
             config_dir: None,
+            isolation: IsolationSpec::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 }
@@ -123,6 +130,8 @@ impl ClaudeSettings {
             model: engine.model.clone(),
             allowed_tools: engine.allowed_tools.clone(),
             env,
+            isolation: engine.isolation.clone(),
+            workspace_dir: config.paths.workspace_dir.clone(),
             ..Self::default()
         }
     }
@@ -316,13 +325,7 @@ impl Engine for ClaudeEngine {
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         let session_args = SessionArgs::for_session(&cfg);
         let settings = effective_settings(&self.settings, &cfg);
-        let session = spawn_session(
-            &settings,
-            &session_args,
-            cfg.initial_prompt.as_deref(),
-            cfg.task_id.as_deref(),
-            cfg.thread_id.as_deref(),
-        )?;
+        let session = spawn_session(&settings, &session_args, &cfg)?;
         Ok(Box::new(session))
     }
 }
@@ -378,56 +381,89 @@ impl StderrTail {
 /// Makes the CLI emit `system/session_state_changed` lines.
 const SESSION_STATE_EVENTS_ENV: &str = "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS";
 
-/// Spawn the `claude` child, wire the reader/writer tasks, and perform the
-/// handshake. Returns the live [`ClaudeSession`].
+/// Env keys naming the engine config dir.
+const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["ENGINE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"];
+
+/// The direct (unisolated) `claude` launch: binary, argv, env and cwd.
 ///
 /// `task_id`/`thread_id` (when present) are exported to the child as
 /// `GINO_TASK_ID`/`GINO_THREAD_ID`, and the runner's own path as
 /// `GINO_RUNNER_BIN`, so in-engine tooling (the `gino-agent cron` CLI) can
 /// self-reference the task and re-invoke the runner without a hard-coded path.
+fn direct_launch(
+    settings: &ClaudeSettings,
+    session_args: &SessionArgs,
+    task_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> Launch {
+    let mut env: Vec<(String, OsString)> = settings
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.into()))
+        .collect();
+    // The provisioned engine config dir — both the generic var and
+    // claude's own, so the child reads the global instruction file + skills.
+    env.extend(
+        config_dir_env(settings)
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.into())),
+    );
+    // In-engine self-reference (used by the `gino-agent cron` skill/CLI).
+    if let Some(exe) = &settings.self_exe {
+        env.push(("GINO_RUNNER_BIN".to_owned(), exe.into()));
+    }
+    if let Some(task_id) = task_id {
+        env.push(("GINO_TASK_ID".to_owned(), task_id.into()));
+    }
+    if let Some(thread_id) = thread_id {
+        env.push(("GINO_THREAD_ID".to_owned(), thread_id.into()));
+    }
+    // Ask for `session_state_changed`, whose `idle` marks the end of the run.
+    env.push((SESSION_STATE_EVENTS_ENV.to_owned(), "1".into()));
+    Launch::direct(
+        settings.binary.clone(),
+        build_args(settings, session_args),
+        env,
+        session_args.cwd.clone(),
+    )
+}
+
+/// The isolation inputs for one spawn.
+fn launch_context<'a>(settings: &'a ClaudeSettings, cfg: &'a SessionCfg) -> LaunchContext<'a> {
+    LaunchContext {
+        isolation: &settings.isolation,
+        task_override: cfg.isolation.as_ref(),
+        workspace_dir: &settings.workspace_dir,
+        work_dir: cfg.work_dir.as_deref(),
+        self_exe: settings.self_exe.as_deref(),
+        global_config_dir: settings.config_dir.as_deref(),
+        config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+    }
+}
+
+/// Spawn the `claude` child (directly or sandboxed, per the run's isolation),
+/// wire the reader/writer tasks, and perform the handshake. Returns the live
+/// [`ClaudeSession`].
 fn spawn_session(
     settings: &ClaudeSettings,
     session_args: &SessionArgs,
-    initial_prompt: Option<&str>,
-    task_id: Option<&str>,
-    thread_id: Option<&str>,
+    cfg: &SessionCfg,
 ) -> Result<ClaudeSession, EngineError> {
-    let argv = build_args(settings, session_args);
-
-    let mut command = Command::new(&settings.binary);
-    command
-        .args(&argv)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Captured (audit P3): a child that dies at startup (bad binary args,
-        // auth failure) writes its reason to stderr only — the bounded tail is
-        // folded into the failure diagnostics instead of vanishing into the
-        // daemon's inherited stderr.
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if !session_args.cwd.as_os_str().is_empty() {
-        command.current_dir(&session_args.cwd);
-    }
-    for (key, value) in &settings.env {
-        command.env(key, value);
-    }
-    // The provisioned engine config dir — both the generic var and
-    // claude's own, so the child reads the global instruction file + skills.
-    for (key, value) in config_dir_env(settings) {
-        command.env(key, value);
-    }
-    // In-engine self-reference (used by the `gino-agent cron` skill/CLI).
-    if let Some(exe) = &settings.self_exe {
-        command.env("GINO_RUNNER_BIN", exe);
-    }
-    if let Some(task_id) = task_id {
-        command.env("GINO_TASK_ID", task_id);
-    }
-    if let Some(thread_id) = thread_id {
-        command.env("GINO_THREAD_ID", thread_id);
-    }
-    // Ask for `session_state_changed`, whose `idle` marks the end of the run.
-    command.env(SESSION_STATE_EVENTS_ENV, "1");
+    let launch = sandbox::launch(
+        direct_launch(
+            settings,
+            session_args,
+            cfg.task_id.as_deref(),
+            cfg.thread_id.as_deref(),
+        ),
+        &launch_context(settings, cfg),
+    )?;
+    // Stderr is captured (audit P3): a child that dies at startup (bad binary
+    // args, auth failure) writes its reason to stderr only — the bounded tail
+    // is folded into the failure diagnostics instead of vanishing into the
+    // daemon's inherited stderr.
+    let mut command = launch.command();
+    let initial_prompt = cfg.initial_prompt.as_deref();
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
     let stdin = child
@@ -652,10 +688,197 @@ impl Drop for ClaudeSession {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
     use super::{
-        ClaudeSettings, SessionArgs, SessionId, build_args, config_dir_env, effective_settings,
+        ClaudeEngine, ClaudeSettings, SessionArgs, SessionId, build_args, config_dir_env,
+        direct_launch, effective_settings, launch_context,
     };
-    use crate::engine::SessionCfg;
+    use crate::config::{Config, ConfigOverlay};
+    use crate::engine::{Engine, EngineError, SessionCfg};
+    use crate::sandbox::{self, IsolationSpec, Launch, SandboxHost};
+
+    fn env_of<'a>(launch: &'a Launch, key: &str) -> Vec<&'a OsString> {
+        launch
+            .env
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .collect()
+    }
+
+    fn os_args(args: Vec<String>) -> Vec<std::ffi::OsString> {
+        args.into_iter().map(Into::into).collect()
+    }
+
+    fn sandbox_spec() -> IsolationSpec {
+        IsolationSpec {
+            mode: Some("sandbox".to_owned()),
+            ..IsolationSpec::default()
+        }
+    }
+
+    #[test]
+    fn from_config_carries_isolation_and_workspace_dir() {
+        let mut config = Config::default();
+        config.apply(
+            ConfigOverlay::from_json(r#"{ "engine": { "isolation": { "mode": "sandbox" } } }"#)
+                .unwrap(),
+        );
+        let settings = ClaudeSettings::from_config(&config);
+        assert_eq!(settings.isolation, sandbox_spec());
+        assert_eq!(settings.workspace_dir, config.paths.workspace_dir);
+
+        let settings = ClaudeSettings::from_config(&Config::default());
+        assert_eq!(settings.isolation, IsolationSpec::default());
+        assert_eq!(
+            settings.workspace_dir,
+            Config::default().paths.workspace_dir
+        );
+    }
+
+    #[test]
+    fn off_launch_is_the_direct_spawn() {
+        let settings = ClaudeSettings {
+            self_exe: Some("/app/gino-agent".into()),
+            env: vec![("ANTHROPIC_API_KEY".to_owned(), "k".to_owned())],
+            config_dir: Some("/ws/engine-config".into()),
+            ..ClaudeSettings::default()
+        };
+        let cfg = SessionCfg {
+            cwd: "/ws/threads/t1/project".into(),
+            work_dir: Some("/ws/threads/t1".into()),
+            ..SessionCfg::default()
+        };
+        let args = SessionArgs::for_session(&cfg);
+        let direct = direct_launch(&settings, &args, Some("task-1"), Some("th-1"));
+        assert_eq!(direct.program, Path::new("claude"));
+        assert_eq!(direct.cwd, cfg.cwd);
+        assert_eq!(direct.args, os_args(build_args(&settings, &args)));
+        let env: Vec<(&str, &str)> = direct
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("ANTHROPIC_API_KEY", "k"),
+                ("ENGINE_CONFIG_DIR", "/ws/engine-config"),
+                ("CLAUDE_CONFIG_DIR", "/ws/engine-config"),
+                ("GINO_RUNNER_BIN", "/app/gino-agent"),
+                ("GINO_TASK_ID", "task-1"),
+                ("GINO_THREAD_ID", "th-1"),
+                ("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1"),
+            ]
+        );
+        let launched = sandbox::launch(direct.clone(), &launch_context(&settings, &cfg)).unwrap();
+        assert_eq!(launched, direct);
+    }
+
+    #[test]
+    fn sandboxed_launch_points_the_claude_config_at_the_engine_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let binary = root.join("claude");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let work_dir = root.join("threads/t1");
+        let settings = ClaudeSettings {
+            binary: binary.clone(),
+            self_exe: Some("/opt/gino/gino-agent".into()),
+            config_dir: Some(root.join("engine-config")),
+            isolation: sandbox_spec(),
+            workspace_dir: root.clone(),
+            ..ClaudeSettings::default()
+        };
+        let cfg = SessionCfg {
+            cwd: work_dir.join("project"),
+            work_dir: Some(work_dir.clone()),
+            ..SessionCfg::default()
+        };
+        let args = SessionArgs::for_session(&cfg);
+        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let wrapped = sandbox::wrap(
+            direct_launch(&settings, &args, Some("task-1"), None),
+            &launch_context(&settings, &cfg),
+            &isolation,
+            &SandboxHost::fixture(None),
+        )
+        .unwrap();
+
+        assert!(wrapped.sandboxed);
+        let boundary = wrapped
+            .args
+            .iter()
+            .position(|a| a == "sandbox-init")
+            .unwrap();
+        assert_eq!(wrapped.args[boundary - 1], "/opt/gino/gino-agent");
+        assert_eq!(wrapped.args[boundary + 1], "--");
+        assert_eq!(wrapped.args[boundary + 2], binary.as_os_str());
+        assert_eq!(
+            wrapped.args[boundary + 3..],
+            os_args(build_args(&settings, &args))[..]
+        );
+        let hook = wrapped.args.iter().position(|a| a == "--settings").unwrap();
+        assert!(
+            wrapped.args[hook + 1]
+                .to_str()
+                .unwrap()
+                .contains("/opt/gino/gino-agent archive")
+        );
+
+        let home = work_dir.join(".engine-home");
+        assert_eq!(env_of(&wrapped, "ENGINE_CONFIG_DIR"), [home.as_os_str()]);
+        assert_eq!(env_of(&wrapped, "CLAUDE_CONFIG_DIR"), [home.as_os_str()]);
+        assert_eq!(
+            env_of(&wrapped, "GINO_RUNNER_BIN"),
+            ["/opt/gino/gino-agent"]
+        );
+        assert_eq!(env_of(&wrapped, "GINO_TASK_ID"), ["task-1"]);
+        assert_eq!(env_of(&wrapped, "GINO_SANDBOX"), ["1"]);
+        assert_eq!(
+            env_of(&wrapped, "GINO_ARCHIVE_DIR"),
+            [work_dir.join("conversations").as_os_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_isolation_fails_before_spawning() {
+        for (default, task) in [
+            (
+                IsolationSpec {
+                    mode: Some("vm".to_owned()),
+                    ..IsolationSpec::default()
+                },
+                None,
+            ),
+            (
+                IsolationSpec::default(),
+                Some(IsolationSpec {
+                    mode: Some("jail".to_owned()),
+                    ..IsolationSpec::default()
+                }),
+            ),
+        ] {
+            let engine = ClaudeEngine::new(ClaudeSettings {
+                binary: PathBuf::from("/nonexistent/claude"),
+                isolation: default,
+                ..ClaudeSettings::default()
+            });
+            let err = engine
+                .start_session(SessionCfg {
+                    isolation: task,
+                    ..SessionCfg::default()
+                })
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(err, EngineError::Isolation(_)), "{err:?}");
+        }
+    }
 
     fn args_with(session: SessionId) -> SessionArgs {
         SessionArgs {
