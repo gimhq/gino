@@ -17,8 +17,10 @@ Decisions so far (user, 2026-10-24):
 - Kernel: a custom trimmed guest kernel loaded through `krun_payload_load_external`.
 - Shared filesystem: virtiofs (`krun_fs_device_new` / read-only variant) for the thread work
   dir, per-thread engine home and a read-only guest rootfs.
-- Docker: dockerd inside the guest; images pulled through a host-side pull-through registry
-  mirror for caching.
+- Docker: deferred (user, 2026-10-24: no Docker in the first VM version). Later: dockerd inside
+  the guest, images pulled through a host-side pull-through registry mirror.
+- In-engine tooling reaches the daemon through the local agent API socket mapped over vsock
+  (task 20261024-1758-agent-local-api).
 
 Open points for the plan: TSI disabled; the guest NIC is libkrun virtio-net attached to the
 agent's per-run exit through an ethernet adapter (`krun_net_device_new_unixstream_path`,
@@ -32,8 +34,8 @@ the dev container has no `/dev/kvm`, but a sibling container with `--device /dev
 it (verified upstream 2026-10-24), so real libkrun guests can run in sibling-container tests.
 
 Acceptance criteria: a task with `meta.isolation = "vm"` runs claude inside a microVM with the
-same file and network guarantees as the sandbox mode, can `docker build` and `docker run`
-inside the guest using the mirror, and leaves no VM or disk behind after the session ends.
+same file and network guarantees as the sandbox mode, can use the `gino` CLI through the local
+agent API, and leaves no VM behind after the session ends. Docker in the guest is a later step.
 
 ## ActiveForm
 
@@ -41,5 +43,5 @@ Adding a VM isolation backend
 
 ## Dependencies
 
-- **blocked by**: 20261024-0058-engine-sandbox
+- **blocked by**: 20261024-1758-agent-local-api
 - **blocks**: (none)

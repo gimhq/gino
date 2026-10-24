@@ -49,3 +49,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [ ] [**20261024-0130-engine-vm-isolation VM isolation backend for engine runs**](20261024-0130-engine-vm-isolation.md) `P2`
 - [ ] [**20261024-1341-host-isolation-overlay Host-delivered engine isolation overlay**](20261024-1341-host-isolation-overlay.md) `P2`
 - [ ] [**20261024-1527-sandbox-followups Engine sandbox follow-ups**](20261024-1527-sandbox-followups.md) `P1`
+- [-] [**20261024-1758-agent-local-api Local agent API socket for in-engine tooling**](20261024-1758-agent-local-api.md) `P1`
