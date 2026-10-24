@@ -10,7 +10,12 @@
 //! every test is `#[ignore]` and also returns early unless `GINO_SANDBOX_IT=1`;
 //! `scripts/sandbox-it.sh` runs them in a suitably configured container.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
 
 #[allow(dead_code)]
 mod support;
