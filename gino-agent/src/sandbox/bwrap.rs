@@ -27,6 +27,9 @@ const STDERR_TAIL: usize = 512;
 /// In-sandbox path of the allowlist control socket.
 pub(crate) const CTL_SOCK: &str = "/run/gino/ctl.sock";
 
+/// In-sandbox path of the daemon's local agent API socket.
+pub(crate) const AGENT_SOCK: &str = "/run/gino/agent.sock";
+
 /// Control socket file name in the per-run network dir.
 pub(crate) const CTL_SOCK_NAME: &str = "ctl.sock";
 
@@ -131,6 +134,9 @@ pub(crate) struct SandboxLayout {
     /// Per-run daemon dir holding the control socket and `resolv.conf`; set
     /// in allowlist mode.
     pub(crate) net_dir: Option<PathBuf>,
+    /// Host path of the daemon's agent API socket, bound read-write at
+    /// `AGENT_SOCK`.
+    pub(crate) agent_sock: Option<PathBuf>,
 }
 
 impl SandboxLayout {
@@ -343,6 +349,12 @@ pub(crate) fn bwrap_args(
     rw_bind(&mut args, &layout.work_dir);
     for path in &layout.write_paths {
         rw_bind(&mut args, path);
+    }
+    if let Some(sock) = &layout.agent_sock {
+        push(
+            &mut args,
+            &["--bind".as_ref(), sock.as_os_str(), AGENT_SOCK.as_ref()],
+        );
     }
 
     if let Some(src) = layout.global_claude_md() {
@@ -564,6 +576,7 @@ mod tests {
             read_paths: vec!["/data/ro1".into(), "/data/ro2".into()],
             write_paths: vec!["/data/rw1".into()],
             net_dir: None,
+            agent_sock: None,
         }
     }
 
@@ -936,6 +949,39 @@ mod tests {
                 .any(|x| x.starts_with("/run") || x.starts_with("/var"))
         );
         assert!(!a.iter().any(|x| x.contains("agent.db")));
+    }
+
+    #[test]
+    fn agent_socket_is_bound_in_every_network_mode() {
+        let bind = ["--bind", "/ws/run/agent.sock", "/run/gino/agent.sock"];
+        for network in [NetworkMode::None, NetworkMode::Full, NetworkMode::Allowlist] {
+            let mut l = layout();
+            l.network = network;
+            if network == NetworkMode::Allowlist {
+                l.net_dir = Some("/tmp/gino-net-x".into());
+            }
+            let without_sock = args(&l, &host());
+            assert!(!without_sock.iter().any(|x| x.contains("agent.sock")));
+
+            l.agent_sock = Some("/ws/run/agent.sock".into());
+            let a = args(&l, &host());
+            assert_eq!(a.windows(3).filter(|w| *w == bind).count(), 1);
+            let at = pos(&a, &bind);
+            // No later mount touches /run, so nothing covers the socket.
+            assert!(!a[at + 3..].iter().any(|x| x.starts_with("/run")));
+            assert!(at < pos(&a, &["--remount-ro", "/"]));
+            if network == NetworkMode::Allowlist {
+                assert!(
+                    pos(
+                        &a,
+                        &["--bind", "/tmp/gino-net-x/ctl.sock", "/run/gino/ctl.sock"]
+                    ) < at
+                );
+            }
+            // Only the socket file of the workspace is visible.
+            assert!(!a.iter().any(|x| x == "/ws/run" || x == "/ws"));
+            assert_eq!(without(&a, &[&bind]), without_sock);
+        }
     }
 
     #[test]

@@ -29,8 +29,8 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use self::bwrap::{
-    CTL_SOCK, CTL_SOCK_NAME, HostRoot, ProvisionedGlobals, RESOLV_CONF_NAME, SandboxLayout,
-    bwrap_args, engine_home, host_root, prepare_engine_home, resolve_binary,
+    AGENT_SOCK, CTL_SOCK, CTL_SOCK_NAME, HostRoot, ProvisionedGlobals, RESOLV_CONF_NAME,
+    SandboxLayout, bwrap_args, engine_home, host_root, prepare_engine_home, resolve_binary,
 };
 use crate::engine::EngineError;
 use crate::net::exit::{Exit, ExitConfig, GatewayForward};
@@ -44,6 +44,9 @@ const DEFAULT_SANDBOX_HOME: &str = "/home/gino";
 
 /// Env var naming the LLM API the engine talks to.
 const LLM_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+
+/// Env var naming the daemon's agent API socket.
+const AGENT_SOCK_ENV: &str = "GINO_AGENT_SOCK";
 
 /// LLM API endpoint always allowed when no base URL is set.
 const DEFAULT_LLM_HOST: &str = "api.anthropic.com";
@@ -907,6 +910,11 @@ pub(crate) fn wrap(
         read_paths: isolation.read_paths.clone(),
         write_paths: isolation.write_paths.clone(),
         net_dir: net.as_ref().map(|net| net.dir.0.clone()),
+        agent_sock: direct
+            .env
+            .iter()
+            .find(|(key, value)| key == AGENT_SOCK_ENV && !value.is_empty())
+            .map(|(_, value)| PathBuf::from(value)),
     };
     prepare_engine_home(&layout).map_err(EngineError::Spawn)?;
 
@@ -933,6 +941,10 @@ pub(crate) fn wrap(
     if let Some(url) = llm_url {
         env.retain(|(key, _)| key != LLM_BASE_URL_ENV);
         env.push((LLM_BASE_URL_ENV.to_owned(), url.into()));
+    }
+    if layout.agent_sock.is_some() {
+        env.retain(|(key, _)| key != AGENT_SOCK_ENV);
+        env.push((AGENT_SOCK_ENV.to_owned(), AGENT_SOCK.into()));
     }
     env.retain(|(key, _)| {
         key != "GINO_WORKSPACE_DIR" && !ctx.config_dir_keys.contains(&key.as_str())
@@ -2307,6 +2319,40 @@ mod tests {
         .unwrap();
         assert!(env_values(&wrapped, "GINO_WORKSPACE_DIR").is_empty());
         assert_eq!(env_values(&wrapped, "GINO_TASK_ID"), ["task-1"]);
+    }
+
+    #[test]
+    fn sandboxed_launch_binds_the_agent_socket_and_rewrites_its_env() {
+        let (tmp, _, host) = stub_host();
+        let work_dir = tmp.path().join("threads/t1");
+        let mut d = direct(&work_dir.join("project"));
+        d.env.extend([
+            ("GINO_AGENT_SOCK".to_owned(), "/ws/run/agent.sock".into()),
+            ("GINO_AGENT_TOKEN".to_owned(), "tok".into()),
+        ]);
+        let off = IsolationSpec::default();
+        let agent = Path::new("/opt/gino/gino-agent");
+        let ctx = ctx(&off, None, Some(&work_dir), Some(agent));
+
+        let unwrapped = launch(d.clone(), &ctx).unwrap();
+        assert_eq!(
+            env_values(&unwrapped, "GINO_AGENT_SOCK"),
+            ["/ws/run/agent.sock"]
+        );
+
+        let wrapped = wrap(d, &ctx, &sandboxed(), &host).unwrap();
+        assert_eq!(
+            env_values(&wrapped, "GINO_AGENT_SOCK"),
+            ["/run/gino/agent.sock"]
+        );
+        assert_eq!(env_values(&wrapped, "GINO_AGENT_TOKEN"), ["tok"]);
+        let bind: [OsString; 3] =
+            ["--bind", "/ws/run/agent.sock", "/run/gino/agent.sock"].map(OsString::from);
+        assert_eq!(wrapped.args.windows(3).filter(|w| *w == bind).count(), 1);
+
+        let wrapped = wrap(direct(&work_dir.join("project")), &ctx, &sandboxed(), &host).unwrap();
+        assert!(env_values(&wrapped, "GINO_AGENT_SOCK").is_empty());
+        assert!(!wrapped.args.iter().any(|a| a == "/run/gino/agent.sock"));
     }
 
     #[test]
