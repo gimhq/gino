@@ -403,8 +403,9 @@ pub(crate) struct TaskRow {
     /// but no runner path reads it — the executor still materializes its own
     /// per-thread workspace.
     pub(crate) workdir: Option<String>,
-    /// PERSIST-ONLY (align-2026-08 D2): the host's free-form JSON object, kept
-    /// verbatim as text. No runner path reads it.
+    /// The host's free-form JSON object, stored verbatim as text. The executor
+    /// reads only its `isolation` key (the per-task isolation override); nothing
+    /// else reads it.
     pub(crate) meta: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
