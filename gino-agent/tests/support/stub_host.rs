@@ -590,6 +590,13 @@ impl StubHost {
         self.poll(timeout, |m| m.ws_connects >= 1).await
     }
 
+    /// Wait (≤`timeout`) until the runner has opened `count` WebSocket connections
+    /// in total — a restarted daemon is connected once this reaches the
+    /// pre-restart count plus one.
+    pub async fn wait_connects(&self, count: u64, timeout: Duration) -> bool {
+        self.poll(timeout, |m| m.ws_connects >= count).await
+    }
+
     /// Snapshot the mirrored `thread_runs` row for `thread_id`.
     pub async fn thread_run(&self, thread_id: &str) -> Option<ThreadRun> {
         self.model.lock().await.thread_runs.get(thread_id).cloned()

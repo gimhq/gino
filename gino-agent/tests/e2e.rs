@@ -895,9 +895,10 @@ async fn cron_crash_restart_no_double_execution() {
 
     // Restart on the SAME workspace/db, acking again.
     host.set_auto_ack(true);
+    let connects = host.ws_connects().await;
     let restarted = RunnerProc::spawn_in(&host, &behavior, &workspace);
     assert!(
-        host.wait_connected(SETTLE).await,
+        host.wait_connects(connects + 1, SETTLE).await,
         "runner never reconnected after restart"
     );
 
@@ -1576,13 +1577,21 @@ async fn restart_same_global_version_is_durable() {
     assert!(ws.join("store/clauderc").join(&file_short).is_file());
     assert!(ws.join("store/demo-skill").join(&skill_short).is_dir());
 
+    // The applied version is persisted after the reconcile commits; killing the
+    // daemon before that would leave nothing for the restart to keep.
+    assert!(
+        wait_until(SETTLE, || workspace.applied_global_version().is_some()).await,
+        "applied global version never persisted"
+    );
+
     // RESTART on the SAME workspace; the stub still serves the SAME config version.
     // The version gate takes the repair-only path — no reconcile-to-empty (the old
     // bug, since the register response no longer carries `entries`), no re-fetch.
     runner.shutdown().await;
+    let connects = host.ws_connects().await;
     let restarted = RunnerProc::spawn_in(&host, &behavior, &workspace);
     assert!(
-        host.wait_connected(SETTLE).await,
+        host.wait_connects(connects + 1, SETTLE).await,
         "runner never reconnected"
     );
 
@@ -1679,9 +1688,11 @@ async fn restart_higher_global_version_reconciles() {
         "served version advanced"
     );
 
+    let connects = host.ws_connects().await;
+
     let restarted = RunnerProc::spawn_in(&host, &behavior, &workspace);
     assert!(
-        host.wait_connected(SETTLE).await,
+        host.wait_connects(connects + 1, SETTLE).await,
         "runner never reconnected"
     );
 
@@ -1748,14 +1759,20 @@ async fn offline_startup_fetch_keeps_installed_global() {
     assert!(ws.join("store/clauderc").join(&file_short).is_file());
     assert_eq!(host.get_count("clauderc").await, 1);
 
+    assert!(
+        wait_until(SETTLE, || workspace.applied_global_version().is_some()).await,
+        "applied global version never persisted"
+    );
+
     // RESTART with GET /agent/config OFFLINE (non-200). The startup fetch fails →
     // no authoritative version → the gate NEVER reconciles-to-empty: the installed
     // global set is kept (repair-only). (This is the exact path the bug wiped.)
     runner.shutdown().await;
     host.set_config_offline(true).await;
+    let connects = host.ws_connects().await;
     let restarted = RunnerProc::spawn_in(&host, &behavior, &workspace);
     assert!(
-        host.wait_connected(SETTLE).await,
+        host.wait_connects(connects + 1, SETTLE).await,
         "runner never reconnected"
     );
 

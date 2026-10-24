@@ -80,6 +80,24 @@ impl Workspace {
         &self.dir
     }
 
+    /// The global config version the daemon recorded as applied — persisted only
+    /// after the global reconcile has fully committed, so a restart scenario waits
+    /// on it before killing the first daemon.
+    #[must_use]
+    pub fn applied_global_version(&self) -> Option<String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        conn.query_row(
+            "SELECT value FROM config_meta WHERE key = 'applied_global_config_version'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
     /// Acquire the serial lock and mint a fresh temp workspace + db path. The
     /// daemon creates both directories on boot, so nothing is pre-created here.
     pub async fn new() -> Self {
