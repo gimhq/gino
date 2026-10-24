@@ -2054,8 +2054,8 @@ mod tests {
             ("http://[::1]/v1", "http://10.0.2.2/v1"),
             ("http://localhost?q", "http://10.0.2.2?q"),
             (
-                "http://user:p%40ss@127.0.0.1:8080/llm",
-                "http://user:p%40ss@10.0.2.2:8080/llm",
+                "http://user:p%40ss@127.0.0.1:8080/llm", // trufflehog:ignore
+                "http://user:p%40ss@10.0.2.2:8080/llm",  // trufflehog:ignore
             ),
         ] {
             assert_eq!(super::gateway_url(url).as_deref(), Some(want), "{url}");
