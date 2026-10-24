@@ -482,6 +482,101 @@ async fn network_full_reaches_the_host() {
 }
 
 // ---------------------------------------------------------------------------
+// Allowlist network: the loopback LLM endpoint through the gateway, nothing else
+// ---------------------------------------------------------------------------
+
+const ALLOWLIST_PROBE: &str = r#"
+u="${ANTHROPIC_BASE_URL#*://}"
+hp="${u%%/*}"
+h="${hp%:*}"
+p="${hp##*:}"
+value LLM_HOST 'echo "$h"'
+value LLM_PATH 'echo "/${u#*/}"'
+check LLM 'exec 3<>"/dev/tcp/$h/$p"; printf "ping\n" >&3; read -t 5 -r r <&3; test "$r" = pong'
+check LLM_DIRECT 'timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p"'
+check GATEWAY_OTHER 'timeout 5 bash -c "exec 3<>/dev/tcp/10.0.2.2/@OTHER_PORT@"'
+check ALLOWED_NAME 'getent hosts allowed.test'
+check DISALLOWED_NAME 'getent hosts example.com'
+check DISALLOWED_CONNECT 'timeout 5 bash -c "exec 3<>/dev/tcp/example.com/80"'
+check EXTERNAL 'timeout 5 bash -c "exec 3<>/dev/tcp/@EXT_IP@/@EXT_PORT@"'
+value RESOLV 'cat /etc/resolv.conf'
+value LINKS 'tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\n" ","'
+value CAPEFF 'grep "^CapEff:" /proc/self/status | cut -f2'
+"#;
+
+/// A loopback TCP server answering each `ping` line with `pong`.
+fn llm_stub() -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&stream);
+            if reader.read_line(&mut line).is_ok() && line == "ping\n" {
+                let _ = (&stream).write_all(b"pong\n");
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+#[ignore = "needs bubblewrap, user namespaces and /dev/net/tun; run scripts/sandbox-it.sh"]
+async fn allowlist_reaches_the_loopback_llm_endpoint_and_nothing_else() {
+    if !enabled() {
+        return;
+    }
+    let llm_port = llm_stub();
+    let mut config = sandbox_config("allowlist", json!({}));
+    config["engine"]["anthropicBaseUrl"] = json!(format!("http://127.0.0.1:{llm_port}/api/llm"));
+    config["engine"]["isolation"]["network"]["allow"] =
+        json!([{ "host": "allowed.test", "ports": [443] }]);
+    let host = StubHost::start(config).await;
+    let external = TcpListener::bind("0.0.0.0:0").unwrap();
+    let body = ALLOWLIST_PROBE
+        .replace("@OTHER_PORT@", &host.addr.port().to_string())
+        .replace("@EXT_IP@", &non_loopback_ip().to_string())
+        .replace(
+            "@EXT_PORT@",
+            &external.local_addr().unwrap().port().to_string(),
+        );
+    let workspace = Workspace::new().await;
+    let fakes = claude_fakes(&body);
+    let runner = RunnerProc::spawn_in_with_fakes(&host, &workspace, fakes, None);
+    assert!(
+        host.wait_connected(RUN_TIMEOUT).await,
+        "runner never connected"
+    );
+
+    let run = run_thread(&host, "t-al", "th-al", 1).await;
+    assert_eq!(run.status, "succeeded", "run: {run:?}");
+    let results = probes(&host, "t-al", "th-al").await;
+    runner.shutdown().await;
+    expect(
+        &results,
+        &[
+            ("LLM_HOST", "10.0.2.2"),
+            ("LLM_PATH", "/api/llm"),
+            ("LLM", "ok"),
+            ("LLM_DIRECT", "denied"),
+            ("GATEWAY_OTHER", "denied"),
+            ("ALLOWED_NAME", "ok"),
+            ("DISALLOWED_NAME", "denied"),
+            ("DISALLOWED_CONNECT", "denied"),
+            ("EXTERNAL", "denied"),
+            ("RESOLV", "nameserver 10.0.2.2"),
+            ("CAPEFF", "0000000000000000"),
+        ],
+    );
+    assert!(
+        results["LINKS"].contains("gino0"),
+        "links: {}",
+        results["LINKS"]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // SIGINT reaches a sandboxed codex through sandbox-init
 // ---------------------------------------------------------------------------
 

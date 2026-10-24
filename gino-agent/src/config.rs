@@ -25,17 +25,20 @@
 //! they are redacted in `Debug`/log output and never echoed. Overlays carry the
 //! raw strings only transiently and are deliberately not `Debug`-printable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
 use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::protocol::frames::ProvisioningEntry;
-use crate::sandbox::IsolationSpec;
+use crate::sandbox::{self, IsolationError, IsolationSpec};
 
 /// Default workspace directory (configurable; never a hardcoded Docker mount).
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
+/// Env var naming the local isolation floor file (`engine.isolation` shape).
+const ISOLATION_FILE_ENV: &str = "GINO_ISOLATION_FILE";
 /// Default SQLite filename within the workspace directory.
 const DEFAULT_DB_FILE: &str = "agent.db";
 /// Sub-directory of the workspace dir holding the GLOBAL engine-config scope root:
@@ -74,6 +77,27 @@ pub(crate) enum ConfigError {
         "CLAUDE_CONFIG_USE_DEFAULT is set but neither CLAUDE_CONFIG_DIR nor HOME is set, so claude's default config dir cannot be resolved"
     )]
     MissingHome,
+    /// The isolation floor file could not be read.
+    #[error("cannot read isolation file {}: {source}", path.display())]
+    IsolationFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The isolation floor file is not a JSON isolation block.
+    #[error("isolation file {} is not a valid isolation block: {source}", path.display())]
+    IsolationFileParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// The isolation floor file holds an invalid setting, path or rule.
+    #[error("invalid isolation file {}: {source}", path.display())]
+    IsolationFileInvalid {
+        path: PathBuf,
+        #[source]
+        source: IsolationError,
+    },
 }
 
 /// Fully-resolved runner configuration.
@@ -180,6 +204,9 @@ pub(crate) struct EngineConfig {
     pub(crate) codex: CodexConfig,
     /// Default engine isolation (`engine.isolation`); empty means off.
     pub(crate) isolation: IsolationSpec,
+    /// Local isolation floor from `GINO_ISOLATION_FILE`; host blocks may only
+    /// tighten it.
+    pub(crate) isolation_floor: Option<IsolationSpec>,
 }
 
 /// Settings for the `codex` backend (`engine.codex`).
@@ -349,6 +376,7 @@ impl Config {
             heartbeat_interval_ms,
             remote_ops,
             paths,
+            isolation_floor,
         } = overlay;
 
         overlay_field(&mut self.host_url, host_url);
@@ -387,9 +415,7 @@ impl Config {
         }
 
         apply_codex_overlay(&mut self.engine.codex, codex);
-        if let Some(isolation) = isolation {
-            self.engine.isolation = isolation;
-        }
+        self.apply_isolation(isolation_floor, isolation);
 
         let ExecutorOverlay {
             dispatched_timeout_secs,
@@ -441,6 +467,31 @@ impl Config {
         }
         if let Some(dir) = engine_config_dir {
             self.paths.engine_config_dir = dir;
+        }
+    }
+
+    /// Merge the isolation floor and a host `engine.isolation` block. With a
+    /// floor, the host block may only tighten it (see
+    /// [`sandbox::tighten_floor`]); without one it replaces the default.
+    fn apply_isolation(&mut self, floor: Option<IsolationSpec>, isolation: Option<IsolationSpec>) {
+        if let Some(floor) = floor {
+            self.engine.isolation = floor.clone();
+            self.engine.isolation_floor = Some(floor);
+        }
+        if let Some(isolation) = isolation {
+            self.engine.isolation = match &self.engine.isolation_floor {
+                Some(floor) => {
+                    let (effective, ignored) = sandbox::tighten_floor(floor, isolation);
+                    for field in ignored {
+                        warn!(
+                            field,
+                            "ignoring host engine.isolation.{field}: the local isolation file only lets the host tighten mode and network.mode"
+                        );
+                    }
+                    effective
+                }
+                None => isolation,
+            };
         }
     }
 
@@ -576,6 +627,9 @@ pub(crate) struct ConfigOverlay {
     heartbeat_interval_ms: Option<u64>,
     remote_ops: RemoteOpsOverlay,
     paths: PathsOverlay,
+    /// Local isolation floor; set only by the env bootstrap layer.
+    #[serde(skip)]
+    isolation_floor: Option<IsolationSpec>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -726,17 +780,29 @@ impl ConfigOverlay {
     /// [`claude_default_config_dir`]), so an already-logged-in local claude
     /// (credentials, settings, plugins) is reused as-is. Shared by the daemon and
     /// the `login` subcommand so both resolve the same directories.
+    ///
+    /// When `GINO_ISOLATION_FILE` is set, the file it names is loaded as the
+    /// isolation floor (see [`load_isolation_file`]); any error fails startup.
     pub(crate) fn paths_from_env() -> Result<Self, ConfigError> {
         let engine_config_dir = claude_default_config_dir(
             std::env::var("CLAUDE_CONFIG_USE_DEFAULT").ok().as_deref(),
             std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             std::env::var_os("HOME").map(PathBuf::from),
         )?;
-        Ok(Self::paths_bootstrap(
+        let mut overlay = Self::paths_bootstrap(
             std::env::var_os("GINO_WORKSPACE_DIR").map(PathBuf::from),
             std::env::var_os("GINO_DB_PATH").map(PathBuf::from),
             engine_config_dir,
-        ))
+        );
+        if let Some(file) = std::env::var_os(ISOLATION_FILE_ENV) {
+            let workspace_dir = overlay
+                .paths
+                .workspace_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WORKSPACE_DIR));
+            overlay.isolation_floor = Some(load_isolation_file(Path::new(&file), &workspace_dir)?);
+        }
+        Ok(overlay)
     }
 
     /// Parse a host-assigned config payload into an overlay. Production callers
@@ -764,6 +830,36 @@ impl ConfigOverlay {
     pub(crate) fn version(&self) -> Option<i64> {
         self.version
     }
+}
+
+/// Read and validate an isolation floor file: a JSON `engine.isolation` block
+/// whose modes, extra paths and allowlist rules must all be valid.
+pub(crate) fn load_isolation_file(
+    path: &Path,
+    workspace_dir: &Path,
+) -> Result<IsolationSpec, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::IsolationFileRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let parse_error = |source| ConfigError::IsolationFileParse {
+        path: path.to_path_buf(),
+        source,
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(parse_error)?;
+    if !value.is_object() {
+        return Err(parse_error(serde::de::Error::custom(
+            "expected a JSON object",
+        )));
+    }
+    let spec: IsolationSpec = serde_json::from_value(value).map_err(parse_error)?;
+    sandbox::validate_floor(&spec, workspace_dir).map_err(|source| {
+        ConfigError::IsolationFileInvalid {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    Ok(spec)
 }
 
 /// Apply the `engine.codex` overlay under the same omission-preserves rule as the
@@ -813,8 +909,9 @@ mod tests {
 
     use secrecy::ExposeSecret;
 
-    use super::{Config, ConfigError, ConfigOverlay};
-    use crate::sandbox::IsolationSpec;
+    use super::{Config, ConfigError, ConfigOverlay, load_isolation_file};
+    use crate::net::rules::RuleError;
+    use crate::sandbox::{IsolationError, IsolationSpec};
 
     fn secret(config_secret: Option<&secrecy::SecretString>) -> Option<&str> {
         config_secret.map(ExposeSecret::expose_secret)
@@ -1604,5 +1701,176 @@ mod tests {
         assert!(config.remote_ops.pty);
         config.apply(ConfigOverlay::from_json(r#"{ "remoteOps": { "pty": false } }"#).unwrap());
         assert!(!config.remote_ops.pty);
+    }
+
+    const WORKSPACE: &str = "/var/lib/gino-agent";
+
+    /// Load `contents` as an isolation file; the error message must name it.
+    fn load(contents: &str) -> (PathBuf, Result<IsolationSpec, ConfigError>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("isolation.json");
+        std::fs::write(&path, contents).unwrap();
+        let result = load_isolation_file(&path, std::path::Path::new(WORKSPACE));
+        (path, result)
+    }
+
+    fn load_err(contents: &str) -> ConfigError {
+        let (path, result) = load(contents);
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+        err
+    }
+
+    #[test]
+    fn isolation_file_loads_the_isolation_block() {
+        let (_, result) = load(
+            r#"{
+                "mode": "sandbox",
+                "network": { "mode": "allowlist", "allow": [{ "host": "*.pypi.org", "ports": [443] }] },
+                "readPaths": ["/data/ro"],
+                "writePaths": ["/data/rw"],
+                "allowTaskOverride": false
+            }"#,
+        );
+        let spec = result.unwrap();
+        assert_eq!(spec.mode.as_deref(), Some("sandbox"));
+        assert_eq!(
+            spec.network.as_ref().unwrap().allow.as_ref().unwrap().len(),
+            1
+        );
+        assert_eq!(spec.allow_task_override, Some(false));
+    }
+
+    #[test]
+    fn missing_isolation_file_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        let err = load_isolation_file(&path, std::path::Path::new(WORKSPACE)).unwrap_err();
+        assert!(matches!(err, ConfigError::IsolationFileRead { .. }));
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn malformed_isolation_file_names_the_path() {
+        for raw in [
+            "not json",
+            r#"{ "mode": 5 }"#,
+            r#"{ "readPaths": "/data" }"#,
+            "[]",
+        ] {
+            assert!(
+                matches!(load_err(raw), ConfigError::IsolationFileParse { .. }),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_isolation_file_settings_name_the_path() {
+        assert!(matches!(
+            load_err(r#"{ "mode": "sandbox", "network": { "mode": "open" } }"#),
+            ConfigError::IsolationFileInvalid {
+                source: IsolationError::UnknownNetworkMode(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            load_err(r#"{ "readPaths": ["data/ro"] }"#),
+            ConfigError::IsolationFileInvalid {
+                source: IsolationError::InvalidPath { .. },
+                ..
+            }
+        ));
+        let err = load_err(
+            r#"{ "network": { "allow": [{ "host": "ok.example", "ports": "*" }, { "cidr": "300.0.0.0/8", "ports": "*" }] } }"#,
+        );
+        assert!(matches!(
+            err,
+            ConfigError::IsolationFileInvalid {
+                source: IsolationError::InvalidAllowlist(RuleError::Cidr { index: 1, .. }),
+                ..
+            }
+        ));
+        assert!(err.to_string().contains("rule 1"), "{err}");
+    }
+
+    fn floor_overlay(raw: &str) -> ConfigOverlay {
+        ConfigOverlay {
+            isolation_floor: Some(serde_json::from_str(raw).unwrap()),
+            ..ConfigOverlay::default()
+        }
+    }
+
+    fn host_isolation(raw: &str) -> ConfigOverlay {
+        ConfigOverlay::from_json(&format!(r#"{{ "engine": {{ "isolation": {raw} }} }}"#)).unwrap()
+    }
+
+    fn network_mode(config: &Config) -> Option<&str> {
+        config
+            .engine
+            .isolation
+            .network
+            .as_ref()
+            .and_then(|n| n.mode.as_deref())
+    }
+
+    #[test]
+    fn isolation_floor_becomes_the_default() {
+        let mut config = Config::default();
+        config.apply(floor_overlay(
+            r#"{ "mode": "sandbox", "network": { "mode": "full" }, "readPaths": ["/data/ro"] }"#,
+        ));
+        assert_eq!(config.engine.isolation.mode.as_deref(), Some("sandbox"));
+        assert_eq!(network_mode(&config), Some("full"));
+        assert_eq!(
+            config.engine.isolation_floor.as_ref(),
+            Some(&config.engine.isolation)
+        );
+        // An overlay without an isolation block keeps it.
+        config.apply(ConfigOverlay::from_json(r#"{ "engine": { "model": "m" } }"#).unwrap());
+        assert_eq!(network_mode(&config), Some("full"));
+    }
+
+    #[test]
+    fn host_isolation_only_tightens_the_floor() {
+        let mut config = Config::default();
+        config.apply(floor_overlay(
+            r#"{ "mode": "sandbox", "network": { "mode": "full",
+                 "allow": [{ "host": "*.pypi.org", "ports": [443] }] },
+                 "readPaths": ["/data/ro"] }"#,
+        ));
+        let floor = config.engine.isolation.clone();
+
+        config.apply(host_isolation(r#"{ "network": { "mode": "allowlist" } }"#));
+        assert_eq!(network_mode(&config), Some("allowlist"));
+        assert_eq!(config.engine.isolation.read_paths, floor.read_paths);
+
+        // Each host block is layered on the floor, not on the previous block.
+        config.apply(host_isolation(r#"{ "network": { "mode": "full" } }"#));
+        assert_eq!(config.engine.isolation, floor);
+
+        // Loosening and non-mode fields are ignored.
+        config.apply(host_isolation(
+            r#"{ "mode": "off", "network": { "mode": "full", "allow": [] },
+                 "readPaths": ["/etc"], "writePaths": ["/srv"], "allowTaskOverride": true }"#,
+        ));
+        assert_eq!(config.engine.isolation, floor);
+    }
+
+    #[test]
+    fn without_a_floor_host_isolation_replaces_the_default() {
+        let mut config = Config::default();
+        config.apply(host_isolation(
+            r#"{ "mode": "sandbox", "network": { "mode": "none" } }"#,
+        ));
+        config.apply(host_isolation(
+            r#"{ "mode": "off", "readPaths": ["/etc"] }"#,
+        ));
+        assert_eq!(config.engine.isolation.mode.as_deref(), Some("off"));
+        assert!(config.engine.isolation.read_paths.is_some());
+        assert!(config.engine.isolation_floor.is_none());
     }
 }

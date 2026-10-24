@@ -1,0 +1,43 @@
+# Real-engine sandbox agent image: the v2 gino-agent + the REAL Claude CLI,
+# run as an unprivileged user so the daemon can confine each engine run in a
+# bubblewrap sandbox (engine.isolation mode `sandbox`).
+#
+# The build context is e2e/. The runner binary is compiled outside this
+# Dockerfile by run-real-sandbox.sh (rust:1.96-bookworm) and staged as
+# `gino-agent.bin`; it is a bookworm glibc binary, matching this base.
+FROM node:24-bookworm-slim
+
+# Pinned Claude CLI (npm package @anthropic-ai/claude-code). Installed under
+# /usr/local so the sandbox's read-only /usr bind already covers it.
+ARG CLAUDE_CODE_VERSION=2.1.310
+ENV CLAUDE_CODE_VERSION=${CLAUDE_CODE_VERSION}
+
+# bubblewrap runs the sandbox; curl backs the network probes the engine runs;
+# iproute2 is for diagnosing the sandbox network namespace.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap ca-certificates curl iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && npm cache clean --force \
+    && claude --version
+
+# The base ships `node` as uid 1000; replace it with the agent user, which the
+# real CLI needs (it refuses --dangerously-skip-permissions as root) and which
+# bubblewrap needs (it must be started by an unprivileged user).
+RUN userdel -r node \
+    && useradd -m -u 1000 -U -s /bin/bash gino \
+    && mkdir -p /workspace \
+    && chown gino:gino /workspace
+
+COPY gino-agent.bin /app/gino-agent
+COPY agent-entrypoint.sh /app/entrypoint.sh
+RUN chmod 755 /app/gino-agent /app/entrypoint.sh
+
+ENV GINO_WORKSPACE_DIR=/workspace \
+    GINO_DB_PATH=/workspace/agent.db \
+    HOME=/home/gino
+
+USER gino
+WORKDIR /workspace
+ENTRYPOINT ["/app/entrypoint.sh"]
