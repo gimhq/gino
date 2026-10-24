@@ -317,7 +317,8 @@ namespaces enabled. Run the agent as a dedicated unprivileged user.
   "mode": "sandbox",
   "network": { "mode": "none" },
   "readPaths": ["/opt/node"],
-  "writePaths": ["/data/cache"]
+  "writePaths": ["/data/cache"],
+  "allowTaskOverride": false
 } } }
 ```
 
@@ -328,6 +329,14 @@ namespaces enabled. Run the agent as a dedicated unprivileged user.
 - **Per-task override**: `meta.isolation` on the task (`task_upsert`) overrides `mode` and `network.mode`
   only; extra paths always come from the config. Meta that is not a JSON object, or has no `isolation`
   key, means no override.
+- **Tighten-only overrides.** Unless the config sets `allowTaskOverride: true` (absent = `false`; the key
+  inside `meta.isolation` is ignored), an override may only tighten the default. Modes order
+  `off` < `sandbox` < `vm`; network modes order `full` < `allowlist` < `none`, compared against the
+  default's effective value (absent mode = `off`, absent network = `none`). A default of `off` confines no
+  network, so any network override tightens it. A loosening override (e.g. `sandbox` → `off`, `none` →
+  `full`) fails the run with "task meta.isolation would loosen `<setting>` from … to …; set
+  engine.isolation.allowTaskOverride to allow this", before any not-supported check; neither value is used
+  as a fallback. With `allowTaskOverride: true` the override wins as-is.
 - `vm` and `allowlist` fail the run with "`… is not supported yet`". Unknown values, an invalid path or a
   malformed `meta.isolation` also fail the run. All of these are classified as `runner.invalid_request` (§6) and
   are not retried.
