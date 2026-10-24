@@ -3,8 +3,13 @@ name: release
 # Builds and uploads lode release assets to an EXISTING GitHub Release.
 # Publishing the release is the source of truth (not a tag push), which avoids
 # building against a tag/release mismatch. The host bundle (gino.js) + its
-# lode/v1 manifest, and the agent static binary, are attached to the release;
-# lode (github source) reads them by filename.
+# lode/v1 manifest, and the agent static binary packed as a tar.gz, are attached
+# to the release; lode (github source) reads them by filename.
+#
+# Signing: with the repository secret LODE_SIGNING_KEY (an ed25519 seed from
+# `lode-cli keygen`), every asset gets a `<asset>.sig` sidecar and the host
+# manifest carries inline signatures plus a catalog signature. Without the secret
+# the assets upload unsigned.
 on:
   release:
     types: [published]
@@ -26,7 +31,10 @@ env:
   BUN_VERSION: "1.4.0"
   APP_NAME: gino-host
   HOST_ASSET: gino.js
-  AGENT_ASSET: gino-agent-linux-x64
+  AGENT_APP: gino-agent
+  AGENT_ASSET: gino-agent-linux-x64.tar.gz
+  LODE_VERSION: v0.2.1
+  LODE_SIGNING_KEY: ${{ secrets.LODE_SIGNING_KEY }}
   # Untrusted-input-safe: the tag flows through an env var, never inlined into a run/ref.
   RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
@@ -64,6 +72,35 @@ jobs:
           set -euo pipefail
           bun run package --version "${RELEASE_VERSION}" --asset-url "${ASSET_URL}"
 
+      - name: Install lode-cli (signing only)
+        if: env.LODE_SIGNING_KEY != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          gh release download "${LODE_VERSION}" --repo bkhq/lode -p lode-linux-x64.tar.gz -p SHA256SUMS
+          grep ' lode-linux-x64.tar.gz$' SHA256SUMS | sha256sum -c -
+          tar -xzf lode-linux-x64.tar.gz lode lode-cli
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      # The sidecar serves the github source (no run/exec bound); the manifest entry
+      # is re-signed with its run/exec for the native source, then the catalog.
+      - name: Sign (asset sidecar + manifest)
+        if: env.LODE_SIGNING_KEY != ''
+        working-directory: apps/host/dist
+        run: |
+          set -euo pipefail
+          key="${RUNNER_TEMP}/lode-signing.key"
+          trap 'rm -f "${key}"' EXIT
+          (umask 077 && printf '%s' "${LODE_SIGNING_KEY}" > "${key}")
+          lode-cli sign "${HOST_ASSET}" --app "${APP_NAME}" --version "${RELEASE_VERSION}" --key-env LODE_SIGNING_KEY \
+            | awk '/^sig:/ {print $2}' > "${HOST_ASSET}.sig"
+          test -s "${HOST_ASSET}.sig"
+          lode-cli manifest "${HOST_ASSET}" --app "${APP_NAME}" --version "${RELEASE_VERSION}" --url "${ASSET_URL}" \
+            --size "$(stat -c %s "${HOST_ASSET}")" --run "bun run ${HOST_ASSET}" --exec bun --key "${key}" --into manifest.json
+          lode-cli manifest-sign --into manifest.json --key "${key}"
+
       - name: Validate lode release assets
         run: |
           set -euo pipefail
@@ -73,23 +110,15 @@ jobs:
             --version "${RELEASE_VERSION}" \
             --asset-url "${ASSET_URL}"
 
-      # OPTIONAL signing (ed25519). Set a publisher key as the secret
-      # LODE_SIGN_KEY to sign the asset + catalog with lode-cli; skipped otherwise
-      # (an unsigned manifest still carries integrity).
-      #   - run: lode-cli sign "apps/host/dist/${HOST_ASSET}" --version "${RELEASE_VERSION}" --key-env LODE_SIGN_KEY ...
-      #   - run: lode-cli manifest-sign --into apps/host/dist/manifest.json --key-env LODE_SIGN_KEY
-
       - name: Upload to the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           gh release view "${TAG_NAME}" >/dev/null
-          gh release upload "${TAG_NAME}" \
-            "apps/host/dist/${HOST_ASSET}" \
-            apps/host/dist/manifest.json \
-            apps/host/dist/checksums.txt \
-            --clobber
+          files=("apps/host/dist/${HOST_ASSET}" apps/host/dist/manifest.json apps/host/dist/checksums.txt)
+          if [ -f "apps/host/dist/${HOST_ASSET}.sig" ]; then files+=("apps/host/dist/${HOST_ASSET}.sig"); fi
+          gh release upload "${TAG_NAME}" "${files[@]}" --clobber
 
   agent:
     name: agent static binary (musl)
@@ -100,7 +129,12 @@ jobs:
         working-directory: gino-agent
     steps:
       - name: Resolve release metadata
-        run: echo "TAG_NAME=${RELEASE_TAG}" >> "${GITHUB_ENV}"
+        run: |
+          set -euo pipefail
+          {
+            echo "TAG_NAME=${RELEASE_TAG}"
+            echo "RELEASE_VERSION=${RELEASE_TAG#v}"
+          } >> "${GITHUB_ENV}"
 
       - uses: actions/checkout@v6
         with:
@@ -122,8 +156,9 @@ jobs:
             ~/.cargo/git
           key: cargo-release-${{ hashFiles('gino-agent/Cargo.lock') }}
 
-      # Fully static, non-PIE musl binary — runs on any base, the portable lode asset for the agent.
-      - name: Build (static musl)
+      # Fully static, non-PIE musl binary, packed as `gino-agent` at the archive root
+      # (lode extracts it into the version dir; `[command].run = "./gino-agent"`).
+      - name: Build + package (static musl)
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           AR_x86_64_unknown_linux_musl: ar
@@ -131,9 +166,31 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=static"
         run: |
           set -euo pipefail
-          cargo build --release --locked --target x86_64-unknown-linux-musl
-          install -m 0755 "target/x86_64-unknown-linux-musl/release/gino-agent" "${AGENT_ASSET}"
+          cargo build --profile dist --locked --target x86_64-unknown-linux-musl
+          pkg="$(mktemp -d)"
+          install -m 0755 "target/x86_64-unknown-linux-musl/dist/gino-agent" "${pkg}/gino-agent"
+          tar -C "${pkg}" --owner=0 --group=0 --numeric-owner --mtime='@0' -cf - gino-agent | gzip -n -9 > "${AGENT_ASSET}"
           sha256sum "${AGENT_ASSET}" | tee "${AGENT_ASSET}.sha256"
+
+      - name: Install lode-cli (signing only)
+        if: env.LODE_SIGNING_KEY != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          gh release download "${LODE_VERSION}" --repo bkhq/lode -p lode-linux-x64.tar.gz -p SHA256SUMS
+          grep ' lode-linux-x64.tar.gz$' SHA256SUMS | sha256sum -c -
+          tar -xzf lode-linux-x64.tar.gz lode lode-cli
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Sign (asset sidecar)
+        if: env.LODE_SIGNING_KEY != ''
+        run: |
+          set -euo pipefail
+          lode-cli sign "${AGENT_ASSET}" --app "${AGENT_APP}" --version "${RELEASE_VERSION}" --key-env LODE_SIGNING_KEY \
+            | awk '/^sig:/ {print $2}' > "${AGENT_ASSET}.sig"
+          test -s "${AGENT_ASSET}.sig"
 
       - name: Upload to the GitHub release
         env:
@@ -141,7 +198,6 @@ jobs:
         run: |
           set -euo pipefail
           gh release view "${TAG_NAME}" >/dev/null
-          gh release upload "${TAG_NAME}" \
-            "gino-agent/${AGENT_ASSET}" \
-            "gino-agent/${AGENT_ASSET}.sha256" \
-            --clobber
+          files=("${AGENT_ASSET}" "${AGENT_ASSET}.sha256")
+          if [ -f "${AGENT_ASSET}.sig" ]; then files+=("${AGENT_ASSET}.sig"); fi
+          gh release upload "${TAG_NAME}" "${files[@]}" --clobber

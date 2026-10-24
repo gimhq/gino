@@ -143,3 +143,33 @@ protocol naming is gone (`InboundFrameV2`/`OutboundFrameV2` → `InboundFrame`/`
 `protocol::v2` → `protocol::frames`); "v2" in comments that name the task/cron/thread data model is
 kept. The admin API now returns the host outbox id as `msgId` instead of `outboxId`. Verified by host
 `bun run check`, agent fmt, clippy and 437 unit tests, and the docker e2e (88/88).
+
+## 2026-10-24 01:57 [progress]
+
+Agent TLS stack and pma-rust baseline (tasks `20261024-0123-agent-tls-stack`,
+`20261024-0123-agent-baseline-gaps`). reqwest moves to 0.13 with its rustls + aws-lc-rs default
+and `rustls-platform-verifier`, and tokio-tungstenite to 0.30; `ring` is no longer compiled
+(reqwest 0.12's `rustls-tls-native-roots` had enabled it), and `deny.toml` allows
+CDLA-Permissive-2.0 for `webpki-root-certs`. `main` now sets `RLIMIT_CORE` to 0 and installs a
+panic hook that logs a structured `error` with a backtrace. `[profile.dist]` (fat LTO, one
+codegen unit, `panic = "abort"`, stripped) builds the released static musl binary. The agent CI
+job adds typos, an MSRV check (`cargo hack check --rust-version`), nextest and doctests. Two
+restart races in the integration tests — the source of the intermittent
+`offline_startup_fetch_keeps_installed_global` / `restart_same_global_version_is_durable`
+failures — are fixed: the tests wait for the applied global version before killing the daemon
+and for a new connection after the restart. Verified by fmt, clippy, 439 unit and 21
+integration tests (8 consecutive nextest runs), doctests, cargo-deny, cargo-shear, typos, the
+MSRV check, a static musl `dist` build with a live HTTPS handshake, and the docker e2e (88/88).
+
+## 2026-10-24 02:45 [progress]
+
+Signed lode release assets (task `20261024-0245-signed-release-assets`). The agent ships as `gino-agent-linux-x64.tar.gz`
+(`gino-agent` at the root, reproducible: root owner, zero mtime, `gzip -n`); the old raw-binary
+upload also used a doubled `gino-agent/` path that would have failed. With the
+`LODE_SIGNING_KEY` secret set, the release workflow installs lode-cli v0.2.1 (sha256-checked)
+and writes `<asset>.sig` sidecars for both assets; the host manifest entry is re-signed with its
+`run`/`exec` (keeping `size`) and the catalog signed. Verified on a simulated release with a
+throwaway key: `lode-cli verify` accepts both sidecars and the manifest entry,
+`validate-release.ts` passes, and lode installs the agent archive under
+`require_signature = "enforce"` from a loopback native manifest and runs `./gino-agent`, while a
+tampered asset and an untrusted key are rejected.

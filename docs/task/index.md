@@ -42,3 +42,6 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261013-1955-engine-turn-end Engine turn-end detection for claude and codex**](20261013-1955-engine-turn-end.md) `P1`
 - [x] [**20261023-2333-ulid-delivery-ids ULID delivery ids for host and agent outboxes**](20261023-2333-ulid-delivery-ids.md) `P2`
 - [x] [**20261024-0033-dev-state-reset Drop pre-release compatibility layers**](20261024-0033-dev-state-reset.md) `P2`
+- [x] [**20261024-0123-agent-tls-stack Single aws-lc-rs TLS stack on current client crates**](20261024-0123-agent-tls-stack.md) `P2`
+- [x] [**20261024-0123-agent-baseline-gaps Close the pma-rust baseline gaps in gino-agent**](20261024-0123-agent-baseline-gaps.md) `P2`
+- [x] [**20261024-0245-signed-release-assets Signed lode release assets, agent as tar.gz**](20261024-0245-signed-release-assets.md) `P2`

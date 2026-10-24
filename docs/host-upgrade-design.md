@@ -94,13 +94,16 @@ bun run package --version 0.2.0 \
 #   → apps/host/dist/checksums.txt
 ```
 
-The `release` workflow then `gh release upload`s those (plus the agent static
-binary `gino-agent-linux-x64`). **Signing is optional** — with a publisher key in
-the `LODE_SIGN_KEY` secret, add `lode-cli sign` / `manifest-sign` steps; an
-unsigned manifest still carries the sha256/size integrity and works under
-`require_signature = auto` with no key. Both source modes verify the same way:
-GitHub Releases (`github = "gimhq/gino"`, reads the assets directly) or the native
-`manifest.json`.
+The `release` workflow then `gh release upload`s those, plus the agent static
+binary packed as `gino-agent-linux-x64.tar.gz` (`gino-agent` at the archive root,
+lode app name `gino-agent`). **Signing** is driven by the repository secret
+`LODE_SIGNING_KEY` (an ed25519 seed from `lode-cli keygen`): each asset gets a
+`<asset>.sig` sidecar for the GitHub source (no `run`/`exec` bound), and the host
+`manifest.json` entry is re-signed with its `run`/`exec` and the catalog signed for
+the native source. Without the secret the assets upload unsigned — they still carry
+sha256/size integrity and work under `require_signature = auto` with no key.
+Operators running `require_signature = "enforce"` put the public `trustedKeys` entry
+in `[trust].trusted_keys`.
 
 `BUILD_VERSION` (injected by `package.ts` at build time) matches the manifest
 `version`, so `/api/system/version` and `LODE_ACTIVE_VERSION` agree (used for
@@ -293,8 +296,8 @@ docker.io/dotns/lode:latest` + the volume + the toml mount.)
    docker e2e) and release (`.github/workflows/release.yml`: on a published
    Release, upload the host bundle+manifest and the agent musl binary) are in
    place, modelled on `zzci/bithk`. Remaining: confirm `bun run gino.js` runs
-   under the `[runtime]`-provided bun on `zzci/ubase`; wire `LODE_SIGN_KEY` to
-   enable signing.
+   under the `[runtime]`-provided bun on `zzci/ubase`; set the `LODE_SIGNING_KEY`
+   secret to turn signing on.
 2. **Persistence** — the host now auto-resolves data under
    `DATA_DIR > LODE_DIR > ROOT_DIR` (done, `apps/host/src/dirs.ts`; decoupled from the
    version dir); document the `data_dir` layout and verify a rollback keeps the
