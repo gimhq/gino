@@ -6,13 +6,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::mpsc;
-use tokio::time::{self, Instant};
+use tokio::time;
 
 use super::rules::{Proto, RuleSet};
 
-/// Largest UDP payload relayed in one datagram.
-const MAX_DATAGRAM: usize = 65_535;
 /// Per-direction copy buffer of the TCP relay.
 const TCP_BUF: usize = 16 * 1024;
 
@@ -147,6 +144,60 @@ pub async fn resolve(
     proto: Proto,
     rules: &RuleSet,
 ) -> Result<SocketAddr, UpstreamError> {
+    resolve_with(name, port, |ip| {
+        check_address(ip, port, proto, rules).is_ok()
+    })
+    .await
+}
+
+/// True for loopback and unspecified addresses (also IPv4-mapped), which name
+/// the host itself.
+pub fn is_local(ip: IpAddr) -> bool {
+    let v4_local = |v4: Ipv4Addr| v4.is_loopback() || v4.octets()[0] == 0;
+    match ip {
+        IpAddr::V4(v4) => v4_local(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// True for link-local addresses (`169.254.0.0/16`, `fe80::/10`, also
+/// IPv4-mapped), which include cloud metadata endpoints.
+pub fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or_else(|| v6.is_unicast_link_local(), |v4| v4.is_link_local()),
+    }
+}
+
+/// Accepts `ip` for an always-allowed endpoint, which may live on a private
+/// network: addresses naming the host itself ([`is_local`]) and link-local
+/// addresses are refused.
+pub fn check_always_allowed(ip: IpAddr) -> Result<(), UpstreamError> {
+    if is_local(ip) || is_link_local(ip) {
+        return Err(UpstreamError::new(
+            RejectKind::Reset,
+            format!("{ip} is a forbidden destination address"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the always-allowed endpoint `name` and returns the first address
+/// that passes [`check_always_allowed`].
+pub async fn resolve_always_allowed(name: &str, port: u16) -> Result<SocketAddr, UpstreamError> {
+    resolve_with(name, port, |ip| check_always_allowed(ip).is_ok()).await
+}
+
+async fn resolve_with(
+    name: &str,
+    port: u16,
+    accept: impl Fn(IpAddr) -> bool,
+) -> Result<SocketAddr, UpstreamError> {
     let addrs = tokio::net::lookup_host((name, port)).await.map_err(|err| {
         UpstreamError::new(
             RejectKind::Unreachable,
@@ -157,7 +208,7 @@ pub async fn resolve(
     let mut any = false;
     for addr in addrs {
         any = true;
-        if check_address(addr.ip(), port, proto, rules).is_ok() {
+        if accept(addr.ip()) {
             return Ok(addr);
         }
     }
@@ -313,50 +364,6 @@ pub enum UdpOutcome {
     GuestClosed,
     /// The host socket failed (an ICMP port unreachable surfaces here).
     HostError(RejectKind),
-}
-
-/// Forwards datagrams between the guest channels and the connected `host`
-/// socket until the flow is idle for `idle`, the guest side closes or the
-/// host socket fails.
-pub async fn relay_udp(
-    host: UdpSocket,
-    mut from_guest: mpsc::Receiver<Vec<u8>>,
-    to_guest: mpsc::Sender<Vec<u8>>,
-    idle: Duration,
-) -> UdpOutcome {
-    let mut buf = vec![0; MAX_DATAGRAM];
-    let timer = time::sleep(idle);
-    tokio::pin!(timer);
-    loop {
-        tokio::select! {
-            datagram = from_guest.recv() => {
-                let Some(datagram) = datagram else {
-                    return UdpOutcome::GuestClosed;
-                };
-                if let Err(err) = host.send(&datagram).await {
-                    return udp_host_error(&err);
-                }
-            }
-            received = host.recv(&mut buf) => match received {
-                Ok(n) => {
-                    if to_guest.send(buf[..n].to_vec()).await.is_err() {
-                        return UdpOutcome::GuestClosed;
-                    }
-                }
-                Err(err) => return udp_host_error(&err),
-            },
-            () = to_guest.closed() => return UdpOutcome::GuestClosed,
-            () = &mut timer => return UdpOutcome::IdleTimeout,
-        }
-        timer.as_mut().reset(Instant::now() + idle);
-    }
-}
-
-fn udp_host_error(err: &io::Error) -> UdpOutcome {
-    tracing::debug!(error = %err, "host side of udp relay failed");
-    // UDP has no reset; a refused port (ICMP port unreachable) and every
-    // other socket error is reported to the guest as unreachable.
-    UdpOutcome::HostError(RejectKind::Unreachable)
 }
 
 #[cfg(test)]
@@ -520,6 +527,51 @@ mod tests {
         assert_eq!(err.kind(), RejectKind::Reset);
     }
 
+    #[test]
+    fn always_allowed_refuses_only_local_and_link_local_addresses() {
+        for ip in [
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "fd00::1",
+            "1.1.1.1",
+        ] {
+            let ip = ip.parse().unwrap();
+            assert!(check_always_allowed(ip).is_ok(), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "febf::1",
+            "::ffff:169.254.169.254",
+        ] {
+            let ip = ip.parse().unwrap();
+            let err = check_always_allowed(ip).unwrap_err();
+            assert_eq!(err.kind(), RejectKind::Reset, "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_always_allowed_refuses_loopback() {
+        let err = resolve_always_allowed("localhost", 8080).await.unwrap_err();
+        assert_eq!(err.kind(), RejectKind::Reset);
+    }
+
+    #[tokio::test]
+    async fn resolve_always_allowed_refuses_link_local() {
+        for name in ["169.254.169.254", "fe80::1"] {
+            let err = resolve_always_allowed(name, 80).await.unwrap_err();
+            assert_eq!(err.kind(), RejectKind::Reset, "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn resolve_failure_is_unreachable() {
         let err = resolve("no-such-host.invalid", 80, Proto::Tcp, &no_rules())
@@ -660,94 +712,5 @@ mod tests {
         let mut buf = [0; 1];
         let err = host_peer.read(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
-    }
-
-    /// A UDP socket on 127.0.0.1 echoing every datagram back to its sender.
-    async fn udp_echo() -> SocketAddr {
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = vec![0; MAX_DATAGRAM];
-            loop {
-                let (n, from) = socket.recv_from(&mut buf).await.unwrap();
-                socket.send_to(&buf[..n], from).await.unwrap();
-            }
-        });
-        addr
-    }
-
-    struct UdpFlow {
-        tx: mpsc::Sender<Vec<u8>>,
-        rx: mpsc::Receiver<Vec<u8>>,
-        relay: tokio::task::JoinHandle<UdpOutcome>,
-    }
-
-    async fn udp_flow(target: SocketAddr, idle: Duration) -> UdpFlow {
-        let host = connect_udp(target).await.unwrap();
-        let (tx, from_guest) = mpsc::channel(8);
-        let (to_guest, rx) = mpsc::channel(8);
-        let relay = tokio::spawn(relay_udp(host, from_guest, to_guest, idle));
-        UdpFlow { tx, rx, relay }
-    }
-
-    impl UdpFlow {
-        async fn round_trip(&mut self, payload: &[u8]) {
-            self.tx.send(payload.to_vec()).await.unwrap();
-            assert_eq!(self.rx.recv().await.unwrap(), payload);
-        }
-    }
-
-    #[tokio::test]
-    async fn relay_udp_echo_and_guest_close() {
-        let mut flow = udp_flow(udp_echo().await, Duration::from_secs(10)).await;
-        flow.round_trip(b"one").await;
-        flow.round_trip(&vec![7; 60_000]).await;
-        drop(flow.tx);
-        assert_eq!(flow.relay.await.unwrap(), UdpOutcome::GuestClosed);
-    }
-
-    #[tokio::test]
-    async fn relay_udp_ends_when_guest_receiver_dropped() {
-        let flow = udp_flow(udp_echo().await, Duration::from_secs(10)).await;
-        drop(flow.rx);
-        assert_eq!(flow.relay.await.unwrap(), UdpOutcome::GuestClosed);
-    }
-
-    #[tokio::test]
-    async fn relay_udp_idle_timeout() {
-        let idle = Duration::from_millis(100);
-        let start = Instant::now();
-        let flow = udp_flow(udp_echo().await, idle).await;
-        assert_eq!(flow.relay.await.unwrap(), UdpOutcome::IdleTimeout);
-        assert!(start.elapsed() >= idle);
-    }
-
-    #[tokio::test]
-    async fn relay_udp_activity_resets_idle_timer() {
-        let idle = Duration::from_millis(300);
-        let start = Instant::now();
-        let mut flow = udp_flow(udp_echo().await, idle).await;
-        for _ in 0..3 {
-            time::sleep(Duration::from_millis(150)).await;
-            flow.round_trip(b"keepalive").await;
-        }
-        let last = Instant::now();
-        assert!(last - start > idle);
-        assert!(!flow.relay.is_finished());
-        assert_eq!(flow.relay.await.unwrap(), UdpOutcome::IdleTimeout);
-        assert!(last.elapsed() >= idle);
-    }
-
-    #[tokio::test]
-    async fn relay_udp_port_unreachable() {
-        let closed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let target = closed.local_addr().unwrap();
-        drop(closed);
-        let flow = udp_flow(target, Duration::from_secs(10)).await;
-        flow.tx.send(b"anyone?".to_vec()).await.unwrap();
-        assert_eq!(
-            flow.relay.await.unwrap(),
-            UdpOutcome::HostError(RejectKind::Unreachable)
-        );
     }
 }

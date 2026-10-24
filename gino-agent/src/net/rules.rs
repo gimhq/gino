@@ -1,7 +1,7 @@
 //! Network allow-rule types and the compiled matcher.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -109,6 +109,7 @@ pub struct Rule {
 impl Rule {
     /// Checks the rule; `index` is its position in the rule list and appears
     /// in the error message.
+    #[cfg(test)]
     pub fn validate(&self, index: usize) -> Result<(), RuleError> {
         self.compile(index).map(drop)
     }
@@ -158,6 +159,41 @@ pub struct AlwaysAllow {
     pub host: String,
     /// TCP port.
     pub port: u16,
+}
+
+impl AlwaysAllow {
+    /// The `host:port` of an `http(s)://` URL; the port defaults to 443 for
+    /// https and 80 for http. `None` when the URL has no usable host or port.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let (scheme, rest) = url.split_once("://")?;
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+            // `[v6addr]` or `[v6addr]:port`.
+            let (host, rest) = bracketed.split_once(']')?;
+            match rest {
+                "" => (host, default_port),
+                _ => (host, rest.strip_prefix(':')?.parse().ok()?),
+            }
+        } else {
+            match host_port.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().ok()?),
+                None => (host_port, default_port),
+            }
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
 }
 
 /// Invalid rule or always-allowed endpoint.
@@ -278,6 +314,8 @@ impl CompiledRule {
 pub struct RuleSet {
     rules: Vec<CompiledRule>,
     always: Vec<(String, u16)>,
+    /// Always-allowed TCP endpoints given as an IP address.
+    always_addrs: Vec<(IpAddr, u16)>,
 }
 
 impl RuleSet {
@@ -306,7 +344,25 @@ impl RuleSet {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { rules, always })
+        Ok(Self {
+            rules,
+            always,
+            always_addrs: Vec::new(),
+        })
+    }
+
+    /// Adds an always-allowed TCP endpoint given as an IP address and port.
+    pub fn with_always_addr(mut self, addr: SocketAddr) -> Result<Self, RuleError> {
+        if addr.port() == 0 {
+            return Err(RuleError::AlwaysAllow {
+                index: self.always.len() + self.always_addrs.len(),
+                host: addr.ip().to_string(),
+                reason: "port 0 is not allowed",
+            });
+        }
+        self.always_addrs
+            .push((canonical_ip(addr.ip()), addr.port()));
+        Ok(self)
     }
 
     /// Decides a flow to `ip:port` dialed by `name` (if known). Always-allowed
@@ -318,6 +374,9 @@ impl RuleSet {
             && let Some(name) = &name
             && self.always.iter().any(|(h, p)| h == name && *p == port)
         {
+            return Decision::Allow { rule_index: None };
+        }
+        if proto == Proto::Tcp && self.always_addrs.contains(&(ip, port)) {
             return Decision::Allow { rule_index: None };
         }
         match self
@@ -343,6 +402,22 @@ impl RuleSet {
                 Target::Host(pattern) => pattern.matches(&name),
                 Target::Cidr(_) => false,
             })
+    }
+
+    /// True when a rule covers the endpoint `host:port` over `proto`: a host
+    /// rule matching the name, or a `cidr` rule containing the IP literal.
+    /// Always-allowed endpoints do not count.
+    pub fn rule_covers(&self, host: &str, port: u16, proto: Proto) -> bool {
+        let name = normalize_name(host);
+        let ip = name.parse::<IpAddr>().ok().map(canonical_ip);
+        self.rules.iter().any(|rule| {
+            let target = match (&rule.target, ip) {
+                (Target::Host(pattern), None) => pattern.matches(&name),
+                (Target::Cidr(cidr), Some(ip)) => cidr.contains(ip),
+                _ => false,
+            };
+            target && rule.proto == proto && rule.ports.contains(port)
+        })
     }
 
     /// Index of the first `cidr` rule matching `ip`, `port` and `proto`.
@@ -729,6 +804,88 @@ mod tests {
             s.decide(Some("x.api.anthropic.com"), other, 443, Proto::Tcp),
             Decision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn always_allowed_address() {
+        let addr: SocketAddr = "172.17.0.1:8080".parse().unwrap();
+        let s = set(&[], &[]).with_always_addr(addr).unwrap();
+        let ip = v4(172, 17, 0, 1);
+        let allow = Decision::Allow { rule_index: None };
+        assert_eq!(s.decide(None, ip, 8080, Proto::Tcp), allow);
+        let mapped = IpAddr::V6(Ipv4Addr::new(172, 17, 0, 1).to_ipv6_mapped());
+        assert_eq!(s.decide(None, mapped, 8080, Proto::Tcp), allow);
+        assert!(matches!(
+            s.decide(None, ip, 8081, Proto::Tcp),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            s.decide(None, ip, 8080, Proto::Udp),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            s.decide(None, v4(172, 17, 0, 2), 8080, Proto::Tcp),
+            Decision::Deny { .. }
+        ));
+        assert!(!s.name_allowed("172.17.0.1"));
+
+        let v6: SocketAddr = "[fd00::1]:443".parse().unwrap();
+        let s = set(&[], &[]).with_always_addr(v6).unwrap();
+        assert_eq!(s.decide(None, v6.ip(), 443, Proto::Tcp), allow);
+
+        let err = set(&[], &[])
+            .with_always_addr("10.0.0.1:0".parse().unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("always-allowed endpoint 0 "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rule_covers_endpoints() {
+        let always = [AlwaysAllow {
+            host: "api.anthropic.com".to_owned(),
+            port: 443,
+        }];
+        let s = set(
+            &[
+                r#"{"host":"*.example.com","ports":[443]}"#,
+                r#"{"cidr":"10.0.0.0/8","ports":[8080]}"#,
+                r#"{"host":"dns.example.org","ports":[53],"proto":"udp"}"#,
+            ],
+            &always,
+        );
+        assert!(s.rule_covers("Proxy.Example.com.", 443, Proto::Tcp));
+        assert!(!s.rule_covers("proxy.example.com", 80, Proto::Tcp));
+        assert!(!s.rule_covers("proxy.example.com", 443, Proto::Udp));
+        assert!(s.rule_covers("10.1.2.3", 8080, Proto::Tcp));
+        assert!(!s.rule_covers("10.1.2.3", 443, Proto::Tcp));
+        assert!(!s.rule_covers("dns.example.org", 53, Proto::Tcp));
+        assert!(!s.rule_covers("api.anthropic.com", 443, Proto::Tcp));
+    }
+
+    #[test]
+    fn from_url_reads_ip_literals() {
+        let endpoint = |url| AlwaysAllow::from_url(url).unwrap();
+        let expect = |host: &str, port| AlwaysAllow {
+            host: host.to_owned(),
+            port,
+        };
+        assert_eq!(
+            endpoint("http://172.17.0.1:8080/llm"),
+            expect("172.17.0.1", 8080)
+        );
+        assert_eq!(endpoint("https://[fd00::1]/v1"), expect("fd00::1", 443));
+        assert_eq!(endpoint("http://u:p@[::1]:9000?x"), expect("::1", 9000));
+        for url in [
+            "http://[::1",
+            "http://[::1]x",
+            "http://[::1]:",
+            "http://[::1]:x",
+        ] {
+            assert_eq!(AlwaysAllow::from_url(url), None, "{url}");
+        }
     }
 
     #[test]

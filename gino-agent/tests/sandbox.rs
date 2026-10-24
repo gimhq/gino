@@ -21,6 +21,7 @@
 mod support;
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -391,7 +392,8 @@ async fn sandboxed_engine_sees_only_its_own_processes_without_privileges() {
 // Network modes
 // ---------------------------------------------------------------------------
 
-const NET_PROBE: &str = r#"
+/// Loopback TCP and UDP round trips inside the sandbox.
+const LOOPBACK_PROBE: &str = r#"
 cat > /tmp/lo.pl <<'PL'
 use strict;
 use IO::Socket::INET;
@@ -413,6 +415,9 @@ exit($r eq "ping" ? 0 : 1);
 PL
 check LO_TCP 'timeout 5 perl /tmp/lo.pl tcp'
 check LO_UDP 'timeout 5 perl /tmp/lo.pl udp'
+"#;
+
+const NET_PROBE: &str = r#"
 check STUB_HOST 'timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/@STUB_PORT@"'
 check EXTERNAL 'timeout 5 bash -c "exec 3<>/dev/tcp/@EXT_IP@/@EXT_PORT@"'
 value LINKS 'tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\n" ","'
@@ -422,7 +427,7 @@ value LINKS 'tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\n"
 async fn network_probe(network: &str) -> HashMap<String, String> {
     let host = StubHost::start(sandbox_config(network, json!({}))).await;
     let external = TcpListener::bind("0.0.0.0:0").unwrap();
-    let body = NET_PROBE
+    let body = format!("{LOOPBACK_PROBE}{NET_PROBE}")
         .replace("@STUB_PORT@", &host.addr.port().to_string())
         .replace("@EXT_IP@", &non_loopback_ip().to_string())
         .replace(
@@ -478,6 +483,295 @@ async fn network_full_reaches_the_host() {
             ("STUB_HOST", "ok"),
             ("EXTERNAL", "ok"),
         ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist network: the loopback LLM endpoint through the gateway, nothing else
+// ---------------------------------------------------------------------------
+
+const ALLOWLIST_PROBE: &str = r#"
+u="${ANTHROPIC_BASE_URL#*://}"
+hp="${u%%/*}"
+h="${hp%:*}"
+p="${hp##*:}"
+value LLM_HOST 'echo "$h"'
+value LLM_PATH 'echo "/${u#*/}"'
+check LLM 'exec 3<>"/dev/tcp/$h/$p"; printf "ping\n" >&3; read -t 5 -r r <&3; test "$r" = pong'
+check LLM_DIRECT 'timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p"'
+check GATEWAY_OTHER 'timeout 5 bash -c "exec 3<>/dev/tcp/10.0.2.2/@OTHER_PORT@"'
+check ALLOWED_NAME 'getent hosts allowed.test'
+check DISALLOWED_NAME 'getent hosts example.com'
+check DISALLOWED_CONNECT 'timeout 5 bash -c "exec 3<>/dev/tcp/example.com/80"'
+check EXTERNAL 'timeout 5 bash -c "exec 3<>/dev/tcp/@EXT_IP@/@EXT_PORT@"'
+value RESOLV 'cat /etc/resolv.conf'
+value LINKS 'tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " " | sort | tr "\n" ","'
+value CAPEFF 'grep "^CapEff:" /proc/self/status | cut -f2'
+"#;
+
+/// A loopback TCP server answering each `ping` line with `pong`.
+fn llm_stub() -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut line = String::new();
+            let mut reader = BufReader::new(&stream);
+            if reader.read_line(&mut line).is_ok() && line == "ping\n" {
+                let _ = (&stream).write_all(b"pong\n");
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+#[ignore = "needs bubblewrap, user namespaces and /dev/net/tun; run scripts/sandbox-it.sh"]
+async fn allowlist_reaches_the_loopback_llm_endpoint_and_nothing_else() {
+    if !enabled() {
+        return;
+    }
+    let llm_port = llm_stub();
+    let mut config = sandbox_config("allowlist", json!({}));
+    config["engine"]["anthropicBaseUrl"] = json!(format!("http://127.0.0.1:{llm_port}/api/llm"));
+    config["engine"]["isolation"]["network"]["allow"] =
+        json!([{ "host": "allowed.test", "ports": [443] }]);
+    let host = StubHost::start(config).await;
+    let external = TcpListener::bind("0.0.0.0:0").unwrap();
+    let body = ALLOWLIST_PROBE
+        .replace("@OTHER_PORT@", &host.addr.port().to_string())
+        .replace("@EXT_IP@", &non_loopback_ip().to_string())
+        .replace(
+            "@EXT_PORT@",
+            &external.local_addr().unwrap().port().to_string(),
+        );
+    let workspace = Workspace::new().await;
+    let fakes = claude_fakes(&body);
+    let runner = RunnerProc::spawn_in_with_fakes(&host, &workspace, fakes, None);
+    assert!(
+        host.wait_connected(RUN_TIMEOUT).await,
+        "runner never connected"
+    );
+
+    let run = run_thread(&host, "t-al", "th-al", 1).await;
+    assert_eq!(run.status, "succeeded", "run: {run:?}");
+    let results = probes(&host, "t-al", "th-al").await;
+    runner.shutdown().await;
+    expect(
+        &results,
+        &[
+            ("LLM_HOST", "10.0.2.2"),
+            ("LLM_PATH", "/api/llm"),
+            ("LLM", "ok"),
+            ("LLM_DIRECT", "denied"),
+            ("GATEWAY_OTHER", "denied"),
+            ("ALLOWED_NAME", "ok"),
+            ("DISALLOWED_NAME", "denied"),
+            ("DISALLOWED_CONNECT", "denied"),
+            ("EXTERNAL", "denied"),
+            ("RESOLV", "nameserver 10.0.2.2"),
+            ("CAPEFF", "0000000000000000"),
+        ],
+    );
+    assert!(
+        results["LINKS"].contains("gino0"),
+        "links: {}",
+        results["LINKS"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist rules from the local isolation file
+// ---------------------------------------------------------------------------
+
+/// Fixed port of the SSH-style banner server (a non-HTTP port).
+const BANNER_PORT: u16 = 2222;
+
+const RULES_PROBE: &str = r#"
+cat > /tmp/udp.pl <<'PL'
+use strict;
+use IO::Socket::INET;
+use IO::Select;
+my ($host, $port) = @ARGV;
+my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'udp') or die "socket: $!";
+$s->send("ping") or die "send: $!";
+IO::Select->new($s)->can_read(3) or exit 1;
+my $r;
+defined $s->recv($r, 16) or exit 1;
+exit($r eq "ping" ? 0 : 1);
+PL
+cat > /tmp/rcode.pl <<'PL'
+use strict;
+use IO::Socket::INET;
+use IO::Select;
+my $name = shift;
+my $q = pack('n n n n n n', 0x1234, 0x0100, 1, 0, 0, 0);
+$q .= pack('C', length $_) . $_ for split /\./, $name;
+$q .= pack('C n n', 0, 1, 1);
+my $s = IO::Socket::INET->new(PeerAddr => '10.0.2.2', PeerPort => 53, Proto => 'udp') or die "socket: $!";
+$s->send($q) or die "send: $!";
+IO::Select->new($s)->can_read(3) or die "no answer";
+my $r;
+$s->recv($r, 512);
+my (undef, $flags) = unpack('n n', $r);
+print $flags & 0xf;
+PL
+value BANNER 'exec 3<>/dev/tcp/@IP@/@BANNER_PORT@; read -t 5 -r b <&3; printf "SSH-2.0-probe\r\n" >&3; read -t 5 -r a <&3; echo "$b $a"'
+check TCP_OTHER_PORT 'timeout 5 bash -c "exec 3<>/dev/tcp/@IP@/@OTHER_TCP@"'
+check UDP_ALLOWED 'timeout 5 perl /tmp/udp.pl @IP@ @UDP_PORT@'
+check UDP_DENIED 'timeout 5 perl /tmp/udp.pl @IP@ @OTHER_UDP@'
+value NX_RCODE 'timeout 5 perl /tmp/rcode.pl denied.example'
+check OUTSIDE_CIDR 'timeout 5 bash -c "exec 3<>/dev/tcp/192.0.2.10/@BANNER_PORT@"'
+"#;
+
+/// A TCP server on `ip:port` that greets with an SSH-style banner and answers
+/// the client's banner line with `ok`.
+fn banner_server(ip: IpAddr, port: u16) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = TcpListener::bind((ip, port)).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let _ = (&stream).write_all(b"SSH-2.0-gino-it\r\n");
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_ok() && line.starts_with("SSH-2.0-")
+            {
+                let _ = (&stream).write_all(b"ok\n");
+            }
+        }
+    });
+}
+
+/// A UDP server on `ip` echoing every datagram; returns its port.
+fn udp_echo(ip: IpAddr) -> u16 {
+    let socket = UdpSocket::bind((ip, 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let _ = socket.send_to(&buf[..n], from);
+        }
+    });
+    port
+}
+
+/// The `gino_agent::net` decision lines in the daemon log, ANSI styling removed.
+fn decision_lines(log: &Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(log).unwrap_or_default();
+    let mut plain = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            chars.by_ref().find(|c| *c == 'm');
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+        .lines()
+        .filter(|l| l.contains("gino_agent::net") && l.contains("network decision"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "needs bubblewrap, user namespaces and /dev/net/tun; run scripts/sandbox-it.sh"]
+async fn allowlist_rules_from_the_isolation_file_admit_only_matching_flows() {
+    if !enabled() {
+        return;
+    }
+    // Upstreams live on the container's private address, so only a covering
+    // cidr rule admits them.
+    let ip = non_loopback_ip();
+    banner_server(ip, BANNER_PORT);
+    let other_tcp = TcpListener::bind((ip, 0)).unwrap();
+    let other_tcp_port = other_tcp.local_addr().unwrap().port();
+    let udp_port = udp_echo(ip);
+    let other_udp_port = udp_echo(ip);
+
+    let dir = tempfile::Builder::new()
+        .prefix("allowlist-it-")
+        .tempdir()
+        .unwrap();
+    let cidr = format!("{ip}/32");
+    let isolation = json!({
+        "mode": "sandbox",
+        "network": { "mode": "allowlist", "allow": [
+            { "cidr": cidr, "ports": [BANNER_PORT] },
+            { "cidr": cidr, "ports": [udp_port], "proto": "udp" },
+        ] },
+    });
+    let file = dir.path().join("isolation.json");
+    std::fs::write(&file, isolation.to_string()).unwrap();
+    let log = dir.path().join("agent.log");
+
+    let host = StubHost::start(json!({})).await;
+    let body = format!("{LOOPBACK_PROBE}{RULES_PROBE}")
+        .replace("@IP@", &ip.to_string())
+        .replace("@BANNER_PORT@", &BANNER_PORT.to_string())
+        .replace("@OTHER_TCP@", &other_tcp_port.to_string())
+        .replace("@UDP_PORT@", &udp_port.to_string())
+        .replace("@OTHER_UDP@", &other_udp_port.to_string());
+    let workspace = Workspace::new().await;
+    let fakes = claude_fakes(&body);
+    let runner = RunnerProc::spawn_in_with_env(
+        &host,
+        &workspace,
+        fakes,
+        &[
+            ("GINO_ISOLATION_FILE", file.as_os_str()),
+            ("RUST_LOG", OsStr::new("gino_agent::net=info")),
+        ],
+        std::fs::File::create(&log).unwrap().into(),
+    );
+    assert!(
+        host.wait_connected(RUN_TIMEOUT).await,
+        "runner never connected"
+    );
+
+    let run = run_thread(&host, "t-rules", "th-rules", 1).await;
+    assert_eq!(run.status, "succeeded", "run: {run:?}");
+    let results = probes(&host, "t-rules", "th-rules").await;
+    runner.shutdown().await;
+    expect(
+        &results,
+        &[
+            ("LO_TCP", "ok"),
+            ("LO_UDP", "ok"),
+            ("BANNER", "SSH-2.0-gino-it ok"),
+            ("TCP_OTHER_PORT", "denied"),
+            ("UDP_ALLOWED", "ok"),
+            ("UDP_DENIED", "denied"),
+            ("NX_RCODE", "3"),
+            ("OUTSIDE_CIDR", "denied"),
+        ],
+    );
+
+    let lines = decision_lines(&log);
+    let logged = |proto: &str, port: u16, decision: &str| {
+        lines.iter().any(|l| {
+            l.contains("thread_id=\"th-rules\"")
+                && l.contains(&format!("proto=\"{proto}\""))
+                && l.contains(&format!("port={port} "))
+                && l.contains(&format!("decision=\"{decision}\""))
+        })
+    };
+    for (proto, port, decision) in [
+        ("tcp", BANNER_PORT, "allow"),
+        ("tcp", other_tcp_port, "deny"),
+        ("udp", udp_port, "allow"),
+        ("udp", other_udp_port, "deny"),
+    ] {
+        assert!(
+            logged(proto, port, decision),
+            "no {decision} line for {proto}/{port}: {lines:#?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("target_ip=192.0.2.10") && l.contains("decision=\"deny\"")),
+        "no deny line for the address outside every cidr: {lines:#?}"
     );
 }
 

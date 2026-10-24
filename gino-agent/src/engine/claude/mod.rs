@@ -42,7 +42,7 @@ use self::control::ControlAsk;
 use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
-use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext};
+use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext, NetExit};
 
 /// Everything needed to build the `claude` argv, spawn the child, and resolve its
 /// environment. Built from the global [`Config`]
@@ -77,6 +77,8 @@ pub(crate) struct ClaudeSettings {
     pub(crate) config_dir: Option<PathBuf>,
     /// Default isolation (`engine.isolation`); empty means off.
     pub(crate) isolation: IsolationSpec,
+    /// A local isolation floor (`GINO_ISOLATION_FILE`) is configured.
+    pub(crate) isolation_floored: bool,
     /// The daemon workspace dir, which isolation paths are checked against.
     pub(crate) workspace_dir: PathBuf,
 }
@@ -95,6 +97,7 @@ impl Default for ClaudeSettings {
             env: Vec::new(),
             config_dir: None,
             isolation: IsolationSpec::default(),
+            isolation_floored: false,
             workspace_dir: PathBuf::new(),
         }
     }
@@ -131,6 +134,7 @@ impl ClaudeSettings {
             allowed_tools: engine.allowed_tools.clone(),
             env,
             isolation: engine.isolation.clone(),
+            isolation_floored: engine.isolation_floor.is_some(),
             workspace_dir: config.paths.workspace_dir.clone(),
             ..Self::default()
         }
@@ -325,7 +329,7 @@ impl Engine for ClaudeEngine {
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         let session_args = SessionArgs::for_session(&cfg);
         let settings = effective_settings(&self.settings, &cfg);
-        let session = spawn_session(&settings, &session_args, &cfg)?;
+        let session = spawn_session(&settings, &session_args, &cfg).await?;
         Ok(Box::new(session))
     }
 }
@@ -434,17 +438,19 @@ fn launch_context<'a>(settings: &'a ClaudeSettings, cfg: &'a SessionCfg) -> Laun
         isolation: &settings.isolation,
         task_override: cfg.isolation.as_ref(),
         workspace_dir: &settings.workspace_dir,
+        thread_id: cfg.thread_id.as_deref(),
         work_dir: cfg.work_dir.as_deref(),
         self_exe: settings.self_exe.as_deref(),
         global_config_dir: settings.config_dir.as_deref(),
         config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+        floored: settings.isolation_floored,
     }
 }
 
 /// Spawn the `claude` child (directly or sandboxed, per the run's isolation),
 /// wire the reader/writer tasks, and perform the handshake. Returns the live
 /// [`ClaudeSession`].
-fn spawn_session(
+async fn spawn_session(
     settings: &ClaudeSettings,
     session_args: &SessionArgs,
     cfg: &SessionCfg,
@@ -466,6 +472,7 @@ fn spawn_session(
     let initial_prompt = cfg.initial_prompt.as_deref();
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
+    let net = sandbox::start_network(launch.net, &mut child).await?;
     let stdin = child
         .stdin
         .take()
@@ -512,6 +519,7 @@ fn spawn_session(
         events: Mutex::new(Some(events_rx)),
         child: Mutex::new(Some(child)),
         tasks: vec![writer_handle, reader_handle],
+        _net: net,
     })
 }
 
@@ -656,6 +664,8 @@ pub(crate) struct ClaudeSession {
     events: Mutex<Option<mpsc::UnboundedReceiver<EngineEvent>>>,
     child: Mutex<Option<Child>>,
     tasks: Vec<JoinHandle<()>>,
+    /// Allowlist network exit; stops when the session is dropped.
+    _net: Option<NetExit>,
 }
 
 #[async_trait]
@@ -800,7 +810,13 @@ mod tests {
             ..SessionCfg::default()
         };
         let args = SessionArgs::for_session(&cfg);
-        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let isolation = sandbox::resolve(
+            &settings.isolation,
+            None,
+            &root,
+            sandbox::LlmBaseUrl::default(),
+        )
+        .unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &args, Some("task-1"), None),
             &launch_context(&settings, &cfg),

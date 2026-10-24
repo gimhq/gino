@@ -43,7 +43,7 @@ use tracing::{debug, warn};
 use self::events::EventMapper;
 use crate::config::Config;
 use crate::engine::{Engine, EngineError, EngineEvent, EventStream, LogLevel, Session, SessionCfg};
-use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext};
+use crate::sandbox::{self, IsolationSpec, Launch, LaunchContext, NetExit};
 
 /// Everything needed to build the `codex` argv, spawn the child, and resolve its
 /// environment. Built from the global [`Config`] via [`CodexSettings::from_config`];
@@ -94,6 +94,8 @@ pub(crate) struct CodexSettings {
     pub(crate) config_dir: Option<PathBuf>,
     /// Default isolation (`engine.isolation`); empty means off.
     pub(crate) isolation: IsolationSpec,
+    /// A local isolation floor (`GINO_ISOLATION_FILE`) is configured.
+    pub(crate) isolation_floored: bool,
     /// The daemon workspace dir, which isolation paths are checked against.
     pub(crate) workspace_dir: PathBuf,
 }
@@ -111,6 +113,7 @@ impl Default for CodexSettings {
             env: Vec::new(),
             config_dir: None,
             isolation: IsolationSpec::default(),
+            isolation_floored: false,
             workspace_dir: PathBuf::new(),
         }
     }
@@ -146,6 +149,7 @@ impl CodexSettings {
             env,
             config_dir: None,
             isolation: config.engine.isolation.clone(),
+            isolation_floored: config.engine.isolation_floor.is_some(),
             workspace_dir: config.paths.workspace_dir.clone(),
         }
     }
@@ -288,7 +292,7 @@ impl Engine for CodexEngine {
     /// rather than approximated.
     async fn start_session(&self, cfg: SessionCfg) -> Result<Box<dyn Session>, EngineError> {
         let settings = effective_settings(&self.settings, &cfg);
-        let session = spawn_session(&settings, &cfg)?;
+        let session = spawn_session(&settings, &cfg).await?;
         Ok(Box::new(session))
     }
 }
@@ -389,16 +393,21 @@ fn launch_context<'a>(settings: &'a CodexSettings, cfg: &'a SessionCfg) -> Launc
         isolation: &settings.isolation,
         task_override: cfg.isolation.as_ref(),
         workspace_dir: &settings.workspace_dir,
+        thread_id: cfg.thread_id.as_deref(),
         work_dir: cfg.work_dir.as_deref(),
         self_exe: settings.self_exe.as_deref(),
         global_config_dir: settings.config_dir.as_deref(),
         config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+        floored: settings.isolation_floored,
     }
 }
 
 /// Spawn the `codex exec` child (directly or sandboxed, per the run's
 /// isolation), deliver the prompt, and wire the reader tasks.
-fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSession, EngineError> {
+async fn spawn_session(
+    settings: &CodexSettings,
+    cfg: &SessionCfg,
+) -> Result<CodexSession, EngineError> {
     let launch = sandbox::launch(direct_launch(settings, cfg), &launch_context(settings, cfg))?;
     // Stderr is captured: a child that dies at startup (bad args, auth failure)
     // writes its reason to stderr only — the bounded tail is surfaced as a log
@@ -406,6 +415,7 @@ fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSess
     let mut command = launch.command();
 
     let mut child = command.spawn().map_err(EngineError::Spawn)?;
+    let net = sandbox::start_network(launch.net, &mut child).await?;
     let stdin = child
         .stdin
         .take()
@@ -446,6 +456,7 @@ fn spawn_session(settings: &CodexSettings, cfg: &SessionCfg) -> Result<CodexSess
         child: Arc::new(tokio::sync::Mutex::new(child)),
         sandboxed: launch.sandboxed,
         tasks: vec![reader_handle],
+        _net: net,
     })
 }
 
@@ -534,6 +545,8 @@ pub(crate) struct CodexSession {
     /// The child is `bwrap`; signals go to `sandbox-init` inside it.
     sandboxed: bool,
     tasks: Vec<JoinHandle<()>>,
+    /// Allowlist network exit; stops when the session is dropped.
+    _net: Option<NetExit>,
 }
 
 #[async_trait]
@@ -707,7 +720,13 @@ mod tests {
             work_dir: Some(work_dir.clone()),
             ..SessionCfg::default()
         };
-        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let isolation = sandbox::resolve(
+            &settings.isolation,
+            None,
+            &root,
+            sandbox::LlmBaseUrl::default(),
+        )
+        .unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &cfg),
             &launch_context(&settings, &cfg),
@@ -751,6 +770,7 @@ mod tests {
                 mode: Some("sandbox".to_owned()),
                 network: Some(crate::sandbox::NetworkSpec {
                     mode: Some("allowlist".to_owned()),
+                    ..crate::sandbox::NetworkSpec::default()
                 }),
                 ..IsolationSpec::default()
             },

@@ -50,11 +50,15 @@ pub struct RunLimits {
 
 /// A held TCP slot, released on drop.
 #[derive(Debug)]
-pub struct TcpPermit(OwnedSemaphorePermit);
+pub struct TcpPermit(
+    #[expect(dead_code, reason = "held only to release the slot on drop")] OwnedSemaphorePermit,
+);
 
 /// A held UDP slot, released on drop.
 #[derive(Debug)]
-pub struct UdpPermit(OwnedSemaphorePermit);
+pub struct UdpPermit(
+    #[expect(dead_code, reason = "held only to release the slot on drop")] OwnedSemaphorePermit,
+);
 
 impl RunLimits {
     /// Creates counters for `cfg`; caps above the semaphore maximum are clamped.
@@ -86,11 +90,13 @@ impl RunLimits {
     }
 
     /// Number of held TCP slots.
+    #[cfg(test)]
     pub fn live_tcp(&self) -> usize {
         self.max_tcp - self.tcp.available_permits()
     }
 
     /// Number of held UDP slots.
+    #[cfg(test)]
     pub fn live_udp(&self) -> usize {
         self.max_udp - self.udp.available_permits()
     }

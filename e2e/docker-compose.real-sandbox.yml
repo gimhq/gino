@@ -1,0 +1,106 @@
+# Real-engine sandbox e2e: the REAL Claude CLI, launched by the agent inside a
+# bubblewrap sandbox (engine.isolation mode `sandbox`), driving a REAL model
+# through the host /llm credential proxy.
+#
+#   host    the control plane + /llm proxy (same as docker-compose.real.yml).
+#   agent   the v2 runner as the unprivileged `gino` user, with the namespace
+#           syscalls bubblewrap needs allowed by a generated seccomp profile
+#           (SANDBOX_SECCOMP_PROFILE, written by run-real-sandbox.sh).
+#   tester  creates a sandboxed task and asserts what the engine can see/do.
+#
+# Run via ./run-real-sandbox.sh.
+
+name: gino-e2e-real-sandbox
+
+services:
+  host:
+    image: oven/bun:1.4.0
+    working_dir: /app
+    entrypoint: ["sh", "/app/e2e/host-real-entrypoint.sh"]
+    labels:
+      ai-agent: "true"
+    volumes:
+      # The repo (read-only) also carries the gitignored e2e/.real-creds.json that
+      # run-real-sandbox.sh stages in v1 proxy mode.
+      - ../:/app:ro
+    tmpfs:
+      - /tmp
+    environment:
+      NODE_ENV: development
+      ROOT_DIR: /app/apps/host
+      GINO_PORT: "3000"
+      GINO_HOST: 0.0.0.0
+      GINO_DB_PATH: /tmp/gino/gino.db
+      GINO_STORE_DIR: /tmp/gino/store
+      GINO_LOG_TO_STDOUT: "true"
+      GINO_LOG_LEVEL: info
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_HTTP_CHANNEL_TOKEN: e2e-channel-secret
+      GINO_HTTP_ADMIN_TOKEN: e2e-admin-secret
+      GINO_PROXY_ANTHROPIC_BASE_URL: https://api.anthropic.com
+      GINO_PROXY_ANTHROPIC_API_KEY: "${GINO_PROXY_ANTHROPIC_API_KEY:-}"
+      GINO_PROXY_ANTHROPIC_OAUTH_TOKEN: "${GINO_PROXY_ANTHROPIC_OAUTH_TOKEN:-}"
+      GINO_PROXY_STATIC_KEY: gino-e2e-proxy-key
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 4s
+      retries: 20
+      start_period: 5s
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent.real-sandbox
+      labels:
+        ai-agent: "true"
+    image: ai-agent/gino-agent:e2e-real-sandbox
+    labels:
+      ai-agent: "true"
+    depends_on:
+      host:
+        condition: service_healthy
+    # bubblewrap needs unprivileged user namespaces and its own /proc mount.
+    security_opt:
+      - "seccomp=${SANDBOX_SECCOMP_PROFILE:?run via run-real-sandbox.sh}"
+      - systempaths=unconfined
+      - apparmor=unconfined
+    devices:
+      - /dev/net/tun
+    environment:
+      GINO_HOST_URL: http://host:3000/api
+      GINO_REGISTER_TOKEN: e2e-register-secret
+      GINO_AGENT_NAME: e2e-real-sandbox-runner
+      GINO_WORKSPACE_DIR: /workspace/group
+      GINO_DB_PATH: /workspace/group/agent.db
+      # Inherited by the sandboxed engine: model calls go to the host /llm proxy.
+      ANTHROPIC_BASE_URL: http://host:3000/api/llm
+      ANTHROPIC_API_KEY: gino-e2e-proxy-key
+      RUST_LOG: info
+
+  tester:
+    image: oven/bun:1.4.0
+    working_dir: /work
+    command: ["bun", "/work/e2e-real-sandbox.ts"]
+    labels:
+      ai-agent: "true"
+    depends_on:
+      host:
+        condition: service_healthy
+      agent:
+        condition: service_started
+    volumes:
+      - ./e2e-real-sandbox.ts:/work/e2e-real-sandbox.ts:ro
+    environment:
+      BASE: http://host:3000/api
+      ADMIN_TOKEN: e2e-admin-secret
+      AGENT_NAME: e2e-real-sandbox-runner
+      REAL_MODEL: "${REAL_MODEL:-claude-haiku}"
+      SMOKE: "${SMOKE:-0}"
+      SANDBOX_NETWORK: "${SANDBOX_NETWORK:-none}"
+      SANDBOX_DENIED_HOST: "${SANDBOX_DENIED_HOST:-github.com}"
+
+networks:
+  default:
+    labels:
+      ai-agent: "true"
