@@ -65,7 +65,7 @@ async function register(capabilities: string[] = ["claude"]): Promise<{ agentId:
   const res = await app.fetch(new Request("http://local/api/agent/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER, protocolVersion: 2, source: "manual", capabilities }),
+    body: JSON.stringify({ registerToken: REGISTER, protocolVersion: 1, source: "manual", capabilities }),
   }));
   expect(res.status).toBe(200);
   return await res.json() as { agentId: string; connectToken: string };

@@ -42,10 +42,9 @@
 //! caller drives yet; its own unit tests keep the surface honest. The v1 dead code
 //! above is removed, not suppressed. The write-only reconciliation plane
 //! (`threads.synced` / `crons.dirty` accessors) is removed outright: the result
-//! plane is transactional now ([`Db::immediate_transaction`]), so a terminal
+//! plane is transactional ([`Db::immediate_transaction`]), so a terminal
 //! thread state and its outbox frame commit together and there is nothing left to
-//! reconcile after the fact. The columns stay in the schema — see the decision
-//! note there.
+//! reconcile after the fact.
 //!
 //! ## Statement caching
 //!
@@ -68,32 +67,20 @@ use serde::Serialize;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
-// Schema migration ladder
+// Schema
 // ---------------------------------------------------------------------------
 //
-// The schema is versioned through `PRAGMA user_version` and [`Db::migrate`]
-// steps a database from its recorded version to [`SCHEMA_VERSION`], one
-// transaction per step: a step's DDL/DML and its version bump commit
-// atomically, so a crash mid-ladder resumes at the incomplete step. The former
-// single CREATE-IF-NOT-EXISTS blob could not evolve an existing DB — a column
-// added to a CREATE TABLE (`inbox.msg_id`, `thread_attachments`) simply never
-// appeared in a pre-existing file and every read/write of it broke.
-//
-// DECISION: an unversioned DB (`user_version = 0`) that already has tables is
-// treated as the v1 baseline — the last CREATE-only shape (pre-campaign).
-// Databases created by intermediate development builds between v1 and this
-// ladder are not supported (pre-release: discard and recreate), which keeps
-// every step unconditional.
+// The schema is versioned through `PRAGMA user_version`. [`Db::migrate`] creates
+// a fresh database at [`SCHEMA_VERSION`] in one transaction; a database recorded
+// at any other version is refused (pre-release: discard and recreate it).
 
 /// The schema version this binary reads and writes (`PRAGMA user_version`).
-pub(crate) const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
-/// Step v0 → v1: the baseline schema (the pre-campaign CREATE-only shape).
-/// `IF NOT EXISTS` throughout, so a legacy unversioned DB — which already has
-/// exactly these tables — passes through unchanged and is merely stamped v1.
-const MIGRATE_V1_BASELINE: &str = "\
-CREATE TABLE IF NOT EXISTS outbox (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+/// The full schema, applied once to a fresh database.
+const SCHEMA: &str = "\
+CREATE TABLE outbox (
+  id          TEXT    PRIMARY KEY,                -- monotonic lowercase ULID; the wire `outboxId`
   type        TEXT    NOT NULL,
   payload     TEXT    NOT NULL,
   task_id     TEXT,
@@ -102,40 +89,47 @@ CREATE TABLE IF NOT EXISTS outbox (
   acked_at    TEXT,
   retry_count INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_outbox_task   ON outbox(task_id);
-CREATE INDEX IF NOT EXISTS idx_outbox_thread ON outbox(thread_id);
+CREATE INDEX idx_outbox_task    ON outbox(task_id);
+CREATE INDEX idx_outbox_thread  ON outbox(thread_id);
+-- Partial hot-path indexes: reconnect replay scans WHERE acked_at IS NULL /
+-- processed_at IS NULL under the global DB mutex on every flush, so the scans
+-- stay proportional to the backlog, not the tables' history.
+CREATE INDEX idx_outbox_unacked ON outbox(id) WHERE acked_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS inbox (
+CREATE TABLE inbox (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   type         TEXT    NOT NULL,
   payload      TEXT    NOT NULL,
   task_id      TEXT,
   thread_id    TEXT,
+  msg_id       TEXT,                              -- host delivery id (ULID); NULL when the frame carries none
   received_at  TEXT    NOT NULL DEFAULT (datetime('now')),
   processed_at TEXT,
   retry_count  INTEGER NOT NULL DEFAULT 0         -- PROCESSING failures (not replays); the poison policy discards a row after MAX failures
 );
-CREATE INDEX IF NOT EXISTS idx_inbox_task   ON inbox(task_id);
-CREATE INDEX IF NOT EXISTS idx_inbox_thread ON inbox(thread_id);
+CREATE INDEX idx_inbox_task   ON inbox(task_id);
+CREATE INDEX idx_inbox_thread ON inbox(thread_id);
+-- At-least-once dedup (protocol.md §4.2); multiple NULLs allowed.
+CREATE UNIQUE INDEX idx_inbox_msg_id ON inbox(msg_id);
+CREATE INDEX idx_inbox_unprocessed ON inbox(id) WHERE processed_at IS NULL;
 
--- The global top category (agent-architecture §3). The v2 entity columns are
--- (id, name, kind, status, created_at, updated_at), driven by TaskRow. The legacy
--- v1 columns and their TaskRecord CRUD are removed with the in-runner tool server
--- (PLAN-007). The task-definition columns (engine/model/workdir/meta) are NOT
--- here: like inbox.msg_id they arrived after this baseline was frozen, so they
--- are added by the v4 ladder step and this const stays honestly pre-campaign.
-CREATE TABLE IF NOT EXISTS tasks (
+-- The global top category (agent-architecture §3), driven by TaskRow.
+CREATE TABLE tasks (
   id             TEXT PRIMARY KEY,
   name           TEXT,
   kind           TEXT,
   status         TEXT NOT NULL DEFAULT 'active',
-  entries        TEXT,                              -- v2: JSON array of the task's DESIRED provisioning entries [{id,sha256,target,kind}] (PLAN-007 §5); nullable, set via set_task_entries (insert_task_row omits it)
+  entries        TEXT,                              -- JSON array of the task's DESIRED provisioning entries [{id,sha256,target,kind}] (PLAN-007 §5); nullable, set via set_task_entries (insert_task_row omits it)
+  engine         TEXT,                              -- backend name; only 'claude' is implemented (unknown → warn + claude)
+  model          TEXT,                              -- per-task model id; overrides config.engine.model at the NEXT spawn
+  workdir        TEXT,                              -- PERSIST-ONLY: nothing reads this yet
+  meta           TEXT,                              -- PERSIST-ONLY: free-form host JSON, stored as text
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL
 );
 
 -- A trigger under a task (1 task : N crons). agent-architecture §3/§4.
-CREATE TABLE IF NOT EXISTS crons (
+CREATE TABLE crons (
   id             TEXT PRIMARY KEY,
   task_id        TEXT NOT NULL REFERENCES tasks(id),
   kind           TEXT NOT NULL,                     -- schedule | webhook | api
@@ -147,22 +141,16 @@ CREATE TABLE IF NOT EXISTS crons (
   continuity     TEXT    NOT NULL DEFAULT 'isolated', -- isolated | shared
   run_count      INTEGER NOT NULL DEFAULT 0,        -- CACHE; truth = cron_logs (D4)
   status         TEXT    NOT NULL DEFAULT 'active',  -- active | paused | completed | cancelled
-  -- DECISION: retained-but-unused. `dirty` belonged to a write-only host-mirror
-  -- reconciliation plane that was never wired; with the fire path now running in
-  -- one transaction there is nothing to reconcile, so no code writes this column
-  -- anymore (it keeps its schema default). It stays only because the idempotent
-  -- CREATE TABLE cannot drop a column without a migration, which we avoid.
-  dirty          INTEGER NOT NULL DEFAULT 1,
   created_at     TEXT    NOT NULL,
   updated_at     TEXT    NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_crons_task   ON crons(task_id);
-CREATE INDEX IF NOT EXISTS idx_crons_status ON crons(status, next_run);
+CREATE INDEX idx_crons_task   ON crons(task_id);
+CREATE INDEX idx_crons_status ON crons(status, next_run);
 
 -- One engine execution / conversation under a task (1 task : N threads).
 -- This is what used to be called a 'session'; the engine resume handle survives
 -- as the engine_session_id field. agent-architecture §3/§5.
-CREATE TABLE IF NOT EXISTS threads (
+CREATE TABLE threads (
   id                TEXT PRIMARY KEY,
   task_id           TEXT NOT NULL REFERENCES tasks(id),
   cron_id           TEXT REFERENCES crons(id),     -- NULL = chat/api/direct
@@ -180,25 +168,28 @@ CREATE TABLE IF NOT EXISTS threads (
   duration_ms       INTEGER,
   result            TEXT,
   error             TEXT,
-  -- DECISION: retained-but-unused. `synced` was the designed post-crash repair
-  -- flag for terminal-result delivery, but the repair sweep was never wired and
-  -- the flag was write-only. The terminal state and its outbox frame now commit
-  -- in ONE transaction (executor finalize), so the outbox alone is the durable
-  -- delivery contract and no code writes this column anymore (it keeps its
-  -- schema default). It stays only to avoid a column-drop migration.
-  synced            INTEGER NOT NULL DEFAULT 0,
   last_seq          INTEGER NOT NULL DEFAULT 0,     -- last per-thread executor seq; continues across a runner restart (host dedups on (thread_id, seq))
   created_at        TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_threads_task   ON threads(task_id);
-CREATE INDEX IF NOT EXISTS idx_threads_cron   ON threads(cron_id);
-CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
-CREATE INDEX IF NOT EXISTS idx_threads_synced ON threads(synced);
+CREATE INDEX idx_threads_task   ON threads(task_id);
+CREATE INDEX idx_threads_cron   ON threads(cron_id);
+CREATE INDEX idx_threads_status ON threads(status);
+
+-- Inbound attachment descriptors snapshotted per thread. The inbox `message`
+-- carrying them is CONSUMED at prompt-resolve time, so without this snapshot a
+-- retry or a restarted daemon would re-run the thread with its snapshotted
+-- prompt but ZERO attachments and still report success. Written before the
+-- message is consumed; read (never popped) on every attempt.
+CREATE TABLE thread_attachments (
+  thread_id   TEXT PRIMARY KEY REFERENCES threads(id),
+  descriptors TEXT NOT NULL,                       -- JSON array of wire AttachmentDescriptor
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Per-fire scheduling ledger (LOCAL, incl. skips that produce no thread).
 -- UNIQUE(cron_id, scheduled_at) is the durable firing-dedup contract — it
 -- replaces the in-memory HashSet. agent-architecture §3/§7.
-CREATE TABLE IF NOT EXISTS cron_logs (
+CREATE TABLE cron_logs (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   cron_id      TEXT    NOT NULL REFERENCES crons(id),
   task_id      TEXT    NOT NULL REFERENCES tasks(id),
@@ -211,8 +202,8 @@ CREATE TABLE IF NOT EXISTS cron_logs (
   created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
   UNIQUE(cron_id, scheduled_at)
 );
-CREATE INDEX IF NOT EXISTS idx_cron_logs_cron   ON cron_logs(cron_id);
-CREATE INDEX IF NOT EXISTS idx_cron_logs_thread ON cron_logs(thread_id);
+CREATE INDEX idx_cron_logs_cron   ON cron_logs(cron_id);
+CREATE INDEX idx_cron_logs_thread ON cron_logs(thread_id);
 
 -- Installed manifest + store-refcount index for provisioned config/skills
 -- (agent-architecture §3/§9b, PLAN-007 §4). NOT a copy of config content: the
@@ -220,9 +211,9 @@ CREATE INDEX IF NOT EXISTS idx_cron_logs_thread ON cron_logs(thread_id);
 -- lives in config (global) / the tasks.entries column (task). This table records
 -- only WHAT is materialized WHERE — backing reconcile, GC (refcount), restart
 -- repair, and observability.
-CREATE TABLE IF NOT EXISTS config_entries (
+CREATE TABLE config_entries (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope        TEXT NOT NULL,   -- materialization location: 'global' (engine-config root) | <task_id> (the task project/ scope, P1-11). Rows written under the pre-v3 <thread_id> scoping are deleted by migration step v3.
+  scope        TEXT NOT NULL,   -- materialization location: 'global' (engine-config root) | <task_id> (the task project/ scope, P1-11)
   name         TEXT NOT NULL,   -- logical id (= store <name>)
   sha256       TEXT NOT NULL,   -- full hash (version / integrity)
   short        TEXT NOT NULL,   -- store short id (sha256[:12])
@@ -233,10 +224,10 @@ CREATE TABLE IF NOT EXISTS config_entries (
   installed_at TEXT NOT NULL,
   UNIQUE(scope, target)
 );
-CREATE INDEX IF NOT EXISTS idx_config_entries_scope ON config_entries(scope);
-CREATE INDEX IF NOT EXISTS idx_config_entries_store ON config_entries(name, sha256);
+CREATE INDEX idx_config_entries_scope ON config_entries(scope);
+CREATE INDEX idx_config_entries_store ON config_entries(name, sha256);
 
-CREATE TABLE IF NOT EXISTS identity (
+CREATE TABLE identity (
   id            INTEGER PRIMARY KEY CHECK (id = 1),
   agent_id      TEXT NOT NULL,
   connect_token TEXT NOT NULL,
@@ -247,69 +238,25 @@ CREATE TABLE IF NOT EXISTS identity (
 -- config_entries (the materialized manifest): this records the APPLIED global
 -- config VERSION so a restart can tell an authoritative new desired set (version
 -- advanced → reconcile) from an unchanged one (same version → repair-only, no wipe).
-CREATE TABLE IF NOT EXISTS config_meta (
+CREATE TABLE config_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 ";
 
-/// Step v1 → v2: the inbound-dedup / hot-path additions.
-const MIGRATE_V2_INBOUND_DEDUP: &str = "\
--- Host delivery id (protocol.md §6 dedupe-by-id, audit P0-3); NULL when the
--- frame carries none. Uniqueness lives in the index below (multiple NULLs
--- allowed) so the ALTER-stepped and fresh shapes are identical.
-ALTER TABLE inbox ADD COLUMN msg_id INTEGER;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_msg_id ON inbox(msg_id);
-
--- Partial hot-path indexes (audit P1-9): reconnect replay scans
--- WHERE acked_at IS NULL / processed_at IS NULL under the global DB mutex on
--- every flush, so the scans must stay proportional to the unacked/unprocessed
--- backlog, not the tables' history.
-CREATE INDEX IF NOT EXISTS idx_outbox_unacked ON outbox(id) WHERE acked_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_inbox_unprocessed ON inbox(id) WHERE processed_at IS NULL;
-
--- Inbound attachment descriptors snapshotted per thread (audit P1-10b). The
--- inbox `message` carrying them is CONSUMED at prompt-resolve time, so without
--- this snapshot a retry or a restarted daemon would re-run the thread with its
--- snapshotted prompt but ZERO attachments and still report success. Written
--- before the message is consumed; read (never popped) on every attempt.
-CREATE TABLE IF NOT EXISTS thread_attachments (
-  thread_id   TEXT PRIMARY KEY REFERENCES threads(id),
-  descriptors TEXT NOT NULL,                       -- JSON array of wire AttachmentDescriptor
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-";
-
-/// Step v2 → v3: drop legacy thread-scoped provisioning-manifest rows.
-///
-/// `config_entries.scope` re-keyed from `<thread_id>` to `<task_id>`;
-/// rows written under the old scoping are dead — no reconcile or GC
-/// path ever matches them again. DECISION: delete rather than translate — the
-/// manifest is rebuildable provisioning state (the next fire's reconcile
-/// re-materializes its scope from the desired set), and the old thread-scoped
-/// link trees live inside per-thread work dirs that workspace lifecycle
-/// reclaims wholesale.
-const MIGRATE_V3_SCOPE_CLEANUP: &str = "DELETE FROM config_entries WHERE scope <> 'global';";
-
-/// Step v3 → v4: the task-definition columns the host has always sent on
-/// `task_upsert` (protocol.md §7 `{engine?, model?, workdir?, meta?}`) and
-/// the runner used to discard (align-2026-08 D2). All four are nullable with no
-/// default, so existing rows migrate to "unset" and the omission-preserves rule
-/// in `apply_task_def` reads NULL as "the host never told us".
-const MIGRATE_V4_TASK_DEFINITION: &str = "\
-ALTER TABLE tasks ADD COLUMN engine  TEXT;  -- backend name; only 'claude' is implemented (unknown → warn + claude)
-ALTER TABLE tasks ADD COLUMN model   TEXT;  -- per-task model id; overrides config.engine.model at the NEXT spawn
-ALTER TABLE tasks ADD COLUMN workdir TEXT;  -- PERSIST-ONLY: nothing reads this yet
-ALTER TABLE tasks ADD COLUMN meta    TEXT;  -- PERSIST-ONLY: free-form host JSON, stored as text
-";
-
-/// The ladder: `MIGRATIONS[n]` steps a database from version `n` to `n + 1`.
-const MIGRATIONS: [&str; 4] = [
-    MIGRATE_V1_BASELINE,
-    MIGRATE_V2_INBOUND_DEDUP,
-    MIGRATE_V3_SCOPE_CLEANUP,
-    MIGRATE_V4_TASK_DEFINITION,
-];
+/// A new outbox delivery id: a lowercase ULID, monotonic within the process so
+/// ids minted in the same millisecond still sort in creation order.
+fn new_delivery_id() -> String {
+    static GENERATOR: std::sync::LazyLock<std::sync::Mutex<ulid::Generator>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(ulid::Generator::new()));
+    let mut generator = GENERATOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let id = generator
+        .generate()
+        .unwrap_or_else(ulid::Overflow::commit_overflow_increment);
+    id.to_string().to_lowercase()
+}
 
 /// The per-connection pragma preamble. WAL for concurrent read/write; a busy
 /// timeout to ride out brief locks; `foreign_keys` because SQLite ships FK
@@ -344,10 +291,16 @@ pub(crate) enum DbError {
     /// binary cannot serve.
     #[error(
         "database schema is v{found} but this binary expects v{expected}; \
-         start the daemon to migrate an older database, or upgrade this binary \
+         start the daemon to create a fresh database, or upgrade this binary \
          for a newer one"
     )]
     SchemaVersionMismatch { found: i64, expected: i64 },
+    /// The DB was created by an older development build; delete it and restart.
+    #[error(
+        "database schema v{found} is from an older development build and cannot be \
+         upgraded; delete the database and restart gino-agent"
+    )]
+    UnsupportedSchema { found: i64 },
 }
 
 /// Convenience alias for fallible DB operations.
@@ -400,10 +353,10 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// A row of the `outbox` (runner → host, at-least-once). `task_id`/`thread_id`
-/// are the v2 correlation columns (routing); `payload` stays opaque JSON.
+/// are the correlation columns (routing); `payload` stays opaque JSON.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OutboxRow {
-    pub(crate) id: i64,
+    pub(crate) id: String,
     pub(crate) msg_type: String,
     pub(crate) payload: String,
     pub(crate) task_id: Option<String>,
@@ -414,7 +367,7 @@ pub(crate) struct OutboxRow {
 }
 
 /// A row of the `inbox` (host → runner, at-least-once replay). `task_id`/
-/// `thread_id` are the v2 correlation columns; `payload` stays opaque JSON.
+/// `thread_id` are the correlation columns; `payload` stays opaque JSON.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InboxRow {
     pub(crate) id: i64,
@@ -479,9 +432,6 @@ pub(crate) struct CronRow {
     pub(crate) run_count: i64,
     /// `active` | `paused` | `completed` | `cancelled`.
     pub(crate) status: String,
-    /// Mirrors the retained-but-unused `crons.dirty` column (see the schema
-    /// decision note): read back as the column's default, never written.
-    pub(crate) dirty: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -518,9 +468,6 @@ pub(crate) struct ThreadRow {
     pub(crate) duration_ms: Option<i64>,
     pub(crate) result: Option<String>,
     pub(crate) error: Option<String>,
-    /// Mirrors the retained-but-unused `threads.synced` column (see the schema
-    /// decision note): read back as the column's default, never written.
-    pub(crate) synced: bool,
     pub(crate) created_at: String,
 }
 
@@ -664,32 +611,29 @@ impl Db {
         Ok(db)
     }
 
-    /// Step the schema to [`SCHEMA_VERSION`] through the [`MIGRATIONS`] ladder.
-    /// Idempotent: an up-to-date DB is a no-op. Each step commits its DDL/DML
-    /// together with its `user_version` bump in one `BEGIN IMMEDIATE`
-    /// transaction. A fresh (table-less) DB fast-paths to the latest shape by
-    /// running the WHOLE ladder in a single transaction: every step must apply
-    /// cleanly on top of the baseline it just created (the data-migration step
-    /// v3 simply has nothing to touch), which is what keeps a fresh DB and a
-    /// migrated one at the identical shape.
+    /// Create the schema in a fresh database; an up-to-date one is a no-op. A
+    /// database at any other version, or an unversioned one that already has
+    /// tables, is refused — pre-release, there is no upgrade path.
     pub(crate) fn migrate(&self) -> DbResult<()> {
-        let mut version = self.user_version()?;
+        let version = self.user_version()?;
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
         if version > SCHEMA_VERSION {
             return Err(DbError::SchemaNewerThanBinary {
                 found: version,
                 supported: SCHEMA_VERSION,
             });
         }
-        if version == 0 && self.is_uninitialized()? {
-            return self.run_migration_step(SCHEMA_VERSION, &MIGRATIONS.concat());
+        if version != 0 || !self.is_uninitialized()? {
+            return Err(DbError::UnsupportedSchema { found: version });
         }
-        for (to_version, step) in (1..).zip(MIGRATIONS) {
-            if version < to_version {
-                self.run_migration_step(to_version, step)?;
-                version = to_version;
-            }
-        }
-        Ok(())
+        self.immediate_transaction(|db| {
+            db.conn.execute_batch(SCHEMA)?;
+            db.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            Ok(())
+        })
     }
 
     /// The schema version recorded in the DB header (`PRAGMA user_version`).
@@ -701,7 +645,7 @@ impl Db {
     }
 
     /// Whether the DB holds no tables at all — a freshly created file (or a
-    /// pristine in-memory DB), as opposed to an unversioned legacy baseline.
+    /// pristine in-memory DB).
     fn is_uninitialized(&self) -> DbResult<bool> {
         let tables: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -709,16 +653,6 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(tables == 0)
-    }
-
-    /// Run one ladder step: its statements plus the `user_version` bump to
-    /// `to_version`, atomically.
-    fn run_migration_step(&self, to_version: i64, sql: &str) -> DbResult<()> {
-        self.immediate_transaction(|db| {
-            db.conn.execute_batch(sql)?;
-            db.conn.pragma_update(None, "user_version", to_version)?;
-            Ok(())
-        })
     }
 
     /// Run `f` inside one `BEGIN IMMEDIATE` transaction on the shared connection:
@@ -760,7 +694,7 @@ impl Db {
     pub(crate) fn restore_outbox_table(&self) -> DbResult<()> {
         self.exec_raw(
             "CREATE TABLE outbox (
-               id          INTEGER PRIMARY KEY AUTOINCREMENT,
+               id          TEXT    PRIMARY KEY,
                type        TEXT    NOT NULL,
                payload     TEXT    NOT NULL,
                task_id     TEXT,
@@ -774,26 +708,27 @@ impl Db {
 
     // -- Outbox (at-least-once, runner → host) -----------------------------
 
-    /// Persist a message to the outbox before sending, tagging it with the v2
-    /// correlation ids (either may be `None`). Returns the new row id.
+    /// Persist a message to the outbox before sending, tagging it with the
+    /// correlation ids (either may be `None`). Returns the new row's ULID.
     pub(crate) fn enqueue_outbox_correlated<T: Serialize>(
         &self,
         msg_type: &str,
         payload: &T,
         task_id: Option<&str>,
         thread_id: Option<&str>,
-    ) -> DbResult<i64> {
+    ) -> DbResult<String> {
         let json = serde_json::to_string(payload)?;
+        let id = new_delivery_id();
         self.conn
             .prepare_cached(
-                "INSERT INTO outbox (type, payload, task_id, thread_id) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO outbox (id, type, payload, task_id, thread_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
-            .execute(params![msg_type, json, task_id, thread_id])?;
-        Ok(self.conn.last_insert_rowid())
+            .execute(params![id, msg_type, json, task_id, thread_id])?;
+        Ok(id)
     }
 
     /// Persist a message to the outbox before sending (no correlation ids).
-    /// Returns the new row id.
+    /// Returns the new row's ULID.
     #[cfg_attr(
         not(test),
         allow(
@@ -805,7 +740,7 @@ impl Db {
         &self,
         msg_type: &str,
         payload: &T,
-    ) -> DbResult<i64> {
+    ) -> DbResult<String> {
         self.enqueue_outbox_correlated(msg_type, payload, None, None)
     }
 
@@ -834,7 +769,7 @@ impl Db {
 
     /// Mark an outbox row acknowledged. Idempotent — re-acking an already-acked
     /// row is a harmless no-op (it simply stays out of [`Self::list_unacked_outbox`]).
-    pub(crate) fn mark_outbox_acked(&self, id: i64) -> DbResult<()> {
+    pub(crate) fn mark_outbox_acked(&self, id: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE outbox SET acked_at = datetime('now') WHERE id = ?1")?
             .execute(params![id])?;
@@ -842,7 +777,7 @@ impl Db {
     }
 
     /// Bump an outbox row's retry counter before a replay attempt.
-    pub(crate) fn increment_outbox_retry(&self, id: i64) -> DbResult<()> {
+    pub(crate) fn increment_outbox_retry(&self, id: &str) -> DbResult<()> {
         self.conn
             .prepare_cached("UPDATE outbox SET retry_count = retry_count + 1 WHERE id = ?1")?
             .execute(params![id])?;
@@ -854,14 +789,14 @@ impl Db {
     /// doubles as the tombstone — the inbox poison policy reuses `processed_at`
     /// the same way — so no schema change is needed and `acked_at IS NULL` stays
     /// the single replay predicate the partial index serves.
-    pub(crate) fn mark_outbox_dead(&self, id: i64) -> DbResult<()> {
+    pub(crate) fn mark_outbox_dead(&self, id: &str) -> DbResult<()> {
         self.mark_outbox_acked(id)
     }
 
     // -- Inbox (at-least-once replay, host → runner) -----------------------
 
     /// Persist an inbound message to the inbox for at-least-once processing,
-    /// tagging it with the v2 correlation ids (either may be `None`) and the
+    /// tagging it with the correlation ids (either may be `None`) and the
     /// host's delivery `msg_id`. The `msg_id` UNIQUE column is the at-least-once
     /// dedup (protocol.md §6): a redelivery of an already-stored `msg_id` is a
     /// no-op and returns `None` (the caller re-acks); a fresh insert returns the
@@ -872,7 +807,7 @@ impl Db {
         payload: &T,
         task_id: Option<&str>,
         thread_id: Option<&str>,
-        msg_id: Option<i64>,
+        msg_id: Option<&str>,
     ) -> DbResult<Option<i64>> {
         let json = serde_json::to_string(payload)?;
         let inserted = self
@@ -1069,8 +1004,7 @@ impl Db {
 
     // -- Crons (v2 triggers) -----------------------------------------------
 
-    /// Insert a new cron (trigger) row. The retained-but-unused `dirty` column
-    /// takes its schema default (see the schema decision note).
+    /// Insert a new cron (trigger) row.
     pub(crate) fn insert_cron(&self, cron: &CronRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
@@ -1097,8 +1031,7 @@ impl Db {
         Ok(())
     }
 
-    /// Update an existing cron's mutable columns by id (`created_at` is immutable;
-    /// the retained-but-unused `dirty` column is never written).
+    /// Update an existing cron's mutable columns by id (`created_at` is immutable).
     pub(crate) fn update_cron(&self, cron: &CronRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
@@ -1165,7 +1098,7 @@ impl Db {
             .conn
             .prepare_cached(
                 "SELECT id, task_id, kind, prompt, schedule_type, schedule_value, next_run, last_fired_at,
-                        continuity, run_count, status, dirty, created_at, updated_at
+                        continuity, run_count, status, created_at, updated_at
                    FROM crons WHERE id = ?1",
             )?
             .query_row(params![id], Self::map_cron)
@@ -1177,7 +1110,7 @@ impl Db {
     pub(crate) fn list_active_crons(&self) -> DbResult<Vec<CronRow>> {
         self.query_crons(
             "SELECT id, task_id, kind, prompt, schedule_type, schedule_value, next_run, last_fired_at,
-                    continuity, run_count, status, dirty, created_at, updated_at
+                    continuity, run_count, status, created_at, updated_at
                FROM crons WHERE status = 'active' ORDER BY created_at, id",
         )
     }
@@ -1189,7 +1122,7 @@ impl Db {
             .conn
             .prepare_cached(
                 "SELECT id, task_id, kind, prompt, schedule_type, schedule_value, next_run, last_fired_at,
-                        continuity, run_count, status, dirty, created_at, updated_at
+                        continuity, run_count, status, created_at, updated_at
                    FROM crons WHERE task_id = ?1 ORDER BY created_at, id",
             )?
             .query_map(params![task_id], Self::map_cron)?
@@ -1218,16 +1151,14 @@ impl Db {
             continuity: r.get(8)?,
             run_count: r.get(9)?,
             status: r.get(10)?,
-            dirty: r.get(11)?,
-            created_at: r.get(12)?,
-            updated_at: r.get(13)?,
+            created_at: r.get(11)?,
+            updated_at: r.get(12)?,
         })
     }
 
     // -- Threads (v2 engine executions) ------------------------------------
 
-    /// Insert a new thread row. The retained-but-unused `synced` column takes
-    /// its schema default (see the schema decision note).
+    /// Insert a new thread row.
     pub(crate) fn insert_thread(&self, t: &ThreadRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
@@ -1261,8 +1192,7 @@ impl Db {
     }
 
     /// Update a thread's mutable columns by id (`id`/`task_id`/`cron_id`/
-    /// `source`/`engine`/`created_at` are immutable once the row is born; the
-    /// retained-but-unused `synced` column is never written).
+    /// `source`/`engine`/`created_at` are immutable once the row is born).
     pub(crate) fn update_thread(&self, t: &ThreadRow) -> DbResult<()> {
         self.conn
             .prepare_cached(
@@ -1319,7 +1249,7 @@ impl Db {
             .prepare_cached(
                 "SELECT id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
                         failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                        duration_ms, result, error, synced, created_at
+                        duration_ms, result, error, created_at
                    FROM threads WHERE id = ?1",
             )?
             .query_row(params![id], Self::map_thread)
@@ -1333,7 +1263,7 @@ impl Db {
         self.query_threads(
             "SELECT id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
                     failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                    duration_ms, result, error, synced, created_at
+                    duration_ms, result, error, created_at
                FROM threads WHERE status = 'pending' ORDER BY created_at, id",
         )
     }
@@ -1346,7 +1276,7 @@ impl Db {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
                     failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                    duration_ms, result, error, synced, created_at
+                    duration_ms, result, error, created_at
                FROM threads WHERE status = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt
@@ -1367,7 +1297,7 @@ impl Db {
             .prepare_cached(
                 "SELECT id, task_id, cron_id, source, prompt, engine, engine_session_id, status,
                         failure_reason, attempt, max_attempts, work_dir, started_at, finished_at,
-                        duration_ms, result, error, synced, created_at
+                        duration_ms, result, error, created_at
                    FROM threads WHERE task_id = ?1 ORDER BY created_at, id",
             )?
             .query_map(params![task_id], Self::map_thread)?
@@ -1421,8 +1351,7 @@ impl Db {
             duration_ms: r.get(14)?,
             result: r.get(15)?,
             error: r.get(16)?,
-            synced: r.get(17)?,
-            created_at: r.get(18)?,
+            created_at: r.get(17)?,
         })
     }
 
@@ -1869,8 +1798,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConfigEntryRow, CronLogRow, CronRow, Db, DbError, InboxRow, MIGRATE_V1_BASELINE,
-        MIGRATIONS, OutboxRow, SCHEMA_VERSION, TaskRow, ThreadRow,
+        ConfigEntryRow, CronLogRow, CronRow, Db, DbError, InboxRow, OutboxRow, SCHEMA_VERSION,
+        TaskRow, ThreadRow,
     };
 
     // -- v2 row builders ---------------------------------------------------
@@ -1903,7 +1832,6 @@ mod tests {
             continuity: "isolated".to_owned(),
             run_count: 0,
             status: status.to_owned(),
-            dirty: true,
             created_at: "2026-06-22T11:00:00Z".to_owned(),
             updated_at: "2026-06-22T11:00:00Z".to_owned(),
         }
@@ -1928,7 +1856,6 @@ mod tests {
             duration_ms: None,
             result: None,
             error: None,
-            synced: false,
             created_at: "2026-06-22T11:00:00Z".to_owned(),
         }
     }
@@ -1983,45 +1910,9 @@ mod tests {
         count > 0
     }
 
-    /// A table's columns in declaration order — the shape-convergence probe.
-    fn table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
-        conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
-            .unwrap()
-            .query_map(rusqlite::params![table], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap()
-    }
-
     fn raw_user_version(conn: &rusqlite::Connection) -> i64 {
         conn.query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
-    }
-
-    /// Build an UNVERSIONED legacy database file at `path` — the pre-campaign
-    /// baseline shape old deployments left on disk: no `inbox.msg_id`, no
-    /// `thread_attachments`, `user_version = 0`. The pre-conditions are
-    /// asserted so the constructed shape stays honestly pre-campaign even if
-    /// the baseline const drifts.
-    fn create_legacy_db(path: &std::path::Path) -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute_batch(MIGRATE_V1_BASELINE).unwrap();
-        assert!(!column_exists(&conn, "inbox", "msg_id"));
-        for column in ["engine", "model", "workdir", "meta"] {
-            assert!(
-                !column_exists(&conn, "tasks", column),
-                "the v1 baseline predates the task-definition columns"
-            );
-        }
-        assert!(
-            !conn
-                .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_attachments'")
-                .unwrap()
-                .exists([])
-                .unwrap()
-        );
-        assert_eq!(raw_user_version(&conn), 0);
-        conn
     }
 
     #[test]
@@ -2035,83 +1926,6 @@ mod tests {
         db.migrate().unwrap();
         assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
         assert!(db.get_task_row("t-1").unwrap().is_some());
-    }
-
-    /// Regression: a legacy unversioned DB (pre-campaign shape) used to
-    /// break on every read/write of the later-added `inbox.msg_id` column and
-    /// `thread_attachments` table. The ladder must step it to latest with its
-    /// data intact, after which the daemon paths work.
-    #[test]
-    fn legacy_db_migrates_through_ladder_to_latest() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.db");
-        {
-            let conn = create_legacy_db(&path);
-            // Pre-campaign data that must survive the ladder.
-            conn.execute(
-                "INSERT INTO tasks (id, status, created_at, updated_at)
-                 VALUES ('t-1', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO inbox (type, payload) VALUES ('message', '{}')",
-                [],
-            )
-            .unwrap();
-        }
-
-        let db = Db::open(&path).unwrap();
-        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
-
-        // The audit's broken paths now work: msg_id-deduped inbound recording…
-        assert!(
-            db.record_inbound_correlated("message", &json!({}), None, None, Some(7))
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db.record_inbound_correlated("message", &json!({}), None, None, Some(7))
-                .unwrap()
-                .is_none(),
-            "redelivery of a stored msg_id dedups"
-        );
-        // …and the per-thread attachment snapshot plane.
-        db.insert_thread(&thread_row("th-1", "t-1", None, "pending"))
-            .unwrap();
-        db.set_thread_attachments("th-1", &json!([{"id": "a-1"}]))
-            .unwrap();
-        assert!(db.get_thread_attachments("th-1").unwrap().is_some());
-
-        // Pre-existing rows survived the ladder.
-        assert!(db.get_task_row("t-1").unwrap().is_some());
-        assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 2);
-    }
-
-    /// The v3 data step: `config_entries.scope` re-keyed thread-id → task-id,
-    /// so legacy thread-scoped manifest rows are dead scopes and are
-    /// removed by the migration; the global scope survives.
-    #[test]
-    fn migration_removes_legacy_thread_scoped_config_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.db");
-        {
-            let conn = create_legacy_db(&path);
-            for scope in ["global", "th-dead-1", "th-dead-2"] {
-                conn.execute(
-                    "INSERT INTO config_entries
-                       (scope, name, sha256, short, target, kind, store_path, link_path, installed_at)
-                     VALUES (?1, 'notes', 'aaaa', 'aaaa', 'CLAUDE.md', 'file', 's', 'l', '2026-01-01T00:00:00Z')",
-                    rusqlite::params![scope],
-                )
-                .unwrap();
-            }
-        }
-
-        let db = Db::open(&path).unwrap();
-        let rows = db.list_all_config_entries().unwrap();
-        assert_eq!(rows.len(), 1, "only the global row survives");
-        assert_eq!(rows[0].scope, "global");
     }
 
     /// Regression: SQLite ships `PRAGMA foreign_keys` OFF per connection;
@@ -2142,47 +1956,6 @@ mod tests {
                 .unwrap();
             assert_eq!(on, 1, "foreign_keys must be ON on file opens");
         }
-    }
-
-    /// D2 regression: a database sitting at the pre-v4 schema steps up to the
-    /// task-definition columns with its task rows intact, and lands on the SAME
-    /// shape a fresh DB gets from the fast path.
-    #[test]
-    fn pre_v4_db_gains_task_definition_columns_without_losing_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.db");
-        {
-            // The v3 shape: the ladder up to (but not including) the new step.
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(&MIGRATIONS[..3].concat()).unwrap();
-            conn.pragma_update(None, "user_version", 3).unwrap();
-            conn.execute(
-                "INSERT INTO tasks (id, name, kind, status, created_at, updated_at)
-                 VALUES ('t-old', 'legacy', 'agent', 'active', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .unwrap();
-        }
-
-        let db = Db::open(&path).unwrap();
-        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
-
-        // The pre-existing row survived, with the new columns reading as unset.
-        let row = db.get_task_row("t-old").unwrap().expect("row survived");
-        assert_eq!(row.name.as_deref(), Some("legacy"));
-        assert_eq!(row.status, "active");
-        assert_eq!(
-            (row.engine, row.model, row.workdir, row.meta),
-            (None, None, None, None)
-        );
-
-        // …and the migrated shape matches the fresh fast-path shape exactly.
-        let fresh = Db::open_in_memory().unwrap();
-        assert_eq!(
-            table_columns(&db.conn, "tasks"),
-            table_columns(&fresh.conn, "tasks"),
-            "a migrated DB and a fresh one must converge on the same tasks shape"
-        );
     }
 
     /// D2: the task-definition columns round-trip through insert/get/update.
@@ -2224,6 +1997,22 @@ mod tests {
         ));
     }
 
+    /// A database left by an older development build (unversioned with tables)
+    /// is refused instead of being patched up.
+    #[test]
+    fn daemon_open_refuses_a_database_from_an_older_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE outbox (id INTEGER PRIMARY KEY AUTOINCREMENT);")
+            .unwrap();
+        assert!(matches!(
+            Db::open(&path).unwrap_err(),
+            DbError::UnsupportedSchema { found: 0 }
+        ));
+    }
+
     /// The CLI open path ([`Db::open_existing`]) neither creates nor
     /// migrates — a missing file and a version mismatch both fail fast, and a
     /// mismatched file is left byte-identical (only the daemon migrates).
@@ -2236,23 +2025,23 @@ mod tests {
         assert!(Db::open_existing(&path).is_err());
         assert!(!path.exists(), "open_existing must not create the DB");
 
-        // Legacy (v0) file: refused with the version-mismatch error…
-        drop(create_legacy_db(&path));
+        // Unversioned file: refused with the version-mismatch error…
+        rusqlite::Connection::open(&path).unwrap();
         assert!(matches!(
             Db::open_existing(&path).unwrap_err(),
             DbError::SchemaVersionMismatch { found: 0, expected } if expected == SCHEMA_VERSION
         ));
-        // …and left unmigrated.
+        // …and left without a schema.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             assert_eq!(raw_user_version(&conn), 0);
             assert!(
                 !column_exists(&conn, "inbox", "msg_id"),
-                "open_existing must not migrate"
+                "open_existing must not create the schema"
             );
         }
 
-        // A daemon-migrated file opens fine.
+        // A daemon-initialized file opens fine.
         drop(Db::open(&path).unwrap());
         let db = Db::open_existing(&path).unwrap();
         assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
@@ -2366,8 +2155,7 @@ mod tests {
         db.insert_cron(&cron_row("cr-1", "t-1", "active")).unwrap();
         db.insert_cron(&cron_row("cr-2", "t-1", "paused")).unwrap();
 
-        // Round-trips column-for-column (`dirty` reads back as the schema
-        // default of the retained-but-unused column, matching the builder).
+        // Round-trips column-for-column.
         assert_eq!(
             db.get_cron("cr-1").unwrap().as_ref(),
             Some(&cron_row("cr-1", "t-1", "active"))
@@ -2936,7 +2724,7 @@ mod tests {
                 &json!({ "text": "hi" }),
                 Some("t-1"),
                 Some("cr-1@1718"),
-                Some(7),
+                Some(crate::protocol::test_delivery_id(7).as_str()),
             )
             .unwrap()
             .unwrap();
@@ -2962,7 +2750,7 @@ mod tests {
                 &json!({ "text": "hi" }),
                 Some("t-1"),
                 None,
-                Some(42),
+                Some(crate::protocol::test_delivery_id(42).as_str()),
             )
             .unwrap();
         assert!(first.is_some(), "first delivery inserts");
@@ -2972,7 +2760,7 @@ mod tests {
                 &json!({ "text": "hi" }),
                 Some("t-1"),
                 None,
-                Some(42),
+                Some(crate::protocol::test_delivery_id(42).as_str()),
             )
             .unwrap();
         assert_eq!(dup, None, "redelivery of the same msg_id is a no-op");
@@ -2988,6 +2776,48 @@ mod tests {
         assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 3);
     }
 
+    /// Ids from a recreated host database are fresh ULIDs, never the ids the
+    /// inbox already holds, so they are stored instead of deduped away.
+    #[test]
+    fn inbox_accepts_ids_from_a_recreated_host_db() {
+        let db = Db::open_in_memory().unwrap();
+        let before = "01jab3x7k2m4n5p6q7r8s90001";
+        let after = "01jbcd3x7k2m4n5p6q7r8s9001";
+        for id in [before, after] {
+            let stored = db
+                .record_inbound_correlated("message", &json!({}), Some("t-1"), None, Some(id))
+                .unwrap();
+            assert!(stored.is_some(), "{id} is a new delivery");
+        }
+        assert_eq!(db.list_unprocessed_inbox().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outbox_ids_are_lowercase_ulids_in_creation_order() {
+        let db = Db::open_in_memory().unwrap();
+        let ids: Vec<String> = (0..200)
+            .map(|n| db.enqueue_outbox("heartbeat", &json!({ "n": n })).unwrap())
+            .collect();
+        for id in &ids {
+            assert_eq!(id.len(), 26);
+            assert!(
+                id.chars()
+                    .all(|c| "0123456789abcdefghjkmnpqrstvwxyz".contains(c)),
+                "{id} is lowercase Crockford base32"
+            );
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(sorted, ids);
+        let replayed: Vec<String> = db
+            .list_unacked_outbox()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(replayed, ids);
+    }
+
     // -- Existing outbox/inbox behavior (regression) -----------------------
 
     #[test]
@@ -2999,24 +2829,24 @@ mod tests {
         let id2 = db
             .enqueue_outbox("idle", &json!({ "status": "success" }))
             .unwrap();
-        assert_eq!((id1, id2), (1, 2));
+        assert!(id1 < id2, "ids sort in creation order: {id1} < {id2}");
 
         let unacked = db.list_unacked_outbox().unwrap();
         assert_eq!(unacked.len(), 2);
         assert_eq!(unacked[0].msg_type, "output");
         assert!(unacked[0].acked_at.is_none());
 
-        db.mark_outbox_acked(id1).unwrap();
+        db.mark_outbox_acked(&id1).unwrap();
         let unacked = db.list_unacked_outbox().unwrap();
         assert_eq!(unacked.len(), 1);
         assert_eq!(unacked[0].id, id2);
 
         // Re-acking is idempotent (dedup): no duplicate, count unchanged.
-        db.mark_outbox_acked(id1).unwrap();
+        db.mark_outbox_acked(&id1).unwrap();
         assert_eq!(db.list_unacked_outbox().unwrap().len(), 1);
 
-        db.increment_outbox_retry(id2).unwrap();
-        db.increment_outbox_retry(id2).unwrap();
+        db.increment_outbox_retry(&id2).unwrap();
+        db.increment_outbox_retry(&id2).unwrap();
         assert_eq!(db.list_unacked_outbox().unwrap()[0].retry_count, 2);
     }
 
@@ -3044,9 +2874,9 @@ mod tests {
     // -- Queue GC (retention sweep) -----------------------------
 
     /// Rewrite a DB-defaulted timestamp column so the row is `days` old.
-    fn age_row(db: &Db, table: &str, column: &str, id: i64, days: u32) {
+    fn age_row(db: &Db, table: &str, column: &str, id: impl std::fmt::Display, days: u32) {
         db.exec_raw(&format!(
-            "UPDATE {table} SET {column} = datetime('now', '-{days} days') WHERE id = {id}"
+            "UPDATE {table} SET {column} = datetime('now', '-{days} days') WHERE id = '{id}'"
         ))
         .unwrap();
     }
@@ -3068,10 +2898,10 @@ mod tests {
         let old_acked = db.enqueue_outbox("output", &json!({})).unwrap();
         let fresh_acked = db.enqueue_outbox("output", &json!({})).unwrap();
         let old_unacked = db.enqueue_outbox("output", &json!({})).unwrap();
-        db.mark_outbox_acked(old_acked).unwrap();
-        db.mark_outbox_acked(fresh_acked).unwrap();
-        age_row(&db, "outbox", "created_at", old_acked, 40);
-        age_row(&db, "outbox", "created_at", old_unacked, 400);
+        db.mark_outbox_acked(&old_acked).unwrap();
+        db.mark_outbox_acked(&fresh_acked).unwrap();
+        age_row(&db, "outbox", "created_at", &old_acked, 40);
+        age_row(&db, "outbox", "created_at", &old_unacked, 400);
 
         assert_eq!(db.gc_outbox_batch(30, 100).unwrap(), 1);
 
@@ -3182,8 +3012,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         for _ in 0..5 {
             let id = db.enqueue_outbox("output", &json!({})).unwrap();
-            db.mark_outbox_acked(id).unwrap();
-            age_row(&db, "outbox", "created_at", id, 40);
+            db.mark_outbox_acked(&id).unwrap();
+            age_row(&db, "outbox", "created_at", &id, 40);
         }
 
         // Each invocation deletes at most `limit` rows; repeated calls drain.

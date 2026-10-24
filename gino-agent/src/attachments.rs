@@ -2,7 +2,7 @@
 //!
 //! Bytes never ride a protocol frame — only **descriptors** do
 //! (`{ id, name, content_type, size, sha256, ref, direction? }`, see
-//! [`crate::protocol::v2::AttachmentDescriptor`]). This module owns the byte
+//! [`crate::protocol::frames::AttachmentDescriptor`]). This module owns the byte
 //! plane:
 //!
 //! * a **config-selected backend** ([`build_backend`]): **host-proxy** (`GET`/
@@ -38,7 +38,7 @@ use tracing::{debug, warn};
 
 use crate::config::{AttachmentBackendKind, AttachmentsConfig};
 use crate::db::ThreadRow;
-use crate::protocol::v2::AttachmentDescriptor;
+use crate::protocol::frames::AttachmentDescriptor;
 use crate::transport::http::{HttpClient, HttpError, UploadedAttachment};
 
 /// Fixed sub-directory of a thread's `work_dir` for inbound attachments (A3).
@@ -966,7 +966,7 @@ mod tests {
 
     use super::{AttachmentBackend, AttachmentError, AttachmentManager, sha256_hex};
     use crate::config::AttachmentsConfig;
-    use crate::protocol::v2::AttachmentDescriptor;
+    use crate::protocol::frames::AttachmentDescriptor;
     use crate::transport::http::UploadedAttachment;
 
     /// In-memory backend: serves downloads from `store` (keyed by `ref`), records

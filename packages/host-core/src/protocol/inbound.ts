@@ -41,7 +41,7 @@ import {
 } from "../msgstore";
 import { decodeFrame } from "./envelope";
 import { CronStateData, HeartbeatData, RECOGNIZED_MESSAGE_KINDS, ThreadMessageData, ThreadResultData } from "./frames";
-import { ackMessage, ackOutbox } from "./outbox";
+import { ackMessage } from "./outbox";
 
 export interface InboundDeps {
   storage: Storage;
@@ -264,15 +264,7 @@ export function applyFrame(deps: InboundDeps, decoded: DecodedFrame): Record<str
     case "msg_ack": {
       if (decoded.msgId != null) {
         ackMessage(storage, agentId, decoded.msgId);
-        deps.events?.emit("outbox.acked", { agentId, id: decoded.msgId, type: "msg_ack" });
-      }
-      return null;
-    }
-
-    case "ack": {
-      if (decoded.id != null) {
-        ackOutbox(storage, agentId, decoded.id);
-        deps.events?.emit("outbox.acked", { agentId, id: decoded.id, type: "ack" });
+        deps.events?.emit("outbox.acked", { agentId, id: decoded.msgId });
       }
       return null;
     }

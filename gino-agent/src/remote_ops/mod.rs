@@ -188,7 +188,7 @@ mod tests {
     use super::{RemoteOps, parse_request};
     use crate::attachments::{AttachmentBackend, AttachmentError, AttachmentManager, sha256_hex};
     use crate::config::AttachmentsConfig;
-    use crate::protocol::v2::AttachmentDescriptor;
+    use crate::protocol::frames::AttachmentDescriptor;
     use crate::transport::http::UploadedAttachment;
 
     /// Blobs by `ref` for downloads; uploads recorded by name.

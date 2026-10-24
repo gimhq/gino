@@ -231,49 +231,26 @@ export interface TaskRepo {
 
 // ─── OutboxRepo (M2: outbox) ───
 
-/** Type guard for `OutboxRepo.markAcked`. */
-export interface MarkAckedOptions {
-  /**
-   * Refuse to ack a row of this `type` (the `ack{id}` frame never acks a
-   * `message` row — only the durable-storage `msg_ack` does, protocol §4.2).
-   * Omit for `msg_ack`, which acks any type.
-   */
-  readonly excludeType?: string;
-}
-
 /**
  * The durable host→agent queue behind at-least-once delivery.
  *
- * The invariant an adapter MUST keep: `append` returns a STRICTLY MONOTONIC,
- * globally unique `id` that is never reused, because that id becomes the wire
+ * Row ids are monotonic ULIDs minted by the domain; they become the wire
  * `msgId` the runner dedups on. Replay reads unacked rows in ascending id
- * order, so ordering follows from the same sequence. SQLite gets this from
- * AUTOINCREMENT; a non-SQL backend needs one global increasing sequence, not a
- * per-agent counter.
+ * order, so an adapter must order by `id` (a plain string comparison).
  */
 export interface OutboxRepo {
-  /**
-   * Persist a host→agent frame and return the stored row INCLUDING its `id`.
-   * `id` is STORAGE-GENERATED and STRICTLY MONOTONIC across the whole table
-   * (sqlite: AUTOINCREMENT; other backends: one global increasing sequence —
-   * a per-agent counter is NOT enough, ids must be unique across agents):
-   * every later `append`, for any agent, gets a larger id, and an id is never
-   * reused after a delete. The id becomes the wire `outboxId` / `msgId` the
-   * runner dedups on and replays in ascending order. `createdAt` defaults to
-   * `Date.now()`, `ackedAt` to `null`.
-   */
+  /** Persist a host→agent frame with its caller-minted `id`. `createdAt` defaults to `Date.now()`, `ackedAt` to `null`. */
   append: (row: NewOutboxRow) => OutboxRow;
   /** Unacked rows (`ackedAt IS NULL`) of ONE agent, ascending by `id` (replay order). */
   listUnacked: (agentId: string) => OutboxRow[];
   /** Every unacked row across all agents, ascending by `id` (the GC root-set scan). */
   listAllUnacked: () => OutboxRow[];
   /**
-   * Set `ackedAt = now` on row `id` — SCOPED to `agentId`'s own rows (ids are
-   * a global sequence, so a foreign id is guessable; a foreign agent's ack is
-   * a no-op) and, with `excludeType`, to rows of a different type. Acking an
-   * already-acked row re-stamps it. Returns `true` iff a row was updated.
+   * Set `ackedAt = now` on row `id`, scoped to `agentId`'s own rows (a foreign
+   * agent's ack is a no-op). Acking an already-acked row re-stamps it.
+   * Returns `true` iff a row was updated.
    */
-  markAcked: (agentId: string, id: number, now: number, opts?: MarkAckedOptions) => boolean;
+  markAcked: (agentId: string, id: string, now: number) => boolean;
   /** Delete an agent's UNACKED rows only; acked history stays. Returns the count deleted. */
   purge: (agentId: string) => number;
   /** Retention GC: delete rows that are ACKED with `ackedAt < before`; unacked rows are NEVER deleted. Returns the count. */

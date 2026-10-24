@@ -54,7 +54,7 @@ function makeHost(options: Record<string, unknown> = {}): HostContext {
 }
 
 function registerAgent(): { agentId: string; connectToken: string } {
-  const res = host.wire.register({ registerToken: REGISTER, protocolVersion: 2, capabilities: ["claude"] }, { bearer: null });
+  const res = host.wire.register({ registerToken: REGISTER, protocolVersion: 1, capabilities: ["claude"] }, { bearer: null });
   expect(res.status).toBe(200);
   return res.body as { agentId: string; connectToken: string };
 }
@@ -80,20 +80,20 @@ afterEach(() => {
 
 describe("wire.register — protocol §3 envelopes", () => {
   it("401 invalid_register_token on a missing or wrong token (body or bearer)", () => {
-    expect(host.wire.register({ protocolVersion: 2 }, { bearer: null })).toEqual({ status: 401, body: { register_error: { reason: "invalid_register_token" } } });
-    expect(host.wire.register({ registerToken: "nope", protocolVersion: 2 }, { bearer: null }).status).toBe(401);
-    expect(host.wire.register({ protocolVersion: 2 }, { bearer: "nope" }).status).toBe(401);
+    expect(host.wire.register({ protocolVersion: 1 }, { bearer: null })).toEqual({ status: 401, body: { register_error: { reason: "invalid_register_token" } } });
+    expect(host.wire.register({ registerToken: "nope", protocolVersion: 1 }, { bearer: null }).status).toBe(401);
+    expect(host.wire.register({ protocolVersion: 1 }, { bearer: "nope" }).status).toBe(401);
   });
 
   it("401 fails CLOSED when no register token is configured", () => {
     const bare = makeHost({ registerToken: "" });
-    expect(bare.wire.register({ registerToken: "", protocolVersion: 2 }, { bearer: null }).status).toBe(401);
+    expect(bare.wire.register({ registerToken: "", protocolVersion: 1 }, { bearer: null }).status).toBe(401);
     bare.stop();
   });
 
   it("403 registration_disabled", () => {
     const closed = makeHost({ registrationEnabled: false });
-    const res = closed.wire.register({ registerToken: REGISTER, protocolVersion: 2 }, { bearer: null });
+    const res = closed.wire.register({ registerToken: REGISTER, protocolVersion: 1 }, { bearer: null });
     expect(res).toEqual({ status: 403, body: { register_error: { reason: "registration_disabled" } } });
     closed.stop();
   });
@@ -101,11 +101,11 @@ describe("wire.register — protocol §3 envelopes", () => {
   it("400 invalid_body on a non-object body (token via bearer), 400 unsupported_protocol on a stale major", () => {
     expect(host.wire.register(null, { bearer: REGISTER })).toEqual({ status: 400, body: { register_error: { reason: "invalid_body" } } });
     expect(host.wire.register([1], { bearer: REGISTER }).body).toEqual({ register_error: { reason: "invalid_body" } });
-    expect(host.wire.register({ registerToken: REGISTER, protocolVersion: 1 }, { bearer: null })).toEqual({ status: 400, body: { register_error: { reason: "unsupported_protocol" } } });
+    expect(host.wire.register({ registerToken: REGISTER, protocolVersion: 2 }, { bearer: null })).toEqual({ status: 400, body: { register_error: { reason: "unsupported_protocol" } } });
   });
 
   it("200 with agentId + connectToken + the host config mirror", () => {
-    const res = host.wire.register({ registerToken: REGISTER, protocolVersion: 2, capabilities: ["claude"], maxThreads: 3 }, { bearer: null });
+    const res = host.wire.register({ registerToken: REGISTER, protocolVersion: 1, capabilities: ["claude"], maxThreads: 3 }, { bearer: null });
     expect(res.status).toBe(200);
     const body = res.body as { agentId: string; connectToken: string; config: Record<string, unknown> };
     expect(body.connectToken.length).toBeGreaterThan(0);
@@ -115,7 +115,7 @@ describe("wire.register — protocol §3 envelopes", () => {
       configUrl: `/agent/config/${body.agentId}`,
       outputUrl: `/agent/output/${body.agentId}`,
       heartbeatIntervalMs: host.options.heartbeatIntervalMs,
-      protocolVersion: 2,
+      protocolVersion: 1,
       entries: [],
     });
     expect(typeof body.config.version).toBe("number");

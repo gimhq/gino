@@ -37,7 +37,7 @@ export interface RouteResult {
   /** Whether the (new) task was placed on a permitted agent and the message delivered. */
   delivered: boolean;
   /** The `message` outbox delivery id (null if the new task is pending-assignment). */
-  msgId: number | null;
+  msgId: string | null;
   /** Dispatch outcome for a NEW conversation (absent when continuing). */
   dispatch?: DispatchResult;
 }

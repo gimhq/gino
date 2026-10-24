@@ -1,15 +1,12 @@
 import type { NewOutboxRow, OutboxRepo, OutboxRow } from "../../host/ports/storage";
 
 export function memoryOutboxRepo(): OutboxRepo {
-  // ONE global increasing counter (never reset on delete) — mirrors sqlite
-  // AUTOINCREMENT: ids are unique + monotonic across every agent.
-  let nextId = 1;
   const rows: OutboxRow[] = [];
 
   return {
     append(row: NewOutboxRow): OutboxRow {
       const stored: OutboxRow = {
-        id: nextId++,
+        id: row.id,
         agentId: row.agentId,
         type: row.type,
         taskId: row.taskId ?? null,
@@ -23,14 +20,14 @@ export function memoryOutboxRepo(): OutboxRepo {
       return { ...stored };
     },
     listUnacked(agentId) {
-      return rows.filter(r => r.agentId === agentId && r.ackedAt == null).map(r => ({ ...r }));
+      return rows.filter(r => r.agentId === agentId && r.ackedAt == null).sort(byId).map(r => ({ ...r }));
     },
     listAllUnacked() {
-      return rows.filter(r => r.ackedAt == null).map(r => ({ ...r }));
+      return rows.filter(r => r.ackedAt == null).sort(byId).map(r => ({ ...r }));
     },
-    markAcked(agentId, id, now, opts = {}) {
+    markAcked(agentId, id, now) {
       const row = rows.find(r => r.id === id && r.agentId === agentId);
-      if (!row || (opts.excludeType !== undefined && row.type === opts.excludeType)) {
+      if (!row) {
         return false;
       }
       row.ackedAt = now;
@@ -43,6 +40,10 @@ export function memoryOutboxRepo(): OutboxRepo {
       return remove(rows, r => r.ackedAt != null && r.ackedAt < before);
     },
   };
+}
+
+function byId(a: OutboxRow, b: OutboxRow): number {
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 /** Delete every row matching `pred` in place; returns how many went. */

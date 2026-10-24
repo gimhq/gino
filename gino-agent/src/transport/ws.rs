@@ -13,7 +13,7 @@
 //! (matching the host WS handler). The bootstrap *register* token is never sent
 //! here — only the persisted connect token, reused verbatim across reconnects.
 //!
-//! ## Delivery model (protocol v2)
+//! ## Delivery model
 //!
 //! * **Outbound** — every data frame is persisted to the `outbox` before it is
 //!   sent (producers enqueue via [`crate::db::Db::enqueue_outbox_correlated`] and
@@ -57,7 +57,7 @@ use tracing::{debug, warn};
 
 use super::{Backoff, Cancel, Inbound, build_envelope, lock_db};
 use crate::db::Db;
-use crate::protocol::v2::{InboundFrameV2, OutboundFrameV2};
+use crate::protocol::frames::{InboundFrame, OutboundFrame};
 use crate::remote_ops::{self, RemoteOps};
 
 /// The auth header carrying the connect token (host WS handler reads this name).
@@ -82,7 +82,7 @@ const MAX_HEARTBEAT: Duration = Duration::from_hours(1);
 /// accepts but never completes the WS handshake) must not stall a reconnect
 /// attempt indefinitely — the backoff loop moves on to the next attempt.
 pub(super) const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Pre-serialized liveness ping; equal to the v2 `OutboundFrameV2::Heartbeat`
+/// Pre-serialized liveness ping; equal to `OutboundFrame::Heartbeat`
 /// with no `activeThreads` summary (asserted by a unit test) so the constant
 /// never drifts from the type. The runner-driven periodic heartbeat carries no
 /// live-work summary; a producer wanting `activeThreads` sends its own frame.
@@ -204,7 +204,7 @@ impl WsDriver {
 
         // Full replay on (re)connect — the one moment every unacked row is
         // retransmitted. The returned watermark makes later flushes incremental.
-        let mut sent_watermark = match replay_outbox(&mut sink, &self.db, 0).await {
+        let mut sent_watermark = match replay_outbox(&mut sink, &self.db, "").await {
             Ok(watermark) => watermark,
             Err(err) => {
                 warn!(error = %err, "outbox replay failed on connect; reconnecting");
@@ -223,7 +223,7 @@ impl WsDriver {
         let mut ack_check = tokio::time::interval(clamp_period(self.ack_timeout));
         ack_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ack_check.tick().await;
-        let mut stalled_oldest: Option<i64> = None;
+        let mut stalled_oldest: Option<String> = None;
 
         // Read-liveness: every heartbeat also sends a WS ping, so a live
         // peer produces at least pong traffic; a window with nothing received at
@@ -260,7 +260,7 @@ impl WsDriver {
                     // A producer enqueued frames straight to the outbox; ship the
                     // rows not yet sent on this connection (incremental — already
                     // transmitted rows wait for an ack, a stall, or a reconnect).
-                    match replay_outbox(&mut sink, &self.db, sent_watermark).await {
+                    match replay_outbox(&mut sink, &self.db, &sent_watermark).await {
                         Ok(watermark) => sent_watermark = watermark,
                         Err(err) => {
                             warn!(error = %err, "outbox flush failed; reconnecting");
@@ -284,9 +284,9 @@ impl WsDriver {
                     }
                 }
                 _ = ack_check.tick() => {
-                    if ack_stalled(&self.db, sent_watermark, &mut stalled_oldest) {
+                    if ack_stalled(&self.db, &sent_watermark, &mut stalled_oldest) {
                         debug!("no ack progress within the ack window; retransmitting unacked outbox");
-                        match replay_outbox(&mut sink, &self.db, 0).await {
+                        match replay_outbox(&mut sink, &self.db, "").await {
                             Ok(watermark) => sent_watermark = watermark,
                             Err(err) => {
                                 warn!(error = %err, "outbox retransmit failed; reconnecting");
@@ -372,7 +372,7 @@ impl WsDriver {
 // ---------------------------------------------------------------------------
 
 /// Transmit the unacked outbox rows with id above `after_id`, oldest-first,
-/// bumping each transmitted row's retry counter. `after_id = 0` is the full
+/// bumping each transmitted row's retry counter. `after_id = ""` is the full
 /// replay (reconnect / ack-stall retransmit); a flush passes the connection's
 /// send watermark so only fresh rows ship. Returns the new watermark —
 /// the highest row id considered. DB read/write errors are logged and skipped;
@@ -380,8 +380,8 @@ impl WsDriver {
 async fn replay_outbox(
     sink: &mut WsSink,
     db: &Arc<Mutex<Db>>,
-    after_id: i64,
-) -> Result<i64, TungsteniteError> {
+    after_id: &str,
+) -> Result<String, TungsteniteError> {
     let (envelopes, watermark) = collect_outbox_replay(db, after_id);
     let count = envelopes.len();
     for envelope in envelopes {
@@ -401,37 +401,39 @@ async fn replay_outbox(
 /// envelopes plus the new send watermark (the highest row id considered, or
 /// `after_id` when none qualified). Split from [`replay_outbox`] so the per-row
 /// policy is unit-testable without a live socket.
-fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i64) {
+fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: &str) -> (Vec<String>, String) {
     let rows = match lock_db(db).list_unacked_outbox() {
         Ok(rows) => rows,
         Err(err) => {
             warn!(error = %err, "failed to list outbox for replay");
-            return (Vec::new(), after_id);
+            return (Vec::new(), after_id.to_owned());
         }
     };
-    let mut watermark = after_id;
+    let mut watermark = after_id.to_owned();
     let mut envelopes = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.id <= after_id {
+        if row.id.as_str() <= after_id {
             continue;
         }
-        watermark = watermark.max(row.id);
-        let _ = lock_db(db).increment_outbox_retry(row.id);
+        if row.id > watermark {
+            watermark.clone_from(&row.id);
+        }
+        let _ = lock_db(db).increment_outbox_retry(&row.id);
         let attempts = row.retry_count + 1;
         let Ok(data) = serde_json::from_str::<Value>(&row.payload) else {
             if attempts >= MAX_OUTBOX_RETRIES {
                 warn!(
-                    id = row.id,
+                    id = %row.id,
                     attempts,
                     "outbox row payload malformed after repeated replays; dead-lettering (poison)"
                 );
-                let _ = lock_db(db).mark_outbox_dead(row.id);
+                let _ = lock_db(db).mark_outbox_dead(&row.id);
             } else {
-                warn!(id = row.id, "skipping outbox row with malformed payload");
+                warn!(id = %row.id, "skipping outbox row with malformed payload");
             }
             continue;
         };
-        // Rebuild the v2 envelope from the correlation columns + `data`. The
+        // Rebuild the envelope from the correlation columns + `data`. The
         // `thread_id` column carries the frame's `threadId` (or, for `cron_state`,
         // its `cronId`); `build_envelope` keys it correctly off the row type.
         let envelope = build_envelope(
@@ -439,7 +441,7 @@ fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i6
             &data,
             row.task_id.as_deref(),
             row.thread_id.as_deref(),
-            row.id,
+            &row.id,
         );
         envelopes.push(envelope.to_string());
     }
@@ -451,11 +453,14 @@ fn collect_outbox_replay(db: &Arc<Mutex<Db>>, after_id: i64) -> (Vec<String>, i6
 /// SAME id again means the host acked nothing for a full ack window, so the
 /// caller retransmits the backlog. Any progress (a different oldest, or no
 /// outstanding rows at all) just records the new observation.
-fn ack_stalled(db: &Arc<Mutex<Db>>, watermark: i64, stalled: &mut Option<i64>) -> bool {
+fn ack_stalled(db: &Arc<Mutex<Db>>, watermark: &str, stalled: &mut Option<String>) -> bool {
     let oldest = match lock_db(db).list_unacked_outbox() {
         // Rows are ordered by id, so the first at-or-below the watermark is the
         // oldest row already transmitted on this connection.
-        Ok(rows) => rows.iter().map(|row| row.id).find(|id| *id <= watermark),
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| row.id)
+            .find(|id| id.as_str() <= watermark),
         Err(err) => {
             warn!(error = %err, "failed to inspect outbox for ack progress");
             None
@@ -496,7 +501,7 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
             continue;
         }
 
-        let Ok(frame) = serde_json::from_str::<InboundFrameV2>(&row.payload) else {
+        let Ok(frame) = serde_json::from_str::<InboundFrame>(&row.payload) else {
             warn!(
                 id = row.id,
                 "marking inbox row with malformed payload processed"
@@ -505,7 +510,7 @@ fn replay_inbox(db: &Arc<Mutex<Db>>, inbound_tx: &mpsc::UnboundedSender<Inbound>
             continue;
         };
         // A frame we no longer model (forward-compat) is never re-delivered.
-        if matches!(frame, InboundFrameV2::Unknown) {
+        if matches!(frame, InboundFrame::Unknown) {
             let _ = lock_db(db).mark_inbox_processed(row.id);
             continue;
         }
@@ -552,14 +557,14 @@ enum InboundDisposition {
     Done,
     /// Send a `msg_ack` but deliver nothing: a duplicate redelivery of an
     /// already-stored `msg_id`, or a dead-lettered malformed known-type frame.
-    AckOnly { msg_id: i64 },
+    AckOnly { msg_id: String },
     /// Freshly persisted: ack durable receipt (when the frame carries a
     /// `msg_id`) and forward to the consumer. The frame is boxed to keep the
     /// enum's ack-only variants small.
     Deliver {
-        frame: Box<InboundFrameV2>,
+        frame: Box<InboundFrame>,
         inbox_id: i64,
-        msg_id: Option<i64>,
+        msg_id: Option<String>,
     },
 }
 
@@ -598,7 +603,7 @@ async fn handle_inbound(
 /// Parse, dedup, and persist one received text frame (everything except the
 /// socket IO, so the at-least-once decisions are unit-testable).
 fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
-    let frame = match serde_json::from_str::<InboundFrameV2>(text) {
+    let frame = match serde_json::from_str::<InboundFrame>(text) {
         Ok(frame) => frame,
         // An unknown `type` parses into `Unknown`, so a typed-parse failure is a
         // KNOWN type with a malformed body (or unusable JSON): dead-letter it.
@@ -606,15 +611,15 @@ fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
     };
 
     // The host's `ack {id}` confirms one of our outbox rows.
-    if let InboundFrameV2::Ack { id } = frame {
-        let _ = lock_db(db).mark_outbox_acked(id);
+    if let InboundFrame::Ack { id } = frame {
+        let _ = lock_db(db).mark_outbox_acked(&id);
         return InboundDisposition::Done;
     }
 
     // A frame `type` this runner does not model (additive-within-major): ignore it
     // rather than persist/ack/deliver a frame we cannot act on.
-    if matches!(frame, InboundFrameV2::Unknown) {
-        debug!("ignoring unknown inbound v2 frame");
+    if matches!(frame, InboundFrame::Unknown) {
+        debug!("ignoring unknown inbound frame");
         return InboundDisposition::Done;
     }
 
@@ -632,7 +637,13 @@ fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
     let inbox_type = inbox_type(&frame);
     let (task_id, secondary_id) = correlation_of(&frame);
     let msg_id = msg_id_of(&frame);
-    match lock_db(db).record_inbound_correlated(inbox_type, &raw, task_id, secondary_id, msg_id) {
+    match lock_db(db).record_inbound_correlated(
+        inbox_type,
+        &raw,
+        task_id,
+        secondary_id,
+        msg_id.as_deref(),
+    ) {
         Ok(Some(inbox_id)) => InboundDisposition::Deliver {
             frame: Box::new(frame),
             inbox_id,
@@ -642,7 +653,7 @@ fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
         // the host advances; the original row already drives (or drove) delivery.
         Ok(None) => match msg_id {
             Some(msg_id) => {
-                debug!(msg_id, "duplicate inbound delivery; re-acking");
+                debug!(%msg_id, "duplicate inbound delivery; re-acking");
                 InboundDisposition::AckOnly { msg_id }
             }
             // Unreachable: only a `msg_id` collision can conflict.
@@ -661,9 +672,9 @@ fn classify_inbound(text: &str, db: &Arc<Mutex<Db>>) -> InboundDisposition {
 fn dead_letter(text: &str, err: &serde_json::Error) -> InboundDisposition {
     let msg_id = serde_json::from_str::<Value>(text)
         .ok()
-        .and_then(|raw| raw.get("msgId")?.as_i64());
+        .and_then(|raw| raw.get("msgId")?.as_str().map(str::to_owned));
     if let Some(msg_id) = msg_id {
-        warn!(error = %err, msg_id, "dead-lettering malformed inbound frame (acked, dropped)");
+        warn!(error = %err, %msg_id, "dead-lettering malformed inbound frame (acked, dropped)");
         InboundDisposition::AckOnly { msg_id }
     } else {
         warn!(error = %err, "ignoring unparsable inbound frame");
@@ -672,8 +683,8 @@ fn dead_letter(text: &str, err: &serde_json::Error) -> InboundDisposition {
 }
 
 /// Send a `msg_ack {msgId}` over the live sink.
-async fn send_msg_ack(sink: &mut WsSink, msg_id: i64) -> Result<(), TungsteniteError> {
-    if let Ok(ack) = serde_json::to_string(&OutboundFrameV2::MsgAck { msg_id }) {
+async fn send_msg_ack(sink: &mut WsSink, msg_id: String) -> Result<(), TungsteniteError> {
+    if let Ok(ack) = serde_json::to_string(&OutboundFrame::MsgAck { msg_id }) {
         sink.send(Message::text(ack)).await?;
     }
     Ok(())
@@ -699,12 +710,12 @@ fn read_window(requested: Duration, heartbeat: Duration) -> Duration {
 /// (avoids a spurious re-shutdown if we crash mid-handoff); everything else stays
 /// unprocessed until the consumer acknowledges it.
 fn deliver(
-    frame: InboundFrameV2,
+    frame: InboundFrame,
     inbox_id: i64,
     db: &Arc<Mutex<Db>>,
     inbound_tx: &mpsc::UnboundedSender<Inbound>,
 ) {
-    if matches!(frame, InboundFrameV2::Close { .. }) {
+    if matches!(frame, InboundFrame::Close { .. }) {
         let _ = lock_db(db).mark_inbox_processed(inbox_id);
     }
     if inbound_tx.send(Inbound { inbox_id, frame }).is_err() {
@@ -712,22 +723,22 @@ fn deliver(
     }
 }
 
-/// The inbox `type` column value for a v2 frame — its wire `type` verbatim. The
+/// The inbox `type` column value for a frame — its wire `type` verbatim. The
 /// column drives the replay policy (`config_update` dropped, `close` pre-marked)
 /// and lets a consumer filter via [`crate::db::Db::list_inbox_by_type`]. `ack` and
 /// `unknown` are intercepted before persistence and never reach here.
-fn inbox_type(frame: &InboundFrameV2) -> &'static str {
+fn inbox_type(frame: &InboundFrame) -> &'static str {
     match frame {
-        InboundFrameV2::TaskUpsert { .. } => "task_upsert",
-        InboundFrameV2::TaskDelete { .. } => "task_delete",
-        InboundFrameV2::CronUpsert { .. } => "cron_upsert",
-        InboundFrameV2::CronDelete { .. } => "cron_delete",
-        InboundFrameV2::Message { .. } => "message",
-        InboundFrameV2::Interrupt { .. } => INBOX_TYPE_INTERRUPT,
-        InboundFrameV2::Close { .. } => INBOX_TYPE_CLOSE,
-        InboundFrameV2::ConfigUpdate { .. } => INBOX_TYPE_CONFIG_UPDATE,
-        InboundFrameV2::Ack { .. } => "ack",
-        InboundFrameV2::Unknown => "unknown",
+        InboundFrame::TaskUpsert { .. } => "task_upsert",
+        InboundFrame::TaskDelete { .. } => "task_delete",
+        InboundFrame::CronUpsert { .. } => "cron_upsert",
+        InboundFrame::CronDelete { .. } => "cron_delete",
+        InboundFrame::Message { .. } => "message",
+        InboundFrame::Interrupt { .. } => INBOX_TYPE_INTERRUPT,
+        InboundFrame::Close { .. } => INBOX_TYPE_CLOSE,
+        InboundFrame::ConfigUpdate { .. } => INBOX_TYPE_CONFIG_UPDATE,
+        InboundFrame::Ack { .. } => "ack",
+        InboundFrame::Unknown => "unknown",
     }
 }
 
@@ -735,40 +746,40 @@ fn inbox_type(frame: &InboundFrameV2) -> &'static str {
 /// `secondary_id` is the frame's `threadId` or, for the cron envelopes, its
 /// `cronId` (both share the single `thread_id` column; the full frame in `payload`
 /// remains the source of truth on replay).
-fn correlation_of(frame: &InboundFrameV2) -> (Option<&str>, Option<&str>) {
+fn correlation_of(frame: &InboundFrame) -> (Option<&str>, Option<&str>) {
     match frame {
-        InboundFrameV2::TaskUpsert { task_id, .. } | InboundFrameV2::TaskDelete { task_id, .. } => {
+        InboundFrame::TaskUpsert { task_id, .. } | InboundFrame::TaskDelete { task_id, .. } => {
             (Some(task_id), None)
         }
-        InboundFrameV2::CronUpsert {
+        InboundFrame::CronUpsert {
             task_id, cron_id, ..
         }
-        | InboundFrameV2::CronDelete {
+        | InboundFrame::CronDelete {
             task_id, cron_id, ..
         } => (Some(task_id), Some(cron_id)),
-        InboundFrameV2::Message {
+        InboundFrame::Message {
             task_id, thread_id, ..
         } => (Some(task_id), thread_id.as_deref()),
-        InboundFrameV2::Interrupt { .. }
-        | InboundFrameV2::Close { .. }
-        | InboundFrameV2::ConfigUpdate { .. }
-        | InboundFrameV2::Ack { .. }
-        | InboundFrameV2::Unknown => (None, None),
+        InboundFrame::Interrupt { .. }
+        | InboundFrame::Close { .. }
+        | InboundFrame::ConfigUpdate { .. }
+        | InboundFrame::Ack { .. }
+        | InboundFrame::Unknown => (None, None),
     }
 }
 
 /// The host inbox-message id to acknowledge, if the frame carries one.
-fn msg_id_of(frame: &InboundFrameV2) -> Option<i64> {
+fn msg_id_of(frame: &InboundFrame) -> Option<String> {
     match frame {
-        InboundFrameV2::TaskUpsert { msg_id, .. }
-        | InboundFrameV2::TaskDelete { msg_id, .. }
-        | InboundFrameV2::CronUpsert { msg_id, .. }
-        | InboundFrameV2::CronDelete { msg_id, .. }
-        | InboundFrameV2::Message { msg_id, .. }
-        | InboundFrameV2::Interrupt { msg_id, .. }
-        | InboundFrameV2::Close { msg_id }
-        | InboundFrameV2::ConfigUpdate { msg_id, .. } => *msg_id,
-        InboundFrameV2::Ack { .. } | InboundFrameV2::Unknown => None,
+        InboundFrame::TaskUpsert { msg_id, .. }
+        | InboundFrame::TaskDelete { msg_id, .. }
+        | InboundFrame::CronUpsert { msg_id, .. }
+        | InboundFrame::CronDelete { msg_id, .. }
+        | InboundFrame::Message { msg_id, .. }
+        | InboundFrame::Interrupt { msg_id, .. }
+        | InboundFrame::Close { msg_id }
+        | InboundFrame::ConfigUpdate { msg_id, .. } => msg_id.clone(),
+        InboundFrame::Ack { .. } | InboundFrame::Unknown => None,
     }
 }
 
@@ -786,18 +797,18 @@ mod tests {
         read_window, replay_inbox,
     };
     use crate::db::Db;
-    use crate::protocol::v2::{InboundFrameV2, MessageInData};
+    use crate::protocol::frames::{InboundFrame, MessageInData};
     use tokio::sync::mpsc;
 
-    fn message(thread_id: Option<&str>) -> InboundFrameV2 {
-        InboundFrameV2::Message {
+    fn message(thread_id: Option<&str>) -> InboundFrame {
+        InboundFrame::Message {
             task_id: "t-1".to_owned(),
             thread_id: thread_id.map(str::to_owned),
             data: MessageInData {
                 text: "hi".to_owned(),
                 attachments: None,
             },
-            msg_id: Some(3),
+            msg_id: Some(crate::protocol::test_delivery_id(3)),
         }
     }
 
@@ -813,7 +824,7 @@ mod tests {
             // A malformed payload can only enter via raw SQL — the enqueue API
             // always serializes valid JSON.
             guard
-                .exec_raw("INSERT INTO outbox (type, payload) VALUES ('thread_result', 'not-json')")
+                .exec_raw("INSERT INTO outbox (id, type, payload) VALUES ('7zzzzzzzzzzzzzzzzzzzzzzzzz', 'thread_result', 'not-json')")
                 .unwrap();
             id
         };
@@ -821,20 +832,20 @@ mod tests {
         // Below the limit: the malformed row is skipped (never an envelope) but
         // stays queued; the healthy row replays on every full replay.
         for _ in 0..MAX_OUTBOX_RETRIES - 1 {
-            let (envelopes, _) = collect_outbox_replay(&db, 0);
+            let (envelopes, _) = collect_outbox_replay(&db, "");
             assert_eq!(envelopes.len(), 1);
             assert!(envelopes[0].contains("heartbeat"));
             assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 2);
         }
 
         // The attempt that reaches the limit dead-letters the poison row…
-        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
+        assert_eq!(collect_outbox_replay(&db, "").0.len(), 1);
         let unacked = db.lock().unwrap().list_unacked_outbox().unwrap();
         assert_eq!(unacked.len(), 1);
         assert_eq!(unacked[0].id, healthy);
 
         // …and the healthy row continues to replay afterwards.
-        assert_eq!(collect_outbox_replay(&db, 0).0.len(), 1);
+        assert_eq!(collect_outbox_replay(&db, "").0.len(), 1);
     }
 
     /// Regression: `after_id` makes replay incremental — rows at or below
@@ -843,35 +854,36 @@ mod tests {
     #[test]
     fn collect_outbox_replay_skips_rows_at_or_below_the_watermark() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        {
+        let second = {
             let guard = db.lock().unwrap();
             guard
                 .enqueue_outbox("thread_message", &json!({"seq": 1}))
                 .unwrap();
             guard
                 .enqueue_outbox("thread_message", &json!({"seq": 2}))
-                .unwrap();
-        }
+                .unwrap()
+        };
 
-        // Full replay sends both and reports watermark 2.
-        let (all, watermark) = collect_outbox_replay(&db, 0);
+        // Full replay sends both and reports the second row as the watermark.
+        let (all, watermark) = collect_outbox_replay(&db, "");
         assert_eq!(all.len(), 2);
-        assert_eq!(watermark, 2);
+        assert_eq!(watermark, second);
 
         // A flush at that watermark has nothing new to send…
-        let (incremental, watermark) = collect_outbox_replay(&db, watermark);
+        let (incremental, watermark) = collect_outbox_replay(&db, &watermark);
         assert!(incremental.is_empty());
-        assert_eq!(watermark, 2);
+        assert_eq!(watermark, second);
 
         // …and a freshly enqueued row is the only thing the next flush sends.
-        db.lock()
+        let third = db
+            .lock()
             .unwrap()
             .enqueue_outbox("thread_message", &json!({"seq": 3}))
             .unwrap();
-        let (fresh, watermark) = collect_outbox_replay(&db, watermark);
+        let (fresh, watermark) = collect_outbox_replay(&db, &watermark);
         assert_eq!(fresh.len(), 1);
         assert!(fresh[0].contains("\"seq\":3"));
-        assert_eq!(watermark, 3);
+        assert_eq!(watermark, third);
     }
 
     /// The ack-progress check trips only when the SAME oldest
@@ -893,43 +905,43 @@ mod tests {
 
         // Rows beyond the watermark (never transmitted) are not "stalled".
         let mut stalled = None;
-        assert!(!ack_stalled(&db, 0, &mut stalled));
-        assert!(!ack_stalled(&db, 0, &mut stalled));
+        assert!(!ack_stalled(&db, "", &mut stalled));
+        assert!(!ack_stalled(&db, "", &mut stalled));
 
         // First check under the watermark only records the observation…
-        assert!(!ack_stalled(&db, second, &mut stalled));
+        assert!(!ack_stalled(&db, &second, &mut stalled));
         // …the second check with zero ack progress trips the retransmit.
-        assert!(ack_stalled(&db, second, &mut stalled));
+        assert!(ack_stalled(&db, &second, &mut stalled));
 
         // Ack progress between checks (oldest changes) does not trip.
-        assert!(!ack_stalled(&db, second, &mut stalled));
-        db.lock().unwrap().mark_outbox_acked(first).unwrap();
-        assert!(!ack_stalled(&db, second, &mut stalled));
+        assert!(!ack_stalled(&db, &second, &mut stalled));
+        db.lock().unwrap().mark_outbox_acked(&first).unwrap();
+        assert!(!ack_stalled(&db, &second, &mut stalled));
 
         // Everything acked: nothing outstanding, never trips.
-        db.lock().unwrap().mark_outbox_acked(second).unwrap();
-        assert!(!ack_stalled(&db, second, &mut stalled));
-        assert!(!ack_stalled(&db, second, &mut stalled));
+        db.lock().unwrap().mark_outbox_acked(&second).unwrap();
+        assert!(!ack_stalled(&db, &second, &mut stalled));
+        assert!(!ack_stalled(&db, &second, &mut stalled));
     }
 
     #[test]
     fn inbox_type_is_the_wire_type_for_every_shape() {
         assert_eq!(inbox_type(&message(Some("c-1"))), "message");
         assert_eq!(
-            inbox_type(&InboundFrameV2::ConfigUpdate {
+            inbox_type(&InboundFrame::ConfigUpdate {
                 data: json!({}),
                 msg_id: None
             }),
             INBOX_TYPE_CONFIG_UPDATE
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::Close { msg_id: None }),
+            inbox_type(&InboundFrame::Close { msg_id: None }),
             INBOX_TYPE_CLOSE
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::TaskUpsert {
+            inbox_type(&InboundFrame::TaskUpsert {
                 task_id: "t".to_owned(),
-                data: crate::protocol::v2::TaskUpsertData {
+                data: crate::protocol::frames::TaskUpsertData {
                     name: None,
                     kind: None,
                     status: None,
@@ -944,14 +956,14 @@ mod tests {
             "task_upsert"
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::TaskDelete {
+            inbox_type(&InboundFrame::TaskDelete {
                 task_id: "t".to_owned(),
                 msg_id: None,
             }),
             "task_delete"
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::CronDelete {
+            inbox_type(&InboundFrame::CronDelete {
                 task_id: "t".to_owned(),
                 cron_id: "cr".to_owned(),
                 msg_id: None,
@@ -959,9 +971,9 @@ mod tests {
             "cron_delete"
         );
         assert_eq!(
-            inbox_type(&InboundFrameV2::Interrupt {
+            inbox_type(&InboundFrame::Interrupt {
                 task_id: None,
-                msg_id: Some(1)
+                msg_id: Some(crate::protocol::test_delivery_id(1))
             }),
             "interrupt"
         );
@@ -977,7 +989,7 @@ mod tests {
         assert_eq!(correlation_of(&message(None)), (Some("t-1"), None));
         // A cron envelope routes its `cronId` through the secondary slot.
         assert_eq!(
-            correlation_of(&InboundFrameV2::CronDelete {
+            correlation_of(&InboundFrame::CronDelete {
                 task_id: "t-1".to_owned(),
                 cron_id: "cr-9".to_owned(),
                 msg_id: None,
@@ -986,32 +998,42 @@ mod tests {
         );
         // Control frames carry no correlation ids.
         assert_eq!(
-            correlation_of(&InboundFrameV2::Close { msg_id: None }),
+            correlation_of(&InboundFrame::Close { msg_id: None }),
             (None, None)
         );
     }
 
     #[test]
     fn msg_id_extraction() {
-        assert_eq!(msg_id_of(&message(Some("c-1"))), Some(3));
-        assert_eq!(msg_id_of(&InboundFrameV2::Ack { id: 9 }), None);
         assert_eq!(
-            msg_id_of(&InboundFrameV2::ConfigUpdate {
-                data: json!({}),
-                msg_id: Some(4)
+            msg_id_of(&message(Some("c-1"))),
+            Some(crate::protocol::test_delivery_id(3))
+        );
+        assert_eq!(
+            msg_id_of(&InboundFrame::Ack {
+                id: crate::protocol::test_delivery_id(9)
             }),
-            Some(4)
+            None
         );
         assert_eq!(
-            msg_id_of(&InboundFrameV2::Close { msg_id: Some(5) }),
-            Some(5)
+            msg_id_of(&InboundFrame::ConfigUpdate {
+                data: json!({}),
+                msg_id: Some(crate::protocol::test_delivery_id(4))
+            }),
+            Some(crate::protocol::test_delivery_id(4))
         );
-        assert_eq!(msg_id_of(&InboundFrameV2::Unknown), None);
+        assert_eq!(
+            msg_id_of(&InboundFrame::Close {
+                msg_id: Some(crate::protocol::test_delivery_id(5))
+            }),
+            Some(crate::protocol::test_delivery_id(5))
+        );
+        assert_eq!(msg_id_of(&InboundFrame::Unknown), None);
     }
 
     #[test]
     fn heartbeat_frame_carries_empty_data_object() {
-        // The constant is the v2 liveness ping with no `activeThreads` summary.
+        // The constant is the liveness ping with no `activeThreads` summary.
         assert_eq!(HEARTBEAT_FRAME, r#"{"type":"heartbeat","data":{}}"#);
     }
 
@@ -1054,8 +1076,7 @@ mod tests {
         Arc::new(Mutex::new(Db::open_in_memory().unwrap()))
     }
 
-    const MESSAGE_FRAME: &str =
-        r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hi"},"msgId":7}"#;
+    const MESSAGE_FRAME: &str = r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hi"},"msgId":"01jab3x7k2m4n5p6q7r8s90007"}"#;
 
     /// Regression: delivering the same `msgId` twice stores exactly ONE
     /// inbox row and delivers ONE frame; the duplicate is only re-acked (so a
@@ -1069,16 +1090,16 @@ mod tests {
             matches!(
                 first,
                 InboundDisposition::Deliver {
-                    msg_id: Some(7),
+                    msg_id: Some(ref msg_id),
                     ..
-                }
+                } if *msg_id == crate::protocol::test_delivery_id(7)
             ),
             "first delivery persists and delivers: {first:?}"
         );
 
         let dup = classify_inbound(MESSAGE_FRAME, &db);
         assert!(
-            matches!(dup, InboundDisposition::AckOnly { msg_id: 7 }),
+            matches!(dup, InboundDisposition::AckOnly { ref msg_id } if *msg_id == crate::protocol::test_delivery_id(7)),
             "redelivery is re-acked without delivery: {dup:?}"
         );
         assert_eq!(
@@ -1088,8 +1109,7 @@ mod tests {
         );
     }
 
-    const CONFIG_UPDATE_FRAME: &str =
-        r#"{"type":"config_update","data":{"engine":{"anthropicApiKey":"sk-new"}},"msgId":11}"#;
+    const CONFIG_UPDATE_FRAME: &str = r#"{"type":"config_update","data":{"engine":{"anthropicApiKey":"sk-new"}},"msgId":"01jab3x7k2m4n5p6q7r8s90011"}"#;
 
     /// Regression: a `config_update` flows through the SAME at-least-once
     /// pipeline as every other inbound frame — persisted verbatim under its wire
@@ -1104,9 +1124,9 @@ mod tests {
             matches!(
                 first,
                 InboundDisposition::Deliver {
-                    msg_id: Some(11),
+                    msg_id: Some(ref msg_id),
                     ..
-                }
+                } if *msg_id == crate::protocol::test_delivery_id(11)
             ),
             "first delivery persists, acks and delivers: {first:?}"
         );
@@ -1116,7 +1136,7 @@ mod tests {
 
         let dup = classify_inbound(CONFIG_UPDATE_FRAME, &db);
         assert!(
-            matches!(dup, InboundDisposition::AckOnly { msg_id: 11 }),
+            matches!(dup, InboundDisposition::AckOnly { ref msg_id } if *msg_id == crate::protocol::test_delivery_id(11)),
             "redelivery is re-acked without a second row: {dup:?}"
         );
         assert_eq!(
@@ -1131,9 +1151,12 @@ mod tests {
     #[test]
     fn malformed_config_update_is_dead_lettered_with_ack() {
         let db = test_db();
-        let disposition = classify_inbound(r#"{"type":"config_update","msgId":12}"#, &db);
+        let disposition = classify_inbound(
+            r#"{"type":"config_update","msgId":"01jab3x7k2m4n5p6q7r8s90012"}"#,
+            &db,
+        );
         assert!(
-            matches!(disposition, InboundDisposition::AckOnly { msg_id: 12 }),
+            matches!(disposition, InboundDisposition::AckOnly { ref msg_id } if *msg_id == crate::protocol::test_delivery_id(12)),
             "malformed config_update is acked per the dead-letter policy: {disposition:?}"
         );
         assert!(
@@ -1159,10 +1182,10 @@ mod tests {
     fn malformed_known_type_frame_is_dead_lettered_with_ack() {
         let db = test_db();
         // `data.text` must be a string; a number fails the typed parse.
-        let malformed = r#"{"type":"message","taskId":"t-1","data":{"text":12345},"msgId":9}"#;
+        let malformed = r#"{"type":"message","taskId":"t-1","data":{"text":12345},"msgId":"01jab3x7k2m4n5p6q7r8s90009"}"#;
         let disposition = classify_inbound(malformed, &db);
         assert!(
-            matches!(disposition, InboundDisposition::AckOnly { msg_id: 9 }),
+            matches!(disposition, InboundDisposition::AckOnly { ref msg_id } if *msg_id == crate::protocol::test_delivery_id(9)),
             "malformed known-type frame is acked per the dead-letter policy: {disposition:?}"
         );
         assert!(
@@ -1235,7 +1258,8 @@ mod tests {
     #[test]
     fn interrupt_is_retired_not_replayed() {
         let db = test_db();
-        let interrupt = r#"{"type":"interrupt","taskId":"t-1","msgId":11}"#;
+        let interrupt =
+            r#"{"type":"interrupt","taskId":"t-1","msgId":"01jab3x7k2m4n5p6q7r8s90011"}"#;
         assert!(matches!(
             classify_inbound(interrupt, &db),
             InboundDisposition::Deliver { .. }
@@ -1260,8 +1284,10 @@ mod tests {
     #[test]
     fn unknown_type_is_ignored() {
         let db = test_db();
-        let disposition =
-            classify_inbound(r#"{"type":"brand_new_frame","data":{},"msgId":3}"#, &db);
+        let disposition = classify_inbound(
+            r#"{"type":"brand_new_frame","data":{},"msgId":"01jab3x7k2m4n5p6q7r8s90003"}"#,
+            &db,
+        );
         assert!(matches!(disposition, InboundDisposition::Done));
         assert!(
             db.lock()

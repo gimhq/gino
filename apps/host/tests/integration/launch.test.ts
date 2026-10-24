@@ -95,7 +95,7 @@ async function register(body: Record<string, unknown>) {
   const res = await app.fetch(new Request("http://local/api/agent/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, capabilities: ["claude"], ...body }),
+    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, capabilities: ["claude"], ...body }),
   }));
   return res;
 }
@@ -181,7 +181,7 @@ describe("D-B2b launch↔register correlation (OD17)", () => {
     // Exactly the pre-B2b register contract: agentId + connectToken + config.
     expect(body.agentId).toBeTruthy();
     expect(body.connectToken).toBeTruthy();
-    expect(body.config.protocolVersion).toBe(2);
+    expect(body.config.protocolVersion).toBe(1);
 
     const get = await admin(`/agents/${body.agentId}`);
     const agent = (await get.json() as { data: { launcherKind: string | null; launchRef: string | null; source: string } }).data;

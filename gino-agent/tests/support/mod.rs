@@ -1,7 +1,7 @@
 //! Shared **e2e harness** for the §5b deterministic full-loop tests.
 //!
 //! The runner exposes only `gino_agent::run()` publicly — its `Engine`/`Session`
-//! traits, `protocol::v2` frames and `db` read models are all `pub(crate)`, so an
+//! traits, `protocol::frames` and `db` read models are all `pub(crate)`, so an
 //! integration-test crate cannot construct them. The harness therefore drives the
 //! runner **black-box**: it boots the real `gino-agent` binary as a subprocess
 //! against an in-process [`stub_host::StubHost`] (HTTP register + attachments + WS

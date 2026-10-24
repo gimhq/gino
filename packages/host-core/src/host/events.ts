@@ -34,8 +34,7 @@ import type { CronStateData, ThreadMessageData, ThreadResultData } from "../prot
  *   orphaned).
  * - `task.placed` — a task was pinned to an agent for the first time; placement
  *   is set-once, so this never fires twice for one task.
- * - `outbox.acked` — the agent confirmed an outbox row, by `msg_ack` (durable
- *   storage of a `message`) or a plain `ack`.
+ * - `outbox.acked` — the agent confirmed durable storage of an outbox row (`msg_ack`).
  */
 export interface HostEventMap {
   "transcript.message": { agentId: string; taskId: string; threadId: string; seq: number; data: ThreadMessageData };
@@ -46,7 +45,7 @@ export interface HostEventMap {
   "agent.offline": { agentId: string; reason: "close" | "sweep" };
   "agent.removed": { agentId: string };
   "task.placed": { taskId: string; agentId: string };
-  "outbox.acked": { agentId: string; id: number; type: "ack" | "msg_ack" };
+  "outbox.acked": { agentId: string; id: string };
 }
 
 /** The name of any event in `HostEventMap`. */

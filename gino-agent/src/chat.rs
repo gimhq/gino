@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 
 use crate::db::{Db, TaskRow, ThreadRow};
 use crate::executor::{PromptSource, ThreadExecutor, lock_db, task_parked};
-use crate::protocol::v2::InboundFrameV2;
+use crate::protocol::frames::InboundFrame;
 use crate::scheduler::{now, to_iso};
 
 /// Engine a chat/api thread defaults to (the only engine today; sourced from the
@@ -146,8 +146,8 @@ fn resolve_inbox_message(db: &Mutex<Db>, thread: &ThreadRow) -> Option<String> {
         row.thread_id.as_deref() == Some(thread.id.as_str())
             || (row.thread_id.is_none() && row.task_id.as_deref() == Some(thread.task_id.as_str()))
     })?;
-    let message = match serde_json::from_str::<InboundFrameV2>(&row.payload) {
-        Ok(InboundFrameV2::Message { data, .. }) if !data.text.trim().is_empty() => Some(data),
+    let message = match serde_json::from_str::<InboundFrame>(&row.payload) {
+        Ok(InboundFrame::Message { data, .. }) if !data.text.trim().is_empty() => Some(data),
         _ => None,
     };
     if let Some(data) = &message
@@ -281,7 +281,6 @@ pub(crate) fn ensure_chat_thread(
                 duration_ms: None,
                 result: None,
                 error: None,
-                synced: false,
                 created_at: to_iso(now()),
             };
             match guard.insert_thread(&row) {
@@ -307,7 +306,7 @@ mod tests {
     use crate::attachments::AttachmentSource;
     use crate::db::{Db, TaskRow, ThreadRow};
     use crate::executor::{PromptSource, lock_db};
-    use crate::protocol::v2::{AttachmentDescriptor, InboundFrameV2, MessageInData};
+    use crate::protocol::frames::{AttachmentDescriptor, InboundFrame, MessageInData};
 
     use super::{InboxPromptSource, ensure_chat_thread, minted_thread_id, repend_queued_messages};
 
@@ -330,7 +329,6 @@ mod tests {
             duration_ms: None,
             result: None,
             error: None,
-            synced: false,
             created_at: "2026-06-22T00:00:00Z".to_owned(),
         }
     }
@@ -360,17 +358,23 @@ mod tests {
             inbound_descriptor("spec.txt"),
             inbound_descriptor("data.json"),
         ];
-        let frame = InboundFrameV2::Message {
+        let frame = InboundFrame::Message {
             task_id: "t-1".to_owned(),
             thread_id: Some("th-1".to_owned()),
             data: MessageInData {
                 text: "summarize the inputs".to_owned(),
                 attachments: Some(descriptors.clone()),
             },
-            msg_id: Some(7),
+            msg_id: Some(crate::protocol::test_delivery_id(7)),
         };
         lock_db(&db)
-            .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(7))
+            .record_inbound_correlated(
+                "message",
+                &frame,
+                Some("t-1"),
+                Some("th-1"),
+                Some(crate::protocol::test_delivery_id(7).as_str()),
+            )
             .unwrap();
         let thread = chat_thread("th-1", "t-1");
         {
@@ -430,7 +434,7 @@ mod tests {
     #[test]
     fn message_without_attachments_yields_no_inbound() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        let frame = InboundFrameV2::Message {
+        let frame = InboundFrame::Message {
             task_id: "t-2".to_owned(),
             thread_id: Some("th-2".to_owned()),
             data: MessageInData {
@@ -483,14 +487,14 @@ mod tests {
     #[test]
     fn closed_task_leaves_its_queued_message_in_the_inbox() {
         let db = Mutex::new(Db::open_in_memory().unwrap());
-        let frame = InboundFrameV2::Message {
+        let frame = InboundFrame::Message {
             task_id: "t-1".to_owned(),
             thread_id: Some("th-1".to_owned()),
             data: MessageInData {
                 text: "queued while the turn ran".to_owned(),
                 attachments: None,
             },
-            msg_id: Some(1),
+            msg_id: Some(crate::protocol::test_delivery_id(1)),
         };
         let mut resting = chat_thread("th-1", "t-1");
         "succeeded".clone_into(&mut resting.status);
@@ -512,7 +516,13 @@ mod tests {
                 .unwrap();
             guard.insert_thread(&resting).unwrap();
             guard
-                .record_inbound_correlated("message", &frame, Some("t-1"), Some("th-1"), Some(1))
+                .record_inbound_correlated(
+                    "message",
+                    &frame,
+                    Some("t-1"),
+                    Some("th-1"),
+                    Some(crate::protocol::test_delivery_id(1).as_str()),
+                )
                 .unwrap();
         }
 
@@ -685,33 +695,45 @@ mod tests {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
 
         // Message 1 arrives: inbox row + pending thread th-1.
-        let m1 = InboundFrameV2::Message {
+        let m1 = InboundFrame::Message {
             task_id: "t-1".to_owned(),
             thread_id: Some("th-1".to_owned()),
             data: MessageInData {
                 text: "first".to_owned(),
                 attachments: None,
             },
-            msg_id: Some(1),
+            msg_id: Some(crate::protocol::test_delivery_id(1)),
         };
         lock_db(&db)
-            .record_inbound_correlated("message", &m1, Some("t-1"), Some("th-1"), Some(1))
+            .record_inbound_correlated(
+                "message",
+                &m1,
+                Some("t-1"),
+                Some("th-1"),
+                Some(crate::protocol::test_delivery_id(1).as_str()),
+            )
             .unwrap();
         assert!(ensure_chat_thread(&db, "t-1", "th-1", 1));
 
         // Message 2 arrives while th-1 is in flight: only queued (the original
         // Defect: nothing ever re-checked the inbox after the run).
-        let m2 = InboundFrameV2::Message {
+        let m2 = InboundFrame::Message {
             task_id: "t-1".to_owned(),
             thread_id: Some("th-1".to_owned()),
             data: MessageInData {
                 text: "second".to_owned(),
                 attachments: None,
             },
-            msg_id: Some(2),
+            msg_id: Some(crate::protocol::test_delivery_id(2)),
         };
         lock_db(&db)
-            .record_inbound_correlated("message", &m2, Some("t-1"), Some("th-1"), Some(2))
+            .record_inbound_correlated(
+                "message",
+                &m2,
+                Some("t-1"),
+                Some("th-1"),
+                Some(crate::protocol::test_delivery_id(2).as_str()),
+            )
             .unwrap();
         assert!(
             !ensure_chat_thread(&db, "t-1", "th-1", 1),

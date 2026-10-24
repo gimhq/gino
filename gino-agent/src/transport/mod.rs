@@ -11,14 +11,14 @@
 //!   read-liveness detection of half-open sockets.
 //!
 //! [`Transport`] is the engine-agnostic facade over the WS side: it works purely
-//! on [`crate::protocol::v2`] frames and the [`crate::db`] outbox/inbox, so the
+//! on [`crate::protocol::frames`] frames and the [`crate::db`] outbox/inbox, so the
 //! engine and scheduler (later L3s) never touch tungstenite. Producers persist
 //! outbound frames straight to the durable outbox and poke
 //! [`Transport::flush_handle`]; the manager task drains the outbox, dedups the
 //! inbox, and forwards inbound frames on an unbounded channel drained via
 //! [`Transport::recv`].
 //!
-//! ## Envelope vs payload (protocol v2, agent-architecture §8/§10)
+//! ## Envelope vs payload (agent-architecture §8/§10)
 //!
 //! Correlation/delivery metadata lives at the **envelope top level**
 //! (`type`, `outboxId`/`msgId`, `taskId`/`threadId`/`cronId`); `data` carries the
@@ -51,7 +51,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::db::Db;
-use crate::protocol::v2::InboundFrameV2;
+use crate::protocol::frames::InboundFrame;
 use crate::remote_ops::RemoteOps;
 
 pub(crate) use self::ws::MAX_INBOX_RETRIES;
@@ -140,7 +140,7 @@ impl Default for TransportConfig {
 #[derive(Debug)]
 pub(crate) struct Inbound {
     pub(crate) inbox_id: i64,
-    pub(crate) frame: InboundFrameV2,
+    pub(crate) frame: InboundFrame,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,10 +255,10 @@ async fn run_manager(mut driver: WsDriver) {
 }
 
 // ---------------------------------------------------------------------------
-// Outbox mapping (protocol v2)
+// Outbox mapping
 // ---------------------------------------------------------------------------
 
-/// Rebuild the v2 wire envelope from the outbox correlation columns + `data`.
+/// Rebuild the wire envelope from the outbox correlation columns + `data`.
 /// Correlation ids sit at the **envelope top level** (never inside `data`); the
 /// host routes/correlates off them without parsing `data`. `secondary_id` is the
 /// `thread_id` column, keyed as `cronId` for a `cron_state` frame and `threadId`
@@ -269,7 +269,7 @@ pub(super) fn build_envelope(
     data: &Value,
     task_id: Option<&str>,
     secondary_id: Option<&str>,
-    outbox_id: i64,
+    outbox_id: &str,
 ) -> Value {
     let mut envelope = Map::new();
     envelope.insert("type".to_owned(), Value::from(msg_type));
@@ -404,7 +404,7 @@ mod tests {
 
     use super::{Backoff, BackoffConfig, Transport, TransportConfig, build_envelope};
     use crate::db::Db;
-    use crate::protocol::v2::{HeartbeatData, MessageKind, OutboundFrameV2, ThreadMessageData};
+    use crate::protocol::frames::{HeartbeatData, MessageKind, OutboundFrame, ThreadMessageData};
 
     // -- pure helpers ------------------------------------------------------
 
@@ -445,25 +445,34 @@ mod tests {
     #[test]
     fn build_envelope_round_trips_thread_frame_with_ids_at_top_level() {
         // The envelope rebuilt from the outbox columns must parse straight back
-        // into the typed v2 frame: ids at the top level, `data` nested, the
+        // into the typed frame: ids at the top level, `data` nested, the
         // outbox row id surfacing as `outboxId`.
         let data = sample_message_data();
         let value = serde_json::to_value(&data).unwrap();
-        let envelope = build_envelope("thread_message", &value, Some("t-1"), Some("c-9@1718"), 43);
+        let envelope = build_envelope(
+            "thread_message",
+            &value,
+            Some("t-1"),
+            Some("c-9@1718"),
+            &crate::protocol::test_delivery_id(43),
+        );
         assert_eq!(envelope["type"], json!("thread_message"));
         assert_eq!(envelope["taskId"], json!("t-1"));
         assert_eq!(envelope["threadId"], json!("c-9@1718"));
-        assert_eq!(envelope["outboxId"], json!(43));
+        assert_eq!(
+            envelope["outboxId"],
+            json!(crate::protocol::test_delivery_id(43))
+        );
         assert_eq!(envelope["data"]["seq"], json!(3));
 
-        let parsed: OutboundFrameV2 = serde_json::from_value(envelope).unwrap();
+        let parsed: OutboundFrame = serde_json::from_value(envelope).unwrap();
         assert_eq!(
             parsed,
-            OutboundFrameV2::ThreadMessage {
+            OutboundFrame::ThreadMessage {
                 task_id: "t-1".to_owned(),
                 thread_id: "c-9@1718".to_owned(),
                 data,
-                outbox_id: Some(43),
+                outbox_id: Some(crate::protocol::test_delivery_id(43)),
             }
         );
     }
@@ -472,7 +481,13 @@ mod tests {
     fn build_envelope_keys_cron_state_secondary_as_cron_id() {
         // The `cron_state` frame's secondary column is its `cronId`, not a thread.
         let data = json!({ "kind": "schedule", "round_count": 1, "skipped_count": 0 });
-        let envelope = build_envelope("cron_state", &data, Some("t-1"), Some("cr-7"), 5);
+        let envelope = build_envelope(
+            "cron_state",
+            &data,
+            Some("t-1"),
+            Some("cr-7"),
+            &crate::protocol::test_delivery_id(5),
+        );
         assert_eq!(envelope["cronId"], json!("cr-7"));
         assert!(envelope.get("threadId").is_none());
     }
@@ -480,7 +495,7 @@ mod tests {
     #[test]
     fn heartbeat_constant_matches_serialized_frame() {
         // The manager sends a literal heartbeat string; keep it tied to the type.
-        let serialized = serde_json::to_string(&OutboundFrameV2::Heartbeat {
+        let serialized = serde_json::to_string(&OutboundFrame::Heartbeat {
             data: HeartbeatData {
                 active_threads: None,
             },
@@ -522,6 +537,12 @@ mod tests {
         }
     }
 
+    /// The host's `ack` for a received agent frame, echoing its `outboxId`.
+    fn ack_for(frame: &str) -> Message {
+        let frame: Value = serde_json::from_str(frame).unwrap();
+        Message::text(json!({ "type": "ack", "id": frame["outboxId"] }).to_string())
+    }
+
     async fn wait_until<F: FnMut() -> bool>(mut predicate: F) {
         for _ in 0..200 {
             if predicate() {
@@ -538,10 +559,10 @@ mod tests {
     #[tokio::test]
     async fn outbox_replays_in_order_carries_correlation_and_ack_clears() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        {
+        let (id1, id2) = {
             let guard = db.lock().unwrap();
             // Outbox payload = `data` only; correlation ids ride the columns.
-            guard
+            let id1 = guard
                 .enqueue_outbox_correlated(
                     "thread_message",
                     &json!({ "seq": 1, "kind": "assistant_text", "content": "a" }),
@@ -549,7 +570,7 @@ mod tests {
                     Some("c-1"),
                 )
                 .unwrap();
-            guard
+            let id2 = guard
                 .enqueue_outbox_correlated(
                     "thread_result",
                     &json!({ "status": "succeeded", "duration_ms": 5, "final_seq": 1 }),
@@ -557,7 +578,8 @@ mod tests {
                     Some("c-1"),
                 )
                 .unwrap();
-        }
+            (id1, id2)
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -579,12 +601,8 @@ mod tests {
                 .unwrap();
             let first = next_text(&mut ws).await;
             let second = next_text(&mut ws).await;
-            ws.send(Message::text(r#"{"type":"ack","id":1}"#.to_owned()))
-                .await
-                .unwrap();
-            ws.send(Message::text(r#"{"type":"ack","id":2}"#.to_owned()))
-                .await
-                .unwrap();
+            ws.send(ack_for(&first)).await.unwrap();
+            ws.send(ack_for(&second)).await.unwrap();
             (first, second)
         });
 
@@ -602,7 +620,7 @@ mod tests {
         // Replayed oldest-first; each envelope is rebuilt from the columns with the
         // correlation ids at the top level and the persisted `data` nested.
         assert_eq!(first["type"], json!("thread_message"));
-        assert_eq!(first["outboxId"], json!(1));
+        assert_eq!(first["outboxId"], json!(id1));
         assert_eq!(first["taskId"], json!("t-1"));
         assert_eq!(first["threadId"], json!("c-1"));
         assert_eq!(first["data"]["content"], json!("a"));
@@ -610,7 +628,7 @@ mod tests {
         assert!(first["data"].get("taskId").is_none());
         assert!(first["data"].get("threadId").is_none());
         assert_eq!(second["type"], json!("thread_result"));
-        assert_eq!(second["outboxId"], json!(2));
+        assert_eq!(second["outboxId"], json!(id2));
         assert_eq!(second["threadId"], json!("c-1"));
 
         assert_eq!(
@@ -634,7 +652,7 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             ws.send(Message::text(
-                r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hello"},"msgId":7}"#
+                r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hello"},"msgId":"01jab3x7k2m4n5p6q7r8s90007"}"#
                     .to_owned(),
             ))
             .await
@@ -652,7 +670,7 @@ mod tests {
 
         let inbound = transport.recv().await.unwrap();
         match &inbound.frame {
-            crate::protocol::v2::InboundFrameV2::Message {
+            crate::protocol::frames::InboundFrame::Message {
                 task_id,
                 thread_id,
                 data,
@@ -661,7 +679,7 @@ mod tests {
                 assert_eq!(task_id, "t-1");
                 assert_eq!(thread_id.as_deref(), Some("c-1"));
                 assert_eq!(data.text, "hello");
-                assert_eq!(*msg_id, Some(7));
+                assert_eq!(*msg_id, Some(crate::protocol::test_delivery_id(7)));
             }
             other => panic!("expected a message frame, got {other:?}"),
         }
@@ -681,7 +699,10 @@ mod tests {
         }
 
         let ack: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
-        assert_eq!(ack, json!({ "type": "msg_ack", "msgId": 7 }));
+        assert_eq!(
+            ack,
+            json!({ "type": "msg_ack", "msgId": "01jab3x7k2m4n5p6q7r8s90007" })
+        );
 
         transport.shutdown().await;
     }
@@ -689,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_unacked_outbox() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        {
+        let id = {
             db.lock()
                 .unwrap()
                 .enqueue_outbox_correlated(
@@ -698,8 +719,8 @@ mod tests {
                     Some("t-1"),
                     Some("c-1"),
                 )
-                .unwrap();
-        }
+                .unwrap()
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -715,9 +736,7 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let second = next_text(&mut ws).await;
-            ws.send(Message::text(r#"{"type":"ack","id":1}"#.to_owned()))
-                .await
-                .unwrap();
+            ws.send(ack_for(&second)).await.unwrap();
             (first, second)
         });
 
@@ -733,11 +752,11 @@ mod tests {
         let first: Value = serde_json::from_str(&first).unwrap();
         let second: Value = serde_json::from_str(&second).unwrap();
         assert_eq!(first["type"], json!("thread_result"));
-        assert_eq!(first["outboxId"], json!(1));
+        assert_eq!(first["outboxId"], json!(id));
         assert_eq!(first["threadId"], json!("c-1"));
         // The very same unacked row is replayed (byte-identical) on the fresh
         // connection — the host de-dups on its own `(thread_id, seq)` key.
-        assert_eq!(second["outboxId"], json!(1));
+        assert_eq!(second["outboxId"], json!(id));
         assert_eq!(second["threadId"], json!("c-1"));
 
         wait_until(|| db.lock().unwrap().list_unacked_outbox().unwrap().is_empty()).await;
@@ -756,7 +775,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let frame = r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hello"},"msgId":7}"#;
+            let frame = r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"hello"},"msgId":"01jab3x7k2m4n5p6q7r8s90007"}"#;
             ws.send(Message::text(frame.to_owned())).await.unwrap();
             let first_ack = next_text(&mut ws).await;
             // Simulate a lost msg_ack on the host side: resend the SAME frame.
@@ -774,7 +793,7 @@ mod tests {
         );
 
         let (first_ack, second_ack) = server.await.unwrap();
-        let expected = json!({ "type": "msg_ack", "msgId": 7 });
+        let expected = json!({ "type": "msg_ack", "msgId": "01jab3x7k2m4n5p6q7r8s90007" });
         assert_eq!(serde_json::from_str::<Value>(&first_ack).unwrap(), expected);
         assert_eq!(
             serde_json::from_str::<Value>(&second_ack).unwrap(),
@@ -786,7 +805,7 @@ mod tests {
         let inbound = transport.recv().await.unwrap();
         assert!(matches!(
             inbound.frame,
-            crate::protocol::v2::InboundFrameV2::Message { .. }
+            crate::protocol::frames::InboundFrame::Message { .. }
         ));
         // ...and exactly one inbox row exists (dedup on msg_id).
         assert_eq!(
@@ -809,7 +828,7 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             ws.send(Message::text(
-                r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"still alive"},"msgId":1}"#
+                r#"{"type":"message","taskId":"t-1","threadId":"c-1","data":{"text":"still alive"},"msgId":"01jab3x7k2m4n5p6q7r8s90001"}"#
                     .to_owned(),
             ))
             .await
@@ -832,10 +851,13 @@ mod tests {
         let inbound = transport.recv().await.unwrap();
         assert!(matches!(
             inbound.frame,
-            crate::protocol::v2::InboundFrameV2::Message { .. }
+            crate::protocol::frames::InboundFrame::Message { .. }
         ));
         let ack: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
-        assert_eq!(ack, json!({ "type": "msg_ack", "msgId": 1 }));
+        assert_eq!(
+            ack,
+            json!({ "type": "msg_ack", "msgId": "01jab3x7k2m4n5p6q7r8s90001" })
+        );
         transport.shutdown().await;
     }
 
@@ -1011,8 +1033,7 @@ mod tests {
             .enqueue_outbox_correlated("thread_message", &data, Some("t-1"), Some("c-1"))
             .unwrap();
         transport.flush_handle().notify_one();
-        assert_eq!(id, 1);
-        assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap().len(), 1);
+        assert_eq!(db.lock().unwrap().list_unacked_outbox().unwrap()[0].id, id);
 
         // Well past the fast schedule's old 8-attempt test budget: the manager
         // task must still be dialing, not exited (the old code gave up here).
@@ -1034,7 +1055,7 @@ mod tests {
         const OUTAGE_DIALS: usize = 70;
 
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        {
+        let id = {
             db.lock()
                 .unwrap()
                 .enqueue_outbox_correlated(
@@ -1043,8 +1064,8 @@ mod tests {
                     Some("t-1"),
                     Some("c-1"),
                 )
-                .unwrap();
-        }
+                .unwrap()
+        };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1059,9 +1080,7 @@ mod tests {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             let frame = next_text(&mut ws).await;
-            ws.send(Message::text(r#"{"type":"ack","id":1}"#.to_owned()))
-                .await
-                .unwrap();
+            ws.send(ack_for(&frame)).await.unwrap();
             frame
         });
 
@@ -1082,7 +1101,7 @@ mod tests {
 
         let frame: Value = serde_json::from_str(&server.await.unwrap()).unwrap();
         assert_eq!(frame["type"], json!("thread_result"));
-        assert_eq!(frame["outboxId"], json!(1));
+        assert_eq!(frame["outboxId"], json!(id));
         assert_eq!(frame["threadId"], json!("c-1"));
         wait_until(|| db.lock().unwrap().list_unacked_outbox().unwrap().is_empty()).await;
         transport.shutdown().await;
@@ -1141,7 +1160,8 @@ mod tests {
         let flush = transport.flush_handle();
 
         // Flush 1 ships row 1; the host holds its ack.
-        db.lock()
+        let id1 = db
+            .lock()
             .unwrap()
             .enqueue_outbox_correlated(
                 "thread_message",
@@ -1154,7 +1174,8 @@ mod tests {
         wait_until(|| received.lock().unwrap().len() == 1).await;
 
         // Flush 2 must carry ONLY the fresh row 2 — not retransmit row 1.
-        db.lock()
+        let id2 = db
+            .lock()
             .unwrap()
             .enqueue_outbox_correlated(
                 "thread_message",
@@ -1167,10 +1188,10 @@ mod tests {
         wait_until(|| received.lock().unwrap().len() == 2).await;
         {
             let frames = received.lock().unwrap();
-            assert_eq!(frames[0].1["outboxId"], json!(1));
+            assert_eq!(frames[0].1["outboxId"], json!(id1));
             assert_eq!(
                 frames[1].1["outboxId"],
-                json!(2),
+                json!(id2),
                 "a flush under ack lag must not retransmit the already-sent backlog"
             );
         }
@@ -1186,10 +1207,10 @@ mod tests {
             );
             assert_eq!(
                 frames[2].1["outboxId"],
-                json!(1),
+                json!(id1),
                 "reconnect replays all unacked"
             );
-            assert_eq!(frames[3].1["outboxId"], json!(2));
+            assert_eq!(frames[3].1["outboxId"], json!(id2));
         }
 
         server.await.unwrap();
@@ -1246,7 +1267,7 @@ mod tests {
     #[tokio::test]
     async fn stalled_acks_trigger_a_retransmit_on_the_live_connection() {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        {
+        let id = {
             db.lock()
                 .unwrap()
                 .enqueue_outbox_correlated(
@@ -1255,8 +1276,8 @@ mod tests {
                     Some("t-1"),
                     Some("c-1"),
                 )
-                .unwrap();
-        }
+                .unwrap()
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1286,10 +1307,10 @@ mod tests {
             .unwrap();
         let first: Value = serde_json::from_str(&first).unwrap();
         let second: Value = serde_json::from_str(&second).unwrap();
-        assert_eq!(first["outboxId"], json!(1));
+        assert_eq!(first["outboxId"], json!(id));
         assert_eq!(
             second["outboxId"],
-            json!(1),
+            json!(id),
             "the same unacked row is retransmitted once acks stall"
         );
         transport.shutdown().await;

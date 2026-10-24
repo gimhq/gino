@@ -1,4 +1,4 @@
-// M2 — PROTOCOL v2 ADAPTER (the only code that knows the wire).
+// M2 — PROTOCOL ADAPTER (the only code that knows the wire).
 //
 // Barrel for the module's public surface (docs/host-v2-design.md §1):
 //   envelope.ts  codec — extract ids without parsing `data`; rebuild on send

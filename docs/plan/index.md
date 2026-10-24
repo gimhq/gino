@@ -1,6 +1,6 @@
 # Gino - Plan Index
 
-> Updated: 2026-10-12
+> Updated: 2026-10-23
 
 ## Usage
 
@@ -37,3 +37,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261012-1616-agent-pty Agent PTY sessions over the live operations channel**](20261012-1616-agent-pty.md) `2026-10-12`
 - [x] [**20261012-2019-remote-ops-review-fixes Fix remote operations review findings**](20261012-2019-remote-ops-review-fixes.md) `2026-10-12`
 - [x] [**20261013-1955-engine-turn-end Engine turn-end detection for claude and codex**](20261013-1955-engine-turn-end.md) `2026-10-13`
+- [x] [**20261023-2333-ulid-delivery-ids ULID delivery ids for host and agent outboxes**](20261023-2333-ulid-delivery-ids.md) `2026-10-23`

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-// M2 — PROTOCOL v2 FRAME CATALOG (the single source of truth for the wire).
+// M2 — PROTOCOL FRAME CATALOG (the single source of truth for the wire).
 //
 // This module mirrors `docs/protocol.md` §4 (envelope) + §5 (frame catalog) as
 // executable zod. The host and the Rust runner share **no code**; both treat
@@ -29,8 +29,8 @@ import { z } from "zod";
 
 // ── Primitives ──────────────────────────────────────────────────────────────
 
-/** Delivery / ack ids — `outboxId`, `msgId`, and the ack reference `id`. */
-const DeliveryId = z.number().int();
+/** Delivery / ack ids — `outboxId`, `msgId`, and the ack reference `id`: lowercase ULIDs. */
+const DeliveryId = z.string().regex(/^[0-7][0-9a-hjkmnp-tv-z]{25}$/);
 /** Correlation ids — `taskId`, `threadId`, `cronId` (opaque strings). */
 const CorrelationId = z.string();
 
@@ -342,7 +342,7 @@ export const MsgAckFrame = z.looseObject({
   msgId: DeliveryId,
 });
 
-/** `ack` — acked a peer outbound frame; references its `outboxId` via `id`. */
+/** `ack` — host→agent, acked an agent outbound frame; references its `outboxId` via `id`. */
 export const AckFrame = z.looseObject({
   type: z.literal("ack"),
   id: DeliveryId,
@@ -358,14 +358,11 @@ export const FsResponseFrame = z.looseObject({
 // ── Frames — host → agent ───────────────────────────────────────────────────
 
 // Every durable host→agent frame carries `msgId` (its outbox row id): the
-// runner dedups inbound frames and acknowledges durable storage by `msgId` +
-// `msg_ack` alone (§4.2) — `outboxId` rides along for compatibility but is
-// never acked by the runner.
+// runner dedups inbound frames on it and acks durable storage with `msg_ack`.
 /** `task_upsert` — host→agent, seed or modify a task. Sent once per placement before any work. */
 export const TaskUpsertFrame = z.looseObject({
   type: z.literal("task_upsert"),
   taskId: CorrelationId,
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
   data: TaskUpsertData,
 });
@@ -374,7 +371,6 @@ export const TaskUpsertFrame = z.looseObject({
 export const TaskDeleteFrame = z.looseObject({
   type: z.literal("task_delete"),
   taskId: CorrelationId,
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
 });
 
@@ -383,7 +379,6 @@ export const CronUpsertFrame = z.looseObject({
   type: z.literal("cron_upsert"),
   taskId: CorrelationId,
   cronId: CorrelationId,
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
   data: CronUpsertData,
 });
@@ -393,7 +388,6 @@ export const CronDeleteFrame = z.looseObject({
   type: z.literal("cron_delete"),
   taskId: CorrelationId,
   cronId: CorrelationId,
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
 });
 
@@ -416,21 +410,18 @@ export const InterruptFrame = z.looseObject({
    * current turn regardless).
    */
   taskId: CorrelationId.optional(),
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
 });
 
 /** `close` — host→agent, wind the runner down. Not the per-task close; that is an `interrupt` plus a `task_upsert`. */
 export const CloseFrame = z.looseObject({
   type: z.literal("close"),
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
 });
 
 /** `config_update` — host→agent, an opaque live-config overlay. */
 export const ConfigUpdateFrame = z.looseObject({
   type: z.literal("config_update"),
-  outboxId: DeliveryId.optional(),
   msgId: DeliveryId.optional(),
   data: ConfigUpdateData.optional(),
 });
@@ -455,7 +446,6 @@ export const AgentFrame = z.discriminatedUnion("type", [
   PtyOutputFrame,
   PtyExitFrame,
   MsgAckFrame,
-  AckFrame,
 ]);
 export type AgentFrame = z.infer<typeof AgentFrame>;
 
@@ -479,9 +469,8 @@ export const HostFrame = z.discriminatedUnion("type", [
 export type HostFrame = z.infer<typeof HostFrame>;
 
 /**
- * Any valid v2 frame, either direction. A plain union of the two
- * direction-specific discriminated unions (both carry `ack`, so a single
- * discriminated union over both directions would collide on the `ack` tag).
+ * Any valid frame, either direction. A plain union of the two
+ * direction-specific discriminated unions.
  * An unknown `type` matches no member and is REJECTED at parse time — the M2
  * inbound handler turns that rejection into the §4.2 "ignore unknown type"
  * policy.

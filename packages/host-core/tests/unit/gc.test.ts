@@ -20,6 +20,7 @@ import {
   startConfigStoreGc,
   sweep,
 } from "../../src/configstore";
+import { ulid } from "../../src/platform";
 
 // M8 — refcount/LRU GC backing BOTH stores. DISABLED by default: the
 // sweep computes the droppable set but auto-deletes nothing unless `enabled`.
@@ -70,6 +71,7 @@ function addOutboxFrame(sha256: string, opts: { acked?: boolean } = {}) {
     status: "offline",
   }).run();
   db.insert(outbox).values({
+    id: ulid(),
     agentId: `ag_${sha256.slice(0, 8)}`,
     type: "task_upsert",
     dataJson: { entries: [{ name: "skill", sha256, target: "CLAUDE.md", kind: "file" }] },

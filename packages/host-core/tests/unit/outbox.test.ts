@@ -7,10 +7,10 @@ import { outbox } from "@gino/host-store-sqlite/schema";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import { enrollAgent } from "../../src/agents/registry";
-import { ackMessage, ackOutbox, CLOSE_FRAME_TTL_MS, enqueue, gcOutbox, OUTBOX_RETENTION_MS, purgeAgentOutbox, replayUnacked } from "../../src/protocol/outbox";
+import { ackMessage, CLOSE_FRAME_TTL_MS, enqueue, gcOutbox, OUTBOX_RETENTION_MS, purgeAgentOutbox, replayUnacked } from "../../src/protocol/outbox";
 
 // M2 outbox — at-least-once host→agent: persist before send; replay unacked on
-// reconnect; stop replaying on ack{id} / msg_ack{msgId}.
+// reconnect; stop replaying on msg_ack{msgId}.
 
 interface Sent { agentId: string; frame: Record<string, unknown> }
 
@@ -46,15 +46,17 @@ afterEach(() => {
   db.close();
 });
 
+const ULID = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/;
+
 describe("M2 outbox — enqueue", () => {
-  it("persists then sends when online (outboxId on the wire)", () => {
+  it("persists then sends when online, keyed by a ULID msgId", () => {
     const sender = fakeSender(true);
     const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
 
-    expect(row.id).toBeGreaterThan(0);
+    expect(row.id).toMatch(ULID);
     expect(row.ackedAt).toBeNull();
     expect(sender.sent).toHaveLength(1);
-    expect(sender.sent[0]!.frame).toMatchObject({ type: "task_upsert", outboxId: row.id, taskId: "t-1" });
+    expect(sender.sent[0]!.frame).toEqual({ type: "task_upsert", msgId: row.id, taskId: "t-1", data: { name: "job" } });
   });
 
   it("persists but does NOT send when offline; replays later", () => {
@@ -65,28 +67,36 @@ describe("M2 outbox — enqueue", () => {
     sender.online = true;
     const replayed = replayUnacked(storage, sender, agentId);
     expect(replayed).toBe(1);
-    expect(sender.sent[0]!.frame).toMatchObject({ type: "task_upsert", outboxId: row.id });
+    expect(sender.sent[0]!.frame).toMatchObject({ type: "task_upsert", msgId: row.id });
   });
 
-  it("a message frame gets a stable msgId (= row id)", () => {
+  it("host frames never carry outboxId", () => {
+    const sender = fakeSender(true);
+    for (const type of ["message", "task_upsert", "close", "config_update"])
+      enqueue(storage, sender, { agentId, type, taskId: "t-1" });
+    expect(sender.sent.every(s => !("outboxId" in s.frame))).toBe(true);
+  });
+
+  it("a message frame surfaces its msgId (= row id)", () => {
     const sender = fakeSender(true);
     const row = enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", threadId: "c-1", data: { text: "hi" } });
     expect(row.msgId).toBe(row.id);
     expect(sender.sent[0]!.frame).toMatchObject({ type: "message", msgId: row.id });
-    expect(sender.sent[0]!.frame.outboxId).toBeUndefined();
+  });
+
+  it("ids minted in the same millisecond keep insertion order on replay", () => {
+    const sender = fakeSender(false);
+    const ids = Array.from({ length: 50 }, (_, i) =>
+      enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", data: { n: i } }).id);
+    expect([...ids].sort()).toEqual(ids);
+
+    sender.online = true;
+    replayUnacked(storage, sender, agentId);
+    expect(sender.sent.map(s => (s.frame.data as { n: number }).n)).toEqual(ids.map((_, i) => i));
   });
 });
 
-describe("M2 outbox — ack stops replay", () => {
-  it("ack{id} marks the row acked → no longer replayed", () => {
-    const sender = fakeSender(true);
-    const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
-
-    ackOutbox(storage, agentId, row.id);
-    sender.sent.length = 0;
-    expect(replayUnacked(storage, sender, agentId)).toBe(0);
-  });
-
+describe("M2 outbox — msg_ack stops replay", () => {
   it("msg_ack{msgId} marks a message delivered → no longer replayed", () => {
     const sender = fakeSender(true);
     const row = enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
@@ -96,31 +106,21 @@ describe("M2 outbox — ack stops replay", () => {
     expect(replayUnacked(storage, sender, agentId)).toBe(0);
   });
 
-  it("another agent's ack{id} does NOT ack this agent's frame", () => {
+  it("msg_ack of a NON-message frame acks it (the runner acks every durable frame via msg_ack)", () => {
     const sender = fakeSender(false);
-    const otherId = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
     const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
 
-    ackOutbox(storage, otherId, row.id);
+    ackMessage(storage, agentId, row.id);
     sender.online = true;
-    expect(replayUnacked(storage, sender, agentId)).toBe(1);
+    expect(replayUnacked(storage, sender, agentId)).toBe(0);
   });
 
-  it("another agent's msg_ack{msgId} does NOT mark this agent's message delivered", () => {
+  it("another agent's msg_ack does NOT mark this agent's frame delivered", () => {
     const sender = fakeSender(false);
     const otherId = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
     const row = enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
 
     ackMessage(storage, otherId, row.msgId!);
-    sender.online = true;
-    expect(replayUnacked(storage, sender, agentId)).toBe(1);
-  });
-
-  it("a plain ack{id} does NOT mark a message delivered — only msg_ack can", () => {
-    const sender = fakeSender(false);
-    const row = enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
-
-    ackOutbox(storage, agentId, row.id);
     sender.online = true;
     expect(replayUnacked(storage, sender, agentId)).toBe(1);
   });
@@ -135,68 +135,24 @@ describe("M2 outbox — ack stops replay", () => {
     expect(replayUnacked(storage, sender, agentId)).toBe(3);
     expect(sender.sent.map(s => s.frame.type)).toEqual(["task_upsert", "message", "interrupt"]);
   });
-});
 
-// A `message` row's delivery id is its row id,
-// assigned by the single INSERT — there is no insert-then-update window in
-// which a durable row exists without an ackable id.
-describe("M2 outbox — atomic message delivery id", () => {
-  it("the DURABLE message row is born ackable: replay + msg_ack + no re-replay", () => {
+  it("the durable row replays with the msgId it was born with, and msg_ack retires it", () => {
     const sender = fakeSender(false);
     const row = enqueue(storage, sender, { agentId, type: "message", taskId: "t-1", data: { text: "hi" } });
 
-    // Replay re-reads the persisted row (not enqueue's in-memory return), so
-    // the frame's msgId comes straight from what the single INSERT committed.
     sender.online = true;
     expect(replayUnacked(storage, sender, agentId)).toBe(1);
     expect(sender.sent[0]!.frame.msgId).toBe(row.id);
 
-    ackMessage(storage, agentId, sender.sent[0]!.frame.msgId as number);
+    ackMessage(storage, agentId, sender.sent[0]!.frame.msgId as string);
     sender.sent.length = 0;
     expect(replayUnacked(storage, sender, agentId)).toBe(0);
-  });
-
-  it("a bare-inserted message row (bypassing enqueue) is still deliverable and ackable", () => {
-    // The delivery id is derived from the row id at encode time — there is no
-    // msg_id column to back-fill — so ANY durable message row replays WITH a
-    // msgId and is ackable, not stuck as an id-less frame.
-    const raw = db
-      .insert(outbox)
-      .values({ agentId, type: "message", taskId: "t-1", dataJson: { text: "orphan" } })
-      .returning()
-      .get();
-
-    const sender = fakeSender(true);
-    expect(replayUnacked(storage, sender, agentId)).toBe(1);
-    expect(sender.sent[0]!.frame).toMatchObject({ type: "message", msgId: raw.id });
-
-    ackMessage(storage, agentId, raw.id);
-    sender.sent.length = 0;
-    expect(replayUnacked(storage, sender, agentId)).toBe(0);
-  });
-
-  it("msg_ack{id} of a NON-message frame DOES ack it (the runner acks every durable frame via msg_ack)", () => {
-    const sender = fakeSender(false);
-    const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
-
-    ackMessage(storage, agentId, row.id);
-    sender.online = true;
-    expect(replayUnacked(storage, sender, agentId)).toBe(0);
-  });
-
-  it("msg_ack{id} scoped to another agent's row is a no-op", () => {
-    const sender = fakeSender(false);
-    const row = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: { name: "job" } });
-
-    ackMessage(storage, "someone-else", row.id);
-    sender.online = true;
-    expect(replayUnacked(storage, sender, agentId)).toBe(1);
   });
 });
 
 describe("M2 outbox — retention GC", () => {
   /** Backdate a row's acked_at (the GC cutoff is measured against it). */
-  function ackAt(id: number, ackedAt: number): void {
+  function ackAt(id: string, ackedAt: number): void {
     db.update(outbox).set({ ackedAt }).where(eq(outbox.id, id)).run();
   }
 
@@ -254,7 +210,7 @@ describe("M2 outbox — retention GC", () => {
 
 describe("M2 outbox — stale close TTL on replay (HOST-M3-13)", () => {
   /** Backdate a row's created_at (the close TTL is measured against it). */
-  function createdAt(id: number, ts: number): void {
+  function createdAt(id: string, ts: number): void {
     db.update(outbox).set({ createdAt: ts }).where(eq(outbox.id, id)).run();
   }
 
@@ -310,7 +266,7 @@ describe("M2 outbox — purge on remove (HOST-M3-12)", () => {
     const unacked1 = enqueue(storage, sender, { agentId, type: "close", data: { reason: "remove" } });
     const unacked2 = enqueue(storage, sender, { agentId, type: "task_upsert", taskId: "t-1", data: {} });
     const acked = enqueue(storage, sender, { agentId, type: "interrupt" });
-    ackOutbox(storage, agentId, acked.id);
+    ackMessage(storage, agentId, acked.id);
     const other = enrollAgent(storage, { source: "manual", capabilities: { engines: ["claude"] } }).agent.id;
     const foreign = enqueue(storage, sender, { agentId: other, type: "close", data: { reason: "stop" } });
 

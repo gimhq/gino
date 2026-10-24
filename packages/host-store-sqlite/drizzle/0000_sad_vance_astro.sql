@@ -17,11 +17,13 @@ CREATE TABLE `agents` (
 	`status` text NOT NULL,
 	`launcher_kind` text,
 	`launch_ref` text,
+	`launch_nonce` text,
 	`active_threads` integer DEFAULT 0,
 	`last_seen` integer,
 	`created_at` integer NOT NULL
 );
 --> statement-breakpoint
+CREATE UNIQUE INDEX `agents_launch_nonce_unique` ON `agents` (`launch_nonce`);--> statement-breakpoint
 CREATE TABLE `attachments` (
 	`id` text PRIMARY KEY NOT NULL,
 	`task_id` text NOT NULL,
@@ -71,6 +73,7 @@ CREATE TABLE `config_artifacts` (
 	`size` integer NOT NULL,
 	`content_type` text,
 	`store_ref` text NOT NULL,
+	`unreferenced_since` integer,
 	`created_at` integer NOT NULL,
 	PRIMARY KEY(`name`, `sha256`)
 );
@@ -103,6 +106,7 @@ CREATE TABLE `crons` (
 );
 --> statement-breakpoint
 CREATE TABLE `messages` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`task_id` text NOT NULL,
 	`thread_id` text NOT NULL,
 	`seq` integer NOT NULL,
@@ -112,23 +116,33 @@ CREATE TABLE `messages` (
 	`tool` text,
 	`input` text,
 	`output` text,
-	`created_at` integer NOT NULL,
-	PRIMARY KEY(`thread_id`, `seq`)
+	`tool_use_id` text,
+	`parent_tool_use_id` text,
+	`created_at` integer NOT NULL
 );
 --> statement-breakpoint
 CREATE INDEX `messages_task_thread_seq_idx` ON `messages` (`task_id`,`thread_id`,`seq`);--> statement-breakpoint
+CREATE UNIQUE INDEX `messages_thread_seq_unq` ON `messages` (`thread_id`,`seq`);--> statement-breakpoint
 CREATE TABLE `outbox` (
-	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`id` text PRIMARY KEY NOT NULL,
 	`agent_id` text NOT NULL,
 	`type` text NOT NULL,
 	`task_id` text,
 	`thread_id` text,
 	`cron_id` text,
-	`msg_id` integer,
 	`data_json` text NOT NULL,
 	`created_at` integer NOT NULL,
 	`acked_at` integer,
 	FOREIGN KEY (`agent_id`) REFERENCES `agents`(`id`) ON UPDATE no action ON DELETE no action
+);
+--> statement-breakpoint
+CREATE INDEX `outbox_agent_unacked_idx` ON `outbox` (`agent_id`) WHERE acked_at IS NULL;--> statement-breakpoint
+CREATE TABLE `pending_launches` (
+	`nonce` text PRIMARY KEY NOT NULL,
+	`launcher_kind` text NOT NULL,
+	`launch_ref` text,
+	`access` text DEFAULT 'dedicated' NOT NULL,
+	`created_at` integer NOT NULL
 );
 --> statement-breakpoint
 CREATE TABLE `router_state` (
@@ -149,6 +163,7 @@ CREATE TABLE `tasks` (
 	`agent_id` text,
 	`current_thread_id` text,
 	`assigned_at` integer,
+	`seeded_at` integer,
 	`created_at` integer NOT NULL,
 	`updated_at` integer NOT NULL,
 	FOREIGN KEY (`agent_id`) REFERENCES `agents`(`id`) ON UPDATE no action ON DELETE no action

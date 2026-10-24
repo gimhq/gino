@@ -18,7 +18,7 @@ the host spec [`docs/host-architecture.md`](host-architecture.md). The runner ty
 
 ## 1. Versioning
 
-- The protocol carries a `protocolVersion` (integer, current = **2**).
+- The protocol carries a `protocolVersion` (integer, current = **1**).
 - The agent sends `protocolVersion` in `POST /agent/register`; the host returns the
   version it will speak in the register response. If they cannot agree, the host returns
   `register_error { reason: "unsupported_protocol" }` and the agent exits.
@@ -54,7 +54,7 @@ Unauthenticated by connect token; carries the bootstrap **register token** inste
 
 Request:
 ```json
-{ "registerToken": "<secret>", "protocolVersion": 2,
+{ "registerToken": "<secret>", "protocolVersion": 1,
   "name": "<human label?>", "capabilities": ["claude", ...],
   "version": "<agent build version?>", "platform": "<arch-os?>", "source": "docker|vm|bare?" }
 ```
@@ -63,7 +63,7 @@ Response (success):
 { "agentId": "<host-generated>", "connectToken": "<per-agent secret>",
   "config": { "agentId": "...", "wsUrl": "/agent/ws/<agentId>",
               "configUrl": "/agent/config/<agentId>", "outputUrl": "/agent/output/<agentId>",
-              "heartbeatIntervalMs": 30000, "protocolVersion": 2,
+              "heartbeatIntervalMs": 30000, "protocolVersion": 1,
               "entries": [ { "name": "...", "sha256": "...", "target": "...", "kind": "file|dir" } ],
               "version": 0,
               "remoteOps": { "fs": false, "pty": false } } }
@@ -103,11 +103,12 @@ Every frame is one JSON object. **Correlation/delivery metadata lives at the env
 level; `data` carries the type-specific business payload only.**
 
 ```json
-{ "type": "thread_message", "outboxId": 43, "taskId": "t-1", "threadId": "c-9@1718…",
+{ "type": "thread_message", "outboxId": "01jab3x7k2m4n5p6q7r8s9t0vw", "taskId": "t-1", "threadId": "c-9@1718…",
   "data": { "seq": 3, "kind": "assistant_text", "content": "…" } }
 ```
 
-- **Envelope** keys: `type`; the delivery ids `outboxId` / `msgId`; the correlation ids
+- **Envelope** keys: `type`; the delivery ids `outboxId` (agent → host) / `msgId`
+  (host → agent); the correlation ids
   `taskId` / `threadId` / `cronId`; and `reqId` on live-only file requests or `ptyId` on live terminal sessions.
 - **`data`**: business fields only — it **never** repeats the correlation ids. In
   particular `engine_session_id` is a *value* of a thread (the engine `--resume` handle),
@@ -122,14 +123,16 @@ level; `data` carries the type-specific business payload only.**
 
 - Sender persists each outbound frame (outbox) before sending; unacked frames replay on
   reconnect.
-- **Agent→host**: the host replies `{ "type": "ack", "id": <outboxId> }` after the durable
-  mirror write; the agent clears the outbox row on that ack.
-- **Host→agent**: EVERY durable host→agent frame carries `msgId` (the host outbox row id);
-  the agent dedups inbound frames on `msgId` and replies
-  `{ "type": "msg_ack", "msgId": <int> }` once it has durably stored the frame — that
-  `msg_ack` (not `ack{id}`) is what stops host replay, for `message` and for every other
-  durable type alike. Non-`message` frames also carry `outboxId` (same row id) for
-  compatibility; the agent does not acknowledge `outboxId`.
+- **Delivery ids are ULIDs**: 26 lowercase Crockford base32 characters
+  (`^[0-7][0-9a-hjkmnp-tv-z]{25}$`), minted by the sender from a monotonic generator and
+  used as its outbox row key. Ids from a recreated or restored sender database never collide
+  with ids the receiver has already seen, and replay order is the ids' string order.
+- **Agent→host**: every durable frame carries `outboxId`; the host replies
+  `{ "type": "ack", "id": <outboxId> }` after the durable mirror write and the agent clears
+  the outbox row on that ack.
+- **Host→agent**: every durable frame carries `msgId`; the agent dedups inbound frames on
+  `msgId` and replies `{ "type": "msg_ack", "msgId": <msgId> }` once it has durably stored
+  the frame, which stops host replay.
 - Receivers MUST be idempotent (dedupe by id; see §6) and MUST ignore unknown `type`s and
   unknown fields.
 
@@ -150,8 +153,7 @@ agent-architecture); bytes never travel in frames.
 | `cron_state` | `taskId`, `cronId` | `{kind, schedule_type?, schedule_value?, continuity?, next_run?, status?, round_count, skipped_count, last_status?}` | local scheduling-ledger summary (mirror → `crons`) |
 | `heartbeat` | — | `{activeThreads?, …}` | liveness (interval from `config.heartbeatIntervalMs`) |
 | `fs_response` | `reqId` | `{ok, entries? \| stat? \| sha256 + size, error?}` | answers the `fs_request` with the same `reqId`; live-only |
-| `msg_ack` | (top-level `msgId`) | — | durably stored an inbound message |
-| `ack` | (top-level `id`) | — | acked a host outbound frame |
+| `msg_ack` | (top-level `msgId`) | — | durably stored an inbound host frame |
 
 **host → agent**
 
@@ -168,8 +170,8 @@ agent-architecture); bytes never travel in frames.
 | `fs_request` | `reqId` | `{op, path, to?, recursive?, ref? + sha256? + size?, upload?}` | one engine-free file operation; live-only (never queued, never replayed) |
 | `ack` | (top-level `id`) | — | acked an agent outbound frame |
 
-Every durable host→agent frame additionally carries the top-level delivery id `msgId`
-(§4.2); it is omitted from the "envelope ids" column above, which lists the correlation
+Every durable frame additionally carries its top-level delivery id (`outboxId` agent →
+host, `msgId` host → agent; §4.2); the "envelope ids" columns above list the correlation
 ids only.
 
 Field semantics:
@@ -350,7 +352,7 @@ Parse model: a whole job is `WHERE task_id = ?`; one conversation is
 <!-- GENERATED by packages/host-core/scripts/gen-frames-schema.ts from packages/host-core/src/protocol/frames.ts — DO NOT EDIT.
      Regenerate with `bun run gen:frames-schema`. -->
 
-The machine-checkable JSON Schema for the v2 frame catalog (§5), exported from the single
+The machine-checkable JSON Schema for the frame catalog (§5), exported from the single
 zod source of truth in [`packages/host-core/src/protocol/frames.ts`](../packages/host-core/src/protocol/frames.ts). `AnyFrame` is
 the union of the agent→host (`AgentFrame`) and host→agent (`HostFrame`) catalogs; both are
 also exposed under `$defs`. Frames and their `data` objects are **open** — additive fields
@@ -358,8 +360,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
 
 ```json
 {
-  "title": "Gino host ⇄ agent protocol v2 — frame catalog",
-  "description": "Generated from packages/host-core/src/protocol/frames.ts (zod). `AnyFrame` = a valid v2 frame in either direction. Frames and `data` objects are open (additive-compatible): unknown fields are accepted, unknown `type`s are rejected. See protocol.md §4–§6.",
+  "title": "Gino host ⇄ agent protocol — frame catalog",
+  "description": "Generated from packages/host-core/src/protocol/frames.ts (zod). `AnyFrame` = a valid frame in either direction. Frames and `data` objects are open (additive-compatible): unknown fields are accepted, unknown `type`s are rejected. See protocol.md §4–§6.",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "anyOf": [
     {
@@ -378,9 +380,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -490,9 +491,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -552,9 +552,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -615,9 +614,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "heartbeat"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -856,33 +854,13 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "msg_ack"
             },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
             "type",
             "msgId"
-          ],
-          "additionalProperties": {}
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "ack"
-            },
-            "id": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            }
-          },
-          "required": [
-            "type",
-            "id"
           ],
           "additionalProperties": {}
         }
@@ -900,15 +878,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -984,15 +956,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -1014,15 +980,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "cronId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1078,15 +1038,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "cronId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -1110,9 +1064,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1188,15 +1141,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -1211,15 +1158,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string",
               "const": "close"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -1234,15 +1175,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string",
               "const": "config_update"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1475,9 +1410,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "ack"
             },
             "id": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -1507,9 +1441,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1619,9 +1552,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1681,9 +1613,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1744,9 +1675,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "heartbeat"
             },
             "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -1985,33 +1915,13 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "msg_ack"
             },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
             "type",
             "msgId"
-          ],
-          "additionalProperties": {}
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "ack"
-            },
-            "id": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            }
-          },
-          "required": [
-            "type",
-            "id"
           ],
           "additionalProperties": {}
         }
@@ -2030,15 +1940,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -2114,15 +2018,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -2144,15 +2042,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "cronId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -2208,15 +2100,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "cronId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -2240,9 +2126,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string"
             },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -2318,15 +2203,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
             "taskId": {
               "type": "string"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -2341,15 +2220,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string",
               "const": "close"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [
@@ -2364,15 +2237,9 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "type": "string",
               "const": "config_update"
             },
-            "outboxId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
-            },
             "msgId": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             },
             "data": {
               "type": "object",
@@ -2605,9 +2472,8 @@ validate (protocol §1/§4.2) — while an unknown `type` matches no member and 
               "const": "ack"
             },
             "id": {
-              "type": "integer",
-              "minimum": -9007199254740991,
-              "maximum": 9007199254740991
+              "type": "string",
+              "pattern": "^[0-7][0-9a-hjkmnp-tv-z]{25}$"
             }
           },
           "required": [

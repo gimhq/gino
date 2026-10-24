@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /* eslint-disable no-console */
 /**
- * Generate the machine-checkable JSON Schema for the v2 frame catalog from the
+ * Generate the machine-checkable JSON Schema for the frame catalog from the
  * zod source of truth (`packages/host-core/src/protocol/frames.ts`) and embed it in
  * `docs/protocol.md` under the trailing section "## 8. Frame JSON Schema
  * (generated)".
@@ -25,9 +25,9 @@ export const MARKER = "## 8. Frame JSON Schema (generated)";
 export function buildSchema(): unknown {
   const schema = z.toJSONSchema(AnyFrame, { target: "draft-2020-12" });
   return {
-    title: "Gino host ⇄ agent protocol v2 — frame catalog",
+    title: "Gino host ⇄ agent protocol — frame catalog",
     description:
-      "Generated from packages/host-core/src/protocol/frames.ts (zod). `AnyFrame` = a valid v2 "
+      "Generated from packages/host-core/src/protocol/frames.ts (zod). `AnyFrame` = a valid "
       + "frame in either "
       + "direction. Frames and `data` objects are open (additive-compatible): unknown fields are "
       + "accepted, unknown `type`s are rejected. See protocol.md §4–§6.",
@@ -51,7 +51,7 @@ export function renderSection(): string {
     + "packages/host-core/src/protocol/frames.ts — DO NOT EDIT.",
     "     Regenerate with `bun run gen:frames-schema`. -->",
     "",
-    "The machine-checkable JSON Schema for the v2 frame catalog (§5), exported from the single",
+    "The machine-checkable JSON Schema for the frame catalog (§5), exported from the single",
     "zod source of truth in [`packages/host-core/src/protocol/frames.ts`]"
     + "(../packages/host-core/src/protocol/frames.ts). `AnyFrame` is",
     "the union of the agent→host (`AgentFrame`) and host→agent (`HostFrame`) catalogs; both are",

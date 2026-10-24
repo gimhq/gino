@@ -1,8 +1,7 @@
 //! HTTP client (agent-architecture §10).
 //!
 //! The WebSocket is the primary channel; HTTP is retained for the endpoints that
-//! sit outside the persistent socket. Enrollment is **protocol-version-shared**
-//! (unchanged across the v1 → v2 cut); the v2 terminal output of an execution is a
+//! sit outside the persistent socket. The terminal output of an execution is a
 //! `thread_result` frame over the outbox/WS, not an HTTP post.
 //!
 //! * `POST /agent/register` — enrollment (§2.1). The bootstrap *register* token

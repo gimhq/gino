@@ -74,7 +74,7 @@ async function registerAgent(): Promise<{ agentId: string; connectToken: string 
   const res = await fetch(`${httpBase}/agent/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
   });
   expect(res.status).toBe(200);
   return await res.json() as { agentId: string; connectToken: string };
@@ -85,7 +85,7 @@ describe("agentRouter over the Bun upgrade (memory storage)", () => {
     const res = await fetch(`${httpBase}/agent/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ registerToken: "wrong", protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+      body: JSON.stringify({ registerToken: "wrong", protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
     });
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ register_error: { reason: "invalid_register_token" } });

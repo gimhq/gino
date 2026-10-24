@@ -9,6 +9,9 @@ import {
   HostFrame,
 } from "../../src/protocol/frames";
 
+const ID_A = "01jab3x7k2m4n5p6q7r8s9t0vw";
+const ID_B = "01jab3x7k2m4n5p6q7r8s9t0vx";
+
 // One representative VALID frame per `type`, taken from the protocol §5
 // catalog (incl. the §4.1 envelope example). The direction tells the test which
 // discriminated union must also accept it.
@@ -19,7 +22,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
     dir: "agent",
     frame: {
       type: "thread_result",
-      outboxId: 12,
+      outboxId: ID_A,
       taskId: "t-1",
       threadId: "c-9@1718",
       data: {
@@ -40,7 +43,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
     dir: "agent",
     frame: {
       type: "thread_message",
-      outboxId: 43,
+      outboxId: ID_A,
       taskId: "t-1",
       threadId: "c-9@1718",
       data: { seq: 3, kind: "assistant_text", content: "…" },
@@ -68,8 +71,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
   },
   { name: "heartbeat", dir: "agent", frame: { type: "heartbeat", data: { activeThreads: 2 } } },
   { name: "heartbeat (no data)", dir: "agent", frame: { type: "heartbeat" } },
-  { name: "msg_ack", dir: "agent", frame: { type: "msg_ack", msgId: 99 } },
-  { name: "ack (agent)", dir: "agent", frame: { type: "ack", id: 43 } },
+  { name: "msg_ack", dir: "agent", frame: { type: "msg_ack", msgId: ID_A } },
 
   // ── host → agent ──────────────────────────────────────────────────────────
   { name: "task_upsert", dir: "host", frame: { type: "task_upsert", taskId: "t-1", data: { name: "Build", kind: "conversation", status: "active" } } },
@@ -92,7 +94,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
   { name: "task_delete", dir: "host", frame: { type: "task_delete", taskId: "t-1" } },
   { name: "cron_upsert", dir: "host", frame: { type: "cron_upsert", taskId: "t-1", cronId: "cr-1", data: { kind: "cron", prompt: "run the daily digest", schedule_type: "interval", schedule_value: "5m", continuity: "isolated" } } },
   { name: "cron_delete", dir: "host", frame: { type: "cron_delete", taskId: "t-1", cronId: "cr-1" } },
-  { name: "message", dir: "host", frame: { type: "message", taskId: "t-1", threadId: "c-9@1718", msgId: 5, data: { text: "hello" } } },
+  { name: "message", dir: "host", frame: { type: "message", taskId: "t-1", threadId: "c-9@1718", msgId: ID_B, data: { text: "hello" } } },
   { name: "message (no thread)", dir: "host", frame: { type: "message", taskId: "t-1", data: { text: "kick off" } } },
   { name: "interrupt", dir: "host", frame: { type: "interrupt" } },
   { name: "close", dir: "host", frame: { type: "close" } },
@@ -105,7 +107,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
   { name: "pty_output", dir: "agent", frame: { type: "pty_output", ptyId: "p-1", data: { data: "AP8=" } } },
   { name: "pty_exit", dir: "agent", frame: { type: "pty_exit", ptyId: "p-1", data: { exit_code: 0 } } },
   { name: "fs_request", dir: "host", frame: { type: "fs_request", reqId: "r-1", data: { op: "put", path: "notes.txt", ref: "/agent/attachments/xfer-1", sha256: "deadbeef", size: 12 } } },
-  { name: "ack (host)", dir: "host", frame: { type: "ack", id: 7 } },
+  { name: "ack (host)", dir: "host", frame: { type: "ack", id: ID_A } },
   {
     name: "fs_response",
     dir: "agent",
@@ -113,7 +115,7 @@ const VALID: { name: string; dir: "agent" | "host"; frame: unknown }[] = [
   },
 ];
 
-describe("protocol v2 frame contract", () => {
+describe("protocol frame contract", () => {
   describe("valid frames parse", () => {
     for (const { name, dir, frame } of VALID) {
       it(`accepts ${name}`, () => {
@@ -223,18 +225,30 @@ describe("protocol v2 frame contract", () => {
       expect(r.success).toBe(false);
     });
 
-    it("wrong delivery-id type (msg_ack.msgId as string)", () => {
-      const r = AgentFrame.safeParse({ type: "msg_ack", msgId: "99" });
-      expect(r.success).toBe(false);
+    it("integer delivery ids are rejected (msgId, outboxId, ack.id)", () => {
+      expect(AgentFrame.safeParse({ type: "msg_ack", msgId: 99 }).success).toBe(false);
+      expect(HostFrame.safeParse({ type: "ack", id: 7 }).success).toBe(false);
+      expect(AgentFrame.safeParse({ type: "heartbeat", outboxId: 43 }).success).toBe(false);
+      expect(HostFrame.safeParse({ type: "close", msgId: 5 }).success).toBe(false);
+    });
+
+    it("non-ULID delivery id strings are rejected", () => {
+      for (const bad of ["99", ID_A.toUpperCase(), `${ID_A}0`, "81jab3x7k2m4n5p6q7r8s9t0vw", "01jab3x7k2m4n5p6q7r8s9t0vu"]) {
+        expect(AgentFrame.safeParse({ type: "msg_ack", msgId: bad }).success).toBe(false);
+      }
+    });
+
+    it("the agent never acks host frames with ack{id}; only msg_ack", () => {
+      expect(AgentFrame.safeParse({ type: "ack", id: ID_A }).success).toBe(false);
     });
   });
 
   describe("envelope routing surface (§4.1)", () => {
     it("the generic Envelope extracts ids without touching data", () => {
-      const e = Envelope.parse({ type: "thread_message", outboxId: 43, taskId: "t-1", threadId: "c-9@1718", data: { seq: 3, kind: "assistant_text" } });
+      const e = Envelope.parse({ type: "thread_message", outboxId: ID_A, taskId: "t-1", threadId: "c-9@1718", data: { seq: 3, kind: "assistant_text" } });
       expect(e.taskId).toBe("t-1");
       expect(e.threadId).toBe("c-9@1718");
-      expect(e.outboxId).toBe(43);
+      expect(e.outboxId).toBe(ID_A);
     });
   });
 

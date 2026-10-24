@@ -535,12 +535,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_request_carries_protocol_version_two() {
+    async fn register_request_carries_protocol_version_one() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agent/register"))
             // The negotiated wire version must ride the register body (§1/§3).
-            .and(body_partial_json(json!({ "protocolVersion": 2 })))
+            .and(body_partial_json(json!({ "protocolVersion": 1 })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "agentId": "agent-9",
                 "connectToken": "connect-xyz",
@@ -553,7 +553,7 @@ mod tests {
         let http = HttpClient::new().unwrap();
         let mut config = bootstrap_config(&server.uri(), Some("reg-tok"));
 
-        // The mock only matches when protocolVersion==2 is present, so a success
+        // The mock only matches when protocolVersion==1 is present, so a success
         // here *is* the assertion that the field was sent.
         let identity = load_or_register(&mut config, &db, &http).await.unwrap();
         assert_eq!(identity.agent_id, "agent-9");
@@ -595,7 +595,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "agentId": "agent-9",
                 "connectToken": "connect-xyz",
-                "config": { "protocolVersion": 1 },
+                "config": { "protocolVersion": 2 },
             })))
             .mount(&server)
             .await;
@@ -648,13 +648,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agent/register"))
-            // The host echoes v2 *and* a config overlay. The version must be
+            // The host echoes protocol v1 *and* a config overlay. The version must be
             // consumed by the gate (not the strict overlay parser) so the rest of
             // the overlay still applies cleanly.
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "agentId": "agent-9",
                 "connectToken": "connect-xyz",
-                "config": { "protocolVersion": 2, "engine": { "model": "claude-opus-4-8" } },
+                "config": { "protocolVersion": 1, "engine": { "model": "claude-opus-4-8" } },
             })))
             .mount(&server)
             .await;

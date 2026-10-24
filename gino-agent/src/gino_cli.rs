@@ -297,7 +297,6 @@ fn cron_create(db: &Db, a: CreateArgs) -> Result<()> {
         continuity,
         run_count: 0,
         status: "active".to_owned(),
-        dirty: true,
         created_at: now_iso.clone(),
         updated_at: now_iso,
     };
@@ -317,7 +316,6 @@ fn cron_set_status(db: &Db, id: &str, status: &str, clear_next: bool) -> Result<
     if clear_next {
         cron.next_run = None;
     }
-    cron.dirty = true;
     cron.updated_at = to_iso(now());
     db.update_cron(&cron).context("updating the cron")?;
     push_cron_state(db, &cron);
@@ -337,7 +335,6 @@ fn cron_resume(db: &Db, id: &str) -> Result<()> {
     ) {
         cron.next_run = next_run_at_creation(ty, val, now()).ok().flatten();
     }
-    cron.dirty = true;
     cron.updated_at = to_iso(now());
     db.update_cron(&cron).context("updating the cron")?;
     push_cron_state(db, &cron);
@@ -462,7 +459,6 @@ mod tests {
             continuity: "isolated".to_owned(),
             run_count: 0,
             status: "active".to_owned(),
-            dirty: false,
             created_at: "2026-07-02T00:00:00.000Z".to_owned(),
             updated_at: "2026-07-02T00:00:00.000Z".to_owned(),
         }

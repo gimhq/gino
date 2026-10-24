@@ -12,6 +12,8 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
+const oid = (n: number): string => `01jab3x7k2m4n5p6q7r8s9${String(n).padStart(4, "0")}`;
+
 // D-B1b — the PROTOCOL SPINE, proven end-to-end against a LIVE Bun server with a
 // real WebSocket: register → connect (connect-token auth) → frames persist + ack
 // → host→agent outbox delivers → drop + reconnect → unacked outbox REPLAYS.
@@ -166,7 +168,7 @@ describe("D-B1b protocol spine — register → connect → frames → store →
     // 1. REGISTER (shared register token) → agentId + connect token + config.
     const regRes = await register({
       registerToken: REGISTER_TOKEN,
-      protocolVersion: 2,
+      protocolVersion: 1,
       name: "spine-agent",
       source: "manual",
       capabilities: ["claude"],
@@ -179,7 +181,7 @@ describe("D-B1b protocol spine — register → connect → frames → store →
       agentId: reg.agentId,
       wsUrl: `/agent/ws/${reg.agentId}`,
       heartbeatIntervalMs: 30000,
-      protocolVersion: 2,
+      protocolVersion: 1,
     });
 
     const agentId = reg.agentId;
@@ -199,22 +201,22 @@ describe("D-B1b protocol spine — register → connect → frames → store →
     // 3. INBOUND: a transcript event + the terminal result (each with its own outboxId).
     conn.ws.send(JSON.stringify({
       type: "thread_message",
-      outboxId: 1,
+      outboxId: oid(1),
       taskId,
       threadId,
       data: { seq: 1, kind: "assistant_text", content: "hello from agent" },
     }));
     conn.ws.send(JSON.stringify({
       type: "thread_result",
-      outboxId: 2,
+      outboxId: oid(2),
       taskId,
       threadId,
       data: { status: "succeeded", duration_ms: 12, final_seq: 1 },
     }));
 
     // Host replies ack{id} for each inbound frame (at-least-once, agent→host).
-    await waitFor(conn.received, f => f.type === "ack" && f.id === 1, "ack id=1");
-    await waitFor(conn.received, f => f.type === "ack" && f.id === 2, "ack id=2");
+    await waitFor(conn.received, f => f.type === "ack" && f.id === oid(1), "ack id=1");
+    await waitFor(conn.received, f => f.type === "ack" && f.id === oid(2), "ack id=2");
 
     // Rows landed in M5 (read via the M5 read helpers).
     const transcript = getTranscript(storage, threadId);
@@ -264,19 +266,19 @@ describe("D-B1b protocol spine — register → connect → frames → store →
 });
 
 describe("D-B1b protocol spine — gates", () => {
-  it("version gate rejects protocolVersion != 2 with register_error{unsupported_protocol}", async () => {
-    const res = await register({ registerToken: REGISTER_TOKEN, protocolVersion: 1, capabilities: ["claude"] });
+  it("version gate rejects protocolVersion != 1 with register_error{unsupported_protocol}", async () => {
+    const res = await register({ registerToken: REGISTER_TOKEN, protocolVersion: 2, capabilities: ["claude"] });
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ register_error: { reason: "unsupported_protocol" } });
   });
 
   it("register rejects a bad register token (401)", async () => {
-    const res = await register({ registerToken: "wrong", protocolVersion: 2, capabilities: ["claude"] });
+    const res = await register({ registerToken: "wrong", protocolVersion: 1, capabilities: ["claude"] });
     expect(res.status).toBe(401);
   });
 
   it("WS connect rejects a bad connect token and a missing token", async () => {
-    const reg = await (await register({ registerToken: REGISTER_TOKEN, protocolVersion: 2, capabilities: ["claude"] })).json() as { agentId: string };
+    const reg = await (await register({ registerToken: REGISTER_TOKEN, protocolVersion: 1, capabilities: ["claude"] })).json() as { agentId: string };
     expect(await wsRejected(reg.agentId, { "x-internal-token": "bogus-token" })).toBe(true);
     expect(await wsRejected(reg.agentId)).toBe(true);
   });

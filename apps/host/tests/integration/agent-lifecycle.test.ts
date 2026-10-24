@@ -98,7 +98,7 @@ async function registerAgent(): Promise<{ agentId: string; connectToken: string 
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       registerToken: REGISTER_TOKEN,
-      protocolVersion: 2,
+      protocolVersion: 1,
       source: "manual",
       capabilities: ["claude"],
     }),

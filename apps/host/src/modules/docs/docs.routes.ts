@@ -47,7 +47,7 @@ export function mountDocs(api: Hono<AppEnv>, config: Config): void {
         info: {
           title: `${config.APP_NAME} host API`,
           version: BUILD_INFO.version,
-          description: "Protocol-v2 host control plane. HTTP API generated from the in-process Hono route definitions.",
+          description: "Gino host control plane. HTTP API generated from the in-process Hono route definitions.",
         },
         servers: [{ url: base, description: "This deployment" }],
         components: {

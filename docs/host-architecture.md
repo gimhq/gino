@@ -152,11 +152,11 @@ correlation `taskId`/`threadId`/`cronId`) + `data` (business only, never repeats
 stays in `data`).
 - **Codec** — decode extracts ids without parsing `data`; encode rebuilds the envelope from columns on send.
 - **Inbound** — `frame → demux by threadId → dispatch by type → M5 writer → ack`. Handlers: `thread_message`,
-  `thread_result`, `cron_state`, `heartbeat`(→M3 liveness), `msg_ack`(→M4 cursor), `ack`(→ outbox). Unknown
+  `thread_result`, `cron_state`, `heartbeat`(→M3 liveness), `msg_ack`(→ outbox). Unknown
   `type`/fields ignored.
-- **Outbox** — persist every host→agent frame before send (`outbox` table); agent replies `ack {id}`;
-  **unacked replay on reconnect**. The `message` frame uses **`msgId` + `msg_ack`** so M4 advances its
-  delivery cursor only after the agent has *durably stored* the input.
+- **Outbox** — persist every host→agent frame before send (`outbox` table, keyed by a monotonic ULID that
+  is the frame's `msgId`); the agent replies `msg_ack {msgId}` once it has *durably stored* the frame;
+  **unacked replay on reconnect** in id order.
 - **Version gate** — register declares `protocolVersion`; mismatch → `register_error{unsupported_protocol}`.
 
 ### M3 — Agent Management
@@ -447,7 +447,7 @@ messages(    task_id, thread_id, seq, kind, role?, content?, tool?, input?, outp
 attachments( id PK, task_id, thread_id, name, content_type, size, sha256, ref, direction, created_at )
 
 -- Plumbing (host-private)
-outbox(      id PK, agent_id → agents, type, task_id?, thread_id?, cron_id?, msg_id?,
+outbox(      id PK (ULID = wire msgId), agent_id → agents, type, task_id?, thread_id?, cron_id?,
              data_json, created_at, acked_at? )                       -- at-least-once host→agent
 channels(    id PK, name, type, owner_id, config?, msg_filter?, created_at )  -- registered with an owner
 channel_bindings( channel_id → channels, conversation_ref, task_id → tasks, created_at,

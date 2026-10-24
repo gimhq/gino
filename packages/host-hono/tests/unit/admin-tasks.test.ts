@@ -72,7 +72,7 @@ describe("POST /admin/tasks/:id/close", () => {
     const res = await taskApp().request(`/${task.id}/close`, { method: "POST" });
     expect(res.status).toBe(200);
 
-    const body = await res.json() as { data: { task: { status: string }; outboxId: number } };
+    const body = await res.json() as { data: { task: { status: string }; msgId: string } };
     expect(body.data.task.status).toBe("closed");
 
     const rows = db.select().from(outbox).where(eq(outbox.taskId, task.id)).all();
@@ -81,7 +81,7 @@ describe("POST /admin/tasks/:id/close", () => {
     const interrupt = rows.find(r => r.type === "interrupt");
     expect(interrupt).toBeDefined();
     expect(interrupt!.taskId).toBe(task.id);
-    expect(body.data.outboxId).toBe(interrupt!.id);
+    expect(body.data.msgId).toBe(interrupt!.id);
 
     const upsert = rows.find(r => r.type === "task_upsert");
     expect(upsert).toBeDefined();
@@ -96,9 +96,9 @@ describe("POST /admin/tasks/:id/close", () => {
 
     const res = await taskApp().request(`/${task.id}/close`, { method: "POST" });
     expect(res.status).toBe(200);
-    const body = await res.json() as { data: { task: { status: string }; outboxId: number | null } };
+    const body = await res.json() as { data: { task: { status: string }; msgId: string | null } };
     expect(body.data.task.status).toBe("closed");
-    expect(body.data.outboxId).toBeNull();
+    expect(body.data.msgId).toBeNull();
 
     const rows = db.select().from(outbox).where(eq(outbox.taskId, task.id)).all();
     expect(rows.filter(r => r.type === "interrupt")).toHaveLength(0);
@@ -111,9 +111,9 @@ describe("POST /admin/tasks/:id/close", () => {
 
     const res = await taskApp().request(`/${task.id}/close`, { method: "POST" });
     expect(res.status).toBe(200);
-    const body = await res.json() as { data: { task: { status: string }; outboxId: number | null } };
+    const body = await res.json() as { data: { task: { status: string }; msgId: string | null } };
     expect(body.data.task.status).toBe("closed");
-    expect(body.data.outboxId).toBeNull();
+    expect(body.data.msgId).toBeNull();
 
     expect(getTask(storage, task.id)?.status).toBe("closed");
     expect(db.select().from(outbox).all()).toHaveLength(0);
@@ -162,7 +162,7 @@ describe("cron routes — addressing (HOST-M4-11) + first-cron seeding (HOST-M4-
     const cron = rows.find(r => r.type === "cron_upsert");
     expect(seed).toBeDefined();
     expect(cron).toBeDefined();
-    expect(seed!.id).toBeLessThan(cron!.id); // task exists agent-side before the cron FK needs it
+    expect(seed!.id < cron!.id).toBe(true); // task exists agent-side before the cron FK needs it
     expect(getCron(storage, cronId)?.prompt).toBe("daily digest");
   });
 

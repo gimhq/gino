@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.1.0",
   "private": true,
-  "description": "Gino host — protocol-v2 control plane (Bun + Hono) composed from the @gino/host-* packages.",
+  "description": "Gino host — control plane (Bun + Hono) composed from the @gino/host-* packages.",
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun dist/index.js",

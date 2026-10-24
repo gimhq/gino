@@ -1,9 +1,8 @@
 import type { NewOutboxRow, OutboxRepo, OutboxRow } from "@gino/host-core/domain";
 // SQLITE STORE — `OutboxRepo` on drizzle + sqlite (outbox). Each method is
 // the one statement the domain issues today (`protocol/outbox.ts`), unchanged.
-// The AUTOINCREMENT `id` IS the monotonic delivery id (`outboxId` / `msgId`).
 import type { AppDatabase } from "../driver";
-import { and, asc, eq, isNotNull, isNull, lt, ne } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lt } from "drizzle-orm";
 import { outbox } from "../schema";
 
 export function sqliteOutboxRepo(db: AppDatabase): OutboxRepo {
@@ -27,18 +26,11 @@ export function sqliteOutboxRepo(db: AppDatabase): OutboxRepo {
         .orderBy(asc(outbox.id))
         .all();
     },
-    markAcked(agentId, id, now, opts = {}) {
-      // Scoped to the agent's own rows (ids are a global sequence); with
-      // `excludeType: "message"` this is `ack{id}` — a `message` row is only
-      // acked by the durable-storage `msg_ack` (protocol §4.2).
+    markAcked(agentId, id, now) {
       return db
         .update(outbox)
         .set({ ackedAt: now })
-        .where(and(
-          eq(outbox.id, id),
-          eq(outbox.agentId, agentId),
-          ...(opts.excludeType !== undefined ? [ne(outbox.type, opts.excludeType)] : []),
-        ))
+        .where(and(eq(outbox.id, id), eq(outbox.agentId, agentId)))
         .returning({ id: outbox.id })
         .get() != null;
     },

@@ -5,9 +5,11 @@ import { decodeFrame, encodeOutbox } from "../../src/protocol/envelope";
 // M2 codec — decode reads ONLY the routing envelope (data stays opaque); encode
 // rebuilds a host→agent frame from an outbox row. No business parsing here.
 
+const ID = "01jab3x7k2m4n5p6q7r8s9t0vw";
+
 function outboxRow(over: Partial<Outbox>): Outbox {
   return {
-    id: 1,
+    id: ID,
     agentId: "agent-1",
     type: "task_upsert",
     taskId: null,
@@ -24,14 +26,14 @@ describe("M2 envelope — decode", () => {
   it("extracts the routing ids and passes data through opaque", () => {
     const decoded = decodeFrame(JSON.stringify({
       type: "thread_message",
-      outboxId: 43,
+      outboxId: ID,
       taskId: "t-1",
       threadId: "c-9@1718",
       data: { seq: 3, kind: "assistant_text", content: "hi" },
     }));
     expect(decoded).not.toBeNull();
     expect(decoded!.type).toBe("thread_message");
-    expect(decoded!.outboxId).toBe(43);
+    expect(decoded!.outboxId).toBe(ID);
     expect(decoded!.taskId).toBe("t-1");
     expect(decoded!.threadId).toBe("c-9@1718");
     expect(decoded!.data).toEqual({ seq: 3, kind: "assistant_text", content: "hi" });
@@ -46,10 +48,10 @@ describe("M2 envelope — decode", () => {
   });
 
   it("ignores unknown envelope fields (additive-compatible)", () => {
-    const decoded = decodeFrame(JSON.stringify({ type: "ack", id: 7, somethingNew: true }));
+    const decoded = decodeFrame(JSON.stringify({ type: "ack", id: ID, somethingNew: true }));
     expect(decoded).not.toBeNull();
     expect(decoded!.type).toBe("ack");
-    expect(decoded!.id).toBe(7);
+    expect(decoded!.id).toBe(ID);
   });
 
   it("decodes a binary (ArrayBuffer) payload", () => {
@@ -61,23 +63,19 @@ describe("M2 envelope — decode", () => {
 });
 
 describe("M2 envelope — encode", () => {
-  it("a generic host→agent frame carries msgId (acked by msg_ack) + outboxId (compat)", () => {
-    const frame = encodeOutbox(outboxRow({ id: 5, type: "task_upsert", taskId: "t-1", dataJson: { name: "job" } }));
-    expect(frame).toEqual({ type: "task_upsert", msgId: 5, outboxId: 5, taskId: "t-1", data: { name: "job" } });
+  it("a host→agent frame carries msgId = row id and no outboxId", () => {
+    const frame = encodeOutbox(outboxRow({ type: "task_upsert", taskId: "t-1", dataJson: { name: "job" } }));
+    expect(frame).toEqual({ type: "task_upsert", msgId: ID, taskId: "t-1", data: { name: "job" } });
   });
 
-  // The delivery id is DERIVED from the row id at
-  // encode time (there is no stored msg_id column), so every durable message
-  // row encodes to an ackable frame.
-  it("a message frame carries msgId = row id (acked by msg_ack), not outboxId", () => {
-    const frame = encodeOutbox(outboxRow({ id: 8, type: "message", taskId: "t-1", threadId: "c-1", dataJson: { text: "hi" } }));
-    expect(frame).toEqual({ type: "message", msgId: 8, taskId: "t-1", threadId: "c-1", data: { text: "hi" } });
-    expect(frame.outboxId).toBeUndefined();
+  it("a message frame carries msgId = row id", () => {
+    const frame = encodeOutbox(outboxRow({ type: "message", taskId: "t-1", threadId: "c-1", dataJson: { text: "hi" } }));
+    expect(frame).toEqual({ type: "message", msgId: ID, taskId: "t-1", threadId: "c-1", data: { text: "hi" } });
   });
 
   it("a delete frame (no data) is envelope-only", () => {
-    const frame = encodeOutbox(outboxRow({ id: 9, type: "task_delete", taskId: "t-1", dataJson: {} }));
-    expect(frame).toEqual({ type: "task_delete", msgId: 9, outboxId: 9, taskId: "t-1" });
+    const frame = encodeOutbox(outboxRow({ type: "task_delete", taskId: "t-1", dataJson: {} }));
+    expect(frame).toEqual({ type: "task_delete", msgId: ID, taskId: "t-1" });
     expect("data" in frame).toBe(false);
   });
 });

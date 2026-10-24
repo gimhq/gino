@@ -1,9 +1,9 @@
-//! In-process **stub host** speaking protocol v2.
+//! In-process **stub host** speaking the host protocol.
 //!
 //! A single TCP listener serves both the HTTP enrollment/attachment endpoints and
 //! the persistent WebSocket the runner connects on (the runner derives the WS URL
 //! from the same host base, so they must share one port). Frames are hand-rolled
-//! JSON matching `crate::protocol::v2` exactly — correlation ids (`taskId`,
+//! JSON matching `crate::protocol::frames` exactly — correlation ids (`taskId`,
 //! `threadId`, `cronId`, `msgId`, `outboxId`) at the envelope top level, business
 //! fields under `data` (snake_case, since the v2 `data` structs carry no
 //! `rename_all`).
@@ -24,7 +24,7 @@
 //! * `GET  /agent/attachments/:id` → staged inbound bytes (counted, for cache-hit
 //!   assertions)
 //! * `POST /agent/attachments` → records the upload, returns `{id, ref}`
-//! * `WS   /agent/ws/:id` → the v2 frame channel
+//! * `WS   /agent/ws/:id` → the frame channel
 
 // `result_large_err`: the tungstenite WS-handshake `Callback` signature forces a
 // `Result<Response, ErrorResponse>` whose `Err` variant is a large `http::Response`
@@ -93,6 +93,11 @@ pub fn build_tar(members: &[(&str, &[u8])]) -> Vec<u8> {
             .expect("append tar member");
     }
     builder.into_inner().expect("finish tar")
+}
+
+/// The ULID `msgId` the stub host sends for test delivery number `n`.
+pub fn delivery_id(n: i64) -> String {
+    format!("01jab3x7k2m4n5p6q7r8s9{n:04}")
 }
 
 /// The host mirror of one thread execution (host `thread_runs` row), updated from
@@ -211,7 +216,7 @@ struct Model {
     /// Total `thread_message` frames received, including replayed duplicates.
     message_recv_count: u64,
     /// `msgId`s the runner durably acked (`msg_ack`).
-    msg_acks: Vec<i64>,
+    msg_acks: Vec<String>,
     /// Recorded uploads (host `attachments`).
     uploads: Vec<UploadRecord>,
     /// Cron scheduling-ledger summaries (host `crons`), keyed by `cronId`.
@@ -380,8 +385,7 @@ impl StubHost {
         if !attachments.is_empty() {
             data["attachments"] = Value::from(attachments.to_vec());
         }
-        let mut frame =
-            json!({ "type": "message", "taskId": task_id, "data": data, "msgId": msg_id });
+        let mut frame = json!({ "type": "message", "taskId": task_id, "data": data, "msgId": delivery_id(msg_id) });
         if let Some(thread_id) = thread_id {
             frame["threadId"] = Value::from(thread_id);
         }
@@ -412,7 +416,7 @@ impl StubHost {
             "type": "task_upsert",
             "taskId": task_id,
             "data": Value::Object(data),
-            "msgId": msg_id,
+            "msgId": delivery_id(msg_id),
         });
         self.send_raw(&frame.to_string()).await;
     }
@@ -445,7 +449,7 @@ impl StubHost {
             "taskId": task_id,
             "cronId": cron_id,
             "data": data,
-            "msgId": msg_id,
+            "msgId": delivery_id(msg_id),
         });
         self.send_raw(&frame.to_string()).await;
     }
@@ -459,7 +463,7 @@ impl StubHost {
             "type": "task_upsert",
             "taskId": task_id,
             "data": { "engine": engine, "status": "active" },
-            "msgId": msg_id,
+            "msgId": delivery_id(msg_id),
         });
         self.send_raw(&frame.to_string()).await;
     }
@@ -559,7 +563,7 @@ impl StubHost {
             "type": "task_upsert",
             "taskId": task_id,
             "data": Value::Object(data),
-            "msgId": msg_id,
+            "msgId": delivery_id(msg_id),
         });
         self.send_raw(&frame.to_string()).await;
     }
@@ -650,7 +654,7 @@ impl StubHost {
     }
 
     /// The `msgId`s the runner durably acked.
-    pub async fn msg_acks(&self) -> Vec<i64> {
+    pub async fn msg_acks(&self) -> Vec<String> {
         self.model.lock().await.msg_acks.clone()
     }
 
@@ -1116,8 +1120,8 @@ async fn handle_frame(text: &str, ctx: &ConnCtx) -> Option<String> {
             }
         }
         "msg_ack" => {
-            if let Some(msg_id) = frame.get("msgId").and_then(Value::as_i64) {
-                model.msg_acks.push(msg_id);
+            if let Some(msg_id) = frame.get("msgId").and_then(Value::as_str) {
+                model.msg_acks.push(msg_id.to_owned());
             }
             return None;
         }
@@ -1127,7 +1131,7 @@ async fn handle_frame(text: &str, ctx: &ConnCtx) -> Option<String> {
 
     // Outbox-backed frames carry an `outboxId`; ack it (unless withholding).
     if ctx.auto_ack.load(Ordering::SeqCst)
-        && let Some(outbox_id) = frame.get("outboxId").and_then(Value::as_i64)
+        && let Some(outbox_id) = frame.get("outboxId").and_then(Value::as_str)
     {
         return Some(json!({ "type": "ack", "id": outbox_id }).to_string());
     }

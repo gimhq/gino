@@ -8,7 +8,7 @@
 // Conventions:
 //   - snake_case column names; camelCase TS keys.
 //   - Host-generated string PKs (`id`) are text ULIDs (see shared/lib/id.ts).
-//     The exceptions are `outbox.id` and `messages.id` (integer autoincrement)
+//     The exceptions are `messages.id` (integer autoincrement)
 //     and `messages.seq` (per-thread integer serial, unique with `thread_id`).
 //   - Timestamps are integer epoch-milliseconds. `created_at` / `updated_at`
 //     default to `Date.now()` at insert time (host = sole writer); optional
@@ -170,7 +170,7 @@ export const attachments = sqliteTable("attachments", {
 // ---------------------------------------------------------------------------
 
 export const outbox = sqliteTable("outbox", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+  id: text("id").primaryKey(),
   agentId: text("agent_id").notNull().references(() => agents.id),
   type: text("type").notNull(),
   taskId: text("task_id"),
@@ -182,8 +182,6 @@ export const outbox = sqliteTable("outbox", {
 }, t => [
   // Reconnect replay scan (`agent_id = ? AND acked_at IS NULL`) — partial, so
   // only in-flight rows are indexed and acked history costs nothing.
-  // (`msg_ack{msgId}` keys on the integer PK directly — a message's delivery
-  // id IS its row id — so no dedicated msg_ack index is needed.)
   index("outbox_agent_unacked_idx").on(t.agentId).where(sql`acked_at IS NULL`),
 ]);
 

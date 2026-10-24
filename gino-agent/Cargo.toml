@@ -60,6 +60,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Session and request ids for the engine control protocol.
 uuid = { version = "1", features = ["v4"] }
+# Monotonic ULID delivery ids for outbox rows.
+ulid = "3"
 
 [dev-dependencies]
 # Temp-file SQLite DB for the identity persist/reload test (in-memory DBs cannot

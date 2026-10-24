@@ -11,6 +11,8 @@ import { createApp, createAppHost } from "@/app";
 import { loadConfigStrict } from "@/config";
 import { createLogger } from "@/shared/lib/logger";
 
+const oid = (n: number): string => `01jab3x7k2m4n5p6q7r8s9${String(n).padStart(4, "0")}`;
+
 // D-B3 — the END-TO-END MILESTONE, proven against a LIVE Bun server + real WS:
 // create task → owner-pinned dispatch → orchestrator sends task_upsert + message
 // over the M2 outbox → the connected agent SOCKET receives them → the agent
@@ -129,7 +131,7 @@ async function register(): Promise<{ agentId: string; connectToken: string }> {
   const res = await fetch(`${httpBase}/agent/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
   });
   expect(res.status).toBe(200);
   return await res.json() as { agentId: string; connectToken: string };
@@ -175,26 +177,26 @@ describe("D-B3 end-to-end — create → pin → send → run → mirror", () =>
     expect((message.data as { text?: string }).text).toBe("do the thing");
 
     // Agent acks both (so the outbox stops replaying).
-    conn.ws.send(JSON.stringify({ type: "ack", id: taskUpsert.outboxId }));
+    conn.ws.send(JSON.stringify({ type: "msg_ack", msgId: taskUpsert.msgId }));
     conn.ws.send(JSON.stringify({ type: "msg_ack", msgId: message.msgId }));
 
     // 6. Agent RUNS the thread → streams a transcript event + the terminal result.
     conn.ws.send(JSON.stringify({
       type: "thread_message",
-      outboxId: 1001,
+      outboxId: oid(1001),
       taskId,
       threadId,
       data: { seq: 1, kind: "assistant_text", content: "done the thing" },
     }));
     conn.ws.send(JSON.stringify({
       type: "thread_result",
-      outboxId: 1002,
+      outboxId: oid(1002),
       taskId,
       threadId,
       data: { status: "succeeded", engine_session_id: "sess-1", duration_ms: 42, final_seq: 1 },
     }));
-    await waitFor(conn.received, f => f.type === "ack" && f.id === 1001, "ack thread_message");
-    await waitFor(conn.received, f => f.type === "ack" && f.id === 1002, "ack thread_result");
+    await waitFor(conn.received, f => f.type === "ack" && f.id === oid(1001), "ack thread_message");
+    await waitFor(conn.received, f => f.type === "ack" && f.id === oid(1002), "ack thread_result");
 
     // 7. M5 stored it; /admin/tasks/:id MIRRORS the thread as a SUMMARY
     // and pages the transcript via ?thread=.
@@ -264,7 +266,7 @@ describe("D-B3 end-to-end — create → pin → send → run → mirror", () =>
 
     const cronCmd = await waitFor(conn.received, f => f.type === "cron_upsert" && f.cronId === cronId, "cron_upsert");
     expect((cronCmd.data as { continuity?: string }).continuity).toBe("isolated");
-    conn.ws.send(JSON.stringify({ type: "ack", id: cronCmd.outboxId }));
+    conn.ws.send(JSON.stringify({ type: "msg_ack", msgId: cronCmd.msgId }));
 
     expect((await admin(`/tasks/${taskId}/crons/${cronId}`, { method: "DELETE" })).status).toBe(200);
     const del = await waitFor(conn.received, f => f.type === "cron_delete" && f.cronId === cronId, "cron_delete");

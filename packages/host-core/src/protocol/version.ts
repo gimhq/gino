@@ -6,7 +6,7 @@
 // sibling M7 proxy owns `src/config`; nothing protocol-shaped goes there.
 
 /** Current wire protocol (protocol §1). The register gate rejects any other. */
-export const PROTOCOL_VERSION = 2 as const;
+export const PROTOCOL_VERSION = 1 as const;
 
 /**
  * Liveness cadence advertised to the agent in the register/config response

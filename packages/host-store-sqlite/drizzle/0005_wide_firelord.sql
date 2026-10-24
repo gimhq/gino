@@ -1,1 +1,0 @@
-ALTER TABLE `config_artifacts` ADD `unreferenced_since` integer;

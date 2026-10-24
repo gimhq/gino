@@ -20,7 +20,7 @@ async function register(base: string, token = REGISTER_TOKEN): Promise<Response>
   return fetch(`${base}/agent/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: token, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: token, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
   });
 }
 
@@ -127,7 +127,7 @@ describe("createAgentHandler basePath", () => {
       const res = await fetch(`${served.url}/api/agent/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+        body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
       });
       expect(res.status).toBe(200);
     }

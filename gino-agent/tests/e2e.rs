@@ -111,7 +111,9 @@ use serde_json::{Value, json};
 
 use support::fake_claude::{self, Behavior};
 use support::fake_codex;
-use support::stub_host::{CronSpec, StubHost, build_tar, provisioning_entry, sha256_hex};
+use support::stub_host::{
+    CronSpec, StubHost, build_tar, delivery_id, provisioning_entry, sha256_hex,
+};
 use support::{RunnerProc, SETTLE, Workspace, wait_until};
 
 /// `assistant_text` is the kind the echo behaviour's `Output` events map to.
@@ -160,7 +162,7 @@ async fn basic_loop_streams_ordered_messages_and_final_seq() {
 
     // The runner durably acked the inbound message, and presented its connect token.
     assert!(
-        host.msg_acks().await.contains(&1),
+        host.msg_acks().await.contains(&delivery_id(1)),
         "missing msg_ack for msgId 1"
     );
     assert_eq!(

@@ -3,15 +3,8 @@
 // Every host→agent frame is PERSISTED (the `outbox` table) BEFORE it is sent
 // (protocol §4.2). If the agent is online the frame is also pushed immediately;
 // if not — or if the push is lost — it stays unacked and is REPLAYED in id
-// order on the next connect. The agent acks delivery and the host stops
-// replaying:
-//   • generic host→agent frames carry `outboxId` and are acked by `ack{id}`;
-//   • the `message` frame carries `msgId` and is acked by `msg_ack{msgId}` so
-//     M4 (B3) can advance its delivery cursor only after the agent has DURABLY
-//     stored the input. The message's `msgId` IS the row id — derived at encode
-//     time, never stored (there is no `msg_id` column) — so a `message` row is
-//     atomically born with its delivery id and the ack just marks the row
-//     delivered (the cursor advance is a B3 seam).
+// order on the next connect. Every frame carries `msgId` — the row's ULID —
+// and the agent acks durable storage with `msg_ack{msgId}`, which stops replay.
 //
 // Layering: the outbox talks to the live socket only through the abstract
 // `AgentTransport` port (sessions implements it), and rebuilds the wire frame
@@ -19,6 +12,7 @@
 import type { OutboxRow, Storage } from "../host/ports/storage";
 import type { AgentTransport } from "../host/ports/transport";
 import type { Logger } from "../logger";
+import { ulid } from "../platform";
 import { encodeOutbox } from "./envelope";
 
 export interface EnqueueInput {
@@ -31,23 +25,17 @@ export interface EnqueueInput {
   data?: Record<string, unknown>;
 }
 
-/**
- * An enqueued outbox row. `msgId` is NOT a column — for a `message` row it is
- * the derived delivery id (= row id), attached so callers can surface it.
- */
-export type EnqueuedOutbox = OutboxRow & { msgId?: number };
+/** An enqueued outbox row; a `message` row also surfaces its `msgId` (= row id). */
+export type EnqueuedOutbox = OutboxRow & { msgId?: string };
 
 /**
  * Persist a host→agent frame and, if the agent is online, send it. The row is
  * written FIRST (durability before delivery); the live push is best-effort —
- * a miss is recovered by `replayUnacked` on reconnect. A `message` frame's
- * delivery id (`msgId`) IS the row id: it exists the instant the single INSERT
- * commits, so there is no crash window in which a durable `message` row lacks
- * an ackable id. The returned row carries the derived `msgId` for callers that
- * surface it.
+ * a miss is recovered by `replayUnacked` on reconnect.
  */
 export function enqueue(storage: Storage, sender: AgentTransport, input: EnqueueInput): EnqueuedOutbox {
   const inserted = storage.outbox.append({
+    id: ulid(),
     agentId: input.agentId,
     type: input.type,
     taskId: input.taskId ?? null,
@@ -79,27 +67,8 @@ export function enqueueLiveOnly(storage: Storage, sender: AgentTransport, input:
   return { ...row, ackedAt };
 }
 
-/**
- * Agent acked a generic host→agent frame (`ack{id}`) → stop replaying it.
- * Scoped to the authenticated agent's own rows (outbox ids are a global
- * autoincrement, so a foreign id is trivially guessable), and to non-`message`
- * rows: a `message` is delivered only by the durable-storage `msg_ack` (§4.2).
- */
-export function ackOutbox(storage: Storage, agentId: string, id: number): void {
-  storage.outbox.markAcked(agentId, id, Date.now(), { excludeType: "message" });
-}
-
-/**
- * Agent durably stored a host→agent frame (`msg_ack{msgId}`) → mark it
- * delivered. A frame's `msgId` is its row id, so the match keys on `id`
- * alone, scoped to the authenticated agent's own rows. Not limited to
- * `message` rows: the runner acknowledges EVERY durable host→agent frame via
- * `msg_ack` (it never sends `ack{id}`), so this is the ack that stops replay
- * for `task_upsert`/`cron_upsert`/`close`/`config_update`/… as well.
- * TODO(M4/B3): advance the per-task delivery cursor here; for B1b marking the
- * row acked is enough to stop replay.
- */
-export function ackMessage(storage: Storage, agentId: string, msgId: number): void {
+/** Agent durably stored a host→agent frame (`msg_ack{msgId}`) → stop replaying it, scoped to the agent's own rows. */
+export function ackMessage(storage: Storage, agentId: string, msgId: string): void {
   storage.outbox.markAcked(agentId, msgId, Date.now());
 }
 

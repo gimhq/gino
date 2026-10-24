@@ -3,7 +3,7 @@
 //!
 //! Every non-success thread execution is tagged with a [`FailureReason`] that
 //! lands in `threads.failure_reason` and rides the wire on
-//! [`thread_result.failure_reason`](crate::protocol::v2::ThreadResultData). The
+//! [`thread_result.failure_reason`](crate::protocol::frames::ThreadResultData). The
 //! taxonomy splits into two groups whose distinction drives policy:
 //!
 //! * **`runner.*`** — the runner/platform side is at fault (a timeout, an offline

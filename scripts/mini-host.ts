@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /* eslint-disable no-console */
 /**
- * mini-host — a single-file, zero-dependency gino host speaking protocol v2
+ * mini-host — a single-file, zero-dependency gino host speaking the host protocol
  * (docs/protocol.md). Enough to enroll a `gino-agent`, dispatch work to it and
  * read back the execution transcript. Not the real control plane: no launchers,
  * no attachments, no provisioning, no auth on the operator API (bind to loopback).
@@ -16,7 +16,7 @@
  *   ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_BASE_URL / MINI_HOST_MODEL
  *                             forwarded to the agent in `config.engine`
  *
- * Agent side (protocol v2):
+ * Agent side (protocol v1):
  *   POST /agent/register          GET /agent/config/:id
  *   WS   /agent/ws/:id            POST /agent/output/:id
  *
@@ -38,7 +38,7 @@ import type { ServerWebSocket } from "bun";
 import process from "node:process";
 import { Database } from "bun:sqlite";
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const PORT = Number(process.env.MINI_HOST_PORT ?? 3100);
 const BIND = process.env.MINI_HOST_BIND ?? "127.0.0.1";
@@ -55,7 +55,7 @@ db.exec(`
     capabilities TEXT, registered_at TEXT NOT NULL, last_seen TEXT
   );
   CREATE TABLE IF NOT EXISTS outbox (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT NOT NULL,
+    id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
     frame TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS tasks (
@@ -86,8 +86,8 @@ const q = {
   agents: db.query<Row, []>("SELECT id, name, capabilities, registered_at, last_seen FROM agents ORDER BY registered_at"),
   insertAgent: db.query("INSERT INTO agents (id, name, connect_token, capabilities, registered_at) VALUES (?, ?, ?, ?, ?)"),
   touchAgent: db.query("UPDATE agents SET last_seen = ? WHERE id = ?"),
-  insertOutbox: db.query<{ id: number }, [string, string, string]>("INSERT INTO outbox (agent_id, frame, created_at) VALUES (?, ?, ?) RETURNING id"),
-  unacked: db.query<{ id: number; frame: string }, [string]>("SELECT id, frame FROM outbox WHERE agent_id = ? AND acked = 0 ORDER BY id"),
+  insertOutbox: db.query<unknown, [string, string, string, string]>("INSERT INTO outbox (id, agent_id, frame, created_at) VALUES (?, ?, ?, ?)"),
+  unacked: db.query<{ id: string; frame: string }, [string]>("SELECT id, frame FROM outbox WHERE agent_id = ? AND acked = 0 ORDER BY id"),
   ackOutbox: db.query("UPDATE outbox SET acked = 1 WHERE id = ? AND agent_id = ?"),
   tasks: db.query<Row, []>("SELECT * FROM tasks ORDER BY created_at"),
   taskById: db.query<Row, [string]>("SELECT * FROM tasks WHERE id = ?"),
@@ -119,6 +119,28 @@ const q = {
 };
 
 const now = () => new Date().toISOString();
+const CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
+let lastUlid = { ms: -1, tail: [] as number[] };
+/** Monotonic lowercase ULID: same-millisecond ids increment the random tail. */
+function ulid(): string {
+  const ms = Math.max(Date.now(), lastUlid.ms);
+  let tail: number[];
+  if (ms > lastUlid.ms) {
+    tail = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b & 31);
+  }
+  else {
+    tail = [...lastUlid.tail];
+    let i = tail.length - 1;
+    while (i >= 0 && tail[i] === 31) tail[i--] = 0;
+    if (i < 0)
+      throw new Error("ulid tail overflow");
+    tail[i]! += 1;
+  }
+  lastUlid = { ms, tail };
+  let time = "";
+  for (let t = ms, k = 0; k < 10; k++, t = Math.floor(t / 32)) time = CROCKFORD[t % 32] + time;
+  return time + tail.map(c => CROCKFORD[c]).join("");
+}
 const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}`;
 const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
@@ -154,11 +176,12 @@ type Socket = ServerWebSocket<{ agentId: string }>;
 const sockets = new Map<string, Socket>();
 
 /** Persist a host→agent frame (its row id is the `msgId`) and push it if the agent is online. */
-function enqueue(agentId: string, frame: Row): number {
-  const { id } = q.insertOutbox.get(agentId, JSON.stringify(frame), now())!;
+function enqueue(agentId: string, frame: Row): string {
+  const id = ulid();
+  q.insertOutbox.run(id, agentId, JSON.stringify(frame), now());
   const ws = sockets.get(agentId);
   if (ws)
-    ws.send(JSON.stringify({ ...frame, msgId: id, outboxId: id }));
+    ws.send(JSON.stringify({ ...frame, msgId: id }));
   return id;
 }
 
@@ -174,7 +197,7 @@ function sendLive(agentId: string, frame: Row): boolean {
 function replayUnacked(ws: Socket) {
   const rows = q.unacked.all(ws.data.agentId);
   for (const row of rows) {
-    ws.send(JSON.stringify({ ...JSON.parse(row.frame), msgId: row.id, outboxId: row.id }));
+    ws.send(JSON.stringify({ ...JSON.parse(row.frame), msgId: row.id }));
   }
   if (rows.length > 0)
     console.log(`[ws] ${ws.data.agentId} replayed ${rows.length} unacked frame(s)`);
@@ -183,22 +206,20 @@ function replayUnacked(ws: Socket) {
 // ─── agent → host frames ─────────────────────────────────────────────────────
 
 /** Mirror one inbound frame; returns the `outboxId` to ack (or undefined when nothing needs acking). */
-function handleAgentFrame(agentId: string, frame: Row): number | undefined {
+function handleAgentFrame(agentId: string, frame: Row): string | undefined {
   const type = str(frame.type);
-  const outboxId = num(frame.outboxId);
+  const outboxId = str(frame.outboxId);
   const taskId = str(frame.taskId) ?? "";
   const threadId = str(frame.threadId) ?? "";
   const data = asObject(frame.data);
   const ts = now();
   switch (type) {
     case "msg_ack": {
-      const msgId = num(frame.msgId);
+      const msgId = str(frame.msgId);
       if (msgId !== undefined)
         q.ackOutbox.run(msgId, agentId);
       return undefined;
     }
-    case "ack":
-      return undefined;
     case "heartbeat":
       q.touchAgent.run(ts, agentId);
       return outboxId;

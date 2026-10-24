@@ -240,7 +240,7 @@ export interface NewAttachmentRow {
 
 /** One queued host→agent frame. `id` is the wire `msgId`; `ackedAt` is null until the agent confirms it. */
 export interface OutboxRow {
-  id: number;
+  id: string;
   agentId: string;
   type: string;
   taskId: string | null;
@@ -251,8 +251,9 @@ export interface OutboxRow {
   ackedAt: number | null;
 }
 
-/** Insert shape for `OutboxRepo.append`; `id` is storage-generated and must come back on the returned row. */
+/** Insert shape for `OutboxRepo.append`; `id` is a monotonic ULID minted by the caller. */
 export interface NewOutboxRow {
+  id: string;
   agentId: string;
   type: string;
   taskId?: string | null;

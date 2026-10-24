@@ -2,7 +2,7 @@
 # upstream and a test driver — wired on one compose network.
 #
 #   mock-llm  oven/bun        canned Anthropic-ish upstream for the /llm proxy test
-#   host      oven/bun        the protocol-v2 control plane (bun apps/host/src/index.ts), repo bind-mounted
+#   host      oven/bun        the control plane (bun apps/host/src/index.ts), repo bind-mounted
 #   agent     Dockerfile.agent  the Rust gino-agent + a fake `claude` engine; dials the host
 #   tester    oven/bun        drives the host HTTP surface end-to-end, exits 0/1
 #

@@ -22,9 +22,9 @@ import { Envelope } from "./frames";
  */
 export interface DecodedFrame {
   type: string;
-  outboxId?: number;
-  msgId?: number;
-  id?: number;
+  outboxId?: string;
+  msgId?: string;
+  id?: string;
   taskId?: string;
   threadId?: string;
   cronId?: string;
@@ -82,23 +82,14 @@ export function decodeFrame(raw: string | ArrayBuffer | Uint8Array): DecodedFram
 /**
  * Encode a durable `outbox` row into the host→agent wire frame, rebuilding the
  * envelope from the row's columns (protocol §4.2 — the outbox is the sole
- * host→agent path). EVERY durable frame's delivery id is `msgId` (acked by
- * `msg_ack` after the runner's durable store) and is DERIVED from the row id,
- * so even a row written by a host that crashed mid-enqueue carries an ackable
- * id. The runner keys its inbound dedup and its `msg_ack` on `msgId` alone —
- * it never acknowledges an `outboxId` — so `msgId` is the only id that stops
- * replay. Non-`message` frames additionally carry `outboxId` (same row id) for
- * §4.2 compatibility with receivers that ack by `ack{id}`. Correlation ids and
- * `data` are emitted only when present, so a delete/control frame (which
- * carries no `data`) stays envelope-only.
+ * host→agent path). The row id is the frame's `msgId`: the runner dedups on it
+ * and acks durable storage with `msg_ack`. Correlation ids and `data` are
+ * emitted only when present, so a delete/control frame stays envelope-only.
  */
 export function encodeOutbox(row: OutboxRow): Record<string, unknown> {
   const frame: Record<string, unknown> = { type: row.type };
 
   frame.msgId = row.id;
-  if (row.type !== "message") {
-    frame.outboxId = row.id;
-  }
 
   if (row.taskId != null) {
     frame.taskId = row.taskId;

@@ -111,7 +111,7 @@ describe("M1 edge skeleton — /agent/register register token", () => {
     const res = await app.fetch(new Request("http://local/api/agent/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, capabilities: ["claude"] }),
+      body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, capabilities: ["claude"] }),
     }));
     expect(res.status).toBe(200);
     const body = await res.json() as { agentId?: string; connectToken?: string };

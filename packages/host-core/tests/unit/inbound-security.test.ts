@@ -9,6 +9,8 @@ import { getCron, getThreadRun, getTranscript, writeCronState, writeThreadMessag
 import { applyFrame } from "../../src/protocol/inbound";
 import { createTask, setPlacement } from "../../src/tasks";
 
+const oid = (n: number): string => `01jab3x7k2m4n5p6q7r8s9${String(n).padStart(4, "0")}`;
+
 // D-SEC SECURITY regression — IDOR on the M2/M5 inbound WRITE path (the sibling
 // of B4s egress + B6s byte-channel). `applyFrame` wrote thread_message /
 // thread_result / cron_state keyed by the FRAME's caller-supplied taskId /
@@ -63,13 +65,13 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
 
     // The IDOR: attacker forges the victim's taskId → must be dropped. The
     // denial is permanent, so the drop is acked (poison policy).
-    const denied = apply(attacker, { type: "thread_message", outboxId: 9, taskId: victimTask, threadId: "thr-V", data: tmsg(1, "injected") });
-    expect(denied).toEqual({ type: "ack", id: 9 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "thread_message", outboxId: oid(9), taskId: victimTask, threadId: "thr-V", data: tmsg(1, "injected") });
+    expect(denied).toEqual({ type: "ack", id: oid(9) }); // acked-and-dropped
     expect(getTranscript(storage, "thr-V")).toHaveLength(0); // not written
 
     // The placed owner writes its OWN task → accepted + acked.
-    const ok = apply(victim, { type: "thread_message", outboxId: 10, taskId: victimTask, threadId: "thr-V", data: tmsg(1, "real") });
-    expect(ok).toEqual({ type: "ack", id: 10 });
+    const ok = apply(victim, { type: "thread_message", outboxId: oid(10), taskId: victimTask, threadId: "thr-V", data: tmsg(1, "real") });
+    expect(ok).toEqual({ type: "ack", id: oid(10) });
     expect(getTranscript(storage, "thr-V").map(m => m.content)).toEqual(["real"]);
   });
 
@@ -78,12 +80,12 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
     const victim = agent();
     const victimTask = placedTask("owner-V", victim);
 
-    const denied = apply(attacker, { type: "thread_result", outboxId: 1, taskId: victimTask, threadId: "thr-R", data: tresult });
-    expect(denied).toEqual({ type: "ack", id: 1 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "thread_result", outboxId: oid(1), taskId: victimTask, threadId: "thr-R", data: tresult });
+    expect(denied).toEqual({ type: "ack", id: oid(1) }); // acked-and-dropped
     expect(getThreadRun(storage, "thr-R")).toBeUndefined();
 
-    const ok = apply(victim, { type: "thread_result", outboxId: 2, taskId: victimTask, threadId: "thr-R", data: tresult });
-    expect(ok).toEqual({ type: "ack", id: 2 });
+    const ok = apply(victim, { type: "thread_result", outboxId: oid(2), taskId: victimTask, threadId: "thr-R", data: tresult });
+    expect(ok).toEqual({ type: "ack", id: oid(2) });
     expect(getThreadRun(storage, "thr-R")?.status).toBe("succeeded");
   });
 
@@ -92,12 +94,12 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
     const victim = agent();
     const victimTask = placedTask("owner-V", victim);
 
-    const denied = apply(attacker, { type: "cron_state", outboxId: 1, taskId: victimTask, cronId: "cron-V", data: cstate(7, "scheduled") });
-    expect(denied).toEqual({ type: "ack", id: 1 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "cron_state", outboxId: oid(1), taskId: victimTask, cronId: "cron-V", data: cstate(7, "scheduled") });
+    expect(denied).toEqual({ type: "ack", id: oid(1) }); // acked-and-dropped
     expect(getCron(storage, "cron-V")).toBeUndefined();
 
-    const ok = apply(victim, { type: "cron_state", outboxId: 2, taskId: victimTask, cronId: "cron-V", data: cstate(7, "scheduled") });
-    expect(ok).toEqual({ type: "ack", id: 2 });
+    const ok = apply(victim, { type: "cron_state", outboxId: oid(2), taskId: victimTask, cronId: "cron-V", data: cstate(7, "scheduled") });
+    expect(ok).toEqual({ type: "ack", id: oid(2) });
     expect(getCron(storage, "cron-V")?.roundCount).toBe(7);
   });
 
@@ -105,15 +107,15 @@ describe("D-SEC — inbound write IDOR: a frame for ANOTHER agent's task is drop
     const attacker = agent();
     const pending = createTask(storage, { ownerId: "owner-V", engine: "claude", model: "sonnet" }).id; // not placed
 
-    const denied = apply(attacker, { type: "thread_message", outboxId: 1, taskId: pending, threadId: "thr-P", data: tmsg(1, "x") });
-    expect(denied).toEqual({ type: "ack", id: 1 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "thread_message", outboxId: oid(1), taskId: pending, threadId: "thr-P", data: tmsg(1, "x") });
+    expect(denied).toEqual({ type: "ack", id: oid(1) }); // acked-and-dropped
     expect(getTranscript(storage, "thr-P")).toHaveLength(0);
   });
 
   it("DROPS a write for an unknown taskId (fails closed)", () => {
     const attacker = agent();
-    const denied = apply(attacker, { type: "thread_message", outboxId: 1, taskId: "task-does-not-exist", threadId: "thr-X", data: tmsg(1, "x") });
-    expect(denied).toEqual({ type: "ack", id: 1 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "thread_message", outboxId: oid(1), taskId: "task-does-not-exist", threadId: "thr-X", data: tmsg(1, "x") });
+    expect(denied).toEqual({ type: "ack", id: oid(1) }); // acked-and-dropped
     expect(getTranscript(storage, "thr-X")).toHaveLength(0);
   });
 });
@@ -131,8 +133,8 @@ describe("D-SEC — inbound write IDOR: a placed agent cannot forge a SIBLING ta
     // The attacker is genuinely placed on its OWN task, but forges the victim's
     // threadId tagged with its own taskId — the taskId gate passes, but the thread
     // is bound to the victim's task → denied (no slot squatting, no overwrite race).
-    const denied = apply(attacker, { type: "thread_message", outboxId: 3, taskId: attackerTask, threadId: "shared-thr", data: tmsg(2, "attacker inject") });
-    expect(denied).toEqual({ type: "ack", id: 3 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "thread_message", outboxId: oid(3), taskId: attackerTask, threadId: "shared-thr", data: tmsg(2, "attacker inject") });
+    expect(denied).toEqual({ type: "ack", id: oid(3) }); // acked-and-dropped
     expect(getTranscript(storage, "shared-thr").map(m => m.content)).toEqual(["victim real"]); // untouched
   });
 
@@ -146,8 +148,8 @@ describe("D-SEC — inbound write IDOR: a placed agent cannot forge a SIBLING ta
     writeCronState(storage, { taskId: victimTask, cronId: "shared-cron", data: cstate(5, "scheduled") });
 
     // The attacker (placed on its own task) forges the victim's cronId.
-    const denied = apply(attacker, { type: "cron_state", outboxId: 4, taskId: attackerTask, cronId: "shared-cron", data: cstate(999, "hijacked") });
-    expect(denied).toEqual({ type: "ack", id: 4 }); // acked-and-dropped
+    const denied = apply(attacker, { type: "cron_state", outboxId: oid(4), taskId: attackerTask, cronId: "shared-cron", data: cstate(999, "hijacked") });
+    expect(denied).toEqual({ type: "ack", id: oid(4) }); // acked-and-dropped
 
     const cron = getCron(storage, "shared-cron");
     expect(cron?.taskId).toBe(victimTask); // still the victim's

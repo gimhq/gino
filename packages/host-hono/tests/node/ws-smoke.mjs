@@ -46,7 +46,7 @@ async function main() {
   const res = await fetch(`${httpBase}/agent/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
   });
   assert(res.status === 200, `register → ${res.status}`);
   const { agentId, connectToken } = await res.json();

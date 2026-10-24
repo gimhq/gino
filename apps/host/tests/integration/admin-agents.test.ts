@@ -65,7 +65,7 @@ async function enroll(): Promise<{ agentId: string; connectToken: string }> {
   const res = await app.fetch(new Request("http://local/api/agent/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 2, capabilities: ["claude"], maxThreads: 3 }),
+    body: JSON.stringify({ registerToken: REGISTER_TOKEN, protocolVersion: 1, capabilities: ["claude"], maxThreads: 3 }),
   }));
   expect(res.status).toBe(200);
   const body = await res.json() as { agentId: string; connectToken: string };
@@ -257,7 +257,7 @@ describe("M3 /admin/agents — engine-free file operations", () => {
   it("the switch is off by default, cannot be self-declared at register, and is served once an admin sets it", async () => {
     const res = await app.fetch(new Request("http://local/api/agent/register", json({
       registerToken: REGISTER_TOKEN,
-      protocolVersion: 2,
+      protocolVersion: 1,
       capabilities: { engines: ["claude"], remote_ops: { fs: true } },
     })));
     const { agentId, connectToken, config: registered } = await res.json() as { agentId: string; connectToken: string; config: { remoteOps: { fs: boolean } } };

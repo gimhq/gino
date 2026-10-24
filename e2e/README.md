@@ -1,7 +1,7 @@
 # Gino docker-compose end-to-end test
 
 A black-box, docker-orchestrated e2e that runs the **real host** (`apps/host/src/`,
-protocol-v2 control plane) and a **real gino-agent** (`gino-agent/`, the Rust
+control plane) and a **real gino-agent** (`gino-agent/`, the Rust
 daemon) side by side and drives the host's entire HTTP surface to exercise every
 major feature. It is the first test that runs **host-v2 and runner-v2 together** —
 they were built in separate campaigns and had never been integration-tested — so

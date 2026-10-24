@@ -2,7 +2,7 @@
 //! P1-10b).
 //!
 //! Inbound attachment **descriptors** ride the inbox `message` frame
-//! ([`MessageInData::attachments`](crate::protocol::v2::MessageInData)), not the
+//! ([`MessageInData::attachments`](crate::protocol::frames::MessageInData)), not the
 //! `threads` row, so the executor materializes them through a resolver
 //! ([`AttachmentSource`]) that the runner supplies.
 //!
@@ -31,7 +31,7 @@ use tracing::warn;
 
 use crate::attachments::AttachmentSource;
 use crate::db::{Db, ThreadRow};
-use crate::protocol::v2::AttachmentDescriptor;
+use crate::protocol::frames::AttachmentDescriptor;
 
 /// The runner's [`AttachmentSource`]: reads the inbound descriptors the prompt
 /// drainer snapshotted into `thread_attachments` for a thread. Engine-agnostic
@@ -105,7 +105,7 @@ mod tests {
     use super::DbAttachmentSource;
     use crate::attachments::AttachmentSource;
     use crate::db::{Db, TaskRow, ThreadRow};
-    use crate::protocol::v2::AttachmentDescriptor;
+    use crate::protocol::frames::AttachmentDescriptor;
 
     /// A bare `pending` thread row carrying just the id `inbound_for` keys on.
     fn thread(id: &str) -> ThreadRow {
@@ -127,7 +127,6 @@ mod tests {
             duration_ms: None,
             result: None,
             error: None,
-            synced: false,
             created_at: "2026-06-22T00:00:00Z".to_owned(),
         }
     }

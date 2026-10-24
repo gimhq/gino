@@ -8,6 +8,8 @@ import { sqliteStorage } from "@gino/host-store-sqlite";
 import { createDb } from "@gino/host-store-sqlite/bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
+const oid = (n: number): string => `01jab3x7k2m4n5p6q7r8s9${String(n).padStart(4, "0")}`;
+
 // Regression: outbound webhook egress is WIRED. Pre-fix,
 // `pushChannelWebhooks` had no production caller: webhook channels stored
 // endpoints that were never pushed to. Now a `thread_message` landing through
@@ -49,7 +51,7 @@ function setup(): Setup {
 function threadMessageFrame(taskId: string, seq: number, content: string): string {
   return JSON.stringify({
     type: "thread_message",
-    outboxId: seq,
+    outboxId: oid(seq),
     taskId,
     threadId: "thr-1",
     data: { seq, kind: "assistant_text", content },
@@ -75,7 +77,7 @@ describe("M6 webhook egress wiring (HOST-M5M6-04)", () => {
 
     // The production inbound path: store the frame, emit `transcript.message` → the pump.
     const ack = ingestHttpFrame({ storage, agentId, events }, threadMessageFrame(taskId, 1, "hello"));
-    expect(ack).toEqual({ type: "ack", id: 1 });
+    expect(ack).toEqual({ type: "ack", id: oid(1) });
     await pump.flush();
 
     expect(received).toHaveLength(1);

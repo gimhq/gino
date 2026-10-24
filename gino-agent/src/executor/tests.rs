@@ -16,7 +16,7 @@ use crate::db::{Db, TaskRow, ThreadRow};
 use crate::engine::{
     Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
 };
-use crate::protocol::v2::{
+use crate::protocol::frames::{
     AttachmentDescriptor, EntryKind, MessageKind, ProvisioningEntry, ThreadMessageData,
     ThreadResultData, ThreadStatus,
 };
@@ -160,7 +160,6 @@ fn pending_thread(id: &str, max_attempts: i64) -> ThreadRow {
         duration_ms: None,
         result: None,
         error: None,
-        synced: false,
         created_at: to_iso(now()),
     }
 }

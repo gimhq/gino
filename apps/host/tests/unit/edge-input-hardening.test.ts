@@ -72,7 +72,7 @@ function registerReq(body: BodyInit, headers: Record<string, string> = {}) {
 }
 
 async function registerAgent(): Promise<{ agentId: string; connectToken: string }> {
-  const res = await app.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 2, source: "manual", capabilities: ["claude"] })));
+  const res = await app.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 1, source: "manual", capabilities: ["claude"] })));
   expect(res.status).toBe(200);
   return await res.json() as { agentId: string; connectToken: string };
 }
@@ -91,20 +91,20 @@ function channelHeaders() {
 
 describe("HOST-M1M2-14 — register failures use the protocol §3 register_error envelope", () => {
   it("401 register_error{invalid_register_token} on a wrong token", async () => {
-    const res = await app.fetch(registerReq(JSON.stringify({ registerToken: "nope", protocolVersion: 2 })));
+    const res = await app.fetch(registerReq(JSON.stringify({ registerToken: "nope", protocolVersion: 1 })));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ register_error: { reason: "invalid_register_token" } });
   });
 
   it("401 register_error{invalid_register_token} when no token is supplied at all", async () => {
-    const res = await app.fetch(registerReq(JSON.stringify({ protocolVersion: 2 })));
+    const res = await app.fetch(registerReq(JSON.stringify({ protocolVersion: 1 })));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ register_error: { reason: "invalid_register_token" } });
   });
 
   it("fails closed with the envelope when the expected token is unconfigured", async () => {
     const bare = makeApp({ GINO_REGISTER_TOKEN: "" });
-    const res = await bare.fetch(registerReq(JSON.stringify({ registerToken: "", protocolVersion: 2 })));
+    const res = await bare.fetch(registerReq(JSON.stringify({ registerToken: "", protocolVersion: 1 })));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ register_error: { reason: "invalid_register_token" } });
   });
@@ -122,23 +122,23 @@ describe("HOST-M1M2-14 — register failures use the protocol §3 register_error
   });
 
   it("400 register_error{unsupported_protocol} on a version-gate failure", async () => {
-    const res = await app.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 1 })));
+    const res = await app.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 2 })));
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ register_error: { reason: "unsupported_protocol" } });
   });
 
   it("403 register_error{registration_disabled} when GINO_REGISTER_ENABLED=false (valid token)", async () => {
     const disabled = makeApp({ GINO_REGISTER_ENABLED: "false" });
-    const res = await disabled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 2 })));
+    const res = await disabled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 1 })));
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ register_error: { reason: "registration_disabled" } });
   });
 
   it("429 register_error{rate_limited} once the register budget is exhausted", async () => {
     const throttled = makeApp({ GINO_RATE_LIMIT_REGISTER_MAX: "1", GINO_RATE_LIMIT_REGISTER_WINDOW_MS: "60000" });
-    const first = await throttled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 2, capabilities: ["claude"] })));
+    const first = await throttled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 1, capabilities: ["claude"] })));
     expect(first.status).toBe(200);
-    const over = await throttled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 2, capabilities: ["claude"] })));
+    const over = await throttled.fetch(registerReq(JSON.stringify({ registerToken: REGISTER, protocolVersion: 1, capabilities: ["claude"] })));
     expect(over.status).toBe(429);
     expect(await over.json()).toEqual({ register_error: { reason: "rate_limited" } });
   });

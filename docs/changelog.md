@@ -114,3 +114,32 @@ dispatches a background subagent reports the answer of the follow-up turn instea
 text; a CLI without session state still ends on its first `result`. The codex backend maps a
 stream-level `error` (a reconnect notice) to a warn log instead of a failed run. Verified by the
 agent gates: fmt, clippy, 436 unit, 21 integration and 1 doc test.
+
+## 2026-10-24 00:22 [decision]
+
+ULID delivery ids (task `20261023-2333-ulid-delivery-ids`). `msgId` (host outbox) and `outboxId`
+(agent outbox) were SQLite integer row ids; a recreated or restored sender database reissued ids the
+receiver had already stored, so new frames were acked and dropped as duplicates. Both outboxes are now
+keyed by a monotonic lowercase ULID minted by the sender, and `msgId`, `outboxId`, `msg_ack.msgId` and
+`ack.id` are ULID strings on the wire (integers are rejected). Host → agent frames no longer carry the
+compatibility `outboxId`, and the host no longer accepts an agent-sent `ack` for host frames; the
+`ackOutbox` export, `MarkAckedOptions` and the `outbox.acked` event's `type` field are removed.
+`protocolVersion` is reset to 1 (pre-release, no version history kept). Host migration `0007` and agent
+schema v5 rebuild the outbox and drop any pending integer-keyed rows; the agent inbox keeps its rows
+but loses stored integer `msg_id`s. Verified by host `bun run check`, agent fmt, clippy, 439 unit tests
+and cargo-shear, and the docker e2e (88/88). The agent integration tests
+`offline_startup_fetch_keeps_installed_global` and `restart_same_global_version_is_durable` fail
+intermittently on this host both before and after the change.
+
+## 2026-10-24 00:44 [decision]
+
+Pre-release compatibility layers removed (task `20261024-0033-dev-state-reset`). The host drizzle
+migrations are squashed into a single `0000` baseline (the resulting schema matches the old chain
+except for column order and the ULID `outbox.id`), and the agent schema ladder is replaced by one
+schema at `user_version = 1`; the agent refuses a database from an older build
+(`DbError::UnsupportedSchema`) instead of upgrading it, so existing development databases must be
+deleted. The retained-but-unused `crons.dirty` and `threads.synced` columns are dropped. The `v2`
+protocol naming is gone (`InboundFrameV2`/`OutboundFrameV2` → `InboundFrame`/`OutboundFrame`, module
+`protocol::v2` → `protocol::frames`); "v2" in comments that name the task/cron/thread data model is
+kept. The admin API now returns the host outbox id as `msgId` instead of `outboxId`. Verified by host
+`bun run check`, agent fmt, clippy and 437 unit tests, and the docker e2e (88/88).

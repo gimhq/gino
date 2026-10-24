@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::chat::InboxPromptSource;
 use crate::db::{Db, TaskRow, ThreadRow};
-use crate::protocol::v2::{EntryKind, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
+use crate::protocol::frames::{EntryKind, InboundFrame, ProvisioningEntry, TaskUpsertData};
 use crate::transport::Inbound;
 
 use super::{
@@ -31,7 +31,6 @@ fn chat_thread(id: &str, task_id: &str) -> ThreadRow {
         duration_ms: None,
         result: None,
         error: None,
-        synced: false,
         created_at: "2026-06-22T00:00:00Z".to_owned(),
     }
 }
@@ -172,12 +171,18 @@ async fn config_update_rotated_key_applies_to_the_next_engine_run() {
         "no key configured at startup"
     );
 
-    let frame = InboundFrameV2::ConfigUpdate {
+    let frame = InboundFrame::ConfigUpdate {
         data: serde_json::json!({ "engine": { "anthropicApiKey": "sk-rotated" } }),
-        msg_id: Some(21),
+        msg_id: Some(crate::protocol::test_delivery_id(21)),
     };
     let inbox_id = lock_db(&db)
-        .record_inbound_correlated("config_update", &frame, None, None, Some(21))
+        .record_inbound_correlated(
+            "config_update",
+            &frame,
+            None,
+            None,
+            Some(crate::protocol::test_delivery_id(21).as_str()),
+        )
         .unwrap()
         .expect("a fresh msg_id stores a row");
 
@@ -209,13 +214,19 @@ async fn malformed_config_update_overlay_is_dropped_and_settled() {
     let context = serve_context(Arc::clone(&db), dir.path()).await;
     let before = lock(&context.engine_settings).env.clone();
 
-    let frame = InboundFrameV2::ConfigUpdate {
+    let frame = InboundFrame::ConfigUpdate {
         // `engine` must be an object; a number fails the overlay parse.
         data: serde_json::json!({ "engine": 5 }),
-        msg_id: Some(22),
+        msg_id: Some(crate::protocol::test_delivery_id(22)),
     };
     let inbox_id = lock_db(&db)
-        .record_inbound_correlated("config_update", &frame, None, None, Some(22))
+        .record_inbound_correlated(
+            "config_update",
+            &frame,
+            None,
+            None,
+            Some(crate::protocol::test_delivery_id(22).as_str()),
+        )
         .unwrap()
         .expect("a fresh msg_id stores a row");
 
@@ -261,12 +272,18 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
         })
         .unwrap();
 
-    let frame = InboundFrameV2::TaskDelete {
+    let frame = InboundFrame::TaskDelete {
         task_id: "t-1".to_owned(),
-        msg_id: Some(31),
+        msg_id: Some(crate::protocol::test_delivery_id(31)),
     };
     let inbox_id = lock_db(&db)
-        .record_inbound_correlated("task_delete", &frame, Some("t-1"), None, Some(31))
+        .record_inbound_correlated(
+            "task_delete",
+            &frame,
+            Some("t-1"),
+            None,
+            Some(crate::protocol::test_delivery_id(31).as_str()),
+        )
         .unwrap()
         .expect("a fresh msg_id stores a row");
     assert!(
@@ -283,7 +300,7 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
         "a deleted task parks its crons/threads/messages"
     );
 
-    let frame = InboundFrameV2::TaskUpsert {
+    let frame = InboundFrame::TaskUpsert {
         task_id: "t-1".to_owned(),
         data: TaskUpsertData {
             name: None,
@@ -295,10 +312,16 @@ async fn task_delete_parks_the_tasks_work_until_a_task_upsert_reactivates_it() {
             meta: None,
             entries: None,
         },
-        msg_id: Some(32),
+        msg_id: Some(crate::protocol::test_delivery_id(32)),
     };
     let inbox_id = lock_db(&db)
-        .record_inbound_correlated("task_upsert", &frame, Some("t-1"), None, Some(32))
+        .record_inbound_correlated(
+            "task_upsert",
+            &frame,
+            Some("t-1"),
+            None,
+            Some(crate::protocol::test_delivery_id(32).as_str()),
+        )
         .unwrap()
         .expect("a fresh msg_id stores a row");
     assert!(
@@ -548,7 +571,7 @@ fn processing_failure_leaves_row_unprocessed_and_poisons_after_limit() {
             &serde_json::json!({ "type": "cron_upsert" }),
             Some("t-1"),
             Some("cr-1"),
-            Some(11),
+            Some(crate::protocol::test_delivery_id(11).as_str()),
         )
         .unwrap()
         .unwrap();
@@ -577,7 +600,7 @@ fn processing_failure_leaves_row_unprocessed_and_poisons_after_limit() {
             &serde_json::json!({ "type": "task_delete" }),
             Some("t-2"),
             None,
-            Some(12),
+            Some(crate::protocol::test_delivery_id(12).as_str()),
         )
         .unwrap()
         .unwrap();
@@ -603,7 +626,7 @@ fn processing_failure_leaves_row_unprocessed_and_poisons_after_limit() {
 fn cron_upsert_before_task_upsert_is_not_dropped() {
     let db = Mutex::new(Db::open_in_memory().unwrap());
     let nudge = tokio::sync::Notify::new();
-    let data = crate::protocol::v2::CronUpsertData {
+    let data = crate::protocol::frames::CronUpsertData {
         kind: "schedule".to_owned(),
         prompt: "do the rounds".to_owned(),
         schedule_type: Some("interval".to_owned()),
@@ -748,7 +771,6 @@ async fn local_planes_run_and_shut_down_cleanly_while_host_unreachable() {
             continuity: "isolated".to_owned(),
             run_count: 0,
             status: "active".to_owned(),
-            dirty: false,
             created_at: "2026-06-22T09:00:00.000Z".to_owned(),
             updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
         })

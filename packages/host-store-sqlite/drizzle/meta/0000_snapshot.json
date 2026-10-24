@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "d9b82617-af30-40b0-80ac-219cb93ef84a",
+  "id": "93a5f6b5-16eb-4d52-84c9-0f7bbe388859",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "tables": {
     "agent_grants": {
@@ -130,6 +130,13 @@
           "notNull": false,
           "autoincrement": false
         },
+        "launch_nonce": {
+          "name": "launch_nonce",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "active_threads": {
           "name": "active_threads",
           "type": "integer",
@@ -153,7 +160,15 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "agents_launch_nonce_unique": {
+          "name": "agents_launch_nonce_unique",
+          "columns": [
+            "launch_nonce"
+          ],
+          "isUnique": true
+        }
+      },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
@@ -476,6 +491,13 @@
           "notNull": true,
           "autoincrement": false
         },
+        "unreferenced_since": {
+          "name": "unreferenced_since",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "integer",
@@ -679,6 +701,13 @@
     "messages": {
       "name": "messages",
       "columns": {
+        "id": {
+          "name": "id",
+          "type": "integer",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": true
+        },
         "task_id": {
           "name": "task_id",
           "type": "text",
@@ -742,6 +771,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "tool_use_id": {
+          "name": "tool_use_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "parent_tool_use_id": {
+          "name": "parent_tool_use_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "integer",
@@ -759,18 +802,18 @@
             "seq"
           ],
           "isUnique": false
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {
-        "messages_thread_id_seq_pk": {
+        },
+        "messages_thread_seq_unq": {
+          "name": "messages_thread_seq_unq",
           "columns": [
             "thread_id",
             "seq"
           ],
-          "name": "messages_thread_id_seq_pk"
+          "isUnique": true
         }
       },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
     },
@@ -779,10 +822,10 @@
       "columns": {
         "id": {
           "name": "id",
-          "type": "integer",
+          "type": "text",
           "primaryKey": true,
           "notNull": true,
-          "autoincrement": true
+          "autoincrement": false
         },
         "agent_id": {
           "name": "agent_id",
@@ -819,13 +862,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "msg_id": {
-          "name": "msg_id",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "data_json": {
           "name": "data_json",
           "type": "text",
@@ -848,7 +884,16 @@
           "autoincrement": false
         }
       },
-      "indexes": {},
+      "indexes": {
+        "outbox_agent_unacked_idx": {
+          "name": "outbox_agent_unacked_idx",
+          "columns": [
+            "agent_id"
+          ],
+          "isUnique": false,
+          "where": "acked_at IS NULL"
+        }
+      },
       "foreignKeys": {
         "outbox_agent_id_agents_id_fk": {
           "name": "outbox_agent_id_agents_id_fk",
@@ -864,6 +909,52 @@
           "onUpdate": "no action"
         }
       },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "pending_launches": {
+      "name": "pending_launches",
+      "columns": {
+        "nonce": {
+          "name": "nonce",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "launcher_kind": {
+          "name": "launcher_kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "launch_ref": {
+          "name": "launch_ref",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "access": {
+          "name": "access",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'dedicated'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {},
       "checkConstraints": {}
@@ -974,6 +1065,13 @@
         },
         "assigned_at": {
           "name": "assigned_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "seeded_at": {
+          "name": "seeded_at",
           "type": "integer",
           "primaryKey": false,
           "notNull": false,

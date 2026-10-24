@@ -10,6 +10,8 @@ import { createHostEvents } from "../../src/host";
 import { ingestHttpFrame } from "../../src/protocol/inbound";
 import { createTask, placeTask, setPlacement } from "../../src/tasks";
 
+const oid = (n: number): string => `01jab3x7k2m4n5p6q7r8s9${String(n).padStart(4, "0")}`;
+
 // HostEvents — the typed post-write notification seam (host-sdk-design §3.3):
 //   • `on` returns an unsubscribe; `off` removes a listener.
 //   • a throwing listener is warn-logged and neither stops later listeners nor
@@ -111,7 +113,7 @@ describe("createHostEvents — emission sites", () => {
 
     ingestHttpFrame({ storage, agentId, events }, JSON.stringify({
       type: "thread_message",
-      outboxId: 1,
+      outboxId: oid(1),
       taskId,
       threadId: "thr-1",
       data: { seq: 1, kind: "assistant_text", content: "hello" },
@@ -128,8 +130,8 @@ describe("createHostEvents — emission sites", () => {
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ agentId, taskId, threadId: "thr-1", source: "chat", data: { status: "succeeded", final_seq: 1 } });
 
-    ingestHttpFrame({ storage, agentId, events }, JSON.stringify({ type: "ack", id: 1 }));
-    expect(acks).toEqual([{ agentId, id: 1, type: "ack" }]);
+    ingestHttpFrame({ storage, agentId, events }, JSON.stringify({ type: "msg_ack", msgId: oid(1) }));
+    expect(acks).toEqual([{ agentId, id: oid(1) }]);
   });
 
   it("placeTask emits task.placed once — not on the already-placed replay", () => {

@@ -85,7 +85,7 @@ describe("M4 orchestrator — task_upsert", () => {
     const wire = sender.sent.at(-1)!.frame;
     expect(wire.type).toBe("task_upsert");
     expect(wire.taskId).toBe(task.id);
-    expect(wire.outboxId).toBe(row.id);
+    expect(wire.msgId).toBe(row.id);
   });
 
   it("carries task-scope config entries when supplied (M8 passthrough)", () => {
@@ -280,7 +280,7 @@ describe("M4 orchestrator — cron commands + control", () => {
     const seed = rows.find(r => r.type === "task_upsert");
     expect(seed).toBeDefined();
     expect(seed!.taskId).toBe(task.id);
-    expect(seed!.id).toBeLessThan(cron.id);
+    expect(seed!.id < cron.id).toBe(true);
     expect(hasSeededTask(storage, task.id)).toBe(true);
 
     // A second cron does not re-seed.

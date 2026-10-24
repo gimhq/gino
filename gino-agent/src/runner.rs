@@ -1,16 +1,16 @@
 //! The persistent gino-agent daemon.
 //!
-//! [`run_daemon`] wires the whole node agent together on the **protocol-v2** path
+//! [`run_daemon`] wires the whole node agent together
 //! and serves until shutdown:
 //!
 //! 1. resolve [`Config`] from bootstrap inputs,
 //! 2. load-or-register the runner [`identity`](crate::register),
-//! 3. open the reconnecting [`Transport`] (v2 frames, outbox/inbox),
+//! 3. open the reconnecting [`Transport`] (frames, outbox/inbox),
 //! 4. build the engine and the v2 [`ThreadExecutor`] (the pending-thread drainer),
 //! 5. recover crash-orphan threads from a previous process,
 //! 6. start the local [`Scheduler`] (fires crons → pending threads + `cron_state`),
 //! 7. start the **executor worker** (drains pending threads, flushes the outbox),
-//! 8. **serve**: route inbound v2 frames to the executor / scheduler / config.
+//! 8. **serve**: route inbound frames to the executor / scheduler / config.
 //!
 //! ## Two planes, one runtime
 //!
@@ -49,7 +49,7 @@ use crate::engine::claude::{ClaudeEngine, ClaudeSettings};
 use crate::engine::codex::{self, CodexEngine, CodexSettings};
 use crate::engine::{Engine, EngineError, Session, SessionCfg};
 use crate::executor::{ThreadExecutor, WatchdogCfg};
-use crate::protocol::v2::{CronUpsertData, InboundFrameV2, ProvisioningEntry, TaskUpsertData};
+use crate::protocol::frames::{CronUpsertData, InboundFrame, ProvisioningEntry, TaskUpsertData};
 use crate::provisioning::{BlobFetcher, Provisioner};
 use crate::register::{self, ResolvedIdentity};
 use crate::remote_ops::RemoteOps;
@@ -891,7 +891,7 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-/// Pump inbound v2 frames until a shutdown signal or a `close`. Outbound frames
+/// Pump inbound frames until a shutdown signal or a `close`. Outbound frames
 /// are produced straight into the durable outbox by the executor/scheduler and
 /// shipped by the transport (flush/replay), so the serve loop has no outbound
 /// branch. Transport loss never ends the loop: the manager reconnects
@@ -937,7 +937,7 @@ async fn wait_for_shutdown(cancel: &Cancel) {
     }
 }
 
-/// Route one inbound v2 frame to the executor / scheduler / config, then settle
+/// Route one inbound frame to the executor / scheduler / config, then settle
 /// its inbox row: a successfully applied frame is marked processed; a FAILED
 /// apply leaves the row unprocessed (it replays on reconnect) and bumps its
 /// processing-failure counter, so the poison policy counts real failures — never
@@ -947,10 +947,10 @@ async fn wait_for_shutdown(cancel: &Cancel) {
 /// thread's prompt, consumed (and marked) later by the [`InboxPromptSource`].
 async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
     let Inbound { inbox_id, frame } = inbound;
-    let defer_processing = matches!(frame, InboundFrameV2::Message { .. });
+    let defer_processing = matches!(frame, InboundFrame::Message { .. });
     let mut applied = true;
     let flow = match frame {
-        InboundFrameV2::Message {
+        InboundFrame::Message {
             task_id, thread_id, ..
         } => {
             // Idempotent thread minting: an absent `threadId` derives the
@@ -961,7 +961,7 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             context.drain.notify_one();
             ControlFlow::Continue(())
         }
-        InboundFrameV2::Interrupt { task_id, .. } => {
+        InboundFrame::Interrupt { task_id, .. } => {
             // No `taskId` → legacy global interrupt: cancel whatever is in
             // flight. Scoped → interrupt only when the task owns the active
             // run. Always marked processed (even on a scope-check DB error):
@@ -978,7 +978,7 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             }
             ControlFlow::Continue(())
         }
-        InboundFrameV2::TaskUpsert { task_id, data, .. } => {
+        InboundFrame::TaskUpsert { task_id, data, .. } => {
             let reactivated = data.status.as_deref() == Some("active");
             applied = apply_task_def(&context.db, &task_id, &data);
             // Re-activation unparks this task's work (D1): wake both loops so the
@@ -990,11 +990,11 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             }
             ControlFlow::Continue(())
         }
-        InboundFrameV2::TaskDelete { task_id, .. } => {
+        InboundFrame::TaskDelete { task_id, .. } => {
             applied = delete_task(&context.db, &task_id);
             ControlFlow::Continue(())
         }
-        InboundFrameV2::CronUpsert {
+        InboundFrame::CronUpsert {
             task_id,
             cron_id,
             data,
@@ -1003,7 +1003,7 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             applied = handle_cron_upsert(&context.db, &task_id, &cron_id, &data, &context.nudge);
             ControlFlow::Continue(())
         }
-        InboundFrameV2::CronDelete { cron_id, .. } => {
+        InboundFrame::CronDelete { cron_id, .. } => {
             applied = apply_trigger(
                 || apply_cron_delete(&context.db, &cron_id),
                 "cron_delete",
@@ -1011,7 +1011,7 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             );
             ControlFlow::Continue(())
         }
-        InboundFrameV2::ConfigUpdate { data, .. } => {
+        InboundFrame::ConfigUpdate { data, .. } => {
             debug!(keys = ?config_keys(&data), "config_update received");
             // Applied on both planes: the overlay merges onto the
             // live config + engine settings (rotated credentials reach the next
@@ -1021,9 +1021,9 @@ async fn route(inbound: Inbound, context: &ServeContext) -> ControlFlow<()> {
             apply_config_update(context, &data).await;
             ControlFlow::Continue(())
         }
-        InboundFrameV2::Close { .. } => ControlFlow::Break(()),
+        InboundFrame::Close { .. } => ControlFlow::Break(()),
         // The transport intercepts `ack`; an unknown frame is forward-compat noise.
-        InboundFrameV2::Ack { .. } | InboundFrameV2::Unknown => ControlFlow::Continue(()),
+        InboundFrame::Ack { .. } | InboundFrame::Unknown => ControlFlow::Continue(()),
     };
     if !defer_processing {
         conclude_inbox_row(&context.db, inbox_id, applied);
@@ -1433,7 +1433,7 @@ mod provisioning_wiring_tests {
 
     use crate::attachments::sha256_hex;
     use crate::db::Db;
-    use crate::protocol::v2::{EntryKind, ProvisioningEntry};
+    use crate::protocol::frames::{EntryKind, ProvisioningEntry};
     use crate::provisioning::{BlobFetcher, Provisioner, ProvisioningError};
 
     use super::reconcile_global_startup;

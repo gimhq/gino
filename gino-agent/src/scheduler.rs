@@ -66,7 +66,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::{CronLogRow, CronRow, Db, DbError, ThreadRow};
 use crate::executor::task_parked;
-use crate::protocol::v2::{CronStateData, CronUpsertData};
+use crate::protocol::frames::{CronStateData, CronUpsertData};
 
 /// Upper bound on how long the loop sleeps before re-scanning the DB even with no
 /// nudge — the bounded re-scan safety net for a trigger change that lands without
@@ -304,7 +304,6 @@ pub(crate) fn apply_cron_upsert(
         continuity: data.continuity.clone(),
         run_count: existing.as_ref().map_or(0, |c| c.run_count),
         status: data.status.clone().unwrap_or_else(|| "active".to_owned()),
-        dirty: true,
         created_at: existing
             .as_ref()
             .map_or_else(|| now_iso.clone(), |c| c.created_at.clone()),
@@ -531,7 +530,6 @@ fn new_pending_thread(
         duration_ms: None,
         result: None,
         error: None,
-        synced: false,
         created_at: to_iso(now),
     }
 }
@@ -1066,7 +1064,7 @@ mod tests {
         Engine, EngineError, EngineEvent, RunErrorKind, RunOutcome, RunStatus, Session, SessionCfg,
     };
     use crate::executor::{PromptSource, ThreadExecutor, WatchdogCfg};
-    use crate::protocol::v2::CronUpsertData;
+    use crate::protocol::frames::CronUpsertData;
 
     fn at(value: &str) -> DateTime<Utc> {
         parse_iso(value).expect("valid timestamp")
@@ -1145,7 +1143,6 @@ mod tests {
             continuity: continuity.to_owned(),
             run_count: 0,
             status: "active".to_owned(),
-            dirty: false,
             created_at: "2026-06-22T09:00:00.000Z".to_owned(),
             updated_at: "2026-06-22T09:00:00.000Z".to_owned(),
         }
@@ -1736,7 +1733,6 @@ mod tests {
                 duration_ms: None,
                 result: None,
                 error: None,
-                synced: false,
                 created_at: "2026-06-22T11:59:00.000Z".to_owned(),
             })
             .unwrap();
@@ -2267,14 +2263,14 @@ mod tests {
             let acked = guard
                 .enqueue_outbox("output", &serde_json::json!({}))
                 .unwrap();
-            guard.mark_outbox_acked(acked).unwrap();
+            guard.mark_outbox_acked(&acked).unwrap();
             let unacked = guard
                 .enqueue_outbox("output", &serde_json::json!({}))
                 .unwrap();
             guard
                 .exec_raw(&format!(
                     "UPDATE outbox SET created_at = datetime('now', '-400 days')
-                      WHERE id IN ({acked}, {unacked})"
+                      WHERE id IN ('{acked}', '{unacked}')"
                 ))
                 .unwrap();
             // inbox: an expired processed row.

@@ -85,7 +85,7 @@ function register(capabilities: string[]) {
   return app.fetch(new Request("http://local/api/agent/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: REGISTER, protocolVersion: 2, source: "manual", capabilities }),
+    body: JSON.stringify({ registerToken: REGISTER, protocolVersion: 1, source: "manual", capabilities }),
   }));
 }
 

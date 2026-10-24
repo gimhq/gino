@@ -6,7 +6,7 @@
 //! an api call created them), drives each through the lifecycle state machine
 //! `pending → dispatched → running → {succeeded | failed | cancelled}` (a *shared*
 //! thread settles to `active` between turns; a host `interrupt` settles the
-//! in-flight turn `cancelled`), and emits the protocol-v2 result-plane frames
+//! in-flight turn `cancelled`), and emits the result-plane frames
 //! durably through the [`outbox`](crate::db). The runner drives it from a serial
 //! worker loop (one engine run at a time) and reaches the live run via
 //! [`ThreadExecutor::interrupt`].
@@ -29,7 +29,7 @@
 //! §8 the **outbox payload is the frame's `data`** (the envelope `{type, …ids,
 //! data}` is rebuilt on send by the transport from the columns), so this module
 //! stores [`ThreadMessageData`]/[`ThreadResultData`] payloads — it never builds the
-//! outer [`OutboundFrameV2`](crate::protocol::v2::OutboundFrameV2). This keeps the
+//! outer [`OutboundFrame`](crate::protocol::frames::OutboundFrame). This keeps the
 //! executor decoupled from the transport lane (E); the runner pokes the transport
 //! flush after a drain so the enqueued rows ship over the live socket.
 //!
@@ -65,7 +65,7 @@ use crate::engine::{
 use crate::failure::{
     AgentFailure, FailureReason, RunnerFailure, classify_engine_error, classify_outcome,
 };
-use crate::protocol::v2::{
+use crate::protocol::frames::{
     AttachmentDescriptor, MessageKind, ProvisioningEntry, ThreadMessageData, ThreadResultData,
     ThreadStatus,
 };

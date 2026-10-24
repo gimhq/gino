@@ -26,7 +26,7 @@ use super::store::{self, EntryKind};
 use super::{ProvisioningError, safe_link_path, short_id};
 use crate::attachments::{AttachmentManager, run_blocking};
 use crate::db::{ConfigEntryRow, Db};
-use crate::protocol::v2::{EntryKind as WireKind, ProvisioningEntry};
+use crate::protocol::frames::{EntryKind as WireKind, ProvisioningEntry};
 
 /// Store sub-directory under the workspace dir. Mirrors the (private) canonical
 /// `store::STORE_SUBDIR`: this is the one read-side that must enumerate the store
@@ -478,7 +478,7 @@ mod tests {
     use super::{BlobFetcher, Provisioner};
     use crate::attachments::sha256_hex;
     use crate::db::Db;
-    use crate::protocol::v2::{EntryKind, ProvisioningEntry};
+    use crate::protocol::frames::{EntryKind, ProvisioningEntry};
     use crate::provisioning::{ProvisioningError, store};
 
     /// In-memory fetcher keyed by `reference`, counting fetches to prove the store

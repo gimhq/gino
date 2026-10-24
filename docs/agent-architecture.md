@@ -310,11 +310,11 @@ WS primary (at-least-once via outbox/inbox + ack/msg_ack); HTTP for register/con
 the type-specific business payload only:
 
 ```json
-{ "type": "thread_message", "outboxId": 43, "taskId": "t-1", "threadId": "c-9@1718…",
+{ "type": "thread_message", "outboxId": "01jab3x7k2m4n5p6q7r8s9t0vw", "taskId": "t-1", "threadId": "c-9@1718…",
   "data": { "seq": 3, "kind": "assistant_text", "content": "…" } }
 ```
 
-- Envelope: `type`, `outboxId`/`msgId` (delivery), **`taskId`/`threadId`/`cronId` (correlation)**.
+- Envelope: `type`, `outboxId`/`msgId` (delivery, lowercase ULIDs minted by the sender), **`taskId`/`threadId`/`cronId` (correlation)**.
 - `data`: business fields only — **never** the correlation ids. `engine_session_id` is a *value* of the
   thread and stays in `data` (stored, not routed-by).
 - The host routes/correlates by the **envelope** ids without parsing `data`, mirroring the runner's
@@ -339,7 +339,7 @@ the type-specific business payload only:
 | `cron_state` | taskId, cronId | `{kind, schedule_type?, …, round_count, skipped_count, last_status}` |
 | `heartbeat` | — | `{activeThreads?, …}` |
 | `fs_response` (live-only) | reqId | `{ok, entries? \| stat? \| sha256 + size, error?}` |
-| `msg_ack` / `ack` | top-level `msgId`/`id` | — |
+| `msg_ack` | top-level `msgId` | — |
 
 `kind` ∈ `{user_input, assistant_text, thinking, tool_use, tool_result, status, error}` (`thinking`/`log`
 config-filterable). Bytes never in frames — only descriptors.

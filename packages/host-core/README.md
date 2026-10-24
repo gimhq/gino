@@ -1,6 +1,6 @@
 # @gino/host-core
 
-The Gino host SDK core: the agent protocol (v2 frames), the domain (agents,
+The Gino host SDK core: the agent protocol (frames), the domain (agents,
 tasks, crons, transcript, config store) and the ports it runs on. No HTTP
 framework, no Bun-only API, no `process.env`, no timers started implicitly.
 Design: `docs/host-sdk-design.md`.
@@ -145,7 +145,7 @@ const off = host.events.on("thread.result", ({ taskId, threadId, data }) => { /*
 | `agent.enrolled` / `agent.online` / `agent.removed` | `{ agentId }` |
 | `agent.offline` | `{ agentId, reason: "close" \| "sweep" }` |
 | `task.placed` | `{ taskId, agentId }` |
-| `outbox.acked` | `{ agentId, id, type: "ack" \| "msg_ack" }` |
+| `outbox.acked` | `{ agentId, id }` |
 
 **Events are hints, never the record.** Each one fires synchronously AFTER the
 durable write it describes, on the writing thread, inside the request that
@@ -179,8 +179,8 @@ conformance results. `memoryStorage()` keeps everything in Maps and drops it on
 ### Writing your own adapter
 
 The invariants an adapter must uphold are documented on each repository method
-and are NOT inferable from the type signatures: monotonic, never-reused outbox
-ids (they become the wire `msgId`), `(threadId, seq)` first-writer-wins on the
+and are NOT inferable from the type signatures: outbox rows stored under the
+caller-minted ULID and replayed in id order (the id is the wire `msgId`), `(threadId, seq)` first-writer-wins on the
 transcript, compare-and-set agent status with `removed` terminal, set-once task
 placement, an atomic `ConfigRepo.replaceScope` that bumps the global version in
 the same unit, and `readVerified` refusing to serve bytes that fail their hash.

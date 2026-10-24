@@ -365,7 +365,7 @@ interface Storage {
 
 | repo | methods (from today's functions) | invariant the adapter MUST uphold |
 |---|---|---|
-| `OutboxRepo` | `append(row) → {id}`, `listUnacked(agentId)`, `listAllUnacked()`, `markAcked(agentId, id, now, {excludeType?})`, `purge(agentId)`, `gc(before)` | **`id` is strictly monotonic per agent and returned on append** — it becomes the wire `msgId`; the runner dedups on it and replays in ascending order. SQL: autoincrement; non-SQL: a per-agent sequence |
+| `OutboxRepo` | `append(row)`, `listUnacked(agentId)`, `listAllUnacked()`, `markAcked(agentId, id, now)`, `purge(agentId)`, `gc(before)` | **`id` is a monotonic ULID minted by the domain** — it becomes the wire `msgId`; the runner dedups on it, and the adapter replays in ascending id (string) order |
 | `TranscriptRepo` | `insertIfAbsent(row) → boolean`, `read(threadId, {afterSeq?, limit})`, `readAfterId(taskId, afterId, limit)`, `stats(threadId)`, `threads(taskId)`, `taskOf(threadId)` | `(threadId, seq)` unique, first writer wins; `read` ordered by `seq` |
 | `ThreadRunRepo` | `upsert(row)`, `get(threadId)`, `listByTask(taskId)` | upsert updates only the mutable subset (`status`, `failure_reason`, `engine_session_id`, `duration_ms`, `final_seq`); `source`/`cron_id` set once |
 | `CronMirrorRepo` | `upsertState`, `upsertPrompt`, `get`, `listByTask` | `prompt` and `task_id` preserved across state upserts |
@@ -428,7 +428,7 @@ can prove themselves.
 ## 9. `scripts/mini-host.ts` — the minimal host as a reference point
 
 `scripts/mini-host.ts` (502 lines, `bun:sqlite` + `Bun.serve`, no other dependency) is a
-protocol-v2 host reduced to the essentials: register / config / WS / output on the agent side,
+host reduced to the essentials: register / config / WS / output on the agent side,
 and tasks / messages / crons / threads on the operator side. Verified on 2026-09-04 against the
 real runner (the `bkd/uc3jboex` build = current main) with the e2e fake engine:
 

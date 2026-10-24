@@ -288,7 +288,7 @@ export function adminTaskRoutes() {
       const host = c.get("host");
       const task = requireTask(storage, c.req.param("id"));
       const row = emitInterrupt(storage, host.sessions, task);
-      return c.json(ok({ taskId: task.id, outboxId: row.id }));
+      return c.json(ok({ taskId: task.id, msgId: row.id }));
     },
   );
 
@@ -309,7 +309,7 @@ export function adminTaskRoutes() {
       // instead of 409ing on placement.
       if (task.agentId == null) {
         const closed = transitionTaskStatus(storage, id, TASK_STATUS.closed);
-        return c.json(ok({ task: serializeTask(closed), outboxId: null }));
+        return c.json(ok({ task: serializeTask(closed), msgId: null }));
       }
       // The interrupt is a live-only signal: best-effort while the
       // agent is online; an offline agent still learns the terminal status from
@@ -317,7 +317,7 @@ export function adminTaskRoutes() {
       const interrupt = host.sessions.isOnline(task.agentId) ? emitInterrupt(storage, host.sessions, task) : null;
       const closed = closeTask(storage, id);
       emitTaskUpsert(storage, host.sessions, closed); // carries status "closed" to the agent
-      return c.json(ok({ task: serializeTask(closed), outboxId: interrupt?.id ?? null }));
+      return c.json(ok({ task: serializeTask(closed), msgId: interrupt?.id ?? null }));
     },
   );
 
@@ -351,7 +351,7 @@ export function adminTaskRoutes() {
       const task = requireTask(storage, c.req.param("id"));
       const b = c.req.valid("json");
       const { cron, cronId } = emitCronUpsert(storage, host.sessions, task, { data: cronData(b, b.prompt) });
-      return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }), 201);
+      return c.json(ok({ cronId, taskId: task.id, msgId: cron.id }), 201);
     },
   );
 
@@ -374,7 +374,7 @@ export function adminTaskRoutes() {
       const existing = requireCron(storage, task.id, cronId);
       const b = c.req.valid("json");
       const { cron } = emitCronUpsert(storage, host.sessions, task, { cronId, data: cronData(b, b.prompt ?? existing.prompt) });
-      return c.json(ok({ cronId, taskId: task.id, outboxId: cron.id }));
+      return c.json(ok({ cronId, taskId: task.id, msgId: cron.id }));
     },
   );
 
@@ -392,7 +392,7 @@ export function adminTaskRoutes() {
       const cronId = c.req.param("cronId");
       requireCron(storage, task.id, cronId); // 404 on an unknown id
       const row = emitCronDelete(storage, host.sessions, task, cronId);
-      return c.json(ok({ cronId, taskId: task.id, outboxId: row.id }));
+      return c.json(ok({ cronId, taskId: task.id, msgId: row.id }));
     },
   );
 

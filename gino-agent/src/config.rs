@@ -31,7 +31,7 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::protocol::v2::ProvisioningEntry;
+use crate::protocol::frames::ProvisioningEntry;
 
 /// Default workspace directory (configurable; never a hardcoded Docker mount).
 const DEFAULT_WORKSPACE_DIR: &str = "/var/lib/gino-agent";
@@ -1037,7 +1037,7 @@ mod tests {
         // The retired `scheduler` block (`maxConcurrentTasks`/`maxQueuedTasks` —
         // execution is strictly serial) is likewise just an unknown field now.
         let overlay = ConfigOverlay::from_json(
-            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 2, "bogusField": 1, "scheduler": { "maxConcurrentTasks": 8, "maxQueuedTasks": 16 }, "engine": { "model": "m" } }"#,
+            r#"{ "wsUrl": "/agent/ws/a", "configUrl": "/agent/config/a", "outputUrl": "/agent/output/a", "protocolVersion": 1, "bogusField": 1, "scheduler": { "maxConcurrentTasks": 8, "maxQueuedTasks": 16 }, "engine": { "model": "m" } }"#,
         )
         .expect("unknown host config fields must be ignored, not rejected");
         assert_eq!(overlay.engine.model.as_deref(), Some("m"));
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn from_json_parses_global_provisioning_entries() {
-        use crate::protocol::v2::EntryKind;
+        use crate::protocol::frames::EntryKind;
 
         let mut config = Config::default();
         assert!(config.entries.is_empty());

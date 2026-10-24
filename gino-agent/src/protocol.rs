@@ -5,15 +5,13 @@
 //! (`container/gino-agent/src/types.ts`) and the host WS handler, so the Rust
 //! runner is a drop-in on the same socket.
 //!
-//! ## The live contract is v2
+//! ## The live contract
 //!
-//! The runner speaks `protocolVersion = 2` end to end
-//! (agent-architecture §10): the [`v2`] module is the live frame catalog —
+//! The runner speaks `protocolVersion = 1` end to end
+//! (agent-architecture §10): the [`frames`] module is the live frame catalog —
 //! correlation ids (`taskId`/`threadId`/`cronId`) at the **envelope top level**,
-//! business fields under `data`, and the `thread_*`/`cron_*` frames. The v1
-//! `output`/`idle`/`task_*` frame enums have been removed; only the
-//! shared HTTP registration DTOs ([`RegisterRequest`] et al.) remain at this top
-//! level.
+//! business fields under `data`, and the `thread_*`/`cron_*` frames. The HTTP
+//! registration DTOs ([`RegisterRequest`] et al.) live at this top level.
 //!
 //! ## Secrets
 //!
@@ -32,8 +30,7 @@ use serde_json::Value;
 // Protocol version
 // ---------------------------------------------------------------------------
 
-/// Negotiated wire-protocol version, bumped **1 → 2** for the task/cron/thread
-/// rebuild (agent-architecture §10). The agent sends it in
+/// Negotiated wire-protocol version (agent-architecture §10). The agent sends it in
 /// `POST /agent/register`; the host returns the version it will speak and rejects
 /// a mismatch with `register_error { reason: "unsupported_protocol" }`
 /// ([`RegisterError`]). Compatibility is additive-within-major: new optional
@@ -42,7 +39,13 @@ use serde_json::Value;
 /// Sent on the wire and gated by [`register`](crate::register): it rides the
 /// register request ([`RegisterRequest::protocol_version`]) and the negotiation
 /// refuses a host that cannot speak it (Lane PV).
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
+
+/// A deterministic delivery id for tests: a valid lowercase ULID ordered by `n`.
+#[cfg(test)]
+pub(crate) fn test_delivery_id(n: u32) -> String {
+    format!("01jab3x7k2m4n5p6q7r8s9{n:04}")
+}
 
 // ---------------------------------------------------------------------------
 // Redaction wrapper
@@ -173,7 +176,7 @@ mod tests {
             serde_json::to_value(&req).unwrap(),
             json!({
                 "registerToken": "enroll-tok",
-                "protocolVersion": 2,
+                "protocolVersion": 1,
                 "name": "worker-1",
                 "capabilities": ["claude"],
                 "version": "0.1.0",
@@ -225,10 +228,10 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Protocol v2 frames
+// Protocol frames
 // ---------------------------------------------------------------------------
 
-/// Protocol **v2** frame types (agent-architecture §10/§12/§14).
+/// Protocol frame types (agent-architecture §10/§12/§14).
 ///
 /// ## Envelope vs payload
 ///
@@ -238,7 +241,7 @@ mod tests {
 /// type-specific **business** payload only:
 ///
 /// ```json
-/// { "type": "thread_message", "outboxId": 43, "taskId": "t-1", "threadId": "c-9@1718",
+/// { "type": "thread_message", "outboxId": "01jab3x7k2m4n5p6q7r8s9t0vw", "taskId": "t-1", "threadId": "c-9@1718",
 ///   "data": { "seq": 3, "kind": "assistant_text", "content": "…" } }
 /// ```
 ///
@@ -259,10 +262,8 @@ mod tests {
 /// continuity contract.
 ///
 /// These frames are the **live** wire contract, driven end to end by
-/// `transport`/`executor`/`scheduler`/`runner`; the v1 frame enums they replaced
-/// have been removed. Enrollment ([`RegisterRequest`] et al.) is
-/// shared and unchanged.
-pub(crate) mod v2 {
+/// `transport`/`executor`/`scheduler`/`runner`.
+pub(crate) mod frames {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
@@ -521,10 +522,10 @@ pub(crate) mod v2 {
     // Frame enums
     // -----------------------------------------------------------------------
 
-    /// Inbound frames (host → agent), protocol v2. Internally tagged on `type`;
+    /// Inbound frames (host → agent). Internally tagged on `type`;
     /// correlation ids (`taskId`/`cronId`/`threadId`) and the delivery `msgId`
     /// ride the envelope, business fields sit under `data`. An unknown `type`
-    /// folds into [`InboundFrameV2::Unknown`] so a newer host's frames are
+    /// folds into [`InboundFrame::Unknown`] so a newer host's frames are
     /// ignored, not fatal.
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(
@@ -532,19 +533,19 @@ pub(crate) mod v2 {
         rename_all = "snake_case",
         rename_all_fields = "camelCase"
     )]
-    pub(crate) enum InboundFrameV2 {
+    pub(crate) enum InboundFrame {
         /// Seed or edit a task definition.
         TaskUpsert {
             task_id: String,
             data: TaskUpsertData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Remove a task (identity is the envelope `taskId`; no `data`).
         TaskDelete {
             task_id: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Seed or edit a cron/trigger under a task.
         CronUpsert {
@@ -552,14 +553,14 @@ pub(crate) mod v2 {
             cron_id: String,
             data: CronUpsertData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Remove a cron (identity is the envelope `taskId`/`cronId`; no `data`).
         CronDelete {
             task_id: String,
             cron_id: String,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// A user/system message for a task (optionally targeting a live thread).
         Message {
@@ -568,7 +569,7 @@ pub(crate) mod v2 {
             thread_id: Option<String>,
             data: MessageInData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Graceful cancel of the current turn (no kill). An absent `taskId`
         /// interrupts whatever is in flight; a present one scopes the cancel
@@ -577,44 +578,44 @@ pub(crate) mod v2 {
             #[serde(skip_serializing_if = "Option::is_none")]
             task_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Host requests runner/session shutdown.
         Close {
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Live config change (opaque overlay; merged by the config layer).
         ConfigUpdate {
             data: Value,
             #[serde(skip_serializing_if = "Option::is_none")]
-            msg_id: Option<i64>,
+            msg_id: Option<String>,
         },
         /// Host acknowledges receipt of the outbox row `id`.
-        Ack { id: i64 },
+        Ack { id: String },
         /// Forward-compat catch-all: an unknown `type` deserializes here so a
         /// receiver ignores frames added by a newer peer (additive-within-major).
         #[serde(other)]
         Unknown,
     }
 
-    /// Outbound frames (agent → host), protocol v2. Outbox-backed frames carry an
+    /// Outbound frames (agent → host). Outbox-backed frames carry an
     /// optional `outboxId`; the acks are sent raw. An unknown `type` folds into
-    /// [`OutboundFrameV2::Unknown`].
+    /// [`OutboundFrame::Unknown`].
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     #[serde(
         tag = "type",
         rename_all = "snake_case",
         rename_all_fields = "camelCase"
     )]
-    pub(crate) enum OutboundFrameV2 {
+    pub(crate) enum OutboundFrame {
         /// Terminal outcome of a thread execution (mirror → host `thread_runs`).
         ThreadResult {
             task_id: String,
             thread_id: String,
             data: ThreadResultData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            outbox_id: Option<i64>,
+            outbox_id: Option<String>,
         },
         /// One ordered transcript event (mirror → host `messages`).
         ThreadMessage {
@@ -622,7 +623,7 @@ pub(crate) mod v2 {
             thread_id: String,
             data: ThreadMessageData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            outbox_id: Option<i64>,
+            outbox_id: Option<String>,
         },
         /// Local scheduling-ledger summary for a cron (mirror → host `crons`).
         CronState {
@@ -630,19 +631,17 @@ pub(crate) mod v2 {
             cron_id: String,
             data: CronStateData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            outbox_id: Option<i64>,
+            outbox_id: Option<String>,
         },
         /// Liveness ping (interval from `config.heartbeatIntervalMs`).
         Heartbeat {
             data: HeartbeatData,
             #[serde(skip_serializing_if = "Option::is_none")]
-            outbox_id: Option<i64>,
+            outbox_id: Option<String>,
         },
-        /// Runner durably stored an inbound message `msgId`.
-        MsgAck { msg_id: i64 },
-        /// Runner acknowledges receipt of an inbound frame `id`.
-        Ack { id: i64 },
-        /// Forward-compat catch-all (see [`InboundFrameV2::Unknown`]).
+        /// Runner durably stored an inbound host frame `msgId`.
+        MsgAck { msg_id: String },
+        /// Forward-compat catch-all (see [`InboundFrame::Unknown`]).
         #[serde(other)]
         Unknown,
     }
@@ -653,20 +652,24 @@ pub(crate) mod v2 {
 
         use super::{
             AttachmentDescriptor, CronStateData, CronUpsertData, EntryKind, HeartbeatData,
-            InboundFrameV2, MessageInData, MessageKind, OutboundFrameV2, ProvisioningEntry,
+            InboundFrame, MessageInData, MessageKind, OutboundFrame, ProvisioningEntry,
             TaskUpsertData, ThreadMessageData, ThreadResultData, ThreadStatus,
         };
 
-        fn round_trip_inbound(frame: &InboundFrameV2) {
-            let json = serde_json::to_string(frame).unwrap();
-            let back: InboundFrameV2 = serde_json::from_str(&json).unwrap();
-            assert_eq!(*frame, back, "inbound v2 round-trip mismatch via {json}");
+        fn did(n: u32) -> String {
+            crate::protocol::test_delivery_id(n)
         }
 
-        fn round_trip_outbound(frame: &OutboundFrameV2) {
+        fn round_trip_inbound(frame: &InboundFrame) {
             let json = serde_json::to_string(frame).unwrap();
-            let back: OutboundFrameV2 = serde_json::from_str(&json).unwrap();
-            assert_eq!(*frame, back, "outbound v2 round-trip mismatch via {json}");
+            let back: InboundFrame = serde_json::from_str(&json).unwrap();
+            assert_eq!(*frame, back, "inbound round-trip mismatch via {json}");
+        }
+
+        fn round_trip_outbound(frame: &OutboundFrame) {
+            let json = serde_json::to_string(frame).unwrap();
+            let back: OutboundFrame = serde_json::from_str(&json).unwrap();
+            assert_eq!(*frame, back, "outbound round-trip mismatch via {json}");
         }
 
         fn sample_attachment() -> AttachmentDescriptor {
@@ -682,13 +685,27 @@ pub(crate) mod v2 {
         }
 
         #[test]
-        fn protocol_version_is_two() {
-            assert_eq!(crate::protocol::PROTOCOL_VERSION, 2);
+        fn protocol_version_is_one() {
+            assert_eq!(crate::protocol::PROTOCOL_VERSION, 1);
+        }
+
+        #[test]
+        fn delivery_ids_are_strings_and_integers_are_rejected() {
+            let msg_ack: OutboundFrame =
+                serde_json::from_value(json!({ "type": "msg_ack", "msgId": did(1) })).unwrap();
+            assert_eq!(msg_ack, OutboundFrame::MsgAck { msg_id: did(1) });
+            assert!(
+                serde_json::from_value::<InboundFrame>(json!({ "type": "close", "msgId": 4 }))
+                    .is_err()
+            );
+            assert!(
+                serde_json::from_value::<InboundFrame>(json!({ "type": "ack", "id": 9 })).is_err()
+            );
         }
 
         #[test]
         fn thread_message_splits_envelope_and_data() {
-            let frame = OutboundFrameV2::ThreadMessage {
+            let frame = OutboundFrame::ThreadMessage {
                 task_id: "t-1".to_owned(),
                 thread_id: "c-9@1718".to_owned(),
                 data: ThreadMessageData {
@@ -702,7 +719,7 @@ pub(crate) mod v2 {
                     tool_use_id: None,
                     parent_tool_use_id: None,
                 },
-                outbox_id: Some(43),
+                outbox_id: Some(did(43)),
             };
             assert_eq!(
                 serde_json::to_value(&frame).unwrap(),
@@ -710,7 +727,7 @@ pub(crate) mod v2 {
                     "type": "thread_message",
                     "taskId": "t-1",
                     "threadId": "c-9@1718",
-                    "outboxId": 43,
+                    "outboxId": did(43),
                     "data": {
                         "seq": 3,
                         "kind": "assistant_text",
@@ -728,7 +745,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn thread_message_tool_event_round_trips() {
-            let frame = OutboundFrameV2::ThreadMessage {
+            let frame = OutboundFrame::ThreadMessage {
                 task_id: "t-1".to_owned(),
                 thread_id: "th-2".to_owned(),
                 data: ThreadMessageData {
@@ -749,7 +766,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn thread_result_keeps_business_fields_in_data() {
-            let frame = OutboundFrameV2::ThreadResult {
+            let frame = OutboundFrame::ThreadResult {
                 task_id: "t-1".to_owned(),
                 thread_id: "c-9@1718".to_owned(),
                 data: ThreadResultData {
@@ -762,7 +779,7 @@ pub(crate) mod v2 {
                     final_seq: 9,
                     attachments: Some(vec![sample_attachment()]),
                 },
-                outbox_id: Some(1),
+                outbox_id: Some(did(1)),
             };
             let value = serde_json::to_value(&frame).unwrap();
             assert_eq!(value["type"], json!("thread_result"));
@@ -782,7 +799,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn thread_result_failure_carries_reason_and_drops_session() {
-            let frame = OutboundFrameV2::ThreadResult {
+            let frame = OutboundFrame::ThreadResult {
                 task_id: "t-1".to_owned(),
                 thread_id: "c-9@1718".to_owned(),
                 data: ThreadResultData {
@@ -811,7 +828,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn cron_state_ids_in_envelope_ledger_in_data() {
-            let frame = OutboundFrameV2::CronState {
+            let frame = OutboundFrame::CronState {
                 task_id: "t-1".to_owned(),
                 cron_id: "cr-1".to_owned(),
                 data: CronStateData {
@@ -825,7 +842,7 @@ pub(crate) mod v2 {
                     skipped_count: 1,
                     last_status: Some("dispatched".to_owned()),
                 },
-                outbox_id: Some(2),
+                outbox_id: Some(did(2)),
             };
             let value = serde_json::to_value(&frame).unwrap();
             assert_eq!(value["type"], json!("cron_state"));
@@ -841,7 +858,7 @@ pub(crate) mod v2 {
         #[test]
         fn heartbeat_and_acks_round_trip() {
             assert_eq!(
-                serde_json::to_value(OutboundFrameV2::Heartbeat {
+                serde_json::to_value(OutboundFrame::Heartbeat {
                     data: HeartbeatData {
                         active_threads: Some(2),
                     },
@@ -851,22 +868,17 @@ pub(crate) mod v2 {
                 json!({ "type": "heartbeat", "data": { "activeThreads": 2 } })
             );
             assert_eq!(
-                serde_json::to_value(OutboundFrameV2::MsgAck { msg_id: 5 }).unwrap(),
-                json!({ "type": "msg_ack", "msgId": 5 })
-            );
-            assert_eq!(
-                serde_json::to_value(OutboundFrameV2::Ack { id: 11 }).unwrap(),
-                json!({ "type": "ack", "id": 11 })
+                serde_json::to_value(OutboundFrame::MsgAck { msg_id: did(5) }).unwrap(),
+                json!({ "type": "msg_ack", "msgId": did(5) })
             );
             for frame in [
-                OutboundFrameV2::Heartbeat {
+                OutboundFrame::Heartbeat {
                     data: HeartbeatData {
                         active_threads: None,
                     },
-                    outbox_id: Some(1),
+                    outbox_id: Some(did(1)),
                 },
-                OutboundFrameV2::MsgAck { msg_id: 5 },
-                OutboundFrameV2::Ack { id: 11 },
+                OutboundFrame::MsgAck { msg_id: did(5) },
             ] {
                 round_trip_outbound(&frame);
             }
@@ -874,14 +886,14 @@ pub(crate) mod v2 {
 
         #[test]
         fn inbound_message_carries_ids_in_envelope() {
-            let frame = InboundFrameV2::Message {
+            let frame = InboundFrame::Message {
                 task_id: "t-1".to_owned(),
                 thread_id: Some("c-9@1718".to_owned()),
                 data: MessageInData {
                     text: "hi".to_owned(),
                     attachments: Some(vec![sample_attachment()]),
                 },
-                msg_id: Some(2),
+                msg_id: Some(did(2)),
             };
             assert_eq!(
                 serde_json::to_value(&frame).unwrap(),
@@ -889,7 +901,7 @@ pub(crate) mod v2 {
                     "type": "message",
                     "taskId": "t-1",
                     "threadId": "c-9@1718",
-                    "msgId": 2,
+                    "msgId": did(2),
                     "data": {
                         "text": "hi",
                         "attachments": [{
@@ -909,7 +921,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn inbound_message_omits_absent_thread_id() {
-            let frame = InboundFrameV2::Message {
+            let frame = InboundFrame::Message {
                 task_id: "t-1".to_owned(),
                 thread_id: None,
                 data: MessageInData {
@@ -927,7 +939,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn inbound_task_frames_round_trip() {
-            let upsert = InboundFrameV2::TaskUpsert {
+            let upsert = InboundFrame::TaskUpsert {
                 task_id: "t-1".to_owned(),
                 data: TaskUpsertData {
                     name: Some("nightly".to_owned()),
@@ -939,18 +951,18 @@ pub(crate) mod v2 {
                     meta: None,
                     entries: None,
                 },
-                msg_id: Some(1),
+                msg_id: Some(did(1)),
             };
             assert_eq!(
                 serde_json::to_value(&upsert).unwrap(),
                 json!({
                     "type": "task_upsert",
                     "taskId": "t-1",
-                    "msgId": 1,
+                    "msgId": did(1),
                     "data": { "name": "nightly", "kind": "job", "status": "active" }
                 })
             );
-            let delete = InboundFrameV2::TaskDelete {
+            let delete = InboundFrame::TaskDelete {
                 task_id: "t-1".to_owned(),
                 msg_id: None,
             };
@@ -1028,7 +1040,7 @@ pub(crate) mod v2 {
 
         #[test]
         fn inbound_cron_frames_round_trip() {
-            let upsert = InboundFrameV2::CronUpsert {
+            let upsert = InboundFrame::CronUpsert {
                 task_id: "t-1".to_owned(),
                 cron_id: "cr-1".to_owned(),
                 data: CronUpsertData {
@@ -1059,14 +1071,14 @@ pub(crate) mod v2 {
                     }
                 })
             );
-            let delete = InboundFrameV2::CronDelete {
+            let delete = InboundFrame::CronDelete {
                 task_id: "t-1".to_owned(),
                 cron_id: "cr-1".to_owned(),
-                msg_id: Some(8),
+                msg_id: Some(did(8)),
             };
             assert_eq!(
                 serde_json::to_value(&delete).unwrap(),
-                json!({ "type": "cron_delete", "taskId": "t-1", "cronId": "cr-1", "msgId": 8 })
+                json!({ "type": "cron_delete", "taskId": "t-1", "cronId": "cr-1", "msgId": did(8) })
             );
             round_trip_inbound(&upsert);
             round_trip_inbound(&delete);
@@ -1074,20 +1086,20 @@ pub(crate) mod v2 {
 
         #[test]
         fn inbound_control_frames_round_trip() {
-            let config = InboundFrameV2::ConfigUpdate {
+            let config = InboundFrame::ConfigUpdate {
                 data: json!({ "engine": { "model": "claude-opus-4-8" } }),
-                msg_id: Some(3),
+                msg_id: Some(did(3)),
             };
             assert_eq!(
                 serde_json::to_value(&config).unwrap(),
                 json!({
                     "type": "config_update",
-                    "msgId": 3,
+                    "msgId": did(3),
                     "data": { "engine": { "model": "claude-opus-4-8" } }
                 })
             );
             assert_eq!(
-                serde_json::to_value(InboundFrameV2::Interrupt {
+                serde_json::to_value(InboundFrame::Interrupt {
                     task_id: None,
                     msg_id: None
                 })
@@ -1095,22 +1107,24 @@ pub(crate) mod v2 {
                 json!({ "type": "interrupt" })
             );
             assert_eq!(
-                serde_json::to_value(InboundFrameV2::Ack { id: 9 }).unwrap(),
-                json!({ "type": "ack", "id": 9 })
+                serde_json::to_value(InboundFrame::Ack { id: did(9) }).unwrap(),
+                json!({ "type": "ack", "id": did(9) })
             );
             for frame in [
-                InboundFrameV2::Interrupt {
+                InboundFrame::Interrupt {
                     task_id: None,
                     msg_id: None,
                 },
-                InboundFrameV2::Interrupt {
+                InboundFrame::Interrupt {
                     task_id: Some("t-1".to_owned()),
-                    msg_id: Some(6),
+                    msg_id: Some(did(6)),
                 },
-                InboundFrameV2::Close { msg_id: Some(4) },
-                InboundFrameV2::Close { msg_id: None },
+                InboundFrame::Close {
+                    msg_id: Some(did(4)),
+                },
+                InboundFrame::Close { msg_id: None },
                 config,
-                InboundFrameV2::Ack { id: 9 },
+                InboundFrame::Ack { id: did(9) },
             ] {
                 round_trip_inbound(&frame);
             }
@@ -1119,21 +1133,20 @@ pub(crate) mod v2 {
         #[test]
         fn interrupt_task_id_is_additive() {
             // Scoped form: envelope `taskId` lands in `task_id`.
-            let scoped: InboundFrameV2 =
+            let scoped: InboundFrame =
                 serde_json::from_str(r#"{ "type": "interrupt", "taskId": "t-1" }"#).unwrap();
             assert_eq!(
                 scoped,
-                InboundFrameV2::Interrupt {
+                InboundFrame::Interrupt {
                     task_id: Some("t-1".to_owned()),
                     msg_id: None,
                 }
             );
             // Legacy form: an interrupt without `taskId` must still parse.
-            let global: InboundFrameV2 =
-                serde_json::from_str(r#"{ "type": "interrupt" }"#).unwrap();
+            let global: InboundFrame = serde_json::from_str(r#"{ "type": "interrupt" }"#).unwrap();
             assert_eq!(
                 global,
-                InboundFrameV2::Interrupt {
+                InboundFrame::Interrupt {
                     task_id: None,
                     msg_id: None,
                 }
@@ -1143,10 +1156,10 @@ pub(crate) mod v2 {
         #[test]
         fn unknown_type_is_tolerated() {
             let raw = r#"{ "type": "some_future_frame", "taskId": "t", "data": { "x": 1 } }"#;
-            let inbound: InboundFrameV2 = serde_json::from_str(raw).unwrap();
-            assert_eq!(inbound, InboundFrameV2::Unknown);
-            let outbound: OutboundFrameV2 = serde_json::from_str(raw).unwrap();
-            assert_eq!(outbound, OutboundFrameV2::Unknown);
+            let inbound: InboundFrame = serde_json::from_str(raw).unwrap();
+            assert_eq!(inbound, InboundFrame::Unknown);
+            let outbound: OutboundFrame = serde_json::from_str(raw).unwrap();
+            assert_eq!(outbound, OutboundFrame::Unknown);
         }
 
         #[test]
@@ -1156,12 +1169,12 @@ pub(crate) mod v2 {
                 "type": "thread_message",
                 "taskId": "t-1",
                 "threadId": "th-1",
-                "outboxId": 5,
+                "outboxId": "01jab3x7k2m4n5p6q7r8s90005",
                 "futureEnvelopeField": true,
                 "data": { "seq": 1, "kind": "status", "futureDataField": 42 }
             }"#;
-            let frame: OutboundFrameV2 = serde_json::from_str(raw).unwrap();
-            let OutboundFrameV2::ThreadMessage { task_id, data, .. } = frame else {
+            let frame: OutboundFrame = serde_json::from_str(raw).unwrap();
+            let OutboundFrame::ThreadMessage { task_id, data, .. } = frame else {
                 panic!("expected thread_message, parsed something else");
             };
             assert_eq!(task_id, "t-1");

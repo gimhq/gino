@@ -83,7 +83,7 @@ const msg = (method: string, path: string, body?: unknown): Promise<Res> =>
 async function registerAgent(name: string): Promise<{ status: number; agentId: string; connectToken: string; config: any }> {
   const r = await http("POST", "/agent/register", {
     headers: jsonHeaders,
-    body: JSON.stringify({ registerToken: REG, protocolVersion: 2, source: "manual", name, capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: REG, protocolVersion: 1, source: "manual", name, capabilities: ["claude"] }),
   });
   return { status: r.status, agentId: r.json?.agentId, connectToken: r.json?.connectToken, config: r.json?.config };
 }
@@ -132,7 +132,7 @@ async function testHealth(): Promise<void> {
 async function testAuthGates(): Promise<void> {
   group("auth gates (fail-closed)");
   await step("register w/ wrong token → 401", async () => {
-    const r = await http("POST", "/agent/register", { headers: jsonHeaders, body: JSON.stringify({ registerToken: "WRONG", protocolVersion: 2, capabilities: ["claude"] }) });
+    const r = await http("POST", "/agent/register", { headers: jsonHeaders, body: JSON.stringify({ registerToken: "WRONG", protocolVersion: 1, capabilities: ["claude"] }) });
     check("401", r.status === 401, `status ${r.status}`);
   });
   await step("admin w/o bearer → 401", async () => {
@@ -434,7 +434,7 @@ async function testCrons(): Promise<void> {
     });
     assert(r.status === 201, `status ${r.status} body ${r.text.slice(0, 200)}`);
     cronId = r.json?.data?.cronId;
-    check("cronId + outboxId", typeof cronId === "string" && typeof r.json?.data?.outboxId === "number", JSON.stringify(r.json?.data));
+    check("cronId + ULID msgId", typeof cronId === "string" && /^[0-7][0-9a-hjkmnp-tv-z]{25}$/.test(String(r.json?.data?.msgId)), JSON.stringify(r.json?.data));
   });
   await step("host mirror populates from the agent's cron_state (proves it FIRED)", async () => {
     assert(taskId, "no task");

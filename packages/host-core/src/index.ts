@@ -71,7 +71,6 @@ export type {
   BlobLeaf,
   CronPromptUpsert,
   CronStateUpsert,
-  MarkAckedOptions,
   StatusGuard,
   StoredBlobRef,
   TaskListFilter,

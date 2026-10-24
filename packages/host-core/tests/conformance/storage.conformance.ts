@@ -290,34 +290,20 @@ export function describeOutboxRepoConformance(target: ConformanceTarget, harness
   const { describe, test, expect } = harness;
   describe(`[${target.name}] OutboxRepo`, () => {
     const { s } = useStorage(target, harness);
-    const frame = (agentId: string, type = "task_upsert") => ({ agentId, type, dataJson: {} });
+    let seq = 0;
+    const nextId = () => `01jab3x7k2m4n5p6q7r8s9${String(seq++).padStart(4, "0")}`;
+    const frame = (agentId: string, type = "task_upsert", id = nextId()) => ({ id, agentId, type, dataJson: {} });
 
-    test("ids are strictly monotonic across interleaved agents and returned on append", () => {
-      const ids = [
-        s().outbox.append(frame("a1")),
-        s().outbox.append(frame("a2")),
-        s().outbox.append(frame("a1")),
-        s().outbox.append(frame("a2")),
-      ].map(r => r.id);
-      for (let i = 1; i < ids.length; i++) {
-        expect(ids[i]!).toBeGreaterThan(ids[i - 1]!);
-      }
-      expect(new Set(ids).size).toBe(4);
-      const first = s().outbox.append(frame("a1"));
-      expect(first).toMatchObject({ agentId: "a1", ackedAt: null, taskId: null, createdAt: expect.any(Number) });
+    test("append stores and returns the caller's id", () => {
+      const row = s().outbox.append(frame("a1", "task_upsert", "01jab3x7k2m4n5p6q7r8s9t0vw"));
+      expect(row).toMatchObject({ id: "01jab3x7k2m4n5p6q7r8s9t0vw", agentId: "a1", ackedAt: null, taskId: null, createdAt: expect.any(Number) });
     });
 
-    test("ids are never reused after a delete", () => {
-      const a = s().outbox.append(frame("a1"));
-      expect(s().outbox.purge("a1")).toBe(1);
-      expect(s().outbox.append(frame("a1")).id).toBeGreaterThan(a.id);
-    });
-
-    test("listUnacked replays one agent's rows ascending by id", () => {
-      const r1 = s().outbox.append(frame("a1"));
-      s().outbox.append(frame("a2"));
-      const r3 = s().outbox.append(frame("a1"));
-      expect(s().outbox.listUnacked("a1").map(r => r.id)).toEqual([r1.id, r3.id]);
+    test("listUnacked replays one agent's rows ascending by id, not by insertion order", () => {
+      const late = s().outbox.append(frame("a1", "task_upsert", "01jab3x7k2m4n5p6q7r8s9zzzz"));
+      s().outbox.append(frame("a2", "task_upsert", "01jab3x7k2m4n5p6q7r8s9g000"));
+      const early = s().outbox.append(frame("a1", "task_upsert", "01jab3x7k2m4n5p6q7r8s90000"));
+      expect(s().outbox.listUnacked("a1").map(r => r.id)).toEqual([early.id, late.id]);
       expect(s().outbox.listAllUnacked().map(r => r.agentId)).toEqual(["a1", "a2", "a1"]);
     });
 
@@ -327,17 +313,7 @@ export function describeOutboxRepoConformance(target: ConformanceTarget, harness
       expect(s().outbox.listUnacked("a1")).toHaveLength(1);
       expect(s().outbox.markAcked("a1", r.id, 1_000)).toBe(true);
       expect(s().outbox.listUnacked("a1")).toHaveLength(0);
-      expect(s().outbox.markAcked("a1", 999_999, 1_000)).toBe(false);
-    });
-
-    test("ack (excludeType: message) does not ack a message row; msg_ack acks any type", () => {
-      const msg = s().outbox.append(frame("a1", "message"));
-      const upsert = s().outbox.append(frame("a1", "task_upsert"));
-      expect(s().outbox.markAcked("a1", msg.id, 1_000, { excludeType: "message" })).toBe(false);
-      expect(s().outbox.listUnacked("a1").map(r => r.id)).toEqual([msg.id, upsert.id]);
-      expect(s().outbox.markAcked("a1", upsert.id, 1_000, { excludeType: "message" })).toBe(true);
-      expect(s().outbox.markAcked("a1", msg.id, 2_000)).toBe(true);
-      expect(s().outbox.listUnacked("a1")).toEqual([]);
+      expect(s().outbox.markAcked("a1", "01jab3x7k2m4n5p6q7r8s9xxxx", 1_000)).toBe(false);
     });
 
     test("purge deletes only the agent's unacked rows", () => {

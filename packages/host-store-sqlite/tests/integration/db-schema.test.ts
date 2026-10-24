@@ -232,18 +232,20 @@ describe("v2 host schema (§6)", () => {
     }).run();
 
     const first = db.insert(outbox).values({
+      id: "01jab3x7k2m4n5p6q7r8s9t0v0",
       agentId,
       type: "task.assign",
       dataJson: { taskId: "t1" },
     }).returning().get();
     const second = db.insert(outbox).values({
+      id: "01jab3x7k2m4n5p6q7r8s9t0v1",
       agentId,
       type: "task.cancel",
       dataJson: { taskId: "t1" },
     }).returning().get();
 
-    expect(typeof first?.id).toBe("number");
-    expect(second!.id).toBeGreaterThan(first!.id);
+    expect(first?.id).toBe("01jab3x7k2m4n5p6q7r8s9t0v0");
+    expect(second?.id).toBe("01jab3x7k2m4n5p6q7r8s9t0v1");
     expect(first?.dataJson).toEqual({ taskId: "t1" });
   });
 

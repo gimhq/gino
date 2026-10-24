@@ -71,7 +71,7 @@ function registerReq(token: string = REGISTER_TOKEN): Request {
   return new Request("http://local/api/agent/register", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ registerToken: token, protocolVersion: 2, source: "manual", capabilities: ["claude"] }),
+    body: JSON.stringify({ registerToken: token, protocolVersion: 1, source: "manual", capabilities: ["claude"] }),
   });
 }
 
