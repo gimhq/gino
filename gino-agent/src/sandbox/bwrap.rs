@@ -44,13 +44,24 @@ pub(crate) struct HostRoot {
     pub(crate) resolv_conf_outside_etc: Option<PathBuf>,
 }
 
+/// One global skill entry, bound at `<engine_home>/skills/<name>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SkillBind {
+    /// Entry name under `<global>/skills`.
+    pub(crate) name: OsString,
+    /// Canonical target of the entry (symlinks followed).
+    pub(crate) source: PathBuf,
+    /// Whether `source` is a directory (otherwise a file).
+    pub(crate) is_dir: bool,
+}
+
 /// Which provisioning globals exist under the global config dir.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProvisionedGlobals {
     /// `<global>/CLAUDE.md` is a file.
     pub(crate) claude_md: bool,
-    /// `<global>/skills` is a directory.
-    pub(crate) skills: bool,
+    /// Resolved `<global>/skills` entries, sorted by name; dangling ones skipped.
+    pub(crate) skills: Vec<SkillBind>,
 }
 
 impl ProvisionedGlobals {
@@ -58,9 +69,30 @@ impl ProvisionedGlobals {
     pub(crate) fn inspect(global_config_dir: Option<&Path>) -> Self {
         global_config_dir.map_or_else(Self::default, |dir| Self {
             claude_md: dir.join("CLAUDE.md").is_file(),
-            skills: dir.join("skills").is_dir(),
+            skills: inspect_skills(&dir.join("skills")),
         })
     }
+}
+
+/// Resolve every entry of `skills_dir` to its canonical file or dir target.
+fn inspect_skills(skills_dir: &Path) -> Vec<SkillBind> {
+    let Ok(entries) = fs::read_dir(skills_dir) else {
+        return Vec::new();
+    };
+    let mut skills: Vec<SkillBind> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let source = fs::canonicalize(entry.path()).ok()?;
+            let meta = fs::metadata(&source).ok()?;
+            (meta.is_dir() || meta.is_file()).then(|| SkillBind {
+                name: entry.file_name(),
+                source,
+                is_dir: meta.is_dir(),
+            })
+        })
+        .collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
 }
 
 /// Everything the sandbox mounts for one engine run (all paths absolute).
@@ -98,12 +130,13 @@ impl SandboxLayout {
             .map(|dir| dir.join("CLAUDE.md"))
     }
 
-    /// Global `skills/` bind source, when it will be mounted.
-    fn global_skills(&self) -> Option<PathBuf> {
-        self.global_config_dir
-            .as_ref()
-            .filter(|_| self.globals.skills)
-            .map(|dir| dir.join("skills"))
+    /// Global skill binds, empty when no global config dir is set.
+    fn global_skills(&self) -> &[SkillBind] {
+        if self.global_config_dir.is_some() {
+            &self.globals.skills
+        } else {
+            &[]
+        }
     }
 }
 
@@ -168,6 +201,30 @@ fn push_root(args: &mut Vec<OsString>, host: &HostRoot) {
     }
 }
 
+/// Top-level dirs under the writable `/tmp` and `$HOME` tmpfs mounts that only
+/// hold the parents of bind targets; each gets its own tmpfs, remounted
+/// read-only after the binds so those parents are not writable.
+fn tmpfs_shadows(layout: &SandboxLayout) -> Vec<PathBuf> {
+    let roots = [Path::new("/tmp"), layout.home.as_path()];
+    let targets: Vec<&Path> = std::iter::once(layout.work_dir.as_path())
+        .chain(layout.read_paths.iter().map(PathBuf::as_path))
+        .chain(layout.write_paths.iter().map(PathBuf::as_path))
+        .collect();
+    let mut shadows: Vec<PathBuf> = targets
+        .iter()
+        .flat_map(|target| {
+            roots.iter().filter_map(|root| {
+                let first = target.strip_prefix(root).ok()?.components().next()?;
+                Some(root.join(first))
+            })
+        })
+        .filter(|shadow| !roots.contains(&shadow.as_path()) && !targets.contains(&shadow.as_path()))
+        .collect();
+    shadows.sort();
+    shadows.dedup();
+    shadows
+}
+
 /// Build the full `bwrap` argv (without the program) that runs `inner`.
 pub(crate) fn bwrap_args(
     layout: &SandboxLayout,
@@ -203,6 +260,10 @@ pub(crate) fn bwrap_args(
             layout.home.as_os_str(),
         ],
     );
+    let shadows = tmpfs_shadows(layout);
+    for shadow in &shadows {
+        push(&mut args, &["--tmpfs".as_ref(), shadow.as_os_str()]);
+    }
 
     push_root(&mut args, host);
     ro_bind(&mut args, Path::new("/etc"));
@@ -236,12 +297,26 @@ pub(crate) fn bwrap_args(
             &["--ro-bind".as_ref(), src.as_os_str(), dest.as_os_str()],
         );
     }
-    if let Some(src) = layout.global_skills() {
-        let dest = layout.engine_home.join("skills");
+    let skills_dir = layout.engine_home.join("skills");
+    if !layout.global_skills().is_empty() {
+        ro_bind(&mut args, &skills_dir);
+    }
+    for skill in layout.global_skills() {
+        let dest = skills_dir.join(&skill.name);
         push(
             &mut args,
-            &["--ro-bind".as_ref(), src.as_os_str(), dest.as_os_str()],
+            &[
+                "--ro-bind".as_ref(),
+                skill.source.as_os_str(),
+                dest.as_os_str(),
+            ],
         );
+    }
+
+    // Everything outside the writable mounts above is read-only.
+    push(&mut args, &["--remount-ro".as_ref(), "/".as_ref()]);
+    for shadow in &shadows {
+        push(&mut args, &["--remount-ro".as_ref(), shadow.as_os_str()]);
     }
 
     push(
@@ -261,8 +336,21 @@ pub(crate) fn prepare_engine_home(layout: &SandboxLayout) -> std::io::Result<()>
             .append(true)
             .open(layout.engine_home.join("CLAUDE.md"))?;
     }
-    if layout.global_skills().is_some() {
-        fs::create_dir_all(layout.engine_home.join("skills"))?;
+    let skills = layout.global_skills();
+    if !skills.is_empty() {
+        let skills_dir = layout.engine_home.join("skills");
+        fs::create_dir_all(&skills_dir)?;
+        for skill in skills {
+            let target = skills_dir.join(&skill.name);
+            if skill.is_dir {
+                fs::create_dir_all(&target)?;
+            } else {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&target)?;
+            }
+        }
     }
     Ok(())
 }
@@ -370,8 +458,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        HostRoot, ProvisionedGlobals, ROOT_DIRS, RootEntry, SandboxLayout, bwrap_args, engine_home,
-        ensure_available, host_root, prepare_engine_home, probe, probe_args, resolve_binary,
+        HostRoot, ProvisionedGlobals, ROOT_DIRS, RootEntry, SandboxLayout, SkillBind, bwrap_args,
+        engine_home, ensure_available, host_root, prepare_engine_home, probe, probe_args,
+        resolve_binary,
     };
     use crate::sandbox::NetworkMode;
 
@@ -387,6 +476,21 @@ mod tests {
         }
     }
 
+    fn skills() -> Vec<SkillBind> {
+        vec![
+            SkillBind {
+                name: "alpha".into(),
+                source: "/ws/store/alpha/h1".into(),
+                is_dir: true,
+            },
+            SkillBind {
+                name: "beta.md".into(),
+                source: "/ws/store/beta.md/h2".into(),
+                is_dir: false,
+            },
+        ]
+    }
+
     fn layout() -> SandboxLayout {
         let work_dir = PathBuf::from("/ws/threads/t1");
         SandboxLayout {
@@ -396,7 +500,7 @@ mod tests {
             global_config_dir: Some("/ws/global".into()),
             globals: ProvisionedGlobals {
                 claude_md: true,
-                skills: true,
+                skills: skills(),
             },
             engine_binary: "/opt/claude/bin/claude".into(),
             agent_exe: "/opt/gino/gino-agent".into(),
@@ -566,11 +670,35 @@ mod tests {
             &a,
             &[
                 "--ro-bind",
-                "/ws/global/skills",
+                "/ws/threads/t1/.engine-home/skills",
                 "/ws/threads/t1/.engine-home/skills",
             ],
         );
-        assert!(ro1 < ro2 && ro2 < work && work < rw1 && rw1 < md && md < skills);
+        let alpha = pos(
+            &a,
+            &[
+                "--ro-bind",
+                "/ws/store/alpha/h1",
+                "/ws/threads/t1/.engine-home/skills/alpha",
+            ],
+        );
+        let beta = pos(
+            &a,
+            &[
+                "--ro-bind",
+                "/ws/store/beta.md/h2",
+                "/ws/threads/t1/.engine-home/skills/beta.md",
+            ],
+        );
+        assert!(
+            ro1 < ro2
+                && ro2 < work
+                && work < rw1
+                && rw1 < md
+                && md < skills
+                && skills < alpha
+                && alpha < beta
+        );
         assert!(find(&a, &["--bind", "/data/ro1"]).is_none());
         assert!(find(&a, &["--ro-bind", "/data/rw1"]).is_none());
     }
@@ -581,17 +709,20 @@ mod tests {
         l.globals.claude_md = false;
         let a = args(&l, &host());
         assert!(!a.iter().any(|x| x.ends_with("CLAUDE.md")));
-        pos(&a, &["--ro-bind", "/ws/global/skills"]);
+        pos(&a, &["--ro-bind", "/ws/store/alpha/h1"]);
 
         l.globals = ProvisionedGlobals {
             claude_md: true,
-            skills: false,
+            skills: Vec::new(),
         };
         let a = args(&l, &host());
-        assert!(!a.iter().any(|x| x.ends_with("skills")));
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("skills") || x.starts_with("/ws/store"))
+        );
         pos(&a, &["--ro-bind", "/ws/global/CLAUDE.md"]);
 
-        l.globals.skills = true;
+        l.globals.skills = skills();
         l.global_config_dir = None;
         let a = args(&l, &host());
         assert!(!a.iter().any(|x| x.contains(".engine-home")));
@@ -610,9 +741,65 @@ mod tests {
     }
 
     #[test]
+    fn parents_under_writable_tmpfs_get_read_only_shadows() {
+        let mut l = layout();
+        l.work_dir = "/tmp/e2e/ws/threads/t1".into();
+        l.cwd = l.work_dir.clone();
+        l.engine_home = engine_home(&l.work_dir);
+        l.read_paths = vec!["/home/sandbox/data/ro".into()];
+        l.write_paths = vec!["/tmp/rw".into(), "/tmp/e2e/rw".into()];
+        let a = args(&l, &host());
+        let home = pos(&a, &["--tmpfs", "/home/sandbox"]);
+        let e2e = pos(&a, &["--tmpfs", "/tmp/e2e"]);
+        let data = pos(&a, &["--tmpfs", "/home/sandbox/data"]);
+        assert_eq!(a.iter().filter(|x| *x == "--tmpfs").count(), 4);
+        let first_bind = a.iter().position(|x| x == "--ro-bind").unwrap();
+        assert!(home < data && data < e2e && e2e < first_bind);
+
+        let root = pos(&a, &["--remount-ro", "/"]);
+        let ro_e2e = pos(&a, &["--remount-ro", "/tmp/e2e"]);
+        let ro_data = pos(&a, &["--remount-ro", "/home/sandbox/data"]);
+        assert!(root < ro_data && ro_data < ro_e2e);
+        assert_eq!(a[ro_e2e + 2], "--chdir");
+        assert_eq!(a.iter().filter(|x| *x == "--remount-ro").count(), 3);
+        // A bind target directly under a tmpfs root needs no shadow.
+        assert!(find(&a, &["--tmpfs", "/tmp/rw"]).is_none());
+    }
+
+    #[test]
+    fn root_is_remounted_read_only_after_every_mount() {
+        let a = args(&layout(), &host());
+        let remount = pos(&a, &["--remount-ro", "/"]);
+        assert_eq!(find(&a[remount + 1..], &["--remount-ro", "/"]), None);
+        assert_eq!(a[remount + 2], "--chdir");
+        let mount_flags = [
+            "--ro-bind",
+            "--bind",
+            "--symlink",
+            "--tmpfs",
+            "--proc",
+            "--dev",
+        ];
+        let last_mount = a
+            .iter()
+            .rposition(|x| mount_flags.contains(&x.as_str()))
+            .unwrap();
+        assert!(last_mount < remount);
+    }
+
+    #[test]
     fn nothing_else_of_the_host_is_mounted() {
         let a = args(&layout(), &host());
-        for forbidden in ["/run", "/var", "/ws", "/ws/threads", "/ws/global", "/root"] {
+        for forbidden in [
+            "/run",
+            "/var",
+            "/ws",
+            "/ws/threads",
+            "/ws/global",
+            "/ws/global/skills",
+            "/ws/store",
+            "/root",
+        ] {
             assert!(!a.iter().any(|x| x == forbidden), "{forbidden} in {a:?}");
         }
         assert!(
@@ -632,11 +819,18 @@ mod tests {
         let md = l.engine_home.join("CLAUDE.md");
         assert!(md.is_file());
         assert_eq!(fs::metadata(&md).unwrap().len(), 0);
-        assert!(l.engine_home.join("skills").is_dir());
+        let skills = l.engine_home.join("skills");
+        assert!(skills.join("alpha").is_dir());
+        let beta = skills.join("beta.md");
+        assert!(beta.is_file());
+        assert_eq!(fs::metadata(&beta).unwrap().len(), 0);
+        assert_eq!(fs::read_dir(&skills).unwrap().count(), 2);
         // Idempotent and non-truncating.
         fs::write(&md, "x").unwrap();
+        fs::write(&beta, "y").unwrap();
         prepare_engine_home(&l).unwrap();
         assert_eq!(fs::read_to_string(&md).unwrap(), "x");
+        assert_eq!(fs::read_to_string(&beta).unwrap(), "y");
 
         let tmp = tempfile::tempdir().unwrap();
         l.work_dir = tmp.path().join("t2");
@@ -655,13 +849,44 @@ mod tests {
             ProvisionedGlobals::default()
         );
         fs::write(tmp.path().join("CLAUDE.md"), "").unwrap();
-        fs::create_dir(tmp.path().join("skills")).unwrap();
+        let skills = tmp.path().join("skills");
+        fs::create_dir(&skills).unwrap();
         assert_eq!(
             ProvisionedGlobals::inspect(Some(tmp.path())),
             ProvisionedGlobals {
                 claude_md: true,
-                skills: true
+                skills: Vec::new(),
             }
+        );
+
+        let store = fs::canonicalize(tmp.path()).unwrap().join("store");
+        fs::create_dir_all(store.join("zeta/h1")).unwrap();
+        fs::write(store.join("zeta/h1/SKILL.md"), "").unwrap();
+        fs::create_dir_all(store.join("note")).unwrap();
+        fs::write(store.join("note/h2"), "").unwrap();
+        symlink(store.join("zeta/h1"), skills.join("zeta")).unwrap();
+        symlink(store.join("note/h2"), skills.join("note.md")).unwrap();
+        symlink(store.join("gone/h3"), skills.join("dangling")).unwrap();
+        fs::create_dir(skills.join("local")).unwrap();
+        assert_eq!(
+            ProvisionedGlobals::inspect(Some(tmp.path())).skills,
+            [
+                SkillBind {
+                    name: "local".into(),
+                    source: fs::canonicalize(skills.join("local")).unwrap(),
+                    is_dir: true,
+                },
+                SkillBind {
+                    name: "note.md".into(),
+                    source: store.join("note/h2"),
+                    is_dir: false,
+                },
+                SkillBind {
+                    name: "zeta".into(),
+                    source: store.join("zeta/h1"),
+                    is_dir: true,
+                },
+            ]
         );
         assert_eq!(
             ProvisionedGlobals::inspect(None),
