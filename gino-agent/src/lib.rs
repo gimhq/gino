@@ -27,6 +27,7 @@ mod provisioning;
 mod register;
 mod remote_ops;
 mod runner;
+mod sandbox;
 mod scheduler;
 mod transport;
 
