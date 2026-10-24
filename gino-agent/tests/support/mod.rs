@@ -183,6 +183,25 @@ impl RunnerProc {
         }
     }
 
+    /// Boot against a caller-owned [`Workspace`] with engine fakes the caller
+    /// installed into `fake_dir`. `path` replaces the daemon's whole `PATH` when
+    /// set; otherwise `fake_dir` goes first on the inherited one.
+    #[allow(dead_code)] // used by the sandbox suite only
+    pub fn spawn_in_with_fakes(
+        host: &StubHost,
+        workspace: &Workspace,
+        fake_dir: TempDir,
+        path: Option<&str>,
+    ) -> Self {
+        let path = path.map_or_else(|| fakes_first_path(fake_dir.path()), str::to_owned);
+        let child = launch(host, workspace, &path);
+        Self {
+            child,
+            fake_dir,
+            _workspace: None,
+        }
+    }
+
     /// Kill the daemon and wait for it to exit. For a [`Self::spawn`] proc this also
     /// drops the owned workspace (removing it and releasing the serial lock); for a
     /// [`Self::spawn_in`] proc the caller's workspace (and lock) persist.
@@ -206,11 +225,21 @@ fn boot(
     if let Some(thread_id) = codex_thread_id {
         fake_codex::install_into(fake_dir.path(), thread_id);
     }
-    let path = match std::env::var("PATH") {
-        Ok(existing) => format!("{}:{existing}", fake_dir.path().display()),
-        Err(_) => fake_dir.path().display().to_string(),
-    };
+    let child = launch(host, workspace, &fakes_first_path(fake_dir.path()));
+    (child, fake_dir)
+}
 
+/// `dir` first, then the inherited `PATH`.
+fn fakes_first_path(dir: &std::path::Path) -> String {
+    match std::env::var("PATH") {
+        Ok(existing) => format!("{}:{existing}", dir.display()),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
+/// Boot the daemon against `host` with `path` as its `PATH` and the workspace
+/// relocated into `workspace`.
+fn launch(host: &StubHost, workspace: &Workspace, path: &str) -> Child {
     let mut command = Command::new(DAEMON_BIN);
     command
         .arg("run")
@@ -229,8 +258,7 @@ fn boot(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let child = command.spawn().expect("spawn gino-agent daemon");
-    (child, fake_dir)
+    command.spawn().expect("spawn gino-agent daemon")
 }
 
 /// A short standard timeout for waiting on host-mirror state in scenarios.
