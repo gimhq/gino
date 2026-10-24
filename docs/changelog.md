@@ -241,3 +241,9 @@ every exit path, engines get `GINO_AGENT_SOCK`/`GINO_AGENT_TOKEN`, sandboxes bin
 removed). Verified on the merged trees: full agent gate (nextest 685 passed / 13 privileged
 skipped) and `sandbox-it.sh` 11/11, including `gino cron create/list` inside the sandbox with only
 the run's own task visible. Untested limits: handler timeout and the total/operator connection caps.
+
+## 2026-10-24 21:45 [decision]
+
+Task `20261024-1855-host-call` (forward in-engine host calls over the agent socket) is replaced by
+`20261024-1855-host-action` (let an engine ask its host to act, through the transcript); the
+host-call detail file is deleted and its index entry is marked `[d]`.

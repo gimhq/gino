@@ -50,4 +50,5 @@ Each task is a single line linking to its detail file. All detailed information 
 - [ ] [**20261024-1341-host-isolation-overlay Host-delivered engine isolation overlay**](20261024-1341-host-isolation-overlay.md) `P2`
 - [ ] [**20261024-1527-sandbox-followups Engine sandbox follow-ups**](20261024-1527-sandbox-followups.md) `P1`
 - [x] [**20261024-1758-agent-local-api Local agent API socket for in-engine tooling**](20261024-1758-agent-local-api.md) `P1`
-- [ ] [**20261024-1855-host-call Forward in-engine host calls over the agent socket**](20261024-1855-host-call.md) `P1`
+- [d] [**20261024-1855-host-call Forward in-engine host calls over the agent socket**](20261024-1855-host-call.md) `P1`
+- [ ] [**20261024-1855-host-action Let an engine ask its host to act, through the transcript**](20261024-1855-host-action.md) `P1`
