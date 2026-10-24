@@ -44,7 +44,7 @@
   },
   "dependencies": {
     "nanoid": "5.1.16",
-    "zod": "4.4.3"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@gino/host-store-sqlite": "workspace:*",
