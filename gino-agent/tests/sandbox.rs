@@ -610,7 +610,8 @@ async fn task_meta_isolation_overrides_the_default() {
     if !enabled() {
         return;
     }
-    // Isolation is off in the agent config; only the task meta turns it on.
+    // Isolation is off in the agent config; only the task meta turns it on
+    // (tightening is always allowed).
     let host = StubHost::start(json!({})).await;
     let workspace = Workspace::new().await;
     let fakes = claude_fakes(&render(META_PROBE, &workspace));
@@ -684,6 +685,44 @@ async fn task_meta_isolation_overrides_the_default() {
     let results = probes(&host, "t-off", "th-off").await;
     expect(&results, &[("SANDBOX", "unset"), ("READ_DB", "ok")]);
     assert!(work_dir(&workspace, "th-off").join("engine-ran").is_file());
+
+    runner.shutdown().await;
+    // Release the workspace's serial lock before taking a new one.
+    drop(workspace);
+    drop(host);
+
+    // With a sandboxed default, an override that turns isolation off fails.
+    let host = StubHost::start(sandbox_config("none", json!({}))).await;
+    let workspace = Workspace::new().await;
+    let fakes = claude_fakes(&render(META_PROBE, &workspace));
+    let runner = RunnerProc::spawn_in_with_fakes(&host, &workspace, fakes, None);
+    assert!(
+        host.wait_connected(RUN_TIMEOUT).await,
+        "runner never connected"
+    );
+    push_task_meta(
+        &host,
+        "t-loose",
+        &json!({ "isolation": { "mode": "off" } }),
+        1,
+    )
+    .await;
+    let run = run_thread(&host, "t-loose", "th-loose", 2).await;
+    assert_eq!(run.status, "failed", "run: {run:?}");
+    let error = run.error.clone().unwrap_or_default();
+    assert!(
+        error.contains("would loosen isolation.mode from `sandbox` to `off`")
+            && error.contains("allowTaskOverride"),
+        "error: {error}"
+    );
+    assert_eq!(
+        run.failure_reason.as_deref(),
+        Some("runner.invalid_request")
+    );
+    assert!(
+        !work_dir(&workspace, "th-loose").join("engine-ran").exists(),
+        "the engine must not run"
+    );
 
     runner.shutdown().await;
 }
