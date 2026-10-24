@@ -687,6 +687,9 @@ async fn task_meta_isolation_overrides_the_default() {
     assert!(work_dir(&workspace, "th-off").join("engine-ran").is_file());
 
     runner.shutdown().await;
+    // Release the workspace's serial lock before taking a new one.
+    drop(workspace);
+    drop(host);
 
     // With a sandboxed default, an override that turns isolation off fails.
     let host = StubHost::start(sandbox_config("none", json!({}))).await;
