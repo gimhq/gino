@@ -287,14 +287,6 @@ pub(crate) enum DbError {
          upgrade gino-agent"
     )]
     SchemaNewerThanBinary { found: i64, supported: i64 },
-    /// A non-migrating open ([`Db::open_existing`]) found a schema version this
-    /// binary cannot serve.
-    #[error(
-        "database schema is v{found} but this binary expects v{expected}; \
-         start the daemon to create a fresh database, or upgrade this binary \
-         for a newer one"
-    )]
-    SchemaVersionMismatch { found: i64, expected: i64 },
     /// The DB was created by an older development build; delete it and restart.
     #[error(
         "database schema v{found} is from an older development build and cannot be \
@@ -559,12 +551,6 @@ impl Db {
     /// Open (creating if absent) the database at `path` and migrate it to
     /// [`SCHEMA_VERSION`] — the **daemon** open path.
     ///
-    /// DECISION (open-path split): this migrating open is reserved for
-    /// the daemon startup (which holds the single-instance lock); short-lived
-    /// CLI invocations go through [`Self::open_existing`], which never
-    /// migrates, so a mismatched CLI binary cannot rewrite the schema under a
-    /// live daemon.
-    ///
     /// The connect token lives in this file in plaintext (SQLite has no secret
     /// type), so the DB file — and its WAL/SHM siblings — are chmod'd `0600` on
     /// every open: fresh files are created private, and pre-existing deployments
@@ -576,27 +562,6 @@ impl Db {
         // left behind by an earlier 0644 deployment are healed explicitly.
         harden_db_files(path)?;
         Self::from_connection(conn)
-    }
-
-    /// Open the database at `path` WITHOUT creating or migrating it — the
-    /// **CLI** open path (see the decision on [`Self::open`]). Fails when the
-    /// file does not exist (no daemon has initialized this state dir) and when
-    /// the recorded schema version is not exactly [`SCHEMA_VERSION`]
-    /// ([`DbError::SchemaVersionMismatch`]) — only the daemon migrates.
-    pub(crate) fn open_existing(path: &Path) -> DbResult<Self> {
-        let flags =
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags)?;
-        conn.execute_batch(PRAGMAS)?;
-        let db = Self { conn };
-        let found = db.user_version()?;
-        if found != SCHEMA_VERSION {
-            return Err(DbError::SchemaVersionMismatch {
-                found,
-                expected: SCHEMA_VERSION,
-            });
-        }
-        Ok(db)
     }
 
     /// Open an ephemeral in-memory database (used by unit tests).
@@ -1899,23 +1864,6 @@ mod tests {
 
     // -- Schema / migration ------------------------------------------------
 
-    /// Whether `table` has a column named `column` (via `pragma_table_info`).
-    fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-                rusqlite::params![table, column],
-                |r| r.get(0),
-            )
-            .unwrap();
-        count > 0
-    }
-
-    fn raw_user_version(conn: &rusqlite::Connection) -> i64 {
-        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap()
-    }
-
     #[test]
     fn schema_init_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
@@ -1947,16 +1895,15 @@ mod tests {
             "FK violation must be rejected"
         );
 
-        // The file-backed open paths enable it too.
+        // The file-backed open path enables it too.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.db");
-        for db in [Db::open(&path).unwrap(), Db::open_existing(&path).unwrap()] {
-            let on: i64 = db
-                .conn
-                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(on, 1, "foreign_keys must be ON on file opens");
-        }
+        let db = Db::open(&path).unwrap();
+        let on: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, 1, "foreign_keys must be ON on file opens");
     }
 
     /// D2: the task-definition columns round-trip through insert/get/update.
@@ -2012,40 +1959,6 @@ mod tests {
             Db::open(&path).unwrap_err(),
             DbError::UnsupportedSchema { found: 0 }
         ));
-    }
-
-    /// The CLI open path ([`Db::open_existing`]) neither creates nor
-    /// migrates — a missing file and a version mismatch both fail fast, and a
-    /// mismatched file is left byte-identical (only the daemon migrates).
-    #[test]
-    fn open_existing_never_creates_or_migrates() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.db");
-
-        // Missing file: refused, and not created.
-        assert!(Db::open_existing(&path).is_err());
-        assert!(!path.exists(), "open_existing must not create the DB");
-
-        // Unversioned file: refused with the version-mismatch error…
-        rusqlite::Connection::open(&path).unwrap();
-        assert!(matches!(
-            Db::open_existing(&path).unwrap_err(),
-            DbError::SchemaVersionMismatch { found: 0, expected } if expected == SCHEMA_VERSION
-        ));
-        // …and left without a schema.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(raw_user_version(&conn), 0);
-            assert!(
-                !column_exists(&conn, "inbox", "msg_id"),
-                "open_existing must not create the schema"
-            );
-        }
-
-        // A daemon-initialized file opens fine.
-        drop(Db::open(&path).unwrap());
-        let db = Db::open_existing(&path).unwrap();
-        assert_eq!(db.user_version().unwrap(), SCHEMA_VERSION);
     }
 
     /// Regression: claiming a pending thread is a CAS — of two claims on

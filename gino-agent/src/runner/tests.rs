@@ -116,6 +116,7 @@ async fn build_execution_plane_wires_the_transport_flush() {
         dir.path(),
         &cancel,
         Arc::clone(&flush),
+        None,
     )
     .await;
     assert!(executor.flush_wired());
@@ -136,6 +137,7 @@ async fn serve_context(db: Arc<Mutex<Db>>, dir: &std::path::Path) -> ServeContex
         dir,
         &cancel,
         Arc::new(tokio::sync::Notify::new()),
+        None,
     )
     .await;
     ServeContext {
