@@ -160,6 +160,32 @@ pub struct AlwaysAllow {
     pub port: u16,
 }
 
+impl AlwaysAllow {
+    /// The `host:port` of an `http(s)://` URL; the port defaults to 443 for
+    /// https and 80 for http. `None` when the URL has no usable host or port.
+    pub fn from_url(url: &str) -> Option<Self> {
+        let (scheme, rest) = url.split_once("://")?;
+        let default_port = match scheme.to_ascii_lowercase().as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        let (host, port) = match host_port.rsplit_once(':') {
+            Some((host, port)) => (host, port.parse().ok()?),
+            None => (host_port, default_port),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            host: host.to_owned(),
+            port,
+        })
+    }
+}
+
 /// Invalid rule or always-allowed endpoint.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RuleError {
