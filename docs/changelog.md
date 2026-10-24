@@ -225,3 +225,19 @@ gino-agent moves to nsplane v0.19.0 (`nsplane`, `nsplane-dns`, `nsplane-netstack
 unreachable `github.com/dotns/simple-dns` git source is gone from `Cargo.lock` and `deny.toml`.
 Verified with an empty cargo git cache (all git dependencies fetched from public repositories):
 full agent gate (nextest 644 passed / 12 privileged skipped) and `sandbox-it.sh` 10/10.
+
+## 2026-10-24 20:30 [progress]
+
+Local agent API (task `20261024-1758-agent-local-api`, BKD campaign
+`l1-i8j3v2zw-20261024183248`, auto mode). Merge ea7b5b0 (`bkd/04tkv9tw`): the daemon serves
+`<workspace>/run/agent.sock` (NDJSON, `v`/`id`, stable error codes, line and connection limits),
+run tokens scoped to `{task_id, thread_id}`, operator access by peer uid plus user/pid namespace,
+`system`/`task`/`thread`/`cron` methods in the daemon (cron mutations enqueue `cron_state` and nudge
+the scheduler; another task's object reads as `not_found` for a run), specified in
+docs/agent-architecture.md §10b. Merge 9f83716 (`bkd/b7szhu6f`): the `gino` CLI is a client of
+that API with unchanged stdout (golden tests), runs register a token before spawn and revoke it on
+every exit path, engines get `GINO_AGENT_SOCK`/`GINO_AGENT_TOKEN`, sandboxes bind the socket at
+`/run/gino/agent.sock`; nothing outside the daemon opens the database (`Db::open_existing`
+removed). Verified on the merged trees: full agent gate (nextest 685 passed / 13 privileged
+skipped) and `sandbox-it.sh` 11/11, including `gino cron create/list` inside the sandbox with only
+the run's own task visible. Untested limits: handler timeout and the total/operator connection caps.

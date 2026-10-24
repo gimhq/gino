@@ -1,6 +1,6 @@
 # 20261024-1758-agent-local-api Local agent API socket for in-engine tooling
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P1
 - **owner**: station/agent-local-api-20261024-1758
 - **createdAt**: 2026-10-24 17:58
@@ -29,3 +29,5 @@ Adding the local agent API
 ## Notes
 
 Plan: [20261024-1758-agent-local-api](../plan/20261024-1758-agent-local-api.md)
+
+- complete: Merged ea7b5b0 (server) and 9f83716 (client); agent gates 685 passed, sandbox-it 11/11 incl. gino cron inside the sandbox.
