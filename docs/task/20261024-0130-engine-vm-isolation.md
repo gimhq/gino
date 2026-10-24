@@ -45,3 +45,12 @@ Adding a VM isolation backend
 
 - **blocked by**: 20261024-1758-agent-local-api
 - **blocks**: (none)
+
+## Notes
+
+Plan: [20261024-2050-engine-vm-isolation](../plan/20261024-2050-engine-vm-isolation.md). The
+current development host (GCE, no nested virtualization) has no `/dev/kvm`; implement on a
+KVM-capable host.
+
+
+- unclaim: Plan written; implementation handed to colleagues on a KVM-capable host.
