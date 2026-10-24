@@ -2,7 +2,6 @@
 //! workspace (`run/agent.sock`). Same-user, same-namespace peers get operator
 //! access; an engine run gets a per-run token scoped to its own task.
 
-#[allow(dead_code)] // used by the CLI client
 pub(crate) mod client;
 mod methods;
 pub(crate) mod protocol;
