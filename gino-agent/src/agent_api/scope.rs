@@ -63,7 +63,6 @@ impl TokenRegistry {
     }
 
     /// Mint a fresh token for `scope`.
-    #[allow(dead_code)] // used by the CLI client / executor
     pub(crate) fn register(&self, scope: RunScope) -> RunToken {
         let token = RunToken(hex(&random_bytes()));
         self.lock().insert(token_hash(token.as_str()), scope);
@@ -71,7 +70,6 @@ impl TokenRegistry {
     }
 
     /// Forget `token`; later lookups of it fail.
-    #[allow(dead_code)] // used by the CLI client / executor
     pub(crate) fn revoke(&self, token: &str) {
         self.lock().remove(&token_hash(token));
     }

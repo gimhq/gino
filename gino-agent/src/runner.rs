@@ -248,6 +248,17 @@ async fn run_async(
     // the startup global reconcile. A resolved message's inbound descriptors reach
     // the executor through the durable `thread_attachments` snapshot (P1-10b).
     let flush = transport.flush_handle();
+    // One retry budget for every thread source (cron fires + chat messages).
+    let max_attempts = config.executor.max_attempts;
+    let scheduler = Scheduler::new(
+        Arc::clone(&db),
+        Arc::clone(&cancel),
+        max_attempts,
+        config.retention.days,
+    );
+    let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
+    // Started before the executor so runs can be handed its token registry.
+    let api = start_agent_api(&config, &db, &nudge, &flush);
     let (executor, provisioner, seams) = build_execution_plane(
         &config,
         &http,
@@ -255,6 +266,7 @@ async fn run_async(
         &engine_config_dir,
         &cancel,
         Arc::clone(&flush),
+        api.as_ref(),
     )
     .await;
     let prompts = Arc::new(InboxPromptSource {
@@ -269,17 +281,7 @@ async fn run_async(
         info!(recovered, "recovered crash-orphan threads at startup");
     }
 
-    // One retry budget for every thread source (cron fires + chat messages).
-    let max_attempts = config.executor.max_attempts;
-    let scheduler = Scheduler::new(
-        Arc::clone(&db),
-        Arc::clone(&cancel),
-        max_attempts,
-        config.retention.days,
-    );
-    let (nudge, drain) = (scheduler.nudge(), scheduler.drain_signal());
     let scheduler_task = tokio::spawn(scheduler.run());
-    let api = start_agent_api(&config, &db, &nudge, &flush);
 
     let worker = tokio::spawn(run_worker(
         Arc::clone(&executor),
@@ -517,6 +519,7 @@ async fn build_execution_plane(
     engine_config_dir: &Path,
     shutdown: &Arc<Cancel>,
     flush: Arc<Notify>,
+    api: Option<&AgentApiServer>,
 ) -> (Arc<ThreadExecutor>, Option<Arc<Provisioner>>, EngineSeams) {
     let seams = EngineSeams {
         claude: Arc::new(Mutex::new(engine_settings(config, engine_config_dir))),
@@ -546,6 +549,14 @@ async fn build_execution_plane(
         Arc::clone(shutdown),
         flush,
     );
+    // Per-run API tokens; without the API, runs get none.
+    let executor = Arc::new(match api {
+        Some(api) => executor.with_agent_api(
+            api.registry(),
+            agent_api::socket_path(&config.paths.workspace_dir),
+        ),
+        None => executor,
+    });
 
     if let Some(provisioner) = &provisioner {
         reconcile_global_startup(
@@ -576,7 +587,7 @@ fn build_executor(
     provisioner: Option<Arc<Provisioner>>,
     shutdown: Arc<Cancel>,
     flush: Arc<Notify>,
-) -> Arc<ThreadExecutor> {
+) -> ThreadExecutor {
     let engine: Arc<dyn Engine> = Arc::new(ReloadableEngine {
         settings: Arc::clone(&seams.claude),
     });
@@ -626,7 +637,7 @@ fn build_executor(
     } else {
         debug!("task provisioning plane disabled (no host base / connect token)");
     }
-    Arc::new(executor)
+    executor
 }
 
 /// Resolve the Claude engine settings from the config, exporting the workspace
