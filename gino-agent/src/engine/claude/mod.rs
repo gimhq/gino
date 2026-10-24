@@ -800,7 +800,7 @@ mod tests {
             ..SessionCfg::default()
         };
         let args = SessionArgs::for_session(&cfg);
-        let isolation = sandbox::resolve(&settings.isolation, None, &root).unwrap();
+        let isolation = sandbox::resolve(&settings.isolation, None, &root, None).unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &args, Some("task-1"), None),
             &launch_context(&settings, &cfg),
