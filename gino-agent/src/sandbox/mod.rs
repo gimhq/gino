@@ -441,8 +441,11 @@ pub(crate) fn wrap(
     ];
     inner.extend(direct.args);
 
+    // The host workspace root is not mounted, so the engine must not see it.
     let mut env = direct.env;
-    env.retain(|(key, _)| !ctx.config_dir_keys.contains(&key.as_str()));
+    env.retain(|(key, _)| {
+        key != "GINO_WORKSPACE_DIR" && !ctx.config_dir_keys.contains(&key.as_str())
+    });
     env.extend(ctx.config_dir_keys.iter().map(|key| {
         (
             (*key).to_owned(),
@@ -1207,6 +1210,35 @@ mod tests {
             env_values(&wrapped, "GINO_ARCHIVE_DIR"),
             [work_dir.join("conversations").as_os_str()]
         );
+    }
+
+    #[test]
+    fn sandboxed_launch_drops_the_workspace_dir() {
+        let (tmp, _, host) = stub_host();
+        let work_dir = tmp.path().join("threads/t1");
+        let mut d = direct(&work_dir.join("project"));
+        d.env.push((
+            "GINO_WORKSPACE_DIR".to_owned(),
+            "/var/lib/gino-agent".into(),
+        ));
+        let off = IsolationSpec::default();
+        let agent = Path::new("/opt/gino/gino-agent");
+
+        let unwrapped = launch(d.clone(), &ctx(&off, None, Some(&work_dir), Some(agent))).unwrap();
+        assert_eq!(
+            env_values(&unwrapped, "GINO_WORKSPACE_DIR"),
+            ["/var/lib/gino-agent"]
+        );
+
+        let wrapped = wrap(
+            d,
+            &ctx(&off, None, Some(&work_dir), Some(agent)),
+            &sandboxed(),
+            &host,
+        )
+        .unwrap();
+        assert!(env_values(&wrapped, "GINO_WORKSPACE_DIR").is_empty());
+        assert_eq!(env_values(&wrapped, "GINO_TASK_ID"), ["task-1"]);
     }
 
     #[test]
