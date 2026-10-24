@@ -4,6 +4,7 @@
 
 pub mod decision_log;
 pub mod dns;
+pub mod exit;
 pub mod fdpass;
 pub mod limits;
 pub mod rules;

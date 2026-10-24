@@ -28,8 +28,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # SIGINT to the `codex exec` child, which has no in-band cancel channel, and
 # the nested user-namespace drop in `sandbox-init`.
 nix = { version = "0.31", default-features = false, features = ["sched", "signal", "term", "user"] }
+# Packet source/sink traits and the pump between the guest TUN and the exit stack.
+nsplane = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
 # Guest DNS: wire codec, the `Resolver` trait and the fake-address pool.
 nsplane-dns = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0", features = ["netstack"] }
+# User-space TCP/IP stack terminating the guest's traffic in the per-run exit.
+nsplane-netstack = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
 # TUN device creation (TUNSETIFF) without unsafe code in this crate.
 nsplane-tun = { version = "0.17.0", git = "https://github.com/dotns/nsplane", tag = "v0.17.0" }
 # Async pseudo-terminal allocation and process spawning.
