@@ -191,10 +191,10 @@ mod tests {
 
     #[test]
     fn cap_set_parsing() {
-        let status = "Name:\tgino-agent\nCapInh:\t0000000000000000\n\
+        let status = "Name:\tgino-agent\nCapAmb:\t0000000000000000\n\
                       CapPrm:\t0000000000000000\nCapEff:\t000001ffffffffff\n";
         assert!(cap_set_is_empty(status, "CapPrm").unwrap());
-        assert!(cap_set_is_empty(status, "CapInh").unwrap());
+        assert!(cap_set_is_empty(status, "CapAmb").unwrap());
         assert!(!cap_set_is_empty(status, "CapEff").unwrap());
         assert!(!cap_set_is_empty("CapEff:\t0000000000001000\n", "CapEff").unwrap());
         assert!(cap_set_is_empty("Name:\tx\n", "CapEff").is_err());
