@@ -1,7 +1,7 @@
 //! Network allow-rule types and the compiled matcher.
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -172,9 +172,18 @@ impl AlwaysAllow {
         };
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-        let (host, port) = match host_port.rsplit_once(':') {
-            Some((host, port)) => (host, port.parse().ok()?),
-            None => (host_port, default_port),
+        let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+            // `[v6addr]` or `[v6addr]:port`.
+            let (host, rest) = bracketed.split_once(']')?;
+            match rest {
+                "" => (host, default_port),
+                _ => (host, rest.strip_prefix(':')?.parse().ok()?),
+            }
+        } else {
+            match host_port.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().ok()?),
+                None => (host_port, default_port),
+            }
         };
         if host.is_empty() {
             return None;
@@ -304,6 +313,8 @@ impl CompiledRule {
 pub struct RuleSet {
     rules: Vec<CompiledRule>,
     always: Vec<(String, u16)>,
+    /// Always-allowed TCP endpoints given as an IP address.
+    always_addrs: Vec<(IpAddr, u16)>,
 }
 
 impl RuleSet {
@@ -332,7 +343,25 @@ impl RuleSet {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { rules, always })
+        Ok(Self {
+            rules,
+            always,
+            always_addrs: Vec::new(),
+        })
+    }
+
+    /// Adds an always-allowed TCP endpoint given as an IP address and port.
+    pub fn with_always_addr(mut self, addr: SocketAddr) -> Result<Self, RuleError> {
+        if addr.port() == 0 {
+            return Err(RuleError::AlwaysAllow {
+                index: self.always.len() + self.always_addrs.len(),
+                host: addr.ip().to_string(),
+                reason: "port 0 is not allowed",
+            });
+        }
+        self.always_addrs
+            .push((canonical_ip(addr.ip()), addr.port()));
+        Ok(self)
     }
 
     /// Decides a flow to `ip:port` dialed by `name` (if known). Always-allowed
@@ -344,6 +373,9 @@ impl RuleSet {
             && let Some(name) = &name
             && self.always.iter().any(|(h, p)| h == name && *p == port)
         {
+            return Decision::Allow { rule_index: None };
+        }
+        if proto == Proto::Tcp && self.always_addrs.contains(&(ip, port)) {
             return Decision::Allow { rule_index: None };
         }
         match self
@@ -755,6 +787,65 @@ mod tests {
             s.decide(Some("x.api.anthropic.com"), other, 443, Proto::Tcp),
             Decision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn always_allowed_address() {
+        let addr: SocketAddr = "172.17.0.1:8080".parse().unwrap();
+        let s = set(&[], &[]).with_always_addr(addr).unwrap();
+        let ip = v4(172, 17, 0, 1);
+        let allow = Decision::Allow { rule_index: None };
+        assert_eq!(s.decide(None, ip, 8080, Proto::Tcp), allow);
+        let mapped = IpAddr::V6(Ipv4Addr::new(172, 17, 0, 1).to_ipv6_mapped());
+        assert_eq!(s.decide(None, mapped, 8080, Proto::Tcp), allow);
+        assert!(matches!(
+            s.decide(None, ip, 8081, Proto::Tcp),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            s.decide(None, ip, 8080, Proto::Udp),
+            Decision::Deny { .. }
+        ));
+        assert!(matches!(
+            s.decide(None, v4(172, 17, 0, 2), 8080, Proto::Tcp),
+            Decision::Deny { .. }
+        ));
+        assert!(!s.name_allowed("172.17.0.1"));
+
+        let v6: SocketAddr = "[fd00::1]:443".parse().unwrap();
+        let s = set(&[], &[]).with_always_addr(v6).unwrap();
+        assert_eq!(s.decide(None, v6.ip(), 443, Proto::Tcp), allow);
+
+        let err = set(&[], &[])
+            .with_always_addr("10.0.0.1:0".parse().unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("always-allowed endpoint 0 "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn from_url_reads_ip_literals() {
+        let endpoint = |url| AlwaysAllow::from_url(url).unwrap();
+        let expect = |host: &str, port| AlwaysAllow {
+            host: host.to_owned(),
+            port,
+        };
+        assert_eq!(
+            endpoint("http://172.17.0.1:8080/llm"),
+            expect("172.17.0.1", 8080)
+        );
+        assert_eq!(endpoint("https://[fd00::1]/v1"), expect("fd00::1", 443));
+        assert_eq!(endpoint("http://u:p@[::1]:9000?x"), expect("::1", 9000));
+        for url in [
+            "http://[::1",
+            "http://[::1]x",
+            "http://[::1]:",
+            "http://[::1]:x",
+        ] {
+            assert_eq!(AlwaysAllow::from_url(url), None, "{url}");
+        }
     }
 
     #[test]

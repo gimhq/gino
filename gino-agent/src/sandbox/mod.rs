@@ -7,25 +7,37 @@
 //!
 //! [`launch`] turns an engine's direct launch into the one a run actually
 //! spawns: unchanged when off, wrapped in `bwrap` + `sandbox-init` when
-//! sandboxed.
+//! sandboxed. In allowlist mode the launch also carries a [`NetHandover`]; the
+//! spawner runs [`start_network`] right after the spawn to receive the guest
+//! TUN device and start the run's network exit.
 
 pub(crate) mod bwrap;
 pub(crate) mod init;
 
 use std::ffi::OsString;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
+use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::net::UnixListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
+use nsplane_tun::Tun;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use self::bwrap::{
-    HostRoot, ProvisionedGlobals, SandboxLayout, bwrap_args, engine_home, host_root,
-    prepare_engine_home, resolve_binary,
+    CTL_SOCK, CTL_SOCK_NAME, HostRoot, ProvisionedGlobals, RESOLV_CONF_NAME, SandboxLayout,
+    bwrap_args, engine_home, host_root, prepare_engine_home, resolve_binary,
 };
 use crate::engine::EngineError;
-use crate::net::rules::{AlwaysAllow, Rule, RuleError, RuleSet};
+use crate::net::exit::{Exit, ExitConfig, GatewayForward};
+use crate::net::fdpass::recv_fd;
+use crate::net::rules::{AlwaysAllow, Rule, RuleError, RuleSet, normalize_name};
+use crate::net::tun::TunConfig;
+use crate::net::upstream::is_local;
 
 /// Sandbox `$HOME` when the daemon has none.
 const DEFAULT_SANDBOX_HOME: &str = "/home/gino";
@@ -35,6 +47,15 @@ const LLM_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 
 /// LLM API endpoint always allowed when no base URL is set.
 const DEFAULT_LLM_HOST: &str = "api.anthropic.com";
+
+/// Byte the daemon sends `sandbox-init` once the run's network exit runs.
+pub(crate) const NET_READY: u8 = 0x52;
+
+/// How long the daemon waits for `sandbox-init` to hand over the TUN device.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes of `sandbox-init` stderr kept in a handover error.
+const HANDOVER_STDERR_TAIL: usize = 1024;
 
 /// How an engine run is isolated from the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -91,6 +112,9 @@ pub(crate) struct Isolation {
     pub(crate) network: NetworkMode,
     /// Compiled rules when the network mode is allowlist.
     pub(crate) allowlist: Option<Arc<RuleSet>>,
+    /// Allowlist only: the LLM endpoint on host loopback, reached by the guest
+    /// on the gateway address.
+    pub(crate) llm_gateway: Option<GatewayForward>,
     /// Extra host paths mounted read-only.
     pub(crate) read_paths: Vec<PathBuf>,
     /// Extra host paths mounted read-write.
@@ -108,6 +132,7 @@ impl PartialEq for Isolation {
         self.mode == other.mode
             && self.network == other.network
             && same_allowlist
+            && self.llm_gateway == other.llm_gateway
             && self.read_paths == other.read_paths
             && self.write_paths == other.write_paths
     }
@@ -122,6 +147,7 @@ impl Isolation {
             mode: IsolationMode::Off,
             network: NetworkMode::None,
             allowlist: None,
+            llm_gateway: None,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
         }
@@ -157,6 +183,8 @@ pub(crate) enum IsolationError {
     Unavailable(String),
     #[error("engine sandbox needs {0}")]
     Missing(&'static str),
+    #[error("engine sandbox network setup failed: {0}")]
+    Network(String),
 }
 
 /// Resolve the effective isolation for a run.
@@ -197,9 +225,12 @@ pub(crate) fn resolve(
         Some("allowlist") => NetworkMode::Allowlist,
         Some(other) => return Err(IsolationError::UnknownNetworkMode(other.to_owned())),
     };
-    let allowlist = match network {
-        NetworkMode::Allowlist => Some(allowlist(default, llm_base_url)?),
-        NetworkMode::None | NetworkMode::Full => None,
+    let (allowlist, llm_gateway) = match network {
+        NetworkMode::Allowlist => {
+            let (rules, gateway) = allowlist(default, llm_base_url)?;
+            (Some(rules), gateway)
+        }
+        NetworkMode::None | NetworkMode::Full => (None, None),
     };
 
     let workspace = normalize(workspace_dir);
@@ -210,25 +241,83 @@ pub(crate) fn resolve(
         mode,
         network,
         allowlist,
+        llm_gateway,
         read_paths,
         write_paths,
     })
 }
 
-/// Compile the config default's allow rules plus the always-allowed LLM endpoint.
+/// Compile the config default's allow rules plus the always-allowed LLM
+/// endpoint. A loopback endpoint is not a rule but the returned gateway
+/// forward; an IP-literal one is an always-allowed address.
 fn allowlist(
     default: &IsolationSpec,
     llm_base_url: Option<&str>,
-) -> Result<Arc<RuleSet>, IsolationError> {
+) -> Result<(Arc<RuleSet>, Option<GatewayForward>), IsolationError> {
     let endpoint = llm_endpoint(llm_base_url)?;
     let rules = default
         .network
         .as_ref()
         .and_then(|n| n.allow.as_deref())
         .unwrap_or_default();
-    RuleSet::compile(rules, &[endpoint])
-        .map(Arc::new)
-        .map_err(IsolationError::InvalidAllowlist)
+    let host = normalize_name(&endpoint.host);
+    let literal = host.parse::<IpAddr>().ok();
+    let (rules, gateway) = if host == "localhost" || literal.is_some_and(is_local) {
+        if endpoint.port == 0 {
+            return Err(IsolationError::InvalidBaseUrl);
+        }
+        let target = match literal {
+            Some(ip) => SocketAddr::new(ip, endpoint.port),
+            None => localhost_addr(endpoint.port),
+        };
+        let gateway = GatewayForward {
+            port: endpoint.port,
+            target,
+        };
+        (RuleSet::compile(rules, &[]), Some(gateway))
+    } else if let Some(ip) = literal {
+        let addr = SocketAddr::new(ip, endpoint.port);
+        let rules = RuleSet::compile(rules, &[]).and_then(|set| set.with_always_addr(addr));
+        (rules, None)
+    } else {
+        (RuleSet::compile(rules, &[endpoint]), None)
+    };
+    let rules = rules.map_err(IsolationError::InvalidAllowlist)?;
+    Ok((Arc::new(rules), gateway))
+}
+
+/// `localhost:port` as resolved on the host, IPv4 first; 127.0.0.1 when the
+/// lookup yields no loopback address.
+fn localhost_addr(port: u16) -> SocketAddr {
+    let resolved: Vec<SocketAddr> = ("localhost", port)
+        .to_socket_addrs()
+        .map(|addrs| addrs.filter(|addr| addr.ip().is_loopback()).collect())
+        .unwrap_or_default();
+    resolved
+        .iter()
+        .find(|addr| addr.is_ipv4())
+        .or_else(|| resolved.first())
+        .copied()
+        .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port))
+}
+
+/// `url` with its host replaced by the guest gateway address; scheme,
+/// userinfo, port, path and query are kept.
+fn gateway_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    let port = match host_port.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once(']')?.1,
+        None => host_port.rfind(':').map_or("", |at| &host_port[at..]),
+    };
+    let userinfo = userinfo.map(|u| format!("{u}@")).unwrap_or_default();
+    let gateway = TunConfig::default().gateway;
+    Some(format!("{scheme}://{userinfo}{gateway}{port}{tail}"))
 }
 
 /// The LLM API endpoint: `llm_base_url`'s host and port, else the default host.
@@ -427,6 +516,156 @@ pub(crate) struct Launch {
     pub(crate) cwd: PathBuf,
     /// Whether `program` is `bwrap` wrapping the engine.
     pub(crate) sandboxed: bool,
+    /// Allowlist only: the network handover to run after the spawn.
+    pub(crate) net: Option<Arc<NetHandover>>,
+}
+
+/// Private per-run daemon dir (mode 0700) holding the control socket and the
+/// sandbox `resolv.conf`; removed on drop.
+#[derive(Debug)]
+struct RunDir(PathBuf);
+
+impl RunDir {
+    fn create() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("gino-net-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.0) {
+            tracing::debug!(error = %err, "removing the sandbox network dir");
+        }
+    }
+}
+
+/// Daemon side of an allowlist sandbox's network, prepared before the spawn:
+/// the bound control socket and the settings of the run's exit.
+#[derive(Debug)]
+pub(crate) struct NetHandover {
+    dir: RunDir,
+    listener: UnixListener,
+    exit: ExitConfig,
+}
+
+/// Compares by identity.
+impl PartialEq for NetHandover {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for NetHandover {}
+
+impl NetHandover {
+    /// Create the per-run dir with `resolv.conf` and bind the control socket.
+    fn prepare(exit: ExitConfig) -> std::io::Result<Self> {
+        let dir = RunDir::create()?;
+        let gateway = TunConfig::default().gateway;
+        std::fs::write(
+            dir.0.join(RESOLV_CONF_NAME),
+            format!("nameserver {gateway}\n"),
+        )?;
+        let listener = UnixListener::bind(dir.0.join(CTL_SOCK_NAME))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            dir,
+            listener,
+            exit,
+        })
+    }
+}
+
+/// A running allowlist network: the exit and its per-run dir. Dropping it
+/// stops the exit and removes the dir.
+#[derive(Debug)]
+pub(crate) struct NetExit {
+    _exit: Exit,
+    _dir: RunDir,
+}
+
+/// Receive the guest TUN device from the just-spawned sandbox `child`, start
+/// the run's exit on it and release the engine. On failure the sandbox is
+/// killed and the run fails with [`IsolationError::Network`].
+pub(crate) async fn start_network(
+    net: Option<Arc<NetHandover>>,
+    child: &mut tokio::process::Child,
+) -> Result<Option<NetExit>, EngineError> {
+    let Some(net) = net else {
+        return Ok(None);
+    };
+    let result = match Arc::into_inner(net) {
+        Some(net) => hand_over(net, child).await,
+        None => Err("the network handover is shared".to_owned()),
+    };
+    match result {
+        Ok(exit) => Ok(Some(exit)),
+        Err(reason) => {
+            if let Err(err) = child.start_kill() {
+                tracing::debug!(error = %err, "killing the sandbox after a failed network setup");
+            }
+            Err(IsolationError::Network(reason).into())
+        }
+    }
+}
+
+async fn hand_over(net: NetHandover, child: &mut tokio::process::Child) -> Result<NetExit, String> {
+    let NetHandover {
+        dir,
+        listener,
+        exit,
+    } = net;
+    let handover = tokio::time::timeout(HANDOVER_TIMEOUT, start_exit(listener, exit));
+    // `Child::wait` closes stdin; keep it for the engine.
+    let stdin = child.stdin.take();
+    let exited = tokio::select! {
+        result = handover => {
+            let exit = result.map_err(|_| {
+                format!("no TUN device from the sandbox within {}s", HANDOVER_TIMEOUT.as_secs())
+            })??;
+            child.stdin = stdin;
+            return Ok(NetExit { _exit: exit, _dir: dir });
+        }
+        status = child.wait() => status,
+    };
+    let status = exited.map_or_else(|err| err.to_string(), |status| status.to_string());
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.stderr.as_mut() {
+        let mut limited = pipe.take(64 * 1024);
+        let _ =
+            tokio::time::timeout(Duration::from_secs(1), limited.read_to_end(&mut stderr)).await;
+    }
+    let start = stderr.len().saturating_sub(HANDOVER_STDERR_TAIL);
+    let tail = String::from_utf8_lossy(&stderr[start..]);
+    Err(format!(
+        "the sandbox exited ({status}) before handing over its network: {}",
+        tail.trim()
+    ))
+}
+
+/// Accept the sandbox's connection, adopt the TUN device it sends, start the
+/// exit and send the ready byte.
+async fn start_exit(listener: UnixListener, cfg: ExitConfig) -> Result<Exit, String> {
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .map_err(|err| format!("control socket: {err}"))?;
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|err| format!("accepting on the control socket: {err}"))?;
+    // Nothing else may connect once the sandbox has.
+    drop(listener);
+    let fd = recv_fd(&stream, HANDOVER_TIMEOUT)
+        .await
+        .map_err(|err| format!("receiving the TUN device: {err}"))?;
+    let tun = Tun::from_fd(fd, cfg.mtu).map_err(|err| format!("adopting the TUN device: {err}"))?;
+    let exit = Exit::start(tun, cfg).map_err(|err| format!("starting the network exit: {err}"))?;
+    stream
+        .write_all(&[NET_READY])
+        .await
+        .map_err(|err| format!("releasing the sandbox: {err}"))?;
+    Ok(exit)
 }
 
 impl Launch {
@@ -443,6 +682,7 @@ impl Launch {
             env,
             cwd,
             sandboxed: false,
+            net: None,
         }
     }
 
@@ -473,6 +713,8 @@ pub(crate) struct LaunchContext<'a> {
     /// The task's override, if any.
     pub(crate) task_override: Option<&'a IsolationSpec>,
     pub(crate) workspace_dir: &'a Path,
+    /// The run's thread, for network decision logs.
+    pub(crate) thread_id: Option<&'a str>,
     /// The thread's work dir.
     pub(crate) work_dir: Option<&'a Path>,
     /// The gino-agent binary.
@@ -531,9 +773,8 @@ impl SandboxHost {
 }
 
 /// Resolve the run's isolation and build its launch: `direct` as-is when off,
-/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root,
-/// `bwrap` is unusable or the network mode is allowlist, which the sandbox
-/// cannot enforce yet.
+/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root
+/// or `bwrap` is unusable.
 pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, EngineError> {
     launch_as(direct, ctx, nix::unistd::geteuid().as_raw())
 }
@@ -549,12 +790,6 @@ fn launch_as(direct: Launch, ctx: &LaunchContext<'_>, euid: u32) -> Result<Launc
     match isolation.mode {
         IsolationMode::Off => Ok(direct),
         IsolationMode::Sandbox => {
-            if isolation.network == NetworkMode::Allowlist {
-                return Err(IsolationError::NotSupported(
-                    "launching with isolation.network.mode: allowlist".into(),
-                )
-                .into());
-            }
             check_not_root(euid)?;
             let bwrap = bwrap::ensure_available()?;
             wrap(direct, ctx, &isolation, &SandboxHost::current(bwrap))
@@ -599,6 +834,17 @@ pub(crate) fn wrap(
     } else {
         direct.cwd.clone()
     };
+    let net = match (isolation.network, &isolation.allowlist) {
+        (NetworkMode::Allowlist, Some(rules)) => {
+            let mut exit = ExitConfig::new(ctx.thread_id.unwrap_or("-"), Arc::clone(rules));
+            exit.gateway = isolation.llm_gateway;
+            Some(NetHandover::prepare(exit).map_err(EngineError::Spawn)?)
+        }
+        (NetworkMode::Allowlist, None) => {
+            return Err(IsolationError::Missing("the allowlist rules").into());
+        }
+        (NetworkMode::None | NetworkMode::Full, _) => None,
+    };
     let layout = SandboxLayout {
         work_dir: work_dir.to_path_buf(),
         cwd,
@@ -611,19 +857,34 @@ pub(crate) fn wrap(
         network: isolation.network,
         read_paths: isolation.read_paths.clone(),
         write_paths: isolation.write_paths.clone(),
+        net_dir: net.as_ref().map(|net| net.dir.0.clone()),
     };
     prepare_engine_home(&layout).map_err(EngineError::Spawn)?;
 
-    let mut inner: Vec<OsString> = vec![
-        layout.agent_exe.clone().into(),
-        "sandbox-init".into(),
-        "--".into(),
-        layout.engine_binary.clone().into(),
-    ];
+    let mut inner: Vec<OsString> = vec![layout.agent_exe.clone().into(), "sandbox-init".into()];
+    if net.is_some() {
+        inner.extend(["--ctl-sock".into(), CTL_SOCK.into()]);
+    }
+    inner.extend(["--".into(), layout.engine_binary.clone().into()]);
     inner.extend(direct.args);
+
+    // A loopback LLM endpoint is reached through the gateway.
+    let llm_url = match isolation.llm_gateway {
+        Some(_) => Some(
+            llm_base_url(&direct.env)
+                .as_deref()
+                .and_then(gateway_url)
+                .ok_or(IsolationError::InvalidBaseUrl)?,
+        ),
+        None => None,
+    };
 
     // The host workspace root is not mounted, so the engine must not see it.
     let mut env = direct.env;
+    if let Some(url) = llm_url {
+        env.retain(|(key, _)| key != LLM_BASE_URL_ENV);
+        env.push((LLM_BASE_URL_ENV.to_owned(), url.into()));
+    }
     env.retain(|(key, _)| {
         key != "GINO_WORKSPACE_DIR" && !ctx.config_dir_keys.contains(&key.as_str())
     });
@@ -649,6 +910,7 @@ pub(crate) fn wrap(
         env,
         cwd: direct.cwd,
         sandboxed: true,
+        net: net.map(Arc::new),
     })
 }
 
@@ -1437,6 +1699,7 @@ mod tests {
             isolation: default,
             task_override: task,
             workspace_dir: Path::new(WORKSPACE),
+            thread_id: Some("th-1"),
             work_dir,
             self_exe,
             global_config_dir: None,
@@ -1497,20 +1760,284 @@ mod tests {
     }
 
     #[test]
-    fn allowlist_launch_fails_closed() {
+    fn allowlist_launch_is_refused_only_for_a_root_agent() {
         let d = direct(Path::new("/ws/threads/t1/project"));
         let task = spec(Some("sandbox"), Some("allowlist"));
-        for euid in [0, 1000] {
-            let err = launch_as(
-                d.clone(),
-                &ctx(&IsolationSpec::default(), Some(&task), None, None),
-                euid,
-            )
-            .unwrap_err();
+        let off = IsolationSpec::default();
+        let ctx = ctx(&off, Some(&task), None, None);
+        let err = launch_as(d.clone(), &ctx, 0).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Isolation(IsolationError::Unavailable(m)) if m.contains("root")),
+            "{err:?}"
+        );
+        // Past the root check only host facts can fail it, never the mode.
+        if let Err(err) = launch_as(d, &ctx, 1000) {
             assert!(
-                matches!(&err, EngineError::Isolation(IsolationError::NotSupported(m))
-                    if m.contains("allowlist")),
+                !matches!(
+                    &err,
+                    EngineError::Isolation(IsolationError::NotSupported(_))
+                ),
                 "{err:?}"
+            );
+        }
+    }
+
+    fn allowlisted(base_url: Option<&str>) -> Isolation {
+        resolve(
+            &spec(Some("sandbox"), Some("allowlist")),
+            None,
+            Path::new(WORKSPACE),
+            base_url,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn loopback_llm_endpoint_becomes_the_gateway_forward() {
+        for (url, target) in [
+            ("http://127.0.0.1:8080/api/llm", "127.0.0.1:8080"),
+            ("http://127.0.0.5:8080", "127.0.0.5:8080"),
+            ("https://[::1]:9443/v1", "[::1]:9443"),
+            ("http://LOCALHOST.:8080/x", "127.0.0.1:8080"),
+            ("http://localhost/x", "127.0.0.1:80"),
+        ] {
+            let iso = allowlisted(Some(url));
+            let target: std::net::SocketAddr = target.parse().unwrap();
+            let gateway = iso.llm_gateway.unwrap();
+            assert_eq!(gateway.port, target.port(), "{url}");
+            if url.contains("localhost") || url.contains("LOCALHOST") {
+                assert!(gateway.target.ip().is_loopback(), "{url}");
+            } else {
+                assert_eq!(gateway.target, target, "{url}");
+            }
+            // Loopback is never a rule.
+            let rules = allowlist_of(&iso);
+            assert!(!rules.name_allowed("localhost"), "{url}");
+            assert!(matches!(
+                rules.decide(None, target.ip(), target.port(), Proto::Tcp),
+                Decision::Deny { .. }
+            ));
+        }
+        assert!(allowlisted(None).llm_gateway.is_none());
+        assert!(
+            allowlisted(Some("https://proxy.example"))
+                .llm_gateway
+                .is_none()
+        );
+        let err = resolve(
+            &spec(Some("sandbox"), Some("allowlist")),
+            None,
+            Path::new(WORKSPACE),
+            Some("http://user:pw@127.0.0.1:0/x"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::InvalidBaseUrl), "{err:?}");
+        assert!(!err.to_string().contains("pw"), "{err}");
+
+        // Full and none have no gateway.
+        for network in ["full", "none"] {
+            let iso = resolve(
+                &spec(Some("sandbox"), Some(network)),
+                None,
+                Path::new(WORKSPACE),
+                Some("http://127.0.0.1:8080"),
+            )
+            .unwrap();
+            assert!(iso.llm_gateway.is_none(), "{network}");
+        }
+    }
+
+    #[test]
+    fn ip_literal_llm_endpoint_is_an_always_allowed_address() {
+        for (url, ip, port) in [
+            ("http://172.17.0.1:8080/llm", "172.17.0.1", 8080),
+            ("https://[fd00::1]/v1", "fd00::1", 443),
+        ] {
+            let iso = allowlisted(Some(url));
+            assert!(iso.llm_gateway.is_none());
+            let rules = allowlist_of(&iso);
+            let ip = ip.parse().unwrap();
+            assert_eq!(
+                rules.decide(None, ip, port, Proto::Tcp),
+                Decision::Allow { rule_index: None },
+                "{url}"
+            );
+            assert!(matches!(
+                rules.decide(None, ip, port + 1, Proto::Tcp),
+                Decision::Deny { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn gateway_url_swaps_only_the_host() {
+        for (url, want) in [
+            (
+                "http://127.0.0.1:8080/api/llm",
+                "http://10.0.2.2:8080/api/llm",
+            ),
+            (
+                "http://localhost:3000/x?y=1#z",
+                "http://10.0.2.2:3000/x?y=1#z",
+            ),
+            ("https://[::1]:9443", "https://10.0.2.2:9443"),
+            ("http://[::1]/v1", "http://10.0.2.2/v1"),
+            ("http://localhost?q", "http://10.0.2.2?q"),
+            (
+                "http://user:p%40ss@127.0.0.1:8080/llm",
+                "http://user:p%40ss@10.0.2.2:8080/llm",
+            ),
+        ] {
+            assert_eq!(super::gateway_url(url).as_deref(), Some(want), "{url}");
+        }
+        assert_eq!(super::gateway_url("localhost:8080"), None);
+    }
+
+    fn launch_with_llm_url(base_url: &str, network: &str) -> (tempfile::TempDir, Launch) {
+        let (tmp, _, host) = stub_host();
+        let work_dir = tmp.path().join("threads/t1");
+        let mut d = direct(&work_dir.join("project"));
+        d.env
+            .push(("ANTHROPIC_BASE_URL".to_owned(), base_url.into()));
+        let isolation = resolve(
+            &spec(Some("sandbox"), Some(network)),
+            None,
+            Path::new(WORKSPACE),
+            Some(base_url),
+        )
+        .unwrap();
+        let off = IsolationSpec::default();
+        let agent = Path::new("/opt/gino/gino-agent");
+        let wrapped = wrap(
+            d,
+            &ctx(&off, None, Some(&work_dir), Some(agent)),
+            &isolation,
+            &host,
+        )
+        .unwrap();
+        (tmp, wrapped)
+    }
+
+    #[test]
+    fn allowlist_launch_hands_over_the_network_and_rewrites_a_loopback_llm_url() {
+        let (_tmp, wrapped) =
+            launch_with_llm_url("http://u:pw@127.0.0.1:8080/api/llm?k=v", "allowlist");
+        assert_eq!(
+            env_values(&wrapped, "ANTHROPIC_BASE_URL"),
+            ["http://u:pw@10.0.2.2:8080/api/llm?k=v"]
+        );
+        let args: Vec<&str> = wrapped.args.iter().map(|a| a.to_str().unwrap()).collect();
+        let init = args.iter().position(|a| *a == "sandbox-init").unwrap();
+        assert_eq!(
+            args[init + 1..init + 4],
+            ["--ctl-sock", "/run/gino/ctl.sock", "--"]
+        );
+        assert!(args.contains(&"CAP_NET_ADMIN"));
+
+        let net = wrapped.net.as_deref().unwrap();
+        let dir = net.dir.0.clone();
+        let meta = std::fs::metadata(&dir).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("resolv.conf")).unwrap(),
+            "nameserver 10.0.2.2\n"
+        );
+        assert!(dir.join("ctl.sock").exists());
+        assert_eq!(net.exit.thread_id, "th-1");
+        assert_eq!(
+            net.exit.gateway.map(|gw| gw.target),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        let ctl = format!("{}", dir.join("ctl.sock").display());
+        let bind = args.iter().position(|a| *a == ctl).unwrap();
+        assert_eq!(args[bind + 1], "/run/gino/ctl.sock");
+        // The dir goes with the launch.
+        drop(wrapped);
+        assert!(!dir.exists());
+    }
+
+    fn handover() -> (std::path::PathBuf, std::sync::Arc<super::NetHandover>) {
+        let rules = std::sync::Arc::new(RuleSet::compile(&[], &[]).unwrap());
+        let net =
+            super::NetHandover::prepare(crate::net::exit::ExitConfig::new("th-1", rules)).unwrap();
+        (net.dir.0.join("ctl.sock"), std::sync::Arc::new(net))
+    }
+
+    fn sandbox_stub(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn handover_without_a_tun_device_kills_the_sandbox() {
+        let (sock, net) = handover();
+        let mut child = sandbox_stub("sleep 30");
+        let connect = tokio::spawn(async move {
+            // Connect and close without sending a descriptor.
+            drop(tokio::net::UnixStream::connect(sock).await.unwrap());
+        });
+        let err = super::start_network(Some(net), &mut child)
+            .await
+            .unwrap_err();
+        connect.await.unwrap();
+        assert!(
+            matches!(&err, EngineError::Isolation(IsolationError::Network(m)) if m.contains("TUN")),
+            "{err:?}"
+        );
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn handover_reports_an_early_sandbox_exit_with_its_stderr() {
+        let (_, net) = handover();
+        let mut child = sandbox_stub("echo 'sandbox-init: creating the TUN device' >&2; exit 125");
+        let err = super::start_network(Some(net), &mut child)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exited"), "{msg}");
+        assert!(msg.contains("creating the TUN device"), "{msg}");
+        assert!(
+            super::start_network(None, &mut child)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn allowlist_launch_keeps_a_non_loopback_llm_url() {
+        let url = "https://proxy.example:8443/v1";
+        let (_tmp, wrapped) = launch_with_llm_url(url, "allowlist");
+        assert_eq!(env_values(&wrapped, "ANTHROPIC_BASE_URL"), [url]);
+        assert_eq!(wrapped.net.as_deref().unwrap().exit.gateway, None);
+    }
+
+    #[test]
+    fn full_and_none_launches_keep_the_llm_url_and_have_no_handover() {
+        let url = "http://127.0.0.1:8080/api/llm";
+        for network in ["full", "none"] {
+            let (_tmp, wrapped) = launch_with_llm_url(url, network);
+            assert_eq!(
+                env_values(&wrapped, "ANTHROPIC_BASE_URL"),
+                [url],
+                "{network}"
+            );
+            assert!(wrapped.net.is_none());
+            assert!(
+                !wrapped
+                    .args
+                    .iter()
+                    .any(|a| a == "--ctl-sock" || a == "CAP_NET_ADMIN")
             );
         }
     }
@@ -1537,7 +2064,6 @@ mod tests {
         let d = direct(Path::new(""));
         for (default, task) in [
             (spec(Some("vm"), None), None),
-            (spec(Some("sandbox"), Some("allowlist")), None),
             (IsolationSpec::default(), Some(spec(Some("jail"), None))),
             (IsolationSpec::default(), Some(spec(Some("vm"), None))),
             (spec(Some("sandbox"), None), Some(spec(Some("off"), None))),

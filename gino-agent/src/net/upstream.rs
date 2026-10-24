@@ -147,6 +147,48 @@ pub async fn resolve(
     proto: Proto,
     rules: &RuleSet,
 ) -> Result<SocketAddr, UpstreamError> {
+    resolve_with(name, port, |ip| {
+        check_address(ip, port, proto, rules).is_ok()
+    })
+    .await
+}
+
+/// True for loopback and unspecified addresses (also IPv4-mapped), which name
+/// the host itself.
+pub fn is_local(ip: IpAddr) -> bool {
+    let v4_local = |v4: Ipv4Addr| v4.is_loopback() || v4.octets()[0] == 0;
+    match ip {
+        IpAddr::V4(v4) => v4_local(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// Accepts `ip` for an always-allowed endpoint, which may live on a private
+/// network: only addresses naming the host itself ([`is_local`]) are refused.
+pub fn check_always_allowed(ip: IpAddr) -> Result<(), UpstreamError> {
+    if is_local(ip) {
+        return Err(UpstreamError::new(
+            RejectKind::Reset,
+            format!("{ip} is a forbidden destination address"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves the always-allowed endpoint `name` and returns the first address
+/// that passes [`check_always_allowed`].
+pub async fn resolve_always_allowed(name: &str, port: u16) -> Result<SocketAddr, UpstreamError> {
+    resolve_with(name, port, |ip| check_always_allowed(ip).is_ok()).await
+}
+
+async fn resolve_with(
+    name: &str,
+    port: u16,
+    accept: impl Fn(IpAddr) -> bool,
+) -> Result<SocketAddr, UpstreamError> {
     let addrs = tokio::net::lookup_host((name, port)).await.map_err(|err| {
         UpstreamError::new(
             RejectKind::Unreachable,
@@ -157,7 +199,7 @@ pub async fn resolve(
     let mut any = false;
     for addr in addrs {
         any = true;
-        if check_address(addr.ip(), port, proto, rules).is_ok() {
+        if accept(addr.ip()) {
             return Ok(addr);
         }
     }
@@ -517,6 +559,38 @@ mod tests {
         let err = resolve("localhost", 8081, Proto::Tcp, &rules)
             .await
             .unwrap_err();
+        assert_eq!(err.kind(), RejectKind::Reset);
+    }
+
+    #[test]
+    fn always_allowed_refuses_only_local_addresses() {
+        for ip in [
+            "10.1.2.3",
+            "172.17.0.1",
+            "192.168.1.1",
+            "fd00::1",
+            "1.1.1.1",
+        ] {
+            let ip = ip.parse().unwrap();
+            assert!(check_always_allowed(ip).is_ok(), "{ip}");
+        }
+        for ip in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip = ip.parse().unwrap();
+            let err = check_always_allowed(ip).unwrap_err();
+            assert_eq!(err.kind(), RejectKind::Reset, "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_always_allowed_refuses_loopback() {
+        let err = resolve_always_allowed("localhost", 8080).await.unwrap_err();
         assert_eq!(err.kind(), RejectKind::Reset);
     }
 

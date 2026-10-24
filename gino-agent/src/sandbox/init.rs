@@ -1,13 +1,18 @@
 //! In-sandbox init that supervises the engine process.
 //!
-//! `sandbox-init` runs as uid 0 of the sandbox's user namespace. It moves into a
+//! `sandbox-init` runs as uid 0 of the sandbox's user namespace. With
+//! `--ctl-sock` it first creates the guest TUN device and hands it to the
+//! daemon, waiting until the daemon's network exit runs. It then moves into a
 //! nested user namespace as a non-root uid with no capabilities, spawns the
 //! engine with inherited stdio and environment, forwards SIGINT/SIGTERM to it,
 //! and exits with the engine's status.
 
 use std::ffi::OsString;
+use std::os::fd::AsFd as _;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -15,10 +20,19 @@ use nix::sched::CloneFlags;
 use nix::sys::signal::Signal;
 use nix::unistd::{Gid, Pid, Uid};
 use rustix::thread::{CapabilitySet, CapabilitySets};
+use tokio::io::AsyncReadExt as _;
+use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
+
+use super::NET_READY;
+use crate::net::fdpass::send_fd;
+use crate::net::tun::{TunConfig, create_tun};
 
 /// Exit code for any failure before or while supervising the engine.
 const SETUP_FAILURE: i32 = 125;
+
+/// Bound on each step of the network handover.
+const HANDOVER_STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Arguments of the hidden `sandbox-init` subcommand.
 #[derive(Args, Debug)]
@@ -31,6 +45,10 @@ pub(crate) struct SandboxInitArgs {
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) gid: u32,
 
+    /// Daemon control socket the guest TUN device is handed over on.
+    #[arg(long)]
+    pub(crate) ctl_sock: Option<PathBuf>,
+
     /// Engine program and its arguments, passed through verbatim.
     #[arg(last = true, required = true)]
     pub(crate) command: Vec<OsString>,
@@ -40,13 +58,53 @@ pub(crate) struct SandboxInitArgs {
 ///
 /// Must be called while the process is still single-threaded.
 pub(crate) fn run(args: &SandboxInitArgs) -> i32 {
-    match drop_to_nested_userns(args.uid, args.gid).and_then(|()| supervise(&args.command)) {
+    let network = match &args.ctl_sock {
+        Some(ctl_sock) => hand_over_network(ctl_sock),
+        None => Ok(()),
+    };
+    match network
+        .and_then(|()| drop_to_nested_userns(args.uid, args.gid))
+        .and_then(|()| supervise(&args.command))
+    {
         Ok(code) => code,
         Err(err) => {
             eprintln!("sandbox-init: {err:#}");
             SETUP_FAILURE
         }
     }
+}
+
+/// Create the guest TUN device, send it to the daemon over `ctl_sock`, close
+/// this copy and wait for the daemon's ready byte. The runtime is gone when
+/// this returns, so the process is single-threaded again.
+fn hand_over_network(ctl_sock: &Path) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building runtime")?;
+    runtime.block_on(async {
+        let tun = create_tun(&TunConfig::default())
+            .await
+            .context("creating the TUN device")?;
+        let stream = tokio::time::timeout(HANDOVER_STEP_TIMEOUT, UnixStream::connect(ctl_sock))
+            .await
+            .context("connecting to the daemon control socket timed out")?
+            .context("connecting to the daemon control socket")?;
+        send_fd(&stream, tun.as_fd(), HANDOVER_STEP_TIMEOUT)
+            .await
+            .context("sending the TUN device to the daemon")?;
+        drop(tun);
+        let mut ready = [0u8; 1];
+        let mut stream = stream;
+        tokio::time::timeout(HANDOVER_STEP_TIMEOUT, stream.read_exact(&mut ready))
+            .await
+            .context("waiting for the daemon network exit timed out")?
+            .context("waiting for the daemon network exit")?;
+        if ready[0] != NET_READY {
+            bail!("unexpected reply from the daemon control socket");
+        }
+        Ok(())
+    })
 }
 
 /// Enter a new user namespace mapping `uid`/`gid` to the current ids, switch
@@ -232,6 +290,18 @@ mod tests {
             args.command,
             ["codex", "-v", "--host", "x"].map(OsString::from)
         );
+    }
+
+    #[test]
+    fn parses_the_control_socket() {
+        let args = parse(&["--", "claude"]).unwrap();
+        assert_eq!(args.ctl_sock, None);
+        let args = parse(&["--ctl-sock", "/run/gino/ctl.sock", "--", "claude"]).unwrap();
+        assert_eq!(
+            args.ctl_sock.as_deref(),
+            Some(std::path::Path::new("/run/gino/ctl.sock"))
+        );
+        assert_eq!(args.command, ["claude"].map(OsString::from));
     }
 
     #[test]

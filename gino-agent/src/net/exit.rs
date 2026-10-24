@@ -59,6 +59,18 @@ pub struct ExitConfig {
     pub connect_timeout: Duration,
     /// A UDP relay without traffic for this long is closed.
     pub udp_idle: Duration,
+    /// Always-allowed TCP port on the gateway address forwarded to a host
+    /// address (the LLM endpoint on host loopback).
+    pub gateway: Option<GatewayForward>,
+}
+
+/// TCP to `gateway address:port` is relayed to `target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayForward {
+    /// Port on the gateway address.
+    pub port: u16,
+    /// Host address the flow is connected to.
+    pub target: SocketAddr,
 }
 
 impl ExitConfig {
@@ -72,6 +84,7 @@ impl ExitConfig {
             admission_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(5),
             udp_idle: Duration::from_mins(1),
+            gateway: None,
         }
     }
 }
@@ -362,10 +375,20 @@ async fn admit(shared: Arc<Shared>, pending: PendingFlow) {
     if dst.ip() == DNS_ADDR.ip() {
         if dst.port() == DNS_ADDR.port() {
             pending.accept();
-        } else {
+            return;
+        }
+        let forward = cfg
+            .gateway
+            .filter(|gw| proto == Proto::Tcp && gw.port == dst.port());
+        let Some(forward) = forward else {
             log_decision(&cfg.thread_id, proto, None, dst.ip(), dst.port(), &deny);
             pending.reject();
-        }
+            return;
+        };
+        let always = Decision::Allow { rule_index: None };
+        log_decision(&cfg.thread_id, proto, None, dst.ip(), dst.port(), &always);
+        let prepared = prepare_tcp(&shared, None, dst, key, Route::Gateway(forward.target)).await;
+        settle(&shared, pending, proto, None, dst, key, prepared).await;
         return;
     }
     let name = if GuestResolver::is_fake(dst.ip()) {
@@ -389,15 +412,36 @@ async fn admit(shared: Arc<Shared>, pending: PendingFlow) {
         dst.port(),
         &decision,
     );
-    if matches!(decision, Decision::Deny { .. }) {
-        pending.reject();
-        return;
-    }
+    let route = match decision {
+        Decision::Deny { .. } => {
+            pending.reject();
+            return;
+        }
+        Decision::Allow { rule_index: None } => Route::AlwaysAllowed,
+        Decision::Allow {
+            rule_index: Some(_),
+        } => Route::Checked,
+    };
 
     let prepared = match proto {
-        Proto::Tcp => prepare_tcp(&shared, name.as_deref(), dst, key).await,
+        Proto::Tcp => prepare_tcp(&shared, name.as_deref(), dst, key, route).await,
         Proto::Udp => prepare_udp(&shared, name.as_deref(), dst, key).await,
     };
+    settle(&shared, pending, proto, name.as_deref(), dst, key, prepared).await;
+}
+
+/// Accepts `pending` when its host socket is ready, or logs the refusal and
+/// rejects it.
+async fn settle(
+    shared: &Shared,
+    pending: PendingFlow,
+    proto: Proto,
+    name: Option<&str>,
+    dst: SocketAddr,
+    key: FlowKey,
+    prepared: Result<u64, Refusal>,
+) {
+    let cfg = &shared.cfg;
     match prepared {
         Ok(id) => {
             pending.accept();
@@ -414,7 +458,7 @@ async fn admit(shared: Arc<Shared>, pending: PendingFlow) {
                 target: "gino_agent::net",
                 thread_id = cfg.thread_id,
                 proto = proto.as_str(),
-                target_name = name.as_deref().unwrap_or("-"),
+                target_name = name.unwrap_or("-"),
                 target_ip = %dst.ip(),
                 port = dst.port(),
                 decision = "refused",
@@ -427,6 +471,17 @@ async fn admit(shared: Arc<Shared>, pending: PendingFlow) {
     }
 }
 
+/// How the host address of an allowed flow is found.
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    /// Allowed by a rule: forbidden addresses need a covering `cidr` rule.
+    Checked,
+    /// An always-allowed endpoint: private addresses are fine, local ones not.
+    AlwaysAllowed,
+    /// The gateway forward: always this host address.
+    Gateway(SocketAddr),
+}
+
 /// The host address for a flow to `dst`: the resolved `name`, or the literal
 /// destination when there is no name.
 async fn host_addr(
@@ -434,10 +489,18 @@ async fn host_addr(
     name: Option<&str>,
     dst: SocketAddr,
     proto: Proto,
+    route: Route,
 ) -> Result<SocketAddr, UpstreamError> {
-    match name {
-        Some(name) => upstream::resolve(name, dst.port(), proto, rules).await,
-        None => upstream::check_address(dst.ip(), dst.port(), proto, rules).map(|()| dst),
+    match (route, name) {
+        (Route::Gateway(target), _) => Ok(target),
+        (Route::AlwaysAllowed, Some(name)) => {
+            upstream::resolve_always_allowed(name, dst.port()).await
+        }
+        (Route::AlwaysAllowed, None) => upstream::check_always_allowed(dst.ip()).map(|()| dst),
+        (Route::Checked, Some(name)) => upstream::resolve(name, dst.port(), proto, rules).await,
+        (Route::Checked, None) => {
+            upstream::check_address(dst.ip(), dst.port(), proto, rules).map(|()| dst)
+        }
     }
 }
 
@@ -446,9 +509,10 @@ async fn prepare_tcp(
     name: Option<&str>,
     dst: SocketAddr,
     key: FlowKey,
+    route: Route,
 ) -> Result<u64, Refusal> {
     let permit = shared.limits.try_tcp()?;
-    let addr = host_addr(&shared.cfg.rules, name, dst, Proto::Tcp).await?;
+    let addr = host_addr(&shared.cfg.rules, name, dst, Proto::Tcp, route).await?;
     let socket = upstream::connect_tcp(addr, shared.cfg.connect_timeout).await?;
     Ok(shared.tcp.insert(key, Upstream { socket, permit }))
 }
@@ -460,7 +524,7 @@ async fn prepare_udp(
     key: FlowKey,
 ) -> Result<u64, Refusal> {
     let permit = shared.limits.try_udp()?;
-    let addr = host_addr(&shared.cfg.rules, name, dst, Proto::Udp).await?;
+    let addr = host_addr(&shared.cfg.rules, name, dst, Proto::Udp, Route::Checked).await?;
     let socket = upstream::connect_udp(addr).await?;
     Ok(shared.udp.insert(key, Upstream { socket, permit }))
 }
@@ -530,20 +594,30 @@ mod tests {
     }
 
     async fn harness(limits: LimitsConfig) -> Harness {
+        harness_with(|tcp_port, udp_port, cfg| {
+            let rules: Vec<Rule> = [
+                format!(r#"{{"host":"localhost","ports":[{tcp_port}]}}"#),
+                format!(r#"{{"cidr":"127.0.0.1/32","ports":[{tcp_port}]}}"#),
+                format!(r#"{{"host":"localhost","ports":[{udp_port}],"proto":"udp"}}"#),
+                format!(r#"{{"cidr":"127.0.0.1/32","ports":[{udp_port}],"proto":"udp"}}"#),
+            ]
+            .iter()
+            .map(|r| serde_json::from_str(r).unwrap())
+            .collect();
+            cfg.rules = Arc::new(RuleSet::compile(&rules, &[]).unwrap());
+            cfg.limits = limits;
+        })
+        .await
+    }
+
+    /// A harness whose exit config (empty rules by default) is adjusted by
+    /// `configure` with the echo servers' TCP and UDP ports.
+    async fn harness_with(configure: impl FnOnce(u16, u16, &mut ExitConfig)) -> Harness {
         let mut tasks = JoinSet::new();
         let (tcp_port, tcp_closed) = tcp_echo(&mut tasks).await;
         let udp_port = udp_echo(&mut tasks).await;
-        let rules: Vec<Rule> = [
-            format!(r#"{{"host":"localhost","ports":[{tcp_port}]}}"#),
-            format!(r#"{{"cidr":"127.0.0.1/32","ports":[{tcp_port}]}}"#),
-            format!(r#"{{"host":"localhost","ports":[{udp_port}],"proto":"udp"}}"#),
-            format!(r#"{{"cidr":"127.0.0.1/32","ports":[{udp_port}],"proto":"udp"}}"#),
-        ]
-        .iter()
-        .map(|r| serde_json::from_str(r).unwrap())
-        .collect();
-        let mut cfg = ExitConfig::new("thread-1", Arc::new(RuleSet::compile(&rules, &[]).unwrap()));
-        cfg.limits = limits;
+        let mut cfg = ExitConfig::new("thread-1", Arc::new(RuleSet::compile(&[], &[]).unwrap()));
+        configure(tcp_port, udp_port, &mut cfg);
         cfg.mtu = MTU;
 
         let (guest_stack, guest) = NetStack::new(NetStackConfig::new(
@@ -850,6 +924,64 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_forward_reaches_host_loopback_only_on_its_port() {
+        let h = harness_with(|tcp_port, _, cfg| {
+            cfg.gateway = Some(GatewayForward {
+                port: tcp_port,
+                target: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), tcp_port),
+            });
+        })
+        .await;
+        let gateway = DNS_ADDR.ip();
+        let mut conn = connect(&h.guest, SocketAddr::new(gateway, h.tcp_port))
+            .await
+            .unwrap();
+        echo(&mut conn, b"to the llm").await;
+
+        let other = if h.tcp_port == 1 { 2 } else { 1 };
+        assert_refused(connect(&h.guest, SocketAddr::new(gateway, other)).await);
+        let loopback = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), h.tcp_port);
+        assert_refused(connect(&h.guest, loopback).await);
+        assert_eq!(resolve(&h.guest, "example.com").await, (3, None));
+    }
+
+    /// A non-loopback address of this machine (routing lookup only, no traffic).
+    fn non_loopback_ip() -> Option<IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        upstream::is_forbidden(ip).then_some(ip)
+    }
+
+    #[tokio::test]
+    async fn always_allowed_private_address_is_relayed() {
+        let Some(ip) = non_loopback_ip() else {
+            eprintln!("skipping: no private non-loopback address");
+            return;
+        };
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut r, mut w) = stream.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let h = harness_with(|_, _, cfg| {
+            let rules = RuleSet::compile(&[], &[]).unwrap();
+            cfg.rules = Arc::new(rules.with_always_addr(addr).unwrap());
+        })
+        .await;
+        let mut conn = connect(&h.guest, addr).await.unwrap();
+        echo(&mut conn, b"private llm").await;
+        let other = SocketAddr::new(ip, if addr.port() == 1 { 2 } else { 1 });
+        assert_refused(connect(&h.guest, other).await);
     }
 
     #[tokio::test]
