@@ -1072,6 +1072,25 @@ mod tests {
     }
 
     #[test]
+    fn from_json_parses_allow_task_override() {
+        for (block, expected) in [
+            (r#"{ "allowTaskOverride": true }"#, Some(true)),
+            (r#"{ "allowTaskOverride": false }"#, Some(false)),
+            (r#"{ "mode": "sandbox" }"#, None),
+        ] {
+            let mut config = Config::default();
+            config.apply(
+                ConfigOverlay::from_json(&format!(r#"{{ "engine": {{ "isolation": {block} }} }}"#))
+                    .unwrap(),
+            );
+            assert_eq!(
+                config.engine.isolation.allow_task_override, expected,
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
     fn an_isolation_block_replaces_the_earlier_one_wholesale() {
         let mut config = Config::default();
         config.apply(
