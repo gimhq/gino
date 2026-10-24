@@ -302,6 +302,85 @@ the way it is `ENGINE_CONFIG_DIR` + `CLAUDE_CONFIG_DIR` for claude.
   run **completes on claude**; a warning in the agent log is the only signal. That is the trade-off of never
   failing a task on an engine-name mismatch.
 
+## 9d. Native deployment and engine sandbox
+
+Outside a container the runner can confine each engine run (claude or codex) in a **bubblewrap sandbox**.
+Isolation is **off by default**; with it off, launches are unchanged.
+
+**Requirements.** A Linux host; `bubblewrap` with `bwrap` on the daemon's `PATH`; unprivileged user
+namespaces enabled. Run the agent as a dedicated unprivileged user.
+
+**Config.** The `engine.isolation` block (an overlay that sets it replaces the earlier block wholesale):
+
+```json
+{ "engine": { "isolation": {
+  "mode": "sandbox",
+  "network": { "mode": "none" },
+  "readPaths": ["/opt/node"],
+  "writePaths": ["/data/cache"]
+} } }
+```
+
+- `mode` ∈ `off | sandbox | vm`; absent = `off`. `network.mode` ∈ `none | full | allowlist`; absent = `none`.
+- `readPaths` / `writePaths` are extra host paths bound read-only / read-write. Each must be absolute,
+  contain no `..`, and be neither the workspace root nor a parent of it. They are checked only when the
+  resolved mode is not `off`.
+- **Per-task override**: `meta.isolation` on the task (`task_upsert`) overrides `mode` and `network.mode`
+  only; extra paths always come from the config. Meta that is not a JSON object, or has no `isolation`
+  key, means no override.
+- `vm` and `allowlist` fail the run with "`… is not supported yet`". Unknown values, an invalid path or a
+  malformed `meta.isolation` also fail the run. All of these are classified as `runner.invalid_request` (§6) and
+  are not retried.
+
+**Launch chain.** daemon → `bwrap` → `gino-agent sandbox-init` (pid 1) → engine.
+
+- `bwrap` unshares every namespace (`--unshare-all`, `--die-with-parent`, `--new-session`) and runs
+  `sandbox-init` as uid/gid 0 of the sandbox user namespace with **only `CAP_SETFCAP`** — needed to map a
+  nested user namespace onto that uid 0 (kernel ≥ 5.12).
+- `sandbox-init` enters a nested user namespace, switches to **uid/gid 1000**, clears every capability
+  set, sets `no_new_privs`, verifies `CapEff`/`CapPrm` are empty, then spawns the engine with the inherited
+  stdio and environment and exits with its status (128 + signal when killed). Any setup failure exits
+  **125** with a `sandbox-init: …` line on stderr.
+- `bwrap` does not forward signals, so `sandbox-init` forwards SIGINT/SIGTERM to the engine; the codex
+  interrupt (§9c) SIGINTs `sandbox-init` rather than `bwrap`.
+- The stdio stream and the claude control protocol are unchanged.
+- The engine binary is resolved on the daemon's `PATH` and canonicalized; its install dir is bound
+  read-only unless it is under `/usr`, and so is the agent binary. An engine that needs files elsewhere
+  (e.g. a node runtime outside `/usr`) needs them in `readPaths`.
+
+**Mounts.**
+
+| visible | how |
+|---|---|
+| `/usr`, `/bin` `/lib` `/lib64` `/sbin` (mirroring the host's dirs/symlinks), `/etc` | read-only |
+| engine install dir, agent binary, `readPaths` | read-only |
+| the thread's `work_dir`, `writePaths` | read-write |
+| `/tmp`, `$HOME` (the daemon's, else `/home/gino`) | fresh tmpfs |
+| `/proc`, `/dev` | new instances |
+
+Not visible: the workspace root and other threads' work dirs, `agent.db`, the global engine config dir
+(except the two binds below), `conversations/` under the workspace, `/run`, `/var`.
+
+**Engine home.** Each thread gets `<work_dir>/.engine-home`, exported as `ENGINE_CONFIG_DIR` plus
+`CLAUDE_CONFIG_DIR` (claude) or `CODEX_HOME` (codex). The global `CLAUDE.md` and `skills/` (§9b) are bound
+into it read-only when present. `claude login` state in the global dir is **not** visible, so credentials
+must come from the environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, or the host proxy
+(`ANTHROPIC_BASE_URL`). The engine also gets `HOME`, `TMPDIR=/tmp` and `GINO_SANDBOX=1`.
+
+**Archive and `gino` CLI.** The PreCompact archive (`gino-agent archive`) writes to `<work_dir>/conversations` via
+`GINO_ARCHIVE_DIR`. The in-engine `gino` CLI cannot open the agent DB and reports "agent state is not
+available inside the sandbox".
+
+**Network.** `none`: own network namespace with loopback only. `full`: the host network
+(`--share-net`); when `/etc/resolv.conf` links outside `/etc`, its target is bound read-only.
+
+**Fail-closed.** The first sandboxed run resolves `bwrap` and probes it once per process (cached). If
+`bwrap` is missing or the probe fails, every sandboxed run fails with "engine sandbox is unavailable: …";
+it never falls back to running unconfined.
+
+**Testing.** Privileged integration tests live in `gino-agent/scripts/sandbox-it.sh` (a sibling container
+with a custom seccomp profile, running as a non-root user) and are switched on by `GINO_SANDBOX_IT=1`.
+
 ## 10. Transport & protocol
 
 WS primary (at-least-once via outbox/inbox + ack/msg_ack); HTTP for register/config/output + attachment proxy.
