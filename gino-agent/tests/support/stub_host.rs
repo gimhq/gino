@@ -568,6 +568,13 @@ impl StubHost {
         self.send_raw(&frame.to_string()).await;
     }
 
+    /// Send an arbitrary host→agent frame (e.g. an `interrupt`, or a
+    /// `task_upsert` carrying `meta`), waiting (≤5s) for a live connection.
+    #[allow(dead_code)] // used by the sandbox suite only
+    pub async fn push_frame(&self, frame: &Value) {
+        self.send_raw(&frame.to_string()).await;
+    }
+
     /// Send a raw host→agent frame, waiting (≤5s) for a live connection.
     async fn send_raw(&self, frame: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
