@@ -308,7 +308,8 @@ Outside a container the runner can confine each engine run (claude or codex) in 
 Isolation is **off by default**; with it off, launches are unchanged.
 
 **Requirements.** A Linux host; `bubblewrap` with `bwrap` on the daemon's `PATH`; unprivileged user
-namespaces enabled. Run the agent as a dedicated unprivileged user.
+namespaces enabled. Run the agent as a dedicated unprivileged user; a sandboxed run fails closed
+before spawn when the agent runs as root.
 
 **Config.** The `engine.isolation` block (an overlay that sets it replaces the earlier block wholesale):
 

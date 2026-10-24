@@ -47,3 +47,4 @@ Each task is a single line linking to its detail file. All detailed information 
 - [x] [**20261024-0245-signed-release-assets Signed lode release assets, agent as tar.gz**](20261024-0245-signed-release-assets.md) `P2`
 - [-] [**20261024-0058-engine-sandbox Filesystem and network restrictions for engine runs**](20261024-0058-engine-sandbox.md) `P2`
 - [ ] [**20261024-0130-engine-vm-isolation VM isolation backend for engine runs**](20261024-0130-engine-vm-isolation.md) `P2`
+- [ ] [**20261024-1341-host-isolation-overlay Host-delivered engine isolation overlay**](20261024-1341-host-isolation-overlay.md) `P2`

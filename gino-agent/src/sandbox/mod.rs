@@ -363,17 +363,34 @@ impl SandboxHost {
 }
 
 /// Resolve the run's isolation and build its launch: `direct` as-is when off,
-/// wrapped in `bwrap` when sandboxed. Fails closed when `bwrap` is unusable.
+/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root
+/// or `bwrap` is unusable.
 pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, EngineError> {
+    launch_as(direct, ctx, nix::unistd::geteuid().as_raw())
+}
+
+fn launch_as(direct: Launch, ctx: &LaunchContext<'_>, euid: u32) -> Result<Launch, EngineError> {
     let isolation = resolve(ctx.isolation, ctx.task_override, ctx.workspace_dir)?;
     match isolation.mode {
         IsolationMode::Off => Ok(direct),
         IsolationMode::Sandbox => {
+            check_not_root(euid)?;
             let bwrap = bwrap::ensure_available()?;
             wrap(direct, ctx, &isolation, &SandboxHost::current(bwrap))
         }
         IsolationMode::Vm => Err(IsolationError::NotSupported("isolation.mode: vm".into()).into()),
     }
+}
+
+/// Refuse to sandbox from a root daemon: the engine's user namespace maps it
+/// onto the daemon's uid, so it would own root's files.
+fn check_not_root(euid: u32) -> Result<(), IsolationError> {
+    if euid == 0 {
+        return Err(IsolationError::Unavailable(
+            "the agent runs as root; run it as an unprivileged user".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Wrap `direct` in `bwrap` + `sandbox-init` and create the engine home.
@@ -527,8 +544,8 @@ mod tests {
 
     use super::{
         Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
-        NetworkMode, NetworkSpec, SandboxHost, first_child, launch, override_from_meta, resolve,
-        sandbox_init_pid, stat_ppid, wrap,
+        NetworkMode, NetworkSpec, SandboxHost, check_not_root, first_child, launch, launch_as,
+        override_from_meta, resolve, sandbox_init_pid, stat_ppid, wrap,
     };
     use crate::engine::EngineError;
 
@@ -1098,6 +1115,34 @@ mod tests {
             d
         );
         assert!(!d.sandboxed);
+    }
+
+    #[test]
+    fn root_euid_is_refused() {
+        let err = check_not_root(0).unwrap_err();
+        assert!(matches!(err, IsolationError::Unavailable(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "engine sandbox is unavailable: the agent runs as root; run it as an unprivileged user"
+        );
+        check_not_root(1000).unwrap();
+    }
+
+    #[test]
+    fn root_euid_fails_only_sandboxed_launches() {
+        let d = direct(Path::new("/ws/threads/t1/project"));
+        let off = IsolationSpec::default();
+        assert_eq!(
+            launch_as(d.clone(), &ctx(&off, None, None, None), 0).unwrap(),
+            d
+        );
+
+        let sandbox = spec(Some("sandbox"), None);
+        let err = launch_as(d, &ctx(&sandbox, None, None, None), 0).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Isolation(IsolationError::Unavailable(m)) if m.contains("root")),
+            "{err:?}"
+        );
     }
 
     #[test]
