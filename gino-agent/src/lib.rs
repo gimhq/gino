@@ -153,7 +153,8 @@ fn install_crypto_provider() {
 }
 
 /// The `archive` subcommand: read the PreCompact hook payload on stdin and write
-/// a Markdown archive + sessions index under the workspace `conversations` dir.
+/// a Markdown archive + sessions index under `GINO_ARCHIVE_DIR`, else the
+/// workspace `conversations` dir.
 ///
 /// This runs as a short-lived subprocess Claude spawns for its PreCompact hook,
 /// so it cannot reach host-assigned config; the workspace path is resolved from
@@ -161,8 +162,12 @@ fn install_crypto_provider() {
 /// or the built-in default. No network, no runtime needed.
 fn archive() -> Result<()> {
     let workspace_dir = env_path_or("GINO_WORKSPACE_DIR", |paths| paths.workspace_dir);
+    let conversations_dir = archive::conversations_dir(
+        std::env::var_os("GINO_ARCHIVE_DIR").map(std::path::PathBuf::from),
+        &workspace_dir,
+    );
     let stdin = std::io::stdin();
-    archive::run(&workspace_dir, stdin.lock()).context("archiving transcript")?;
+    archive::run(&conversations_dir, stdin.lock()).context("archiving transcript")?;
     Ok(())
 }
 
