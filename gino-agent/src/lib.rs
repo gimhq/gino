@@ -21,6 +21,7 @@ mod executor;
 mod failure;
 mod gino_cli;
 mod login;
+mod net;
 mod paths;
 mod protocol;
 mod provisioning;
