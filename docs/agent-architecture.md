@@ -580,7 +580,7 @@ in order; a connection may carry any number of requests.
 | method handler | 10 s | `unavailable` ("request timed out") |
 | concurrent connections, total | 64 | connection closed immediately, no response |
 | concurrent authenticated connections per run token | 8 | that `auth` returns `unavailable` ("too many connections for this token"); the connection stays unauthenticated |
-| concurrent operator connections | 8 | counted separately from run tokens |
+| concurrent operator connections | 8 | connection closed immediately, no response (counted separately from run tokens) |
 
 **Versioning.** `v` must be the integer `1`. A missing or different `v` returns `unsupported_version`
 ("unsupported protocol version; this agent speaks v1"). Future versions bump `v`; the daemon answers only
