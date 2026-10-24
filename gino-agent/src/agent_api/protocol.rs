@@ -167,3 +167,96 @@ pub(crate) struct ThreadCounts {
     pub(crate) pending: usize,
     pub(crate) running: usize,
 }
+
+/// A task in listings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskSummary {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) status: String,
+    pub(crate) created_at: String,
+}
+
+/// A thread in listings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThreadSummary {
+    pub(crate) id: String,
+    pub(crate) task_id: String,
+    pub(crate) status: String,
+    pub(crate) source: String,
+    pub(crate) attempt: i64,
+    pub(crate) max_attempts: i64,
+    pub(crate) engine_session_id: Option<String>,
+}
+
+/// A thread with its run details.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThreadDetail {
+    #[serde(flatten)]
+    pub(crate) summary: ThreadSummary,
+    pub(crate) cron_id: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) engine: String,
+    pub(crate) duration_ms: Option<i64>,
+    pub(crate) prompt: String,
+    pub(crate) result: Option<String>,
+    pub(crate) error: Option<String>,
+}
+
+/// A cron trigger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CronInfo {
+    pub(crate) id: String,
+    pub(crate) task_id: String,
+    pub(crate) kind: String,
+    pub(crate) status: String,
+    pub(crate) schedule_type: Option<String>,
+    pub(crate) schedule_value: Option<String>,
+    pub(crate) next_run: Option<String>,
+    pub(crate) last_fired_at: Option<String>,
+    pub(crate) continuity: String,
+    pub(crate) run_count: i64,
+    pub(crate) prompt: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+/// `task.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskList {
+    pub(crate) tasks: Vec<TaskSummary>,
+}
+
+/// `task.show` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskShow {
+    pub(crate) task: TaskSummary,
+    pub(crate) threads: Vec<ThreadSummary>,
+    pub(crate) crons: Vec<CronInfo>,
+}
+
+/// `thread.list` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThreadList {
+    pub(crate) threads: Vec<ThreadSummary>,
+}
+
+/// `thread.show` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ThreadShow {
+    pub(crate) thread: ThreadDetail,
+}
+
+/// `cron.list` result; `scoped` is false for the all-tasks active listing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CronList {
+    pub(crate) crons: Vec<CronInfo>,
+    pub(crate) scoped: bool,
+}
+
+/// `cron.create` / `cron.delete` / `cron.pause` / `cron.resume` result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CronResult {
+    pub(crate) cron: CronInfo,
+}
