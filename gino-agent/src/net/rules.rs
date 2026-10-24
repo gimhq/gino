@@ -109,6 +109,7 @@ pub struct Rule {
 impl Rule {
     /// Checks the rule; `index` is its position in the rule list and appears
     /// in the error message.
+    #[cfg(test)]
     pub fn validate(&self, index: usize) -> Result<(), RuleError> {
         self.compile(index).map(drop)
     }

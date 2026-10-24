@@ -111,10 +111,14 @@ pub enum ExitError {
     Pool(#[from] FakePoolConfigError),
 }
 
-/// A running exit; dropping it (or [`Exit::shutdown`]) stops the packet pumps,
+/// A running exit; dropping it stops the packet pumps,
 /// the stack, the DNS server, admission and every relay.
 #[derive(Debug)]
 pub struct Exit {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "held only to abort the tasks on drop")
+    )]
     tasks: JoinSet<()>,
 }
 
@@ -158,6 +162,7 @@ impl Exit {
     }
 
     /// Stops everything and waits until the tasks are gone.
+    #[cfg(test)]
     pub async fn shutdown(mut self) {
         self.tasks.shutdown().await;
     }
