@@ -8,11 +8,14 @@
 #                   (default: ai-agent/gino-agent-gates:1.96)
 #   CARGO_REGISTRY  host dir mounted as the container's cargo registry cache
 #                   (default: /srv/station/root/.cargo/registry; empty = no mount)
+#   CARGO_GIT       host dir mounted as the container's cargo git checkout cache
+#                   (default: /srv/station/root/.cargo/git; empty = no mount)
 #   SECCOMP_URL     base seccomp profile to extend
 set -euo pipefail
 
 IMAGE="${IMAGE:-ai-agent/gino-agent-gates:1.96}"
 CARGO_REGISTRY="${CARGO_REGISTRY-/srv/station/root/.cargo/registry}"
+CARGO_GIT="${CARGO_GIT-/srv/station/root/.cargo/git}"
 SECCOMP_URL="${SECCOMP_URL:-https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json}"
 
 for tool in docker curl jq git; do
@@ -35,6 +38,9 @@ jq --argjson names '["unshare","clone","clone3","mount","umount2","pivot_root","
 mounts=(-v "$WT:$WT")
 if [[ -n "$CARGO_REGISTRY" ]]; then
   mounts+=(-v "$CARGO_REGISTRY:/usr/local/cargo/registry")
+fi
+if [[ -n "$CARGO_GIT" ]]; then
+  mounts+=(-v "$CARGO_GIT:/usr/local/cargo/git")
 fi
 
 # Build as root, then run the ignored sandbox tests as uid 1000.
