@@ -194,7 +194,27 @@ impl RunnerProc {
         path: Option<&str>,
     ) -> Self {
         let path = path.map_or_else(|| fakes_first_path(fake_dir.path()), str::to_owned);
-        let child = launch(host, workspace, &path);
+        let child = launch(host, workspace, &path, &[], std::process::Stdio::null());
+        Self {
+            child,
+            fake_dir,
+            _workspace: None,
+        }
+    }
+
+    /// Like [`Self::spawn_in_with_fakes`] with the fakes dir first on the
+    /// inherited `PATH`, plus extra daemon `envs` (overriding the defaults) and
+    /// the daemon's stderr sent to `stderr`.
+    #[allow(dead_code)] // used by the sandbox suite only
+    pub fn spawn_in_with_env(
+        host: &StubHost,
+        workspace: &Workspace,
+        fake_dir: TempDir,
+        envs: &[(&str, &std::ffi::OsStr)],
+        stderr: std::process::Stdio,
+    ) -> Self {
+        let path = fakes_first_path(fake_dir.path());
+        let child = launch(host, workspace, &path, envs, stderr);
         Self {
             child,
             fake_dir,
@@ -225,7 +245,13 @@ fn boot(
     if let Some(thread_id) = codex_thread_id {
         fake_codex::install_into(fake_dir.path(), thread_id);
     }
-    let child = launch(host, workspace, &fakes_first_path(fake_dir.path()));
+    let child = launch(
+        host,
+        workspace,
+        &fakes_first_path(fake_dir.path()),
+        &[],
+        std::process::Stdio::null(),
+    );
     (child, fake_dir)
 }
 
@@ -237,9 +263,15 @@ fn fakes_first_path(dir: &std::path::Path) -> String {
     }
 }
 
-/// Boot the daemon against `host` with `path` as its `PATH` and the workspace
-/// relocated into `workspace`.
-fn launch(host: &StubHost, workspace: &Workspace, path: &str) -> Child {
+/// Boot the daemon against `host` with `path` as its `PATH`, the workspace
+/// relocated into `workspace`, `envs` set last and stderr to `stderr`.
+fn launch(
+    host: &StubHost,
+    workspace: &Workspace,
+    path: &str,
+    envs: &[(&str, &std::ffi::OsStr)],
+    stderr: std::process::Stdio,
+) -> Child {
     let mut command = Command::new(DAEMON_BIN);
     command
         .arg("run")
@@ -256,7 +288,8 @@ fn launch(host: &StubHost, workspace: &Workspace, path: &str) -> Child {
         .env("RUST_LOG", "off")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(stderr)
+        .envs(envs.iter().copied())
         .kill_on_drop(true);
     command.spawn().expect("spawn gino-agent daemon")
 }
