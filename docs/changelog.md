@@ -217,3 +217,11 @@ hidden agent state and sibling threads, resume, denied host unreachable). Open, 
 sandbox follow-ups task: `dotns/simple-dns` is not publicly fetchable (clean builds and CI fail
 until upstream fixes it), harness build and stale-binary handling, one leaky test, PreCompact
 hook and codex under the sandbox not yet verified with real binaries.
+
+## 2026-10-24 17:40 [progress]
+
+gino-agent moves to nsplane v0.19.0 (`nsplane`, `nsplane-dns`, `nsplane-netstack`,
+`nsplane-tun`; smoltcp fork `v0.14.0-nsplane.7`). nsplane v0.18.0 vendors `simple-dns`, so the
+unreachable `github.com/dotns/simple-dns` git source is gone from `Cargo.lock` and `deny.toml`.
+Verified with an empty cargo git cache (all git dependencies fetched from public repositories):
+full agent gate (nextest 644 passed / 12 privileged skipped) and `sandbox-it.sh` 10/10.

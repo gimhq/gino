@@ -1420,8 +1420,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "bytes",
  "nix 0.31.2",
@@ -1435,8 +1435,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane-core"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "nsplane-noise",
  "nsplane-packet",
@@ -1446,8 +1446,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane-dns"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "bytes",
  "nsplane-netstack",
@@ -1459,8 +1459,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane-netstack"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "bytes",
  "futures-core",
@@ -1473,8 +1473,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane-noise"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "aead",
  "aws-lc-rs",
@@ -1493,8 +1493,8 @@ dependencies = [
 
 [[package]]
 name = "nsplane-packet"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "bytes",
  "smallvec",
@@ -1503,11 +1503,12 @@ dependencies = [
 
 [[package]]
 name = "nsplane-tun"
-version = "0.17.0"
-source = "git+https://github.com/dotns/nsplane?tag=v0.17.0#cfec5208c8adde2af69076d4c329163c64fc312f"
+version = "0.19.0"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "libc",
  "nsplane",
+ "nsplane-packet",
  "sha2",
  "tokio",
  "tracing",
@@ -2190,7 +2191,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "simple-dns"
 version = "0.12.0"
-source = "git+https://github.com/dotns/simple-dns?tag=v0.12.0-nsplane.3#e17b0c7bfec7e6378bcaefda7ee782bdd1117993"
+source = "git+https://github.com/dotns/nsplane?tag=v0.19.0#79be1aff5b4b59d7c7d6c6809e5e9d3abf3d9d1a"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -2210,7 +2211,7 @@ checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 [[package]]
 name = "smoltcp"
 version = "0.14.0"
-source = "git+https://github.com/dotns/smoltcp?tag=v0.14.0-nsplane.6#687c56ad47bd831b395bb532da904d20d205140c"
+source = "git+https://github.com/dotns/smoltcp?tag=v0.14.0-nsplane.7#85e9796162bf36e0afbaad8c75c397c7729c8cd2"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
