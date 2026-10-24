@@ -612,7 +612,9 @@ than `auth` on a connection without scope returns `unauthenticated`.
 **Run-scope rules.** A run-scoped caller only sees and changes its own `task_id`:
 
 - an explicit `task_id` param that is not its own → `forbidden`;
-- a thread or cron that exists but belongs to another task → `forbidden`;
+- a task, thread or cron named by id that belongs to another task → `not_found`, with exactly the
+  response a missing id gets, so another task's objects are indistinguishable from nonexistent ones
+  (and nothing is changed);
 - listings are filtered to its own task; `system.info` is redacted (below).
 
 **Threat-model limit.** Unsandboxed engines run as the daemon's uid and can read another engine's token
@@ -651,10 +653,10 @@ separate PID namespace) — matching the isolation model.
   registered); `name` / `host_url` the daemon config `agent_name` / `host_url` (nullable). It never
   includes the connect token, the enrollment token or any other task's data.
 - **`task.list`.** Run: only its own task, if it exists.
-- **`task.show`.** Missing → `not_found` ("no such task: <id>"); run scope with another id → `forbidden`.
+- **`task.show`.** Missing, or (run scope) another task's id → `not_found` ("no such task: <id>").
 - **`thread.list`.** Run: defaults to (and only allows) its own task. Operator: `task_id` required
   (`invalid_params` "task_id is required").
-- **`thread.show`.** Missing → `not_found` ("no such thread: <id>").
+- **`thread.show`.** Missing, or (run scope) another task's thread → `not_found` ("no such thread: <id>").
 - **`cron.create`.** Run: task defaults to its own; operator: `task_id` required. A `continuity` other than
   `isolated`/`shared` → `invalid_params` ("continuity must be 'isolated' or 'shared' (got '<x>')"); a
   schedule rejected by `next_run_at_creation` → `invalid_params` ("invalid schedule: type=<t> value=<v>:
@@ -663,8 +665,8 @@ separate PID namespace) — matching the isolation model.
   `created_at` = `updated_at` = now.
 - **`cron.list`.** Run: all of its own task's crons (every status), `scoped:true`. Operator: with
   `task_id` → that task's crons, `scoped:true`; without → active crons across all tasks, `scoped:false`.
-- **`cron.delete` / `cron.pause` / `cron.resume`.** Missing → `not_found` ("no such cron: <id>"); another
-  task's cron → `forbidden`. `cron.resume` recomputes `next_run` forward from now via
+- **`cron.delete` / `cron.pause` / `cron.resume`.** Missing, or (run scope) another task's cron →
+  `not_found` ("no such cron: <id>"), with no side effects. `cron.resume` recomputes `next_run` forward from now via
   `next_run_at_creation` (`null` if that fails).
 - **Cron side effects.** Every successful cron mutation (`create`, `delete`, `pause`, `resume`) updates
   `updated_at`, enqueues a `cron_state` outbox row (best-effort; a failure is logged, not returned), then
@@ -675,8 +677,8 @@ separate PID namespace) — matching the isolation model.
 | code | meaning |
 |---|---|
 | `unauthenticated` | no valid scope on this connection (no `auth` yet, bad token, revoked token) |
-| `forbidden` | the caller's scope does not cover the requested task / thread / cron |
-| `not_found` | the referenced task / thread / cron does not exist (within the caller's scope) |
+| `forbidden` | an explicit `task_id` param outside the caller's scope |
+| `not_found` | the referenced task / thread / cron does not exist, or is outside the caller's scope |
 | `invalid_params` | malformed JSON, missing / ill-typed fields, invalid schedule, unknown method ("unknown method: <name>") |
 | `unsupported_version` | `v` missing or not `1` |
 | `unavailable` | handler timeout, connection limits, daemon shutting down |

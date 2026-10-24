@@ -481,12 +481,16 @@ struct Fixture {
     shared: Arc<Shared>,
     registry: TokenRegistry,
     db: Arc<Mutex<Db>>,
+    nudge: Arc<Notify>,
+    flush: Arc<Notify>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let (dir, ctx) = context();
         let db = Arc::clone(&ctx.db);
+        let nudge = Arc::clone(&ctx.nudge);
+        let flush = Arc::clone(&ctx.flush);
         let registry = TokenRegistry::default();
         let shared = Arc::new(Shared::new(ctx, registry.clone()));
         Self {
@@ -494,6 +498,8 @@ impl Fixture {
             shared,
             registry,
             db,
+            nudge,
+            flush,
         }
     }
 
@@ -557,6 +563,24 @@ fn cron_json(task: &str) -> Value {
     })
 }
 
+/// `hidden` (for `id`) is the same response as `missing` (for `missing_id`),
+/// apart from the request id.
+fn assert_hidden(hidden: &Value, missing: &Value, missing_id: &str, id: &str) {
+    assert_error(missing, "not_found", None);
+    let strip = |v: &Value| {
+        let mut v = v.clone();
+        v.as_object_mut().unwrap().remove("id");
+        v
+    };
+    let expected = serde_json::to_string(&strip(missing))
+        .unwrap()
+        .replace(missing_id, id);
+    assert_eq!(
+        strip(hidden),
+        serde_json::from_str::<Value>(&expected).unwrap()
+    );
+}
+
 fn assert_error(response: &Value, code: &str, message: Option<&str>) {
     assert_eq!(error_code(response), code, "{response}");
     if let Some(message) = message {
@@ -593,7 +617,9 @@ async fn task_methods_respect_scope() {
     assert_eq!(show["threads"], json!([thread_json("task-a")]));
     assert_eq!(show["crons"], json!([cron_json("task-a")]));
     let other = run.call("task.show", json!({"id": "task-b"})).await;
-    assert_error(&other, "forbidden", None);
+    let missing = run.call("task.show", json!({"id": "nope"})).await;
+    assert_error(&missing, "not_found", Some("no such task: nope"));
+    assert_hidden(&other, &missing, "nope", "task-b");
 }
 
 #[tokio::test]
@@ -635,7 +661,9 @@ async fn thread_methods_respect_scope() {
     let other = run
         .call("thread.show", json!({"id": "task-b-thread"}))
         .await;
-    assert_error(&other, "forbidden", None);
+    let missing = run.call("thread.show", json!({"id": "nope"})).await;
+    assert_error(&missing, "not_found", Some("no such thread: nope"));
+    assert_hidden(&other, &missing, "nope", "task-b-thread");
 }
 
 #[tokio::test]
@@ -749,13 +777,32 @@ async fn cron_create_validates_and_builds_the_cli_row() {
 async fn cron_mutations_update_status_and_enqueue_state() {
     let fx = Fixture::new();
     let mut run = fx.run("task-a").await;
+    let cron_b = || fx.db.lock().unwrap().get_cron("task-b-cron").unwrap();
+    let before = cron_b();
     for method in ["cron.delete", "cron.pause", "cron.resume"] {
         let other = run.call(method, json!({"id": "task-b-cron"})).await;
-        assert_error(&other, "forbidden", None);
         let missing = run.call(method, json!({"id": "nope"})).await;
         assert_error(&missing, "not_found", Some("no such cron: nope"));
+        assert_hidden(&other, &missing, "nope", "task-b-cron");
     }
+    assert_eq!(cron_b(), before, "another task's cron untouched");
     assert_eq!(fx.cron_states("task-b-cron"), 0);
+    let quiet = std::time::Duration::from_millis(50);
+    assert!(
+        tokio::time::timeout(quiet, fx.nudge.notified())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(quiet, fx.flush.notified())
+            .await
+            .is_err()
+    );
+
+    let mut op = fx.operator();
+    let paused_b = conn_result(&mut op, "cron.pause", json!({"id": "task-b-cron"})).await;
+    assert_eq!(paused_b["cron"]["status"], "paused");
+    assert_eq!(fx.cron_states("task-b-cron"), 1);
 
     let paused = conn_result(&mut run, "cron.pause", json!({"id": "task-a-cron"})).await;
     assert_eq!(paused["cron"]["status"], "paused");
@@ -770,7 +817,6 @@ async fn cron_mutations_update_status_and_enqueue_state() {
     assert!(next > before, "next_run recomputed forward from now");
     assert_eq!(fx.cron_states("task-a-cron"), 2);
 
-    let mut op = fx.operator();
     let deleted = conn_result(&mut op, "cron.delete", json!({"id": "task-a-cron"})).await;
     assert_eq!(deleted["cron"]["status"], "cancelled");
     assert_eq!(deleted["cron"]["next_run"], Value::Null);

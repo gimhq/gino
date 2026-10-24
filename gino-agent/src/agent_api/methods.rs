@@ -125,15 +125,36 @@ fn default_continuity() -> String {
     "isolated".to_owned()
 }
 
-/// `forbidden` unless `scope` covers `task_id`.
-fn authorize(scope: &Scope, task_id: &str) -> Result<(), ApiError> {
+/// Whether `scope` covers `task_id`.
+fn in_scope(scope: &Scope, task_id: &str) -> bool {
     match scope {
-        Scope::Run(run) if run.task_id != task_id => Err(ApiError::new(
+        Scope::Run(run) => run.task_id == task_id,
+        Scope::Operator => true,
+    }
+}
+
+/// `forbidden` unless `scope` covers an explicitly named `task_id`.
+fn authorize(scope: &Scope, task_id: &str) -> Result<(), ApiError> {
+    if in_scope(scope, task_id) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
             ErrorCode::Forbidden,
             "this run may only access its own task",
-        )),
-        _ => Ok(()),
+        ))
     }
+}
+
+/// The looked-up `row` if it exists and `scope` covers its task; otherwise
+/// the `missing` error, so a row outside the scope reads as nonexistent.
+fn scoped_row<T>(
+    scope: &Scope,
+    row: Option<T>,
+    task_of: impl Fn(&T) -> &str,
+    missing: impl FnOnce() -> ApiError,
+) -> Result<T, ApiError> {
+    row.filter(|r| in_scope(scope, task_of(r)))
+        .ok_or_else(missing)
 }
 
 /// The task a request targets: a run defaults to (and is limited to) its own;
@@ -198,19 +219,20 @@ fn task_list(ctx: &ApiContext, scope: &Scope) -> Result<TaskList, ApiError> {
     Ok(TaskList {
         tasks: tasks
             .iter()
-            .filter(|t| authorize(scope, &t.id).is_ok())
+            .filter(|t| in_scope(scope, &t.id))
             .map(task_summary)
             .collect(),
     })
 }
 
 fn task_show(ctx: &ApiContext, scope: &Scope, id: &str) -> Result<TaskShow, ApiError> {
-    authorize(scope, id)?;
     let db = ctx.db();
-    let task = db
-        .get_task_row(id)
-        .map_err(db_error)?
-        .ok_or_else(|| no_such_task(id))?;
+    let task = scoped_row(
+        scope,
+        db.get_task_row(id).map_err(db_error)?,
+        |t| &t.id,
+        || no_such_task(id),
+    )?;
     let threads = db.list_threads_by_task(id).map_err(db_error)?;
     let crons = db.list_crons_by_task(id).map_err(db_error)?;
     Ok(TaskShow {
@@ -233,12 +255,12 @@ fn thread_list(
 }
 
 fn thread_show(ctx: &ApiContext, scope: &Scope, id: &str) -> Result<ThreadShow, ApiError> {
-    let thread = ctx
-        .db()
-        .get_thread(id)
-        .map_err(db_error)?
-        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, format!("no such thread: {id}")))?;
-    authorize(scope, &thread.task_id)?;
+    let thread = scoped_row(
+        scope,
+        ctx.db().get_thread(id).map_err(db_error)?,
+        |t| &t.task_id,
+        || ApiError::new(ErrorCode::NotFound, format!("no such thread: {id}")),
+    )?;
     Ok(ThreadShow {
         thread: ThreadDetail {
             summary: thread_summary(&thread),
@@ -323,12 +345,12 @@ fn cron_create(
 
 /// The cron `id`, if it exists and `scope` covers its task.
 fn scoped_cron(db: &Db, scope: &Scope, id: &str) -> Result<CronRow, ApiError> {
-    let cron = db
-        .get_cron(id)
-        .map_err(db_error)?
-        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, format!("no such cron: {id}")))?;
-    authorize(scope, &cron.task_id)?;
-    Ok(cron)
+    scoped_row(
+        scope,
+        db.get_cron(id).map_err(db_error)?,
+        |c| &c.task_id,
+        || ApiError::new(ErrorCode::NotFound, format!("no such cron: {id}")),
+    )
 }
 
 fn cron_set_status(
