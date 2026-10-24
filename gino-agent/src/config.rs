@@ -179,8 +179,6 @@ pub(crate) struct EngineConfig {
     /// Settings for the `codex` backend, namespaced under `engine.codex`.
     pub(crate) codex: CodexConfig,
     /// Default engine isolation (`engine.isolation`); empty means off.
-    // Not read outside tests until isolation is wired into engine spawning.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) isolation: IsolationSpec,
 }
 

@@ -186,6 +186,10 @@ pub(crate) fn bwrap_args(
             "0".as_ref(),
             "--gid".as_ref(),
             "0".as_ref(),
+            // Lets sandbox-init map its nested user namespace onto uid 0; it
+            // drops every capability before the engine starts.
+            "--cap-add".as_ref(),
+            "CAP_SETFCAP".as_ref(),
             "--die-with-parent".as_ref(),
             "--new-session".as_ref(),
             "--as-pid-1".as_ref(),
@@ -438,13 +442,15 @@ mod tests {
     fn process_and_namespace_flags_lead() {
         let a = args(&layout(), &host());
         assert_eq!(
-            a[..13],
+            a[..15],
             [
                 "--unshare-all",
                 "--uid",
                 "0",
                 "--gid",
                 "0",
+                "--cap-add",
+                "CAP_SETFCAP",
                 "--die-with-parent",
                 "--new-session",
                 "--as-pid-1",
@@ -456,6 +462,7 @@ mod tests {
             ]
         );
         assert!(!a.iter().any(|x| x == "--share-net" || x == "--unshare-net"));
+        assert_eq!(a.iter().filter(|x| *x == "--cap-add").count(), 1);
     }
 
     #[test]
