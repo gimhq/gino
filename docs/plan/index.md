@@ -39,4 +39,4 @@ Each plan is a single line linking to its detail file. All detailed information 
 - [x] [**20261013-1955-engine-turn-end Engine turn-end detection for claude and codex**](20261013-1955-engine-turn-end.md) `2026-10-13`
 - [x] [**20261023-2333-ulid-delivery-ids ULID delivery ids for host and agent outboxes**](20261023-2333-ulid-delivery-ids.md) `2026-10-23`
 - [x] [**20261024-0123-agent-baseline Agent TLS stack and pma-rust baseline gaps**](20261024-0123-agent-baseline.md) `2026-10-24`
-- [-] [**20261024-0058-engine-sandbox Filesystem and network restrictions for engine runs**](20261024-0058-engine-sandbox.md) `2026-10-24`
+- [x] [**20261024-0058-engine-sandbox Filesystem and network restrictions for engine runs**](20261024-0058-engine-sandbox.md) `2026-10-24`

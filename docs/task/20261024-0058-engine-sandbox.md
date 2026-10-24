@@ -1,6 +1,6 @@
 # 20261024-0058-engine-sandbox Filesystem and network restrictions for engine runs
 
-- **status**: in_progress
+- **status**: completed
 - **priority**: P2
 - **owner**: station/engine-sandbox-20261024-0058
 - **createdAt**: 2026-10-24 00:58
@@ -33,3 +33,5 @@ Plan: [20261024-0058-engine-sandbox](../plan/20261024-0058-engine-sandbox.md)
 - 2026-10-24: step 1 merged (7f68007) and the nsplane-independent net library merged (1cbd94e).
   Remaining: fail-closed as root, task-override tightening, real-engine verification, and the
   `allowlist` glue on nsplane v0.17.0.
+
+- complete: Merged 7f68007, 1cbd94e, db5a572, a756422; agent gates, sandbox-it 10/10 and real claude e2e (full, allowlist) pass. Leftovers in the sandbox follow-ups task.

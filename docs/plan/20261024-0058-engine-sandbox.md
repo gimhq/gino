@@ -1,6 +1,6 @@
 # 20261024-0058-engine-sandbox Filesystem and network restrictions for engine runs
 
-- **status**: implementing
+- **status**: completed
 - **createdAt**: 2026-10-24 00:58
 - **approvedAt**: 2026-10-24 02:30
 - **relatedTask**: 20261024-0058-engine-sandbox

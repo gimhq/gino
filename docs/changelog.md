@@ -197,3 +197,23 @@ the merged tree by the full agent gate (fmt, clippy, typos, MSRV, nextest 585 pa
 privileged skipped, doctests, deny, shear) and `sandbox-it.sh` 8/8. Open: fail closed when the
 agent runs as root, whether task overrides may loosen isolation, real claude/codex verification,
 and the `allowlist` glue on nsplane v0.17.0.
+
+## 2026-10-24 15:40 [progress]
+
+Engine sandbox completed (task `20261024-0058-engine-sandbox`, BKD campaign
+`l1-i8j3v2zw-20261024030108`, auto mode). Merge db5a572 (`bkd/0pc3dgdu` follow-ups):
+`engine.isolation.allowTaskOverride` (task overrides may only tighten unless set), sandbox fails
+closed when the agent runs as root, no `GINO_WORKSPACE_DIR` in sandboxed engines. Merge a756422
+(`bkd/t7x386ff`): network mode `allowlist` on nsplane v0.17.0 — TUN created by `sandbox-init` and
+handed to the daemon, a per-run transparent `nsplane-netstack` exit with async admission
+(rules, limits, upstream connect before accept, RST/ICMP on refusal, decision log), guest DNS on
+`nsplane-dns` with a fake-address pool, loopback LLM endpoints rewritten to the `10.0.2.2` gateway,
+link-local refused for always-allowed endpoints; `GINO_ISOLATION_FILE` as the local floor that a
+host overlay may only tighten (the LLM endpoint comes from the daemon env under a floor); real
+sandbox e2e harness `e2e/run-real-sandbox.sh`. Verified on the merged trees by the full agent gate
+(nextest 644 passed / 12 privileged skipped), `gino-agent/scripts/sandbox-it.sh` 10/10, and the
+real claude CLI through `run-real-sandbox.sh` in `full` and `allowlist` modes (non-root engine,
+hidden agent state and sibling threads, resume, denied host unreachable). Open, tracked in the
+sandbox follow-ups task: `dotns/simple-dns` is not publicly fetchable (clean builds and CI fail
+until upstream fixes it), harness build and stale-binary handling, one leaky test, PreCompact
+hook and codex under the sandbox not yet verified with real binaries.
