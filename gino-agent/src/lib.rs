@@ -99,6 +99,10 @@ enum Command {
     /// Inspect this agent's execution threads.
     #[command(subcommand)]
     Thread(gino_cli::ThreadCommand),
+    /// First process inside the engine sandbox: drops to a non-root uid and
+    /// supervises the engine.
+    #[command(hide = true)]
+    SandboxInit(sandbox::init::SandboxInitArgs),
 }
 
 /// Parse CLI arguments, install logging, and dispatch the selected subcommand.
@@ -137,6 +141,7 @@ pub fn run() -> Result<()> {
         Command::Cron(cmd) => gino_cli::cron(cmd)?,
         Command::Task(cmd) => gino_cli::task(cmd)?,
         Command::Thread(cmd) => gino_cli::thread(cmd)?,
+        Command::SandboxInit(args) => std::process::exit(sandbox::init::run(&args)),
     }
     Ok(())
 }
