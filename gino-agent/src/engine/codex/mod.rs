@@ -94,6 +94,8 @@ pub(crate) struct CodexSettings {
     pub(crate) config_dir: Option<PathBuf>,
     /// Default isolation (`engine.isolation`); empty means off.
     pub(crate) isolation: IsolationSpec,
+    /// A local isolation floor (`GINO_ISOLATION_FILE`) is configured.
+    pub(crate) isolation_floored: bool,
     /// The daemon workspace dir, which isolation paths are checked against.
     pub(crate) workspace_dir: PathBuf,
 }
@@ -111,6 +113,7 @@ impl Default for CodexSettings {
             env: Vec::new(),
             config_dir: None,
             isolation: IsolationSpec::default(),
+            isolation_floored: false,
             workspace_dir: PathBuf::new(),
         }
     }
@@ -146,6 +149,7 @@ impl CodexSettings {
             env,
             config_dir: None,
             isolation: config.engine.isolation.clone(),
+            isolation_floored: config.engine.isolation_floor.is_some(),
             workspace_dir: config.paths.workspace_dir.clone(),
         }
     }
@@ -394,6 +398,7 @@ fn launch_context<'a>(settings: &'a CodexSettings, cfg: &'a SessionCfg) -> Launc
         self_exe: settings.self_exe.as_deref(),
         global_config_dir: settings.config_dir.as_deref(),
         config_dir_keys: &CONFIG_DIR_ENV_KEYS,
+        floored: settings.isolation_floored,
     }
 }
 
@@ -715,7 +720,13 @@ mod tests {
             work_dir: Some(work_dir.clone()),
             ..SessionCfg::default()
         };
-        let isolation = sandbox::resolve(&settings.isolation, None, &root, None).unwrap();
+        let isolation = sandbox::resolve(
+            &settings.isolation,
+            None,
+            &root,
+            sandbox::LlmBaseUrl::default(),
+        )
+        .unwrap();
         let wrapped = sandbox::wrap(
             direct_launch(&settings, &cfg),
             &launch_context(&settings, &cfg),

@@ -404,6 +404,22 @@ impl RuleSet {
             })
     }
 
+    /// True when a rule covers the endpoint `host:port` over `proto`: a host
+    /// rule matching the name, or a `cidr` rule containing the IP literal.
+    /// Always-allowed endpoints do not count.
+    pub fn rule_covers(&self, host: &str, port: u16, proto: Proto) -> bool {
+        let name = normalize_name(host);
+        let ip = name.parse::<IpAddr>().ok().map(canonical_ip);
+        self.rules.iter().any(|rule| {
+            let target = match (&rule.target, ip) {
+                (Target::Host(pattern), None) => pattern.matches(&name),
+                (Target::Cidr(cidr), Some(ip)) => cidr.contains(ip),
+                _ => false,
+            };
+            target && rule.proto == proto && rule.ports.contains(port)
+        })
+    }
+
     /// Index of the first `cidr` rule matching `ip`, `port` and `proto`.
     pub fn cidr_covers(&self, ip: IpAddr, port: u16, proto: Proto) -> Option<usize> {
         let ip = canonical_ip(ip);
@@ -824,6 +840,29 @@ mod tests {
             err.to_string().starts_with("always-allowed endpoint 0 "),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rule_covers_endpoints() {
+        let always = [AlwaysAllow {
+            host: "api.anthropic.com".to_owned(),
+            port: 443,
+        }];
+        let s = set(
+            &[
+                r#"{"host":"*.example.com","ports":[443]}"#,
+                r#"{"cidr":"10.0.0.0/8","ports":[8080]}"#,
+                r#"{"host":"dns.example.org","ports":[53],"proto":"udp"}"#,
+            ],
+            &always,
+        );
+        assert!(s.rule_covers("Proxy.Example.com.", 443, Proto::Tcp));
+        assert!(!s.rule_covers("proxy.example.com", 80, Proto::Tcp));
+        assert!(!s.rule_covers("proxy.example.com", 443, Proto::Udp));
+        assert!(s.rule_covers("10.1.2.3", 8080, Proto::Tcp));
+        assert!(!s.rule_covers("10.1.2.3", 443, Proto::Tcp));
+        assert!(!s.rule_covers("dns.example.org", 53, Proto::Tcp));
+        assert!(!s.rule_covers("api.anthropic.com", 443, Proto::Tcp));
     }
 
     #[test]
