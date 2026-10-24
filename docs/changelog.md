@@ -173,3 +173,10 @@ throwaway key: `lode-cli verify` accepts both sidecars and the manifest entry,
 `validate-release.ts` passes, and lode installs the agent archive under
 `require_signature = "enforce"` from a loopback native manifest and runs `./gino-agent`, while a
 tampered asset and an untrusted key are rejected.
+
+## 2026-10-24 02:49 [decision]
+
+The release signing key is confined to a dedicated `publish` job. The `host` and `agent` jobs
+only build and upload artifacts; `publish` downloads them, signs with the pinned lode-cli,
+validates and uploads to the release, and exposes `LODE_SIGNING_KEY` only to its key-check and
+sign steps, so no job that runs dependency code (`bun install`, cargo build scripts) can read it.
