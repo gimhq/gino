@@ -61,6 +61,8 @@ pub(crate) struct IsolationSpec {
     pub(crate) network: Option<NetworkSpec>,
     pub(crate) read_paths: Option<Vec<PathBuf>>,
     pub(crate) write_paths: Option<Vec<PathBuf>>,
+    /// Lets a task override loosen the default; read from the config default only.
+    pub(crate) allow_task_override: Option<bool>,
 }
 
 /// Raw `network` sub-block of an [`IsolationSpec`].
@@ -101,6 +103,15 @@ pub(crate) enum IsolationError {
     UnknownNetworkMode(String),
     #[error("`{0}` is not supported yet")]
     NotSupported(String),
+    #[error(
+        "task meta.isolation would loosen {setting} from `{from}` to `{to}`; \
+         set engine.isolation.allowTaskOverride to allow this"
+    )]
+    OverrideLoosens {
+        setting: &'static str,
+        from: String,
+        to: String,
+    },
     #[error("invalid isolation path `{}`: {reason}", path.display())]
     InvalidPath { path: PathBuf, reason: &'static str },
     #[error("invalid isolation in task meta: {0}")]
@@ -114,13 +125,19 @@ pub(crate) enum IsolationError {
 /// Resolve the effective isolation for a run.
 ///
 /// The override's `mode` and `network.mode` win over the default's; extra paths
-/// come from the config default only. When the resolved mode is off nothing
-/// else is validated.
+/// come from the config default only. Unless the default sets
+/// `allowTaskOverride`, an override may only tighten the default. When the
+/// resolved mode is off nothing else is validated.
 pub(crate) fn resolve(
     default: &IsolationSpec,
     task_override: Option<&IsolationSpec>,
     workspace_dir: &Path,
 ) -> Result<Isolation, IsolationError> {
+    if let Some(task) = task_override
+        && !default.allow_task_override.unwrap_or(false)
+    {
+        check_tightens(default, task)?;
+    }
     let mode = task_override
         .and_then(|o| o.mode.as_deref())
         .or(default.mode.as_deref());
@@ -156,6 +173,61 @@ pub(crate) fn resolve(
         read_paths,
         write_paths,
     })
+}
+
+/// Fail when `task` would loosen `default`'s mode or network mode.
+///
+/// Modes order `off` < `sandbox` < `vm`; network modes order `full` <
+/// `allowlist` < `none`. A default that is off confines no network, so any
+/// network override tightens it.
+fn check_tightens(default: &IsolationSpec, task: &IsolationSpec) -> Result<(), IsolationError> {
+    let from = default.mode.as_deref().unwrap_or("off");
+    let default_mode = mode_strictness(from)?;
+    if let Some(to) = task.mode.as_deref()
+        && mode_strictness(to)? < default_mode
+    {
+        return Err(loosens("isolation.mode", from, to));
+    }
+    if default_mode == 0 {
+        return Ok(());
+    }
+    let from = network_mode(default).unwrap_or("none");
+    if let Some(to) = network_mode(task)
+        && network_strictness(to)? < network_strictness(from)?
+    {
+        return Err(loosens("isolation.network.mode", from, to));
+    }
+    Ok(())
+}
+
+fn network_mode(spec: &IsolationSpec) -> Option<&str> {
+    spec.network.as_ref().and_then(|n| n.mode.as_deref())
+}
+
+fn mode_strictness(mode: &str) -> Result<u8, IsolationError> {
+    match mode {
+        "off" => Ok(0),
+        "sandbox" => Ok(1),
+        "vm" => Ok(2),
+        other => Err(IsolationError::UnknownMode(other.to_owned())),
+    }
+}
+
+fn network_strictness(network: &str) -> Result<u8, IsolationError> {
+    match network {
+        "full" => Ok(0),
+        "allowlist" => Ok(1),
+        "none" => Ok(2),
+        other => Err(IsolationError::UnknownNetworkMode(other.to_owned())),
+    }
+}
+
+fn loosens(setting: &'static str, from: &str, to: &str) -> IsolationError {
+    IsolationError::OverrideLoosens {
+        setting,
+        from: from.to_owned(),
+        to: to.to_owned(),
+    }
 }
 
 /// Extract the task override from a task's free-form `meta` JSON.
@@ -291,17 +363,34 @@ impl SandboxHost {
 }
 
 /// Resolve the run's isolation and build its launch: `direct` as-is when off,
-/// wrapped in `bwrap` when sandboxed. Fails closed when `bwrap` is unusable.
+/// wrapped in `bwrap` when sandboxed. Fails closed when the agent runs as root
+/// or `bwrap` is unusable.
 pub(crate) fn launch(direct: Launch, ctx: &LaunchContext<'_>) -> Result<Launch, EngineError> {
+    launch_as(direct, ctx, nix::unistd::geteuid().as_raw())
+}
+
+fn launch_as(direct: Launch, ctx: &LaunchContext<'_>, euid: u32) -> Result<Launch, EngineError> {
     let isolation = resolve(ctx.isolation, ctx.task_override, ctx.workspace_dir)?;
     match isolation.mode {
         IsolationMode::Off => Ok(direct),
         IsolationMode::Sandbox => {
+            check_not_root(euid)?;
             let bwrap = bwrap::ensure_available()?;
             wrap(direct, ctx, &isolation, &SandboxHost::current(bwrap))
         }
         IsolationMode::Vm => Err(IsolationError::NotSupported("isolation.mode: vm".into()).into()),
     }
+}
+
+/// Refuse to sandbox from a root daemon: the engine's user namespace maps it
+/// onto the daemon's uid, so it would own root's files.
+fn check_not_root(euid: u32) -> Result<(), IsolationError> {
+    if euid == 0 {
+        return Err(IsolationError::Unavailable(
+            "the agent runs as root; run it as an unprivileged user".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Wrap `direct` in `bwrap` + `sandbox-init` and create the engine home.
@@ -455,8 +544,8 @@ mod tests {
 
     use super::{
         Isolation, IsolationError, IsolationMode, IsolationSpec, Launch, LaunchContext,
-        NetworkMode, NetworkSpec, SandboxHost, first_child, launch, override_from_meta, resolve,
-        sandbox_init_pid, stat_ppid, wrap,
+        NetworkMode, NetworkSpec, SandboxHost, check_not_root, first_child, launch, launch_as,
+        override_from_meta, resolve, sandbox_init_pid, stat_ppid, wrap,
     };
     use crate::engine::EngineError;
 
@@ -475,6 +564,11 @@ mod tests {
     fn with_paths(mut spec: IsolationSpec, read: &[&str], write: &[&str]) -> IsolationSpec {
         spec.read_paths = Some(read.iter().map(PathBuf::from).collect());
         spec.write_paths = Some(write.iter().map(PathBuf::from).collect());
+        spec
+    }
+
+    fn allowing(mut spec: IsolationSpec) -> IsolationSpec {
+        spec.allow_task_override = Some(true);
         spec
     }
 
@@ -520,7 +614,7 @@ mod tests {
 
     #[test]
     fn override_beats_default_for_mode_and_network() {
-        let default = spec(Some("sandbox"), Some("none"));
+        let default = allowing(spec(Some("sandbox"), Some("none")));
         let iso = run(&default, Some(&spec(None, Some("full")))).unwrap();
         assert_eq!(iso.mode, IsolationMode::Sandbox);
         assert_eq!(iso.network, NetworkMode::Full);
@@ -536,6 +630,275 @@ mod tests {
         )
         .unwrap();
         assert_eq!(iso.mode, IsolationMode::Sandbox);
+    }
+
+    /// The resolved `(mode, network)`, or the error, of `default` + `task`.
+    fn outcome(
+        default: &IsolationSpec,
+        task: &IsolationSpec,
+    ) -> Result<(IsolationMode, NetworkMode), IsolationError> {
+        run(default, Some(task)).map(|iso| (iso.mode, iso.network))
+    }
+
+    fn assert_loosens(
+        default: &IsolationSpec,
+        task: &IsolationSpec,
+        setting: &str,
+        from: &str,
+        to: &str,
+    ) {
+        let err = run(default, Some(task)).unwrap_err();
+        assert!(
+            matches!(&err, IsolationError::OverrideLoosens { setting: s, from: f, to: t }
+                if *s == setting && f == from && t == to),
+            "{default:?} + {task:?}: {err:?}"
+        );
+    }
+
+    fn assert_not_supported(result: Result<(IsolationMode, NetworkMode), IsolationError>) {
+        let err = result.unwrap_err();
+        assert!(matches!(err, IsolationError::NotSupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn mode_override_may_only_tighten() {
+        use IsolationMode::Sandbox;
+        use NetworkMode::None as NoNet;
+
+        // off -> sandbox tightens, also from an absent default.
+        for default in [spec(Some("off"), None), IsolationSpec::default()] {
+            assert_eq!(
+                outcome(&default, &spec(Some("sandbox"), None)).unwrap(),
+                (Sandbox, NoNet)
+            );
+            assert_not_supported(outcome(&default, &spec(Some("vm"), None)));
+            assert_eq!(
+                run(&default, Some(&spec(Some("off"), None))).unwrap(),
+                Isolation::off()
+            );
+        }
+        // sandbox -> vm tightens, then fails as not supported yet.
+        assert_not_supported(outcome(
+            &spec(Some("sandbox"), None),
+            &spec(Some("vm"), None),
+        ));
+        assert_eq!(
+            outcome(&spec(Some("sandbox"), None), &spec(Some("sandbox"), None)).unwrap(),
+            (Sandbox, NoNet)
+        );
+
+        assert_loosens(
+            &spec(Some("sandbox"), None),
+            &spec(Some("off"), None),
+            "isolation.mode",
+            "sandbox",
+            "off",
+        );
+        assert_loosens(
+            &spec(Some("vm"), None),
+            &spec(Some("off"), None),
+            "isolation.mode",
+            "vm",
+            "off",
+        );
+        assert_loosens(
+            &spec(Some("vm"), None),
+            &spec(Some("sandbox"), None),
+            "isolation.mode",
+            "vm",
+            "sandbox",
+        );
+    }
+
+    #[test]
+    fn mode_override_loosens_with_allow_task_override() {
+        let sandbox = allowing(spec(Some("sandbox"), None));
+        assert_eq!(
+            run(&sandbox, Some(&spec(Some("off"), None))).unwrap(),
+            Isolation::off()
+        );
+        let vm = allowing(spec(Some("vm"), None));
+        assert_eq!(
+            run(&vm, Some(&spec(Some("off"), None))).unwrap(),
+            Isolation::off()
+        );
+        assert_eq!(
+            outcome(&vm, &spec(Some("sandbox"), None)).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::None)
+        );
+        let off = allowing(spec(Some("off"), None));
+        assert_eq!(
+            outcome(&off, &spec(Some("sandbox"), None)).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::None)
+        );
+        assert_not_supported(outcome(&sandbox, &spec(Some("vm"), None)));
+    }
+
+    #[test]
+    fn network_override_may_only_tighten() {
+        use IsolationMode::Sandbox;
+        use NetworkMode::{Full, None as NoNet};
+
+        let sandbox = |network| spec(Some("sandbox"), network);
+        let net = |network| spec(None, Some(network));
+
+        // Tightening.
+        assert_not_supported(outcome(&sandbox(Some("full")), &net("allowlist")));
+        assert_eq!(
+            outcome(&sandbox(Some("full")), &net("none")).unwrap(),
+            (Sandbox, NoNet)
+        );
+        assert_eq!(
+            outcome(&sandbox(Some("allowlist")), &net("none")).unwrap(),
+            (Sandbox, NoNet)
+        );
+        assert_eq!(
+            outcome(&sandbox(Some("full")), &net("full")).unwrap(),
+            (Sandbox, Full)
+        );
+
+        // Loosening, including from an absent network (= none).
+        for default in [sandbox(None), sandbox(Some("none"))] {
+            for to in ["full", "allowlist"] {
+                assert_loosens(&default, &net(to), "isolation.network.mode", "none", to);
+            }
+        }
+        assert_loosens(
+            &sandbox(Some("allowlist")),
+            &net("full"),
+            "isolation.network.mode",
+            "allowlist",
+            "full",
+        );
+        // The mode is checked first.
+        assert_loosens(
+            &sandbox(None),
+            &spec(Some("off"), Some("full")),
+            "isolation.mode",
+            "sandbox",
+            "off",
+        );
+    }
+
+    #[test]
+    fn network_override_loosens_with_allow_task_override() {
+        let allow = |network| allowing(spec(Some("sandbox"), Some(network)));
+        let net = |network| spec(None, Some(network));
+        assert_eq!(
+            outcome(&allow("none"), &net("full")).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::Full)
+        );
+        assert_not_supported(outcome(&allow("none"), &net("allowlist")));
+        assert_eq!(
+            outcome(&allow("allowlist"), &net("full")).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::Full)
+        );
+        assert_eq!(
+            outcome(&allow("full"), &net("none")).unwrap(),
+            (IsolationMode::Sandbox, NetworkMode::None)
+        );
+    }
+
+    #[test]
+    fn an_off_default_accepts_any_override_network() {
+        for default in [IsolationSpec::default(), spec(Some("off"), Some("none"))] {
+            for (network, expected) in [
+                (None, Ok(NetworkMode::None)),
+                (Some("none"), Ok(NetworkMode::None)),
+                (Some("full"), Ok(NetworkMode::Full)),
+                (Some("allowlist"), Err(())),
+            ] {
+                let result = outcome(&default, &spec(Some("sandbox"), network));
+                match expected {
+                    Ok(net) => assert_eq!(result.unwrap(), (IsolationMode::Sandbox, net)),
+                    Err(()) => assert_not_supported(result),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_override_keeps_the_default() {
+        let iso = run(&spec(Some("sandbox"), Some("full")), None).unwrap();
+        assert_eq!(
+            (iso.mode, iso.network),
+            (IsolationMode::Sandbox, NetworkMode::Full)
+        );
+        // An empty override changes nothing either.
+        let iso = run(
+            &spec(Some("sandbox"), Some("full")),
+            Some(&IsolationSpec::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            (iso.mode, iso.network),
+            (IsolationMode::Sandbox, NetworkMode::Full)
+        );
+    }
+
+    #[test]
+    fn allow_task_override_inside_the_override_is_ignored() {
+        let task = allowing(spec(Some("off"), None));
+        assert_loosens(
+            &spec(Some("sandbox"), None),
+            &task,
+            "isolation.mode",
+            "sandbox",
+            "off",
+        );
+        let default = IsolationSpec {
+            allow_task_override: Some(false),
+            ..spec(Some("sandbox"), None)
+        };
+        assert_loosens(&default, &task, "isolation.mode", "sandbox", "off");
+    }
+
+    #[test]
+    fn invalid_values_never_pass_as_tighter() {
+        let err = run(
+            &spec(Some("jail"), None),
+            Some(&spec(Some("sandbox"), None)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::UnknownMode(m) if m == "jail"));
+        let err = run(
+            &spec(Some("sandbox"), None),
+            Some(&spec(Some("jail"), None)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::UnknownMode(m) if m == "jail"));
+        let err = run(
+            &spec(Some("sandbox"), Some("partial")),
+            Some(&spec(None, Some("none"))),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::UnknownNetworkMode(m) if m == "partial"));
+        let err = run(
+            &spec(Some("sandbox"), None),
+            Some(&spec(None, Some("partial"))),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IsolationError::UnknownNetworkMode(m) if m == "partial"));
+    }
+
+    #[test]
+    fn loosen_error_names_the_setting_and_the_opt_in() {
+        let err = run(
+            &spec(Some("sandbox"), None),
+            Some(&spec(None, Some("full"))),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "task meta.isolation would loosen isolation.network.mode from `none` to `full`; \
+             set engine.isolation.allowTaskOverride to allow this"
+        );
+        let err = run(&spec(Some("sandbox"), None), Some(&spec(Some("off"), None))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("isolation.mode from `sandbox` to `off`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -629,7 +992,11 @@ mod tests {
         let default = with_paths(IsolationSpec::default(), &["relative", "/"], &[WORKSPACE]);
         assert_eq!(run(&default, None).unwrap(), Isolation::off());
 
-        let default = with_paths(spec(Some("sandbox"), Some("bogus")), &["relative"], &[]);
+        let default = allowing(with_paths(
+            spec(Some("sandbox"), Some("bogus")),
+            &["relative"],
+            &[],
+        ));
         assert_eq!(
             run(&default, Some(&spec(Some("off"), None))).unwrap(),
             Isolation::off()
@@ -741,13 +1108,41 @@ mod tests {
         let off = IsolationSpec::default();
         assert_eq!(launch(d.clone(), &ctx(&off, None, None, None)).unwrap(), d);
 
-        let default = spec(Some("sandbox"), None);
+        let default = allowing(spec(Some("sandbox"), None));
         let task = spec(Some("off"), None);
         assert_eq!(
             launch(d.clone(), &ctx(&default, Some(&task), None, None)).unwrap(),
             d
         );
         assert!(!d.sandboxed);
+    }
+
+    #[test]
+    fn root_euid_is_refused() {
+        let err = check_not_root(0).unwrap_err();
+        assert!(matches!(err, IsolationError::Unavailable(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "engine sandbox is unavailable: the agent runs as root; run it as an unprivileged user"
+        );
+        check_not_root(1000).unwrap();
+    }
+
+    #[test]
+    fn root_euid_fails_only_sandboxed_launches() {
+        let d = direct(Path::new("/ws/threads/t1/project"));
+        let off = IsolationSpec::default();
+        assert_eq!(
+            launch_as(d.clone(), &ctx(&off, None, None, None), 0).unwrap(),
+            d
+        );
+
+        let sandbox = spec(Some("sandbox"), None);
+        let err = launch_as(d, &ctx(&sandbox, None, None, None), 0).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Isolation(IsolationError::Unavailable(m)) if m.contains("root")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -758,6 +1153,7 @@ mod tests {
             (spec(Some("sandbox"), Some("allowlist")), None),
             (IsolationSpec::default(), Some(spec(Some("jail"), None))),
             (IsolationSpec::default(), Some(spec(Some("vm"), None))),
+            (spec(Some("sandbox"), None), Some(spec(Some("off"), None))),
         ] {
             let err = launch(d.clone(), &ctx(&default, task.as_ref(), None, None)).unwrap_err();
             assert!(matches!(err, EngineError::Isolation(_)), "{err:?}");
