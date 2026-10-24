@@ -13,7 +13,7 @@
 //! `$GINO_THREAD_ID`, and the runner's own path as `$GINO_RUNNER_BIN`, so the skill
 //! self-references without hard-coded ids or paths.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -104,12 +104,29 @@ pub(crate) struct IdArg {
 /// (which holds the single-instance lock) migrates.
 fn open_db() -> Result<Db> {
     let path = resolve_db_path();
-    Db::open_existing(&path).with_context(|| {
+    let in_sandbox = std::env::var("GINO_SANDBOX").is_ok_and(|v| is_truthy(&v));
+    Db::open_existing(&path).with_context(|| open_db_error(in_sandbox, &path))
+}
+
+/// Whether an env flag value is set to a truthy value.
+fn is_truthy(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true")
+}
+
+/// The context for a failed agent-DB open: inside the engine sandbox the DB is
+/// deliberately unreachable, so say that instead of suggesting a setup problem.
+fn open_db_error(in_sandbox: bool, path: &Path) -> String {
+    if in_sandbox {
+        format!(
+            "agent state is not available inside the sandbox (agent database at {})",
+            path.display()
+        )
+    } else {
         format!(
             "opening the agent database at {} (is the daemon set up on this machine?)",
             path.display()
         )
-    })
+    }
 }
 
 /// `gino-agent system` — identity, version, host, paths, live counts.
@@ -443,7 +460,9 @@ fn env_or(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_cron_list;
+    use std::path::Path;
+
+    use super::{is_truthy, open_db_error, render_cron_list};
     use crate::db::CronRow;
 
     fn cron(id: &str, task_id: &str) -> CronRow {
@@ -482,6 +501,26 @@ mod tests {
         let out = render_cron_list(&crons, true);
         assert!(out.starts_with("cron-1\tactive\t"));
         assert!(!out.contains("task="));
+    }
+
+    #[test]
+    fn open_db_error_names_the_sandbox_only_inside_it() {
+        let path = Path::new("/ws/agent.db");
+        let sandboxed = open_db_error(true, path);
+        assert!(sandboxed.starts_with("agent state is not available inside the sandbox"));
+        assert!(sandboxed.contains("/ws/agent.db"));
+        assert_eq!(
+            open_db_error(false, path),
+            "opening the agent database at /ws/agent.db (is the daemon set up on this machine?)"
+        );
+    }
+
+    #[test]
+    fn sandbox_flag_accepts_only_truthy_values() {
+        assert!(is_truthy("1"));
+        assert!(is_truthy("true"));
+        assert!(!is_truthy("0"));
+        assert!(!is_truthy(""));
     }
 
     #[test]

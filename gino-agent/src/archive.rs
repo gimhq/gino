@@ -6,8 +6,9 @@
 //! the JSONL transcript and writes a human-readable Markdown archive plus a
 //! `sessions-index.json` summary lookup under the runner's workspace.
 //!
-//! The output directory is **configurable** — `<workspace>/conversations`, where
-//! `<workspace>` comes from [`crate::config`] — never a hardcoded Docker mount.
+//! The output directory is **configurable** — `$GINO_ARCHIVE_DIR` when set, else
+//! `<workspace>/conversations`, where `<workspace>` comes from [`crate::config`]
+//! — never a hardcoded Docker mount.
 //! The Markdown layout reproduces the existing TypeScript runner
 //! (`container/gino-agent/src/claude-backend.ts`) so archives stay consistent
 //! across the rewrite.
@@ -97,13 +98,21 @@ struct SessionsIndex {
     entries: Vec<SessionEntry>,
 }
 
+/// The directory archives are written into: a non-empty `archive_dir_env`
+/// (`GINO_ARCHIVE_DIR`) wins, else `<workspace_dir>/conversations`.
+pub(crate) fn conversations_dir(archive_dir_env: Option<PathBuf>, workspace_dir: &Path) -> PathBuf {
+    archive_dir_env
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| workspace_dir.join("conversations"))
+}
+
 /// Run the `archive` subcommand: read the hook payload from `input`, parse the
 /// transcript, and write the Markdown archive + sessions index under
-/// `<workspace_dir>/conversations`.
+/// `conversations_dir` (see [`conversations_dir`]).
 ///
 /// A missing/empty transcript is a no-op (logged), not an error — the hook fires
 /// on every compaction and an empty conversation is unremarkable.
-pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), ArchiveError> {
+pub(crate) fn run<R: Read>(conversations_dir: &Path, mut input: R) -> Result<(), ArchiveError> {
     let mut raw = String::new();
     input
         .read_to_string(&mut raw)
@@ -138,8 +147,7 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
         _ => fallback_name(now_unix()),
     };
 
-    let conversations_dir = workspace_dir.join("conversations");
-    fs::create_dir_all(&conversations_dir).map_err(|source| ArchiveError::Write {
+    fs::create_dir_all(conversations_dir).map_err(|source| ArchiveError::Write {
         dir: conversations_dir.display().to_string(),
         source,
     })?;
@@ -152,10 +160,10 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
     // neither pick the same archive name nor interleave the index
     // read-modify-write; the index write itself is temp+rename (see
     // [`update_index`]) so a crash mid-write never leaves a torn file behind.
-    let _dir_lock = lock_conversations_dir(&conversations_dir)?;
+    let _dir_lock = lock_conversations_dir(conversations_dir)?;
 
     let now = now_unix();
-    let file_path = unique_archive_path(&conversations_dir, &date_stamp(now), &name);
+    let file_path = unique_archive_path(conversations_dir, &date_stamp(now), &name);
     let markdown = format_markdown(&messages, summary.as_deref(), now);
     fs::write(&file_path, markdown).map_err(|source| ArchiveError::Write {
         dir: file_path.display().to_string(),
@@ -164,7 +172,7 @@ pub(crate) fn run<R: Read>(workspace_dir: &Path, mut input: R) -> Result<(), Arc
     info!(path = %file_path.display(), "archive: wrote conversation");
 
     update_index(
-        &conversations_dir,
+        conversations_dir,
         &session_id,
         &file_path,
         summary.as_deref(),
@@ -488,9 +496,11 @@ mod tests {
 
     use serde_json::json;
 
+    use std::path::{Path, PathBuf};
+
     use super::{
-        SessionsIndex, date_stamp, fallback_name, format_archived, parse_transcript, run,
-        sanitize_filename, truncate_chars,
+        SessionsIndex, conversations_dir, date_stamp, fallback_name, format_archived,
+        parse_transcript, run, sanitize_filename, truncate_chars,
     };
 
     #[test]
@@ -572,7 +582,7 @@ mod tests {
         })
         .to_string();
 
-        run(workspace, Cursor::new(input)).unwrap();
+        run(&workspace.join("conversations"), Cursor::new(input)).unwrap();
 
         // The Markdown archive is named from the summary slug.
         let conversations = workspace.join("conversations");
@@ -647,7 +657,7 @@ mod tests {
                 "session_id": session
             })
             .to_string();
-            run(workspace, Cursor::new(input)).unwrap();
+            run(&workspace.join("conversations"), Cursor::new(input)).unwrap();
         }
 
         let conversations = workspace.join("conversations");
@@ -718,7 +728,7 @@ mod tests {
                             "session_id": format!("sess-{prefix}-{i}")
                         })
                         .to_string();
-                        run(&workspace, Cursor::new(input)).unwrap();
+                        run(&workspace.join("conversations"), Cursor::new(input)).unwrap();
                     }
                 })
             })
@@ -739,9 +749,58 @@ mod tests {
     }
 
     #[test]
+    fn conversations_dir_prefers_a_non_empty_env_path() {
+        let workspace = Path::new("/ws");
+        assert_eq!(
+            conversations_dir(Some(PathBuf::from("/archive")), workspace),
+            PathBuf::from("/archive")
+        );
+        assert_eq!(
+            conversations_dir(None, workspace),
+            PathBuf::from("/ws/conversations")
+        );
+        assert_eq!(
+            conversations_dir(Some(PathBuf::new()), workspace),
+            PathBuf::from("/ws/conversations")
+        );
+    }
+
+    #[test]
+    fn run_writes_into_an_explicit_archive_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript_path,
+            json!({ "type": "user", "message": { "content": "hi" } }).to_string(),
+        )
+        .unwrap();
+        let archive_dir = dir.path().join("elsewhere/archive");
+        let input = json!({
+            "transcript_path": transcript_path.display().to_string(),
+            "session_id": "s"
+        })
+        .to_string();
+
+        run(&archive_dir, Cursor::new(input)).unwrap();
+
+        assert!(archive_dir.join("sessions-index.json").is_file());
+        let markdown = std::fs::read_dir(&archive_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".md"))
+            .count();
+        assert_eq!(markdown, 1);
+        assert!(!dir.path().join("conversations").exists());
+    }
+
+    #[test]
     fn run_is_a_noop_for_empty_input() {
         let dir = tempfile::tempdir().unwrap();
-        run(dir.path(), Cursor::new(String::new())).unwrap();
+        run(
+            &dir.path().join("conversations"),
+            Cursor::new(String::new()),
+        )
+        .unwrap();
         assert!(!dir.path().join("conversations").exists());
     }
 
@@ -750,7 +809,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input =
             json!({ "transcript_path": "/nope/missing.jsonl", "session_id": "s" }).to_string();
-        run(dir.path(), Cursor::new(input)).unwrap();
+        run(&dir.path().join("conversations"), Cursor::new(input)).unwrap();
         assert!(!dir.path().join("conversations").exists());
     }
 }
